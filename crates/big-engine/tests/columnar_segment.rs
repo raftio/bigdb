@@ -14,7 +14,7 @@
 
 //! A segment against a real pager: blocks through the tree, and the pages they own.
 
-use big_column::*;
+use big_engine::columnar::*;
 use big_pager::{MemPager, Store};
 use core::ops::ControlFlow;
 

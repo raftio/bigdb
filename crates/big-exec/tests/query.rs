@@ -475,7 +475,7 @@ fn a_set_column_projects_every_value_it_holds() {
 #[test]
 fn a_projection_reads_the_same_whichever_engine_stored_it() {
     let mut answers = Vec::new();
-    for engine in [TableEngine::Bitmap, TableEngine::BitmapColumnar, TableEngine::Columnar] {
+    for engine in TableEngine::all() {
         let d = Db::in_memory().unwrap();
         d.create_table_with("tx", engine).unwrap();
         d.create_field("tx", "amount", FieldKind::Int, 32).unwrap();

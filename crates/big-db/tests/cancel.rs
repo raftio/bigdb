@@ -20,7 +20,7 @@
 //! and no test that passes on a fast machine and fails on a busy one.
 
 use big_db::*;
-use big_fragment::SHARD_WIDTH;
+use big_engine::SHARD_WIDTH;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;

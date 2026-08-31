@@ -155,7 +155,7 @@ sparse/64 batch-1000 row exactly.
 
 3. **Stop one commit meaning N trees.** One b-tree per field with the shard as a key prefix, so a
    commit rewrites one path rather than 64. This is the fix that would actually move the number,
-   and it changes the addressing in `crates/big-fragment/src/coords.rs` — which that file
+   and it changes the addressing in `crates/big-engine/src/coords.rs` — which that file
    documents as wire format, "part of the wire format: every peer exchanging data must agree". A
    version break, with the process in [`docs/versioning.md`](versioning.md). Not a performance
    patch.

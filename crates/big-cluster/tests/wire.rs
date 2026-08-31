@@ -23,8 +23,8 @@ use big_api::{Plan, Rows, Value};
 use big_cluster::wire::{self, Assignment, FactValue, OwnedFact, WireError};
 use big_container::Container;
 use big_db::Matches;
+use big_engine::bitmap::RowSet;
 use big_exec::Group;
-use big_fragment::RowSet;
 use big_plan::CmpOp;
 use proptest::prelude::*;
 

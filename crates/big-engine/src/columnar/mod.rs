@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Column segments: a field's values, in record order, encoded a block at a time.
+//! The columnar engine: a field's values, in record order, encoded a block at a time.
 //!
 //! The other half of what a table can store. A fragment answers *which records* by holding one
 //! bit per record per row; a segment answers *what a record holds* by keeping the values
@@ -46,12 +46,12 @@
 //! an increasing `part`. The key is `(block << PART_BITS) | part`, which makes a block a
 //! *contiguous span of keys* and reading one a range scan.
 //!
-//! That is the same shape `big_fragment::row_ckeys` already uses for a row, and it is chosen
+//! That is the same shape `crate::coords::row_ckeys` already uses for a row, and it is chosen
 //! over a chain of pages for one reason: a chain would be a second kind of page ownership, and
 //! the free walk, the scrub and the copy would each have to learn it. A span of keys is
 //! something the tree already understands.
 
-#![deny(unsafe_code)]
+use crate::engine::Engine;
 
 pub mod block;
 pub mod codec;
@@ -129,3 +129,24 @@ const _: () = assert!(BLOCK_RECORDS.is_power_of_two());
 // One page holds exactly one block of full-width values. Everything the module claims about a
 // scalar block never needing a second page rests on this.
 const _: () = assert!(BLOCK_RECORDS * 8 == PAGE_BYTES as u64);
+
+/// The descriptor. See [`crate::engine`] for what a descriptor is and is not.
+pub struct ColumnarEngine;
+
+impl Engine for ColumnarEngine {
+    fn code(&self) -> u8 {
+        2
+    }
+
+    fn name(&self) -> &'static str {
+        "columnar"
+    }
+
+    fn has_bitmap(&self) -> bool {
+        false
+    }
+
+    fn has_columns(&self) -> bool {
+        true
+    }
+}

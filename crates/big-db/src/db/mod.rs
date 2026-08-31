@@ -37,13 +37,15 @@ pub use write::{At, DbWrite};
 use crate::catalog::*;
 use crate::error::{DbError, Result};
 use crate::matches::Matches;
-pub use big_column::Cell;
-use big_column::{ColumnRead, ColumnWrite};
-use big_field::{bsi::EXISTS_ROW, BoolField, Bsi, Granularity, MutexField, RangeOp};
-use big_fragment::{
-    local_of, shard_of, Container, ContainerKey, FragmentKey, FragmentRead, FragmentWrite,
-    RecordId, RowId, RowSet, ShardId, SHARD_WIDTH,
+use big_engine::bitmap::field::{
+    bsi::EXISTS_ROW, BoolField, Bsi, Granularity, MutexField, RangeOp,
 };
+use big_engine::bitmap::{
+    Container, ContainerKey, FragmentKey, FragmentRead, FragmentWrite, RowSet,
+};
+pub use big_engine::columnar::Cell;
+use big_engine::columnar::{ColumnRead, ColumnWrite};
+use big_engine::{local_of, shard_of, RecordId, RowId, ShardId, SHARD_WIDTH};
 use big_pager::{Durability, MemPager, Pager, PagerMut, ReadTxn, Store, TxnId, WriteTxn};
 use std::collections::BTreeMap;
 use std::sync::RwLock;
@@ -305,7 +307,7 @@ pub const MUTEX_SHADOW_VIEW: ViewId = u32::MAX;
 /// the tree, the block picks the cell, and the slot picks the value inside it.
 pub fn column_site(record: RecordId) -> (u64, usize) {
     let local = local_of(record);
-    (big_column::block_of(local), big_column::slot_of(local))
+    (big_engine::columnar::block_of(local), big_engine::columnar::slot_of(local))
 }
 
 /// Reserved view holding a field's column segments.

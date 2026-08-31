@@ -147,7 +147,7 @@ impl<P: PagerMut> Db<P> {
     /// day*, not the records. A query with a `BETWEEN` stops finding them; a `count(*)` does
     /// not change. Deleting records is [`crate::db::DbWrite::delete_records`].
     pub fn drop_days_before(&self, table: &str, field: &str, unix_seconds: i64) -> Result<usize> {
-        let cutoff = big_field::day_view(unix_seconds);
+        let cutoff = big_engine::bitmap::field::day_view(unix_seconds);
         let mut w = self.write();
         let table_id = w
             .catalog

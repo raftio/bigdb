@@ -37,7 +37,7 @@
 //! which is the only reason that paragraph is here.
 
 use big_db::*;
-use big_fragment::SHARD_WIDTH;
+use big_engine::SHARD_WIDTH;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier};
 use std::time::Duration;

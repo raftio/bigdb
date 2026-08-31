@@ -37,7 +37,7 @@
 //! empty answer and "this engine cannot see time" call for opposite actions.
 
 use super::*;
-use big_column::BLOCK_RECORDS;
+use big_engine::columnar::BLOCK_RECORDS;
 
 /// How one record's cell is tested. Returning a plain `bool` keeps every predicate below a
 /// one-liner and keeps the block loop in one place.
@@ -123,9 +123,9 @@ impl<'db, P: Pager + Sync> DbRead<'db, P> {
                         continue;
                     }
                     let local = block * BLOCK_RECORDS + slot as u64;
-                    hits.entry(local >> big_fragment::CONTAINER_EXPONENT)
+                    hits.entry(local >> big_engine::CONTAINER_EXPONENT)
                         .or_default()
-                        .push((local & (big_fragment::CONTAINER_WIDTH - 1)) as u16);
+                        .push((local & (big_engine::CONTAINER_WIDTH - 1)) as u16);
                 }
                 Ok(core::ops::ControlFlow::Continue(()))
             })?;
@@ -174,8 +174,8 @@ impl<'db, P: Pager + Sync> DbRead<'db, P> {
                     }
                     let local = block * BLOCK_RECORDS + slot as u64;
                     if let Some(rows) = here {
-                        let container = local >> big_fragment::CONTAINER_EXPONENT;
-                        let offset = (local & (big_fragment::CONTAINER_WIDTH - 1)) as u16;
+                        let container = local >> big_engine::CONTAINER_EXPONENT;
+                        let offset = (local & (big_engine::CONTAINER_WIDTH - 1)) as u16;
                         if !rows.get(container).is_some_and(|c| c.as_ref().contains(offset)) {
                             continue;
                         }
@@ -334,15 +334,15 @@ impl<'db, P: Pager + Sync> DbRead<'db, P> {
         let mut pending = 0usize;
         self.scan_cells(table, field, Some(filter), |record, c| {
             let shard = shard_of(record);
-            let local = big_fragment::local_of(record);
+            let local = big_engine::local_of(record);
             for row in rows_of(c) {
                 hits.entry(row)
                     .or_default()
                     .entry(shard)
                     .or_default()
-                    .entry(local >> big_fragment::CONTAINER_EXPONENT)
+                    .entry(local >> big_engine::CONTAINER_EXPONENT)
                     .or_default()
-                    .push((local & (big_fragment::CONTAINER_WIDTH - 1)) as u16);
+                    .push((local & (big_engine::CONTAINER_WIDTH - 1)) as u16);
                 pending += 1;
             }
             if pending >= CHARGE_EVERY {

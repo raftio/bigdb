@@ -50,8 +50,8 @@ the bottom.
               └───────────────────────────────┬──────────────────────────────┘
                                               │
    storage    ┌───────────────────────────────▼──────────────────────────────┐
-              │ big-fragment │ big-field │ big-keys │ big-column            │
-              │ big-btree │ big-pager │ big-page │ big-container             │
+              │ big-engine  bitmap │ columnar │ hybrid  + Engine registry  │
+              │ big-btree │ big-pager │ big-page │ big-container │ big-keys  │
               │ no WAL — the meta page flip is the only atomic point         │
               └──────────────────────────────────────────────────────────────┘
 
@@ -138,7 +138,7 @@ A table declares a storage engine at creation - `bitmap`, `bitmap+columnar`, or 
 that decides whether its facts are written as bit rows, as column segments, or as both. A segment
 is addressed by the *same* `FragmentKey` as its bitmaps and differs only in the view, which is why
 backup, compaction, `drop_table`, the freelist and the cluster's fragment addressing all reach
-segments without being taught what one is. The block format is in `big-column`: 1024 records to
+segments without being taught what one is. The block format is in `big-engine::columnar`: 1024 records to
 a block, because 1024 values at the full width is exactly one page, so a scalar block never needs
 a second one; four encodings chosen per block by measuring all of them; and **no general-purpose
 compressor**, because the whole engine ships two dependencies and a compression library would be

@@ -478,7 +478,7 @@ pub fn put_schema(out: &mut Vec<u8>, tables: &[big_api::TableInfo]) {
     put_count(out, tables.len());
     for table in tables {
         put_str(out, &table.name);
-        put_u8(out, table.engine as u8);
+        put_u8(out, table.engine.code());
         put_count(out, table.fields.len());
         for field in &table.fields {
             put_str(out, &field.name);

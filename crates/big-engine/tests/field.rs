@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use big_field::*;
-use big_fragment::{FragmentRead, FragmentWrite, RecordId};
+use big_engine::bitmap::field::*;
+use big_engine::bitmap::{FragmentRead, FragmentWrite, RecordId};
 use big_page::Pgno;
 use big_pager::{MemPager, Store};
 use proptest::prelude::*;

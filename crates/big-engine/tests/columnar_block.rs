@@ -19,8 +19,8 @@
 //! measurement, which means a block anybody writes can take any of the four paths and the one a
 //! test happens to hit is not the one production will.
 
-use big_column::block::{Part, PartRef, NULL_BYTES};
-use big_column::*;
+use big_engine::columnar::block::{Part, PartRef, NULL_BYTES};
+use big_engine::columnar::*;
 use proptest::prelude::*;
 
 /// Encodes and decodes, going through the same inline-or-page split a real write does.

@@ -183,7 +183,7 @@ Snapshot-blocked pages are computed exactly; whatever remains is attributed to r
 ## Not here
 
 Container set operations (`big-container`), the b-tree (`big-btree`), fragments
-(`big-fragment`). `trait Pager` is enough for `big-btree` to be tested against `MemPager`
+(`big-engine`). `trait Pager` is enough for `big-btree` to be tested against `MemPager`
 without a file.
 
 ## Tests

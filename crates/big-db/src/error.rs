@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::catalog::{FieldId, TableId};
-use big_field::FieldError;
+use crate::catalog::{FieldId, TableEngine, TableId};
+use big_engine::bitmap::field::FieldError;
 use big_keys::KeyError;
 use big_pager::StoreError;
 
@@ -23,8 +23,8 @@ pub enum DbError {
     Field(FieldError),
     Key(KeyError),
     Tree(big_btree::BTreeError),
-    /// A column segment could not be read or written. See [`big_column::ColumnError`].
-    Column(big_column::ColumnError),
+    /// A column segment could not be read or written. See [`big_engine::columnar::ColumnError`].
+    Column(big_engine::columnar::ColumnError),
     UnknownTable(String),
     UnknownField {
         table: String,
@@ -160,12 +160,12 @@ impl From<big_btree::BTreeError> for DbError {
         Self::Tree(e)
     }
 }
-impl From<big_column::ColumnError> for DbError {
-    fn from(e: big_column::ColumnError) -> Self {
+impl From<big_engine::columnar::ColumnError> for DbError {
+    fn from(e: big_engine::columnar::ColumnError) -> Self {
         // A segment error that is really a tree error keeps its own shape, so a damaged page
         // under a segment reports the same code as the same damage under a fragment.
         match e {
-            big_column::ColumnError::Tree(t) => Self::Tree(t),
+            big_engine::columnar::ColumnError::Tree(t) => Self::Tree(t),
             other => Self::Column(other),
         }
     }
@@ -214,11 +214,12 @@ impl core::fmt::Display for DbError {
                 "table `{table}` already exists with the `{existing}` engine, not `{asked}`; \
                  an engine is fixed at creation"
             ),
-            Self::UnknownEngineName(name) => write!(
-                f,
-                "no storage engine named `{name}`; it is one of bitmap, bitmap+columnar \
-                 or columnar"
-            ),
+            // The list is built from the registry rather than written out here, so an engine
+            // added to `big_engine::ENGINES` names itself in this message without anyone
+            // remembering to come and add it.
+            Self::UnknownEngineName(name) => {
+                write!(f, "no storage engine named `{name}`; it is one of {}", TableEngine::names())
+            }
             Self::UnknownTableEngine { table, engine } => write!(
                 f,
                 "table {table} names storage engine {engine}, which this build does not know; \

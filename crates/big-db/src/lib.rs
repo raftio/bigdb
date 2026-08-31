@@ -42,7 +42,7 @@ pub use catalog::{
 pub use db::{Cell, Db, DbRead, DbWrite, KeyStats, QueryLimits};
 pub use ingest::Ingest;
 pub mod bulk;
-pub use big_fragment::{Container, ContainerKey};
+pub use big_engine::bitmap::{Container, ContainerKey};
 pub use big_keys::KeyError;
 pub use bulk::BulkLoad;
 pub use db::{FragmentAddr, COLUMN_VIEW, MUTEX_SHADOW_VIEW};
@@ -51,6 +51,7 @@ pub use matches::Matches;
 pub mod signed;
 // `day_view` names the boundary a retention drop actually used, which is the one thing a
 // caller passing an instant cannot work out for itself.
-pub use big_field::{day_view, Granularity, RangeOp};
-pub use big_fragment::{FragmentKey, RecordId, RowId, RowSet, ShardId};
+pub use big_engine::bitmap::field::{day_view, Granularity, RangeOp};
+pub use big_engine::bitmap::{FragmentKey, RowSet};
+pub use big_engine::{RecordId, RowId, ShardId};
 pub use big_pager::Durability;

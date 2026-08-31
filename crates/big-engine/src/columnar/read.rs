@@ -14,9 +14,9 @@
 
 //! Reading a segment: one block, or every block in order.
 
-use crate::block::{Block, PartRef};
-use crate::error::{ColumnError, Result};
-use crate::{block_keys, block_of, block_of_key, slot_of, Cell};
+use crate::columnar::block::{Block, PartRef};
+use crate::columnar::error::{ColumnError, Result};
+use crate::columnar::{block_keys, block_of, block_of_key, slot_of, Cell};
 use big_page::{ContainerKey, Pgno};
 use big_pager::Pager;
 use core::ops::ControlFlow;
@@ -137,7 +137,7 @@ impl<'p, P: Pager> ColumnRead<'p, P> {
     pub fn count(&self) -> Result<u64> {
         let mut total = 0u64;
         big_btree::scan(self.pager, self.root, 0, ContainerKey::MAX, |c| {
-            if crate::part_of_key(c.key) == 0 {
+            if crate::columnar::part_of_key(c.key) == 0 {
                 total += c.cardinality as u64;
             }
             ControlFlow::Continue(())

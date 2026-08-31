@@ -18,8 +18,8 @@
 //! but a range query reads the high planes first and stops as soon as the answer is settled
 //! instead of reading every bit of every record.
 
-use crate::error::{FieldError, Result};
-use big_fragment::{FragmentRead, FragmentWrite, RecordId, RowId, RowSet};
+use crate::bitmap::field::error::{FieldError, Result};
+use crate::bitmap::{FragmentRead, FragmentWrite, RecordId, RowId, RowSet};
 use big_pager::{Pager, PagerMut, WriteTxn};
 
 /// Marks records that have a value at all, which is what makes NULL distinguishable from zero.

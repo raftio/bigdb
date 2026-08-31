@@ -26,11 +26,17 @@
 
 use big_db::catalog::TableEngine;
 use big_db::*;
-use big_fragment::SHARD_WIDTH;
+use big_engine::SHARD_WIDTH;
 use std::collections::BTreeMap;
 
-const ENGINES: [TableEngine; 3] =
-    [TableEngine::Bitmap, TableEngine::BitmapColumnar, TableEngine::Columnar];
+/// Every engine the build has, read from `big_engine::ENGINES` rather than listed here.
+///
+/// The point of the registry is that this file does not get to fall behind it: an engine added
+/// to `big-engine` and forgotten here would be an engine nothing in this suite ever created,
+/// and "it works" and "nobody tested it" look the same in a passing suite.
+fn engines() -> Vec<TableEngine> {
+    TableEngine::all().collect()
+}
 
 /// The same table, the same facts, under one engine.
 ///
@@ -75,7 +81,7 @@ fn agree<T: PartialEq + std::fmt::Debug>(
     ask: impl Fn(&DbRead<'_, big_pager::MemPager>) -> T,
 ) -> T {
     let mut answers = Vec::new();
-    for engine in ENGINES {
+    for engine in engines() {
         let d = stocked(engine);
         answers.push((engine, ask(&d.read())));
     }
@@ -251,7 +257,7 @@ fn predicates_compose_the_same_way() {
 fn the_answers_still_agree_after_a_delete() {
     agree("after delete", |_| ());
     let mut answers = Vec::new();
-    for engine in ENGINES {
+    for engine in engines() {
         let d = stocked(engine);
         let mut w = d.write();
         let doomed: Vec<RecordId> =
@@ -307,7 +313,7 @@ fn a_time_window_is_refused_on_a_table_with_no_index() {
 fn a_time_quantum_key_still_answers_without_its_views() {
     agree("time quantum key", |_| ());
     let mut answers = Vec::new();
-    for engine in ENGINES {
+    for engine in engines() {
         let d = Db::in_memory().unwrap();
         d.create_table_with("tx", engine).unwrap();
         d.create_time_quantum("tx", "visit", vec![Granularity::Day]).unwrap();
@@ -348,7 +354,7 @@ fn a_table_with_an_index_answers_predicates_from_it() {
     use big_pager::{CountingPager, MemPager};
 
     let mut page_reads = Vec::new();
-    for engine in ENGINES {
+    for engine in engines() {
         let d = Db::open(CountingPager::new(MemPager::new())).unwrap();
         d.create_table_with("tx", engine).unwrap();
         d.create_field("tx", "amount", FieldKind::Int, 32).unwrap();

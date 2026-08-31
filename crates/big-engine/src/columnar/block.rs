@@ -17,8 +17,8 @@
 //! # The two shapes
 //!
 //! A **scalar** block holds at most one value per record - every field kind but the keyed ones.
-//! It is always exactly one cell, because [`crate::BLOCK_RECORDS`] values at the full width is
-//! one page and [`crate::codec`] never encodes larger than that.
+//! It is always exactly one cell, because [`crate::columnar::BLOCK_RECORDS`] values at the full width is
+//! one page and [`crate::columnar::codec`] never encodes larger than that.
 //!
 //! A **list** block holds any number per record, which is what a set field is. It cannot be
 //! bounded the same way, so it is one cell of *counts* followed by as many cells of values as it
@@ -27,7 +27,7 @@
 //!
 //! # Where a null lives
 //!
-//! In a bitmap of [`crate::BLOCK_RECORDS`] bits at a fixed place in every header, and never in
+//! In a bitmap of [`crate::columnar::BLOCK_RECORDS`] bits at a fixed place in every header, and never in
 //! the values. That is what lets the codecs work on a dense run of real values with no sentinel
 //! and no widening - a column of `u64` has no spare value to mean absent, and picking one would
 //! make some legitimate number unstorable.
@@ -37,9 +37,9 @@
 //! are dense inside a shard by construction - so a block that exists is usually a block that is
 //! mostly full.
 
-use crate::codec::{self, Codec, Encoded};
-use crate::error::{ColumnError, Result};
-use crate::{BLOCK_RECORDS, INLINE_MAX, MAX_PARTS, PAGE_BYTES};
+use crate::columnar::codec::{self, Codec, Encoded};
+use crate::columnar::error::{ColumnError, Result};
+use crate::columnar::{BLOCK_RECORDS, INLINE_MAX, MAX_PARTS, PAGE_BYTES};
 
 /// Bytes of null bitmap: one bit per record in the block.
 pub const NULL_BYTES: usize = (BLOCK_RECORDS as usize).div_ceil(8);

@@ -16,7 +16,7 @@
 
 use big_db::catalog::{Catalog, MAX_NAME_LEN};
 use big_db::*;
-use big_fragment::SHARD_WIDTH;
+use big_engine::SHARD_WIDTH;
 use proptest::prelude::*;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -720,7 +720,7 @@ fn dropping_it_with_records_still_held_is_a_bug() {
 /// live and this one is as deterministic as the rest.
 mod flush_fraction {
     use big_db::*;
-    use big_fragment::SHARD_WIDTH;
+    use big_engine::SHARD_WIDTH;
 
     fn db() -> Db<big_pager::MemPager> {
         let d = Db::in_memory().unwrap();
@@ -903,7 +903,7 @@ fn recreating_a_table_under_another_engine_is_refused() {
 /// Round-trips through the spelling every surface outside the engine uses.
 #[test]
 fn every_engine_has_a_name_that_parses_back() {
-    for engine in [TableEngine::Bitmap, TableEngine::BitmapColumnar, TableEngine::Columnar] {
+    for engine in TableEngine::all() {
         assert_eq!(TableEngine::parse(engine.as_str()), Some(engine));
     }
     assert_eq!(TableEngine::parse("bitmaps"), None);

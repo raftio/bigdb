@@ -15,8 +15,8 @@
 //! Writing a fragment. Batch is the only sane granularity: a single bit costs a whole page
 //! rewrite plus the shadow path up to the root.
 
+use crate::bitmap::rowset::RowSet;
 use crate::coords::*;
-use crate::rowset::RowSet;
 use big_btree::{put_container, put_containers, remove, Result};
 use big_container::{apply, Container, ContainerRef, SetOp};
 use big_page::{ContainerKey, PageType, Pgno};
@@ -52,11 +52,11 @@ impl FragmentWrite {
     pub fn reader<'t, P>(
         &self,
         txn: &'t WriteTxn<'_, P>,
-    ) -> Option<crate::read::FragmentRead<'t, WriteTxn<'t, P>>>
+    ) -> Option<crate::bitmap::read::FragmentRead<'t, WriteTxn<'t, P>>>
     where
         P: PagerMut + 't,
     {
-        self.root.map(|r| crate::read::FragmentRead::new(txn, r, self.shard))
+        self.root.map(|r| crate::bitmap::read::FragmentRead::new(txn, r, self.shard))
     }
 
     fn existing<P: PagerMut>(
@@ -356,7 +356,7 @@ fn group(bits: impl IntoIterator<Item = (RowId, RecordId)>) -> BTreeMap<Containe
 /// being probed once per bit, tens of millions of times, and a probe is a descent and a compare.
 /// Consecutive bits usually belong to the same container, so this holds the run it is building
 /// and hands it over only when the key actually changes. What makes "usually" true is the order
-/// the batch arrives in; see [`big_field::Bsi::bits_for_all`], which exists to produce it.
+/// the batch arrives in; see [`crate::bitmap::field::Bsi::bits_for_all`], which exists to produce it.
 fn offsets_of(bits: &[(RowId, RecordId)]) -> BTreeMap<ContainerKey, Vec<u16>> {
     let mut by_ckey: BTreeMap<ContainerKey, Vec<u16>> = BTreeMap::new();
     let mut open: Option<ContainerKey> = None;

@@ -64,7 +64,7 @@ combine. This engine answered both years before anyone wrote this page, and answ
 the storage layer, so the cluster layer inherits them rather than choosing:
 
 **A record id names its shard, and the client picks the record id.** `shard_of` is a shift —
-`record_id >> SHARD_WIDTH_EXPONENT` ([coords.rs:41](../crates/big-fragment/src/coords.rs#L41)) —
+`record_id >> SHARD_WIDTH_EXPONENT` ([coords.rs:41](../crates/big-engine/src/coords.rs#L41)) —
 and every write path takes the record id from the caller: `Fact::Int { record, .. }` and its
 siblings in [big-api](../crates/big-api/src/lib.rs), one id per line in `POST /import`. Nothing
 in the engine ever allocates a record id. So placement needs no coordination at all: by the time

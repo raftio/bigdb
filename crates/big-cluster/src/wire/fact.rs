@@ -160,7 +160,7 @@ impl Ddl {
             Self::CreateTable { table, engine } => {
                 put_u8(&mut out, 0);
                 put_str(&mut out, table);
-                put_u8(&mut out, *engine as u8);
+                put_u8(&mut out, engine.code());
             }
             Self::CreateField { table, field, kind, bit_depth } => {
                 put_u8(&mut out, 1);

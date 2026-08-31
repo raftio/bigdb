@@ -89,7 +89,7 @@ impl<P: PagerMut + Sync> Cluster<P> {
         match range.end {
             // The first record id this node does *not* own. If the cursor has already reached
             // it, everything here is behind the cursor.
-            Some(end) => end.saturating_mul(big_fragment::SHARD_WIDTH) > after.saturating_add(1),
+            Some(end) => end.saturating_mul(big_engine::SHARD_WIDTH) > after.saturating_add(1),
             None => true,
         }
     }

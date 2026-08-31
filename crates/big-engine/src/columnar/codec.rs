@@ -25,7 +25,7 @@
 //! already-columnar data is small, and what they buy is that every byte of the format is
 //! readable by looking at this file.
 
-use crate::error::{ColumnError, Result};
+use crate::columnar::error::{ColumnError, Result};
 
 /// How the present values of one block are laid out.
 ///

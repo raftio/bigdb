@@ -31,7 +31,10 @@ fn every_error() -> Vec<DbError> {
             stored: 1,
             computed: 2,
         })),
-        DbError::Field(big_field::FieldError::ValueTooWide { value: 9, bit_depth: 2 }),
+        DbError::Field(big_engine::bitmap::field::FieldError::ValueTooWide {
+            value: 9,
+            bit_depth: 2,
+        }),
         DbError::Key(big_keys::KeyError::TooLong { len: 500 }),
         DbError::Tree(big_btree::BTreeError::TooDeep { root: 3 }),
         DbError::UnknownTable("tx".into()),

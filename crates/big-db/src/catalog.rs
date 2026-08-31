@@ -18,8 +18,8 @@
 //! not a single byte of data mentions it.
 
 use crate::error::{DbError, Result};
-use big_field::Granularity;
-use big_fragment::FragmentKey;
+use big_engine::bitmap::field::Granularity;
+use big_engine::bitmap::FragmentKey;
 use big_keys::KeyStore;
 use big_pager::{kind, CATALOG_ENTRY_BYTES};
 use std::collections::BTreeMap;
@@ -73,81 +73,13 @@ pub const EXISTS_FIELD: FieldId = u32::MAX;
 /// column. Chosen once, at creation, and never changed: switching would mean rewriting every
 /// fragment the table owns, which is a migration rather than a setting.
 ///
-/// **Zero is [`TableEngine::Bitmap`], and that is not the default for a new table.** Every file
-/// written before this existed carries a zero in the byte that now holds the engine, and those
-/// files are bitmap-only - so the decoded default and the created default are deliberately
-/// different numbers. See [`TableEngine::default`].
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-#[repr(u8)]
-pub enum TableEngine {
-    /// Bitmaps and bit-sliced indexes, and nothing else. What every table was before there was
-    /// a choice.
-    Bitmap = 0,
-    /// Both. The index answers what an index is good at, the columns answer what a scan is good
-    /// at, and the planner picks. Costs a second copy of every fact.
-    BitmapColumnar = 1,
-    /// Column segments, plus the existence row and nothing else.
-    ///
-    /// The existence row stays even here, and deliberately: it is one bit per record, and it is
-    /// what `Not`, `count(*)` and the record cursor stand on. Dropping it would cost far more
-    /// than the bit it saves.
-    Columnar = 2,
-}
-
-impl TableEngine {
-    /// Public because the number is not private: it is what the catalog stores and what a peer
-    /// is told when a table is created across a cluster, so the mapping has one definition and
-    /// both readers use it.
-    pub fn from_u8(v: u8) -> Option<Self> {
-        Some(match v {
-            0 => Self::Bitmap,
-            1 => Self::BitmapColumnar,
-            2 => Self::Columnar,
-            _ => return None,
-        })
-    }
-
-    /// Whether this engine maintains bitmap and bit-sliced fragments for declared fields.
-    pub fn has_bitmap(self) -> bool {
-        matches!(self, Self::Bitmap | Self::BitmapColumnar)
-    }
-
-    /// Whether this engine maintains column segments.
-    pub fn has_columns(self) -> bool {
-        matches!(self, Self::BitmapColumnar | Self::Columnar)
-    }
-
-    /// The name this engine is written and read as, at every surface outside the engine.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Bitmap => "bitmap",
-            Self::BitmapColumnar => "bitmap+columnar",
-            Self::Columnar => "columnar",
-        }
-    }
-
-    /// The inverse of [`TableEngine::as_str`], for a caller holding text.
-    pub fn parse(s: &str) -> Option<Self> {
-        Some(match s {
-            "bitmap" => Self::Bitmap,
-            "bitmap+columnar" => Self::BitmapColumnar,
-            "columnar" => Self::Columnar,
-            _ => return None,
-        })
-    }
-}
-
-impl Default for TableEngine {
-    /// What a table gets when the caller does not choose.
-    ///
-    /// Not [`TableEngine::Bitmap`], which is what a *decoded* zero means. A caller who says
-    /// nothing wants the engine that answers the widest range of questions well, and a file that
-    /// says nothing predates the choice entirely - two different questions that happen to share
-    /// a type.
-    fn default() -> Self {
-        Self::BitmapColumnar
-    }
-}
+/// Defined in `big-engine`, alongside the engines themselves, and re-exported here because the
+/// catalog is what stores it. The byte on disk is [`TableEngine::code`]; **zero is
+/// [`TableEngine::Bitmap`], and that is not the default for a new table** - every file written
+/// before this existed carries a zero in the byte that now holds the engine, and those files
+/// are bitmap-only, so the decoded default and the created default are deliberately different
+/// numbers. See [`TableEngine::default`].
+pub use big_engine::TableEngine;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
@@ -400,7 +332,7 @@ impl Catalog {
         let end = hi.map_or(Bound::Unbounded, |s| Bound::Included(s.to_string()));
         self.view_ids
             .range((start, end))
-            .filter(|(name, _)| name.len() == big_field::DAY_VIEW_LEN)
+            .filter(|(name, _)| name.len() == big_engine::bitmap::field::DAY_VIEW_LEN)
             .map(|(_, id)| *id)
             .collect()
     }
@@ -649,7 +581,7 @@ impl Catalog {
             // Byte 1 is where a field record keeps its kind, and it was unused here. Reusing it
             // rather than growing the record is what keeps this additive: an entry stays
             // `CATALOG_ENTRY_BYTES` wide and nothing about the chain's stride moves.
-            b[1] = t.engine as u8;
+            b[1] = t.engine.code();
             b[4..8].copy_from_slice(&t.id.to_le_bytes());
             put_name(&mut b, &t.name);
             out.push(b);

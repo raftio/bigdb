@@ -14,8 +14,8 @@
 
 //! Set and bool fields. One row per distinct value; a record may sit in several rows.
 
-use crate::error::Result;
-use big_fragment::{FragmentRead, FragmentWrite, RecordId, RowId, RowSet};
+use crate::bitmap::field::error::Result;
+use crate::bitmap::{FragmentRead, FragmentWrite, RecordId, RowId, RowSet};
 use big_pager::{Pager, PagerMut, WriteTxn};
 
 pub struct SetField;

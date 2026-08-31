@@ -319,7 +319,10 @@ impl<'db, P: Pager + Sync> DbRead<'db, P> {
         }
         let Some(row) = self.catalog.keys.id(t, def.id, value) else { return Ok(Matches::new()) };
 
-        let (lo, hi) = (from.map(big_field::day_view), to.map(big_field::day_view));
+        let (lo, hi) = (
+            from.map(big_engine::bitmap::field::day_view),
+            to.map(big_engine::bitmap::field::day_view),
+        );
         let mut out = Matches::new();
         for view in self.catalog.day_views_between(lo.as_deref(), hi.as_deref()) {
             out = out.or(&self.matching_row_in(table, field, view, row)?);
@@ -484,7 +487,10 @@ impl<'db, P: Pager + Sync> DbRead<'db, P> {
         seg.for_each_block(|block, decoded| {
             for (slot, cell) in decoded.slots().iter().enumerate() {
                 if !cell.is_null() {
-                    out.push((block * big_column::BLOCK_RECORDS + slot as u64, cell.clone()));
+                    out.push((
+                        block * big_engine::columnar::BLOCK_RECORDS + slot as u64,
+                        cell.clone(),
+                    ));
                 }
             }
             Ok(core::ops::ControlFlow::Continue(()))

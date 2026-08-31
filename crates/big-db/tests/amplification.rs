@@ -40,7 +40,7 @@ use big_pager::{CountingPager, MemPager};
 const N: u64 = 10_000;
 const VALUE_CEILING: u64 = 1 << 20;
 const BIT_DEPTH: u32 = 20;
-/// Duplicated from `big_fragment` rather than imported, for the same reason the benchmark
+/// Duplicated from `big_engine::bitmap` rather than imported, for the same reason the benchmark
 /// duplicates it: the workload must not be defined in terms of the thing it is measuring.
 const SHARD_WIDTH: u64 = 1 << 20;
 

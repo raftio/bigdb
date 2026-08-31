@@ -23,7 +23,7 @@ big-pager = { path = "../big-pager", version = "0.1.0" }
 # For `status`, and only for it. Turning an error into an HTTP status means matching on the
 # whole error tree, and the tree is the engine's - a crate lower down cannot do the mapping
 # without learning about HTTP, which is the one thing the layering is trying to prevent.
-big-field = { path = "../big-field", version = "0.1.0" }
+big-engine = { path = "../big-engine", version = "0.1.0" }
 big-plan = { path = "../big-plan", version = "0.1.0" }
 # For the status a refused SQL statement deserves. `status.rs` is the one place that knows both
 # HTTP and the whole error tree, so it is the one place that has to name this error.

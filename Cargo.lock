@@ -607,24 +607,13 @@ dependencies = [
  "big-api",
  "big-container",
  "big-db",
+ "big-engine",
  "big-exec",
- "big-fragment",
  "big-pager",
  "big-plan",
  "bytemuck",
  "proptest",
  "tempfile",
-]
-
-[[package]]
-name = "big-column"
-version = "0.1.0"
-dependencies = [
- "big-btree",
- "big-container",
- "big-page",
- "big-pager",
- "proptest",
 ]
 
 [[package]]
@@ -641,10 +630,8 @@ name = "big-db"
 version = "0.1.0"
 dependencies = [
  "big-btree",
- "big-column",
+ "big-engine",
  "big-exec",
- "big-field",
- "big-fragment",
  "big-keys",
  "big-pager",
  "proptest",
@@ -659,28 +646,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "big-exec"
-version = "0.1.0"
-dependencies = [
- "big-db",
- "big-pager",
- "big-plan",
- "proptest",
-]
-
-[[package]]
-name = "big-field"
-version = "0.1.0"
-dependencies = [
- "big-btree",
- "big-fragment",
- "big-page",
- "big-pager",
- "proptest",
-]
-
-[[package]]
-name = "big-fragment"
+name = "big-engine"
 version = "0.1.0"
 dependencies = [
  "big-btree",
@@ -691,14 +657,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "big-exec"
+version = "0.1.0"
+dependencies = [
+ "big-db",
+ "big-pager",
+ "big-plan",
+ "proptest",
+]
+
+[[package]]
 name = "big-http"
 version = "0.1.0"
 dependencies = [
  "big-api",
  "big-cluster",
  "big-db",
+ "big-engine",
  "big-exec",
- "big-field",
  "big-pager",
  "big-plan",
  "big-sql",

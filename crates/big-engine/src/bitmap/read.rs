@@ -14,8 +14,8 @@
 
 //! Reading a fragment. One fragment is one b-tree, and a row is a contiguous span of its keys.
 
+use crate::bitmap::rowset::RowSet;
 use crate::coords::*;
-use crate::rowset::RowSet;
 use big_btree::{find_many, scan, Result};
 use big_container::{and_cardinality, Container, ContainerRef};
 use big_page::{ContainerKey, ContainerType, LeafCell, Pgno};

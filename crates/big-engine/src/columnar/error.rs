@@ -72,7 +72,7 @@ impl core::fmt::Display for ColumnError {
             Self::TooManyParts { block } => write!(
                 f,
                 "block {block} holds more values than {} parts can carry",
-                crate::MAX_PARTS
+                crate::columnar::MAX_PARTS
             ),
             Self::NotValues(t) => {
                 write!(f, "container type {t} is a set, not a block of column values")

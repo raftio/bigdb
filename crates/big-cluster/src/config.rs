@@ -26,7 +26,7 @@
 //! range the operator did not write - `shard = "0..64"` for `shards` is a typo that costs a
 //! silent misconfiguration everywhere else and a startup error here.
 
-use big_fragment::{RecordId, ShardId, SHARD_WIDTH};
+use big_engine::{RecordId, ShardId, SHARD_WIDTH};
 
 /// A half-open range of shard ids, with an open end for "the rest of the space".
 ///
@@ -49,7 +49,7 @@ impl ShardRange {
 
     /// Whether a record id falls in this range, which is the same question one shift earlier.
     pub fn holds(&self, record: RecordId) -> bool {
-        self.contains(big_fragment::shard_of(record))
+        self.contains(big_engine::shard_of(record))
     }
 
     /// The lowest record id this range can hold. What a paging cursor is clamped to.
@@ -738,7 +738,7 @@ impl ClusterConfig {
 
     /// Which node holds a record, which is the same lookup one shift earlier.
     pub fn owner_of_record(&self, record: RecordId) -> usize {
-        self.owner(big_fragment::shard_of(record))
+        self.owner(big_engine::shard_of(record))
     }
 
     pub fn peer_token_file(&self) -> Option<&str> {

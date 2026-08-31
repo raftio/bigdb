@@ -25,7 +25,7 @@
 //! little of every shard into each batch.
 
 use big_db::*;
-use big_fragment::SHARD_WIDTH;
+use big_engine::SHARD_WIDTH;
 use big_pager::{CountingPager, MemPager};
 use proptest::prelude::*;
 

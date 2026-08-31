@@ -51,8 +51,9 @@ use big_api::{
 };
 use big_container::{Container, ContainerRef, Interval};
 use big_db::Matches;
+use big_engine::bitmap::RowSet;
+use big_engine::ShardId;
 use big_exec::Group;
-use big_fragment::{RowSet, ShardId};
 use big_plan::CmpOp;
 
 /// The same ceiling the query parser applies to nesting, for the same reason: these decoders

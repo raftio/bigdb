@@ -30,8 +30,8 @@
 
 use big_api::ApiError;
 use big_db::DbError;
+use big_engine::bitmap::field::FieldError;
 use big_exec::ExecError;
-use big_field::FieldError;
 use big_pager::StoreError;
 use big_plan::PlanError;
 use big_sql::SqlError;

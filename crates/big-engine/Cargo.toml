@@ -1,6 +1,6 @@
 [package]
-name = "big-fragment"
-description = "Fragment coordinates and row access for big"
+name = "big-engine"
+description = "The storage engines: bitmap fragments, column segments, and the registry that names them"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

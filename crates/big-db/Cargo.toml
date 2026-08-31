@@ -10,9 +10,7 @@ readme = "readme.md"
 
 [dependencies]
 big-btree = { path = "../big-btree", version = "0.1.0" }
-big-column = { path = "../big-column", version = "0.1.0" }
-big-field = { path = "../big-field", version = "0.1.0" }
-big-fragment = { path = "../big-fragment", version = "0.1.0" }
+big-engine = { path = "../big-engine", version = "0.1.0" }
 big-keys = { path = "../big-keys", version = "0.1.0" }
 big-pager = { path = "../big-pager", version = "0.1.0" }
 

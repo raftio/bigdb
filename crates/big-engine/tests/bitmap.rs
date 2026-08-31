@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use big_fragment::*;
+use big_engine::bitmap::*;
 use big_page::Pgno;
 use big_pager::{MemPager, Store};
 use proptest::prelude::*;

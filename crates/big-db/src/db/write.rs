@@ -504,7 +504,11 @@ impl<'db, P: PagerMut> DbWrite<'db, P> {
         // A value wider than the field was declared for is refused, not truncated.
         let declared = if def.bit_depth == 0 { 64 } else { def.bit_depth };
         if 64 - value.leading_zeros() > declared {
-            return Err(big_field::FieldError::ValueTooWide { value, bit_depth: declared }.into());
+            return Err(big_engine::bitmap::field::FieldError::ValueTooWide {
+                value,
+                bit_depth: declared,
+            }
+            .into());
         }
 
         // Widen the fragment and record the zone map in the same breath. Depth only ever
@@ -700,11 +704,11 @@ impl<'db, P: PagerMut> DbWrite<'db, P> {
         let row = self.set_key_at(at, record, value)?;
 
         let granularity = if def.granularity.is_empty() {
-            big_field::DEFAULT_GRANULARITY.to_vec()
+            big_engine::bitmap::field::DEFAULT_GRANULARITY.to_vec()
         } else {
             def.granularity.clone()
         };
-        for name in big_field::views(unix_seconds, &granularity) {
+        for name in big_engine::bitmap::field::views(unix_seconds, &granularity) {
             let view = self.catalog.intern_view(&name)?;
             let key = FragmentKey { table: t, field: def.id, view, shard: shard_of(record) };
             self.buffer_bit(key, row, record, true);
@@ -755,14 +759,14 @@ impl<'db, P: PagerMut> DbWrite<'db, P> {
         let mut by_block: BTreeMap<u64, Vec<(usize, Cell)>> = BTreeMap::new();
         for (local, cell) in cells {
             by_block
-                .entry(big_column::block_of(*local))
+                .entry(big_engine::columnar::block_of(*local))
                 .or_default()
-                .push((big_column::slot_of(*local), cell.clone()));
+                .push((big_engine::columnar::slot_of(*local), cell.clone()));
         }
 
         let mut w = ColumnWrite::new(None);
         for (block, slots) in by_block {
-            let mut value = big_column::Block::new();
+            let mut value = big_engine::columnar::Block::new();
             for (slot, cell) in slots {
                 value.set(slot, cell);
             }

@@ -22,7 +22,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "big-column"
+name = "big-container"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+]
+
+[[package]]
+name = "big-engine"
 version = "0.1.0"
 dependencies = [
  "big-btree",
@@ -32,20 +39,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "big-container"
-version = "0.1.0"
-dependencies = [
- "bytemuck",
-]
-
-[[package]]
 name = "big-fuzz"
 version = "0.0.0"
 dependencies = [
  "arbitrary",
  "big-btree",
- "big-column",
  "big-container",
+ "big-engine",
  "big-page",
  "big-pager",
  "big-plan",

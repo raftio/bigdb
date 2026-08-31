@@ -25,8 +25,6 @@
 //! value means reading the shadow view first; [`quantum`] writes an extra view per granularity
 //! so a range of days reads only the days it asks about.
 
-#![deny(unsafe_code)]
-
 pub mod bsi;
 pub mod error;
 pub mod mutex;

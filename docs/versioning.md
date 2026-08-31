@@ -37,9 +37,9 @@ and format migration are the same walk over every page reachable from a consiste
 
 ## What is not guaranteed
 
-**The fourteen internal crates.** `big-btree`, `big-cli`, `big-cluster`, `big-column`,
-`big-container`, `big-db`, `big-exec`, `big-field`, `big-fragment`, `big-keys`,
-`big-page`, `big-pager`, `big-plan`, `big-sql`.
+**The twelve internal crates.** `big-btree`, `big-cli`, `big-cluster`, `big-container`,
+`big-db`, `big-engine`, `big-exec`, `big-keys`, `big-page`, `big-pager`, `big-plan`,
+`big-sql`.
 
 They are on crates.io because a published crate cannot depend on an unpublished one, and
 `big-api` and `big-http` depend on four of them between them — **that is the only reason.** Their shape is free to change
@@ -63,7 +63,7 @@ why the job exists rather than the field alone.
 
 ## Releasing
 
-Versions move together. Fifteen crates in one workspace at one `workspace.package.version`, so
+Versions move together. Thirteen crates in one workspace at one `workspace.package.version`, so
 there is one number to reason about and no possibility of a partial release where `big-api`
 `0.2` sits on a `big-db` `0.1` that no longer means what it did.
 
@@ -71,7 +71,8 @@ Publish order follows the dependency graph, leaves first:
 
 ```
 big-container  big-page
-big-pager  big-btree  big-fragment  big-keys  big-field  big-plan  big-column
+big-pager  big-btree  big-keys  big-plan
+big-engine
 big-db  big-exec
 big-api
 big-cluster

@@ -39,9 +39,10 @@
 use crate::catalog::{FieldDef, FieldKind, TableId, EXISTS_FIELD, STANDARD_VIEW};
 use crate::db::Db;
 use crate::error::{DbError, Result};
-use big_field::bsi::EXISTS_ROW;
-use big_field::{BoolField, Bsi};
-use big_fragment::{shard_of, FragmentKey, RecordId, RowId};
+use big_engine::bitmap::field::bsi::EXISTS_ROW;
+use big_engine::bitmap::field::{BoolField, Bsi};
+use big_engine::bitmap::FragmentKey;
+use big_engine::{shard_of, RecordId, RowId};
 use big_pager::PagerMut;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -114,7 +115,11 @@ impl<'db, P: PagerMut> BulkLoad<'db, P> {
         let def = self.field(field, |k| k.is_bsi() && !k.is_signed(), "int")?;
         let declared = if def.bit_depth == 0 { 64 } else { def.bit_depth };
         if 64 - value.leading_zeros() > declared {
-            return Err(big_field::FieldError::ValueTooWide { value, bit_depth: declared }.into());
+            return Err(big_engine::bitmap::field::FieldError::ValueTooWide {
+                value,
+                bit_depth: declared,
+            }
+            .into());
         }
         self.push(def.id, record, Value::Stored(value))
     }

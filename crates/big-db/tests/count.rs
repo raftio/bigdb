@@ -21,7 +21,7 @@
 //! tree reads that number without also reading the payload, so nothing else would notice.
 
 use big_db::*;
-use big_fragment::SHARD_WIDTH;
+use big_engine::SHARD_WIDTH;
 use proptest::prelude::*;
 
 fn db() -> Db<big_pager::MemPager> {

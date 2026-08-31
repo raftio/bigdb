@@ -23,7 +23,7 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 arbitrary = { version = "1", features = ["derive"] }
 big-btree = { path = "../crates/big-btree" }
-big-column = { path = "../crates/big-column" }
+big-engine = { path = "../crates/big-engine" }
 big-container = { path = "../crates/big-container" }
 big-page = { path = "../crates/big-page" }
 big-pager = { path = "../crates/big-pager" }

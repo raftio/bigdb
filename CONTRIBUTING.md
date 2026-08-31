@@ -14,7 +14,7 @@ direction and a handful of invariants that are cheaper to discuss than to review
 - Anything that changes a byte layout, `SHARD_WIDTH_EXPONENT`, or `CATALOG_ENTRY_BYTES` is a
   format break. Say so in the issue.
 - A row must never straddle a container boundary. Several prefix-scan claims rest on it, and
-  `crates/big-fragment/src/coords.rs` asserts it at compile time.
+  `crates/big-engine/src/coords.rs` asserts it at compile time.
 
 ## Building and testing
 

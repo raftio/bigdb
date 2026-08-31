@@ -21,8 +21,8 @@
 //! them feeds an index or an allocation. The first bug this found was a running offset added to
 //! a count without a check - a debug overflow, and in release a backwards slice.
 
-use big_column::block::PartRef;
-use big_column::Block;
+use big_engine::columnar::block::PartRef;
+use big_engine::columnar::Block;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {

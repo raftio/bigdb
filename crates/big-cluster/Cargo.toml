@@ -16,7 +16,7 @@ big-api = { path = "../big-api", version = "0.1.0" }
 big-container = { path = "../big-container", version = "0.1.0" }
 big-db = { path = "../big-db", version = "0.1.0" }
 big-exec = { path = "../big-exec", version = "0.1.0" }
-big-fragment = { path = "../big-fragment", version = "0.1.0" }
+big-engine = { path = "../big-engine", version = "0.1.0" }
 big-pager = { path = "../big-pager", version = "0.1.0" }
 big-plan = { path = "../big-plan", version = "0.1.0" }
 bytemuck = "1"

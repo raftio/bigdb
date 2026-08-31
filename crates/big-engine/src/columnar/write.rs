@@ -20,9 +20,9 @@
 //! that makes that affordable lives one layer up, in `big_db`, for the same reason the
 //! fragment layer's does.
 
-use crate::block::Block;
-use crate::error::{ColumnError, Result};
-use crate::{block_keys, key_of, MAX_PARTS};
+use crate::columnar::block::Block;
+use crate::columnar::error::{ColumnError, Result};
+use crate::columnar::{block_keys, key_of, MAX_PARTS};
 use big_btree::LeafItem;
 use big_page::{ContainerKey, ContainerType, Pgno};
 use big_pager::{PagerMut, WriteTxn};
@@ -30,7 +30,7 @@ use core::ops::ControlFlow;
 
 /// A handle on one field's segment inside one shard, within a transaction.
 ///
-/// Holds no borrow of the transaction, for the reason [`big_fragment::FragmentWrite`] holds
+/// Holds no borrow of the transaction, for the reason [`crate::bitmap::FragmentWrite`] holds
 /// none: one batch touches a table's fragments *and* its segments in a single commit, and a
 /// handle that owned `&mut WriteTxn` would make the second one impossible to create.
 #[derive(Clone, Copy, Debug)]
@@ -52,11 +52,11 @@ impl ColumnWrite {
     pub fn reader<'t, P>(
         &self,
         txn: &'t WriteTxn<'_, P>,
-    ) -> Option<crate::read::ColumnRead<'t, WriteTxn<'t, P>>>
+    ) -> Option<crate::columnar::read::ColumnRead<'t, WriteTxn<'t, P>>>
     where
         P: PagerMut + 't,
     {
-        self.root.map(|r| crate::read::ColumnRead::new(txn, r))
+        self.root.map(|r| crate::columnar::read::ColumnRead::new(txn, r))
     }
 
     /// Replaces a block outright.
@@ -108,7 +108,10 @@ impl ColumnWrite {
                     // own, with the checksum in the cell above them. That is what lets the free
                     // walk, the scrub and the backup copy handle a values page already.
                     let page = big_page::Page(bytes.as_slice().try_into().map_err(|_| {
-                        ColumnError::Truncated { need: crate::PAGE_BYTES, have: bytes.len() }
+                        ColumnError::Truncated {
+                            need: crate::columnar::PAGE_BYTES,
+                            have: bytes.len(),
+                        }
                     })?);
                     let checksum = big_page::bitmap_page_checksum(&page);
                     let pgno = txn.alloc().map_err(big_btree::BTreeError::from)?;

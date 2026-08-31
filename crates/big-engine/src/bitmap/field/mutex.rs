@@ -22,9 +22,9 @@
 //! The shadow lives in its own fragment rather than in reserved rows of the value fragment, so
 //! the value row space stays exactly what the user declared.
 
-use crate::bsi::Bsi;
-use crate::error::Result;
-use big_fragment::{FragmentRead, FragmentWrite, RecordId, RowId, RowSet};
+use crate::bitmap::field::bsi::Bsi;
+use crate::bitmap::field::error::Result;
+use crate::bitmap::{FragmentRead, FragmentWrite, RecordId, RowId, RowSet};
 use big_pager::{Pager, PagerMut, WriteTxn};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -108,13 +108,13 @@ impl MutexField {
         for row in values.rows()? {
             if values.get(row, record)? {
                 if actual.is_some() {
-                    return Err(crate::error::FieldError::MutexConflict { record });
+                    return Err(crate::bitmap::field::error::FieldError::MutexConflict { record });
                 }
                 actual = Some(row);
             }
         }
         if actual != claimed {
-            return Err(crate::error::FieldError::MutexConflict { record });
+            return Err(crate::bitmap::field::error::FieldError::MutexConflict { record });
         }
         Ok(())
     }

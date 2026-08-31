@@ -15,7 +15,7 @@
 //! Deleting, and dropping. The half of the engine that lets a mistake be undone.
 
 use big_db::*;
-use big_fragment::SHARD_WIDTH;
+use big_engine::SHARD_WIDTH;
 
 fn db() -> Db<big_pager::MemPager> {
     let d = Db::in_memory().unwrap();

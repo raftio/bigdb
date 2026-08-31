@@ -19,7 +19,8 @@
 //! algebra was already there in `RowSet`; it was being computed and thrown away at this
 //! boundary. This type is the boundary keeping it.
 
-use big_fragment::{shard_of, RecordId, RowSet, ShardId, SHARD_WIDTH};
+use big_engine::bitmap::RowSet;
+use big_engine::{shard_of, RecordId, ShardId, SHARD_WIDTH};
 use std::collections::BTreeMap;
 
 /// Which records matched, kept per shard and unmaterialised.

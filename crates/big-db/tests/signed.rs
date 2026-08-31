@@ -23,7 +23,7 @@
 //! work for positives and quietly stop at zero, which every ordinary test would pass.
 
 use big_db::*;
-use big_fragment::SHARD_WIDTH;
+use big_engine::SHARD_WIDTH;
 use proptest::prelude::*;
 
 const DEPTH: u32 = 20;

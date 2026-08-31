@@ -34,7 +34,7 @@
 
 use crate::db::Db;
 use crate::error::{DbError, Result};
-use big_fragment::{shard_of, RecordId, ShardId};
+use big_engine::{shard_of, RecordId, ShardId};
 use big_pager::PagerMut;
 use std::collections::BTreeMap;
 

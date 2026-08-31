@@ -385,7 +385,7 @@ fn writes_for(batch: &[(u64, Vec<u16>)], batched: bool) -> u64 {
 }
 
 /// Sorted, deduplicated batches: what `put_many` documents as its precondition, and what the
-/// grouping in `big-fragment` already produces.
+/// grouping in `big-engine`'s bitmap module already produces.
 fn sorted_batch() -> impl Strategy<Value = Vec<(u64, Vec<u16>)>> {
     proptest::collection::btree_map(
         0u64..4_000,
