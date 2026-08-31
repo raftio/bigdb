@@ -32,7 +32,7 @@ mod schema;
 mod write;
 
 pub use read::{DbRead, QueryLimits};
-pub use write::DbWrite;
+pub use write::{At, DbWrite};
 
 use crate::catalog::*;
 use crate::error::{DbError, Result};

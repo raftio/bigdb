@@ -351,11 +351,29 @@ fn group(bits: impl IntoIterator<Item = (RowId, RecordId)>) -> BTreeMap<Containe
 }
 
 /// One chunk's worth: container key to the offsets landing in it, in arrival order.
+///
+/// **A run at a time, not a bit at a time.** The map is small — a few hundred keys — but it was
+/// being probed once per bit, tens of millions of times, and a probe is a descent and a compare.
+/// Consecutive bits usually belong to the same container, so this holds the run it is building
+/// and hands it over only when the key actually changes. What makes "usually" true is the order
+/// the batch arrives in; see [`big_field::Bsi::bits_for_all`], which exists to produce it.
 fn offsets_of(bits: &[(RowId, RecordId)]) -> BTreeMap<ContainerKey, Vec<u16>> {
     let mut by_ckey: BTreeMap<ContainerKey, Vec<u16>> = BTreeMap::new();
+    let mut open: Option<ContainerKey> = None;
+    let mut run: Vec<u16> = Vec::new();
     for (row, rec) in bits {
         let pos = pos_of(*row, *rec);
-        by_ckey.entry(ckey_of(pos)).or_default().push(offset_in_container(pos));
+        let ckey = ckey_of(pos);
+        if open != Some(ckey) {
+            if let Some(prev) = open {
+                by_ckey.entry(prev).or_default().append(&mut run);
+            }
+            open = Some(ckey);
+        }
+        run.push(offset_in_container(pos));
+    }
+    if let Some(prev) = open {
+        by_ckey.entry(prev).or_default().append(&mut run);
     }
     by_ckey
 }

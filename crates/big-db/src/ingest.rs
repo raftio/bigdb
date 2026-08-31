@@ -252,6 +252,13 @@ impl<'db, P: PagerMut> Ingest<'db, P> {
 
         let db = self.db;
         let mut w = db.write();
+        // Every target resolved once, before a single op is replayed. There are a handful of
+        // these and millions of ops, and resolving by name per op walked the catalog twice and
+        // cloned a `FieldDef` — a name and a granularity list allocated per fact — to learn
+        // something fixed for the length of the transaction. Doing it up front also means a
+        // batch naming a field that does not exist is refused before any of it is applied.
+        let at: Vec<crate::db::At> =
+            self.targets.iter().map(|(table, field)| w.at(table, field)).collect::<Result<_>>()?;
         let mut written = 0u64;
         for op in &self.ops {
             if let Some(shards) = &selected {
@@ -259,15 +266,15 @@ impl<'db, P: PagerMut> Ingest<'db, P> {
                     continue;
                 }
             }
-            let (table, field) = &self.targets[op.target as usize];
+            let at = &at[op.target as usize];
             match &op.value {
-                Value::Int(v) => w.set_int(table, field, op.record, *v)?,
-                Value::Bool(v) => w.set_bool(table, field, op.record, *v)?,
+                Value::Int(v) => w.set_int_at(at, op.record, *v)?,
+                Value::Bool(v) => w.set_bool_at(at, op.record, *v)?,
                 Value::Key(v) => {
-                    w.set_key(table, field, op.record, v)?;
+                    w.set_key_at(at, op.record, v)?;
                 }
                 Value::Time { value, unix_seconds } => {
-                    w.set_time(table, field, op.record, value, *unix_seconds)?;
+                    w.set_time_at(at, op.record, value, *unix_seconds)?;
                 }
             }
             written += 1;

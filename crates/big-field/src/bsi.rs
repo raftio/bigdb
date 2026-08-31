@@ -111,6 +111,45 @@ impl Bsi {
         Ok(())
     }
 
+    /// The same bits for a whole batch, plane by plane rather than record by record.
+    ///
+    /// **The contents are identical; the order is the point.** `pos_of` puts a plane a whole
+    /// shard's width away from its neighbour, so walking one record's planes lands every one of
+    /// its bits in a different container from the bit before it — and the grouping downstream
+    /// then looks a container up per bit. Walking a plane's records instead keeps a long run of
+    /// ascending records inside one container, so that grouping can stay on the container it is
+    /// already holding. Nothing after this cares about the order: containers are built from
+    /// offsets that get sorted anyway.
+    ///
+    /// Every value is checked before any bit is emitted, so a batch carrying one value too wide
+    /// for the field is refused whole rather than half-written.
+    pub fn bits_for_all(
+        &self,
+        values: &[(RecordId, u64)],
+        set: &mut Vec<(RowId, RecordId)>,
+        clear: &mut Vec<(RowId, RecordId)>,
+    ) -> Result<()> {
+        for (_, value) in values {
+            if !self.fits(*value) {
+                return Err(FieldError::ValueTooWide { value: *value, bit_depth: self.bit_depth });
+            }
+        }
+        for (record, _) in values {
+            set.push((EXISTS_ROW, *record));
+        }
+        for i in 0..self.bit_depth {
+            let row = Self::plane_row(i);
+            for (record, value) in values {
+                if value >> i & 1 == 1 {
+                    set.push((row, *record));
+                } else {
+                    clear.push((row, *record));
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn clear<P: PagerMut>(
         &self,
         txn: &mut WriteTxn<'_, P>,

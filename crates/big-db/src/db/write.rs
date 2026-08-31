@@ -31,14 +31,40 @@ enum ColEdit {
     /// The cell becomes exactly this. Every scalar kind, and a mutex - which is a keyed field
     /// that holds one value at a time, so a second write replaces the first.
     Replace(Cell),
-    /// These row ids join whatever the record already holds. A set field only ever adds, so its
-    /// column has to merge with what is stored rather than replace it - which is the one place
-    /// a column write is not simply the caller's last word.
+    /// One row id joins whatever the record already holds.
+    ///
+    /// Split from [`ColEdit::Add`] because it is what every `set_key` produces and a `Vec` of one
+    /// is an allocation per fact — two per record for a table with two set fields, tens of
+    /// millions in a load, and the allocator was a quarter of it. The list shape is still needed:
+    /// a record written twice in one transaction holds both values, and that is where these are
+    /// promoted.
+    AddOne(RowId),
+    /// Several row ids join it. Only [`fold_edits`] builds these, by merging the above.
     ///
     /// There is deliberately no `Clear`: a delete does not go through the buffer at all. It
     /// nulls slots a block at a time in [`DbWrite::clear_column_records`], because the records
     /// of one delete are already grouped and the buffer would only regroup them.
     Add(Vec<RowId>),
+}
+
+impl ColEdit {
+    /// Merges `next` into an edit already buffered for the same record.
+    ///
+    /// A set field adds, so two `Add`s are both part of what the record holds. Anything else is
+    /// the caller's last word and replaces — an `Add` landing on a `Replace` included, which the
+    /// map-keyed buffer this replaced treated the same way.
+    fn absorb(&mut self, next: ColEdit) {
+        match (&mut *self, next) {
+            (ColEdit::AddOne(have), ColEdit::AddOne(one)) => *self = ColEdit::Add(vec![*have, one]),
+            (ColEdit::AddOne(have), ColEdit::Add(mut more)) => {
+                more.insert(0, *have);
+                *self = ColEdit::Add(more);
+            }
+            (ColEdit::Add(have), ColEdit::AddOne(one)) => have.push(one),
+            (ColEdit::Add(have), ColEdit::Add(more)) => have.extend(more),
+            (_, next) => *self = next,
+        }
+    }
 }
 
 /// Facts waiting to reach one fragment.
@@ -63,13 +89,15 @@ struct Pending {
     /// are: a block holds a thousand records, so a write that reached storage per record would
     /// re-encode a thousand values to change one of them.
     ///
-    /// Keyed, unlike the two above, and measured that way: a set field *adds*, so collapsing a
-    /// buffer of these means folding rather than dropping all but the last, and the fold has to
-    /// sort a `Vec` whose elements own a `Vec` of their own. Records arrive ascending in a load,
-    /// which is the case a `BTreeMap` appends into its rightmost leaf for almost nothing, so the
-    /// sort lost to it by 1.3x. The bits above are keyed on `(row, record)` and cycle through
-    /// rows, which is why the same change wins there and loses here.
-    cells: BTreeMap<RecordId, ColEdit>,
+    /// Arrival order like the two above, folded rather than collapsed: a set field *adds*, so
+    /// two edits for one record are both part of what it holds. See [`fold_edits`].
+    ///
+    /// This was a `BTreeMap` until the fold learned to skip its sort. Sorting unconditionally
+    /// lost to the map by 1.3x, and the reason is the same one that now makes the `Vec` win: a
+    /// load hands records over ascending, which is both the case a map appends into its
+    /// rightmost leaf for almost nothing *and* the case a fold can detect in one pass and do
+    /// nothing about.
+    cells: Vec<(RecordId, ColEdit)>,
 }
 
 /// Collapses a buffer of writes to one entry per key, keeping the last — which is exactly what
@@ -83,19 +111,80 @@ struct Pending {
 /// per write — and the flush was going to walk the whole buffer anyway.
 ///
 /// The sort is stable, so entries for one key keep their arrival order; reversing before the
-/// dedup is what makes the survivor the *last* arrival rather than the first.
-fn last_per_key<K: Ord, V>(buf: Vec<(K, V)>) -> Vec<(K, V)> {
-    let mut buf = last_sorted(buf);
+/// dedup is what makes the survivor the *last* arrival rather than the first. An already-ordered
+/// buffer skips the sort and keeps that property for free, having never been reordered.
+fn last_per_key<K: Ord + Copy, V>(mut buf: Vec<(K, V)>) -> Vec<(K, V)> {
+    // One pass first, because the common case needs no work at all: a load hands records over
+    // ascending and writes each field of one record once, so the buffer arrives strictly
+    // increasing and every entry survives. Establishing that costs one comparison per entry and
+    // skips an `n log n` sort of tens of millions — which is most of what the sort was for.
+    let (sorted, repeats) = shape_of(&buf);
+    if sorted && !repeats {
+        return buf;
+    }
+    if !sorted {
+        buf.sort_by_key(|entry| entry.0);
+    }
     buf.reverse();
     buf.dedup_by(|a, b| a.0 == b.0);
     buf.reverse();
     buf
 }
 
-/// Ascending by key, with entries for one key left in arrival order.
-fn last_sorted<K: Ord, V>(mut buf: Vec<(K, V)>) -> Vec<(K, V)> {
-    buf.sort_by(|a, b| a.0.cmp(&b.0));
-    buf
+/// Whether a buffer is already ascending by key, and whether any key repeats.
+///
+/// One comparison per entry, to find out whether the expensive half of collapsing it can be
+/// skipped outright. It usually can: a load hands records over in order and writes each field
+/// of one record once.
+fn shape_of<K: Ord, V>(buf: &[(K, V)]) -> (bool, bool) {
+    let mut repeats = false;
+    for pair in buf.windows(2) {
+        match pair[0].0.cmp(&pair[1].0) {
+            core::cmp::Ordering::Less => {}
+            core::cmp::Ordering::Equal => repeats = true,
+            core::cmp::Ordering::Greater => return (false, repeats),
+        }
+    }
+    (true, repeats)
+}
+
+/// Collapses a buffer of column edits to one per record, ascending.
+///
+/// Not [`last_per_key`], because the last edit is not always the whole answer: a set field adds,
+/// so two `Add`s for one record are both part of what it holds. Everything else is the caller's
+/// last word and replaces — including an `Add` landing on a `Replace`, which the map-keyed
+/// version this replaced also treated as a fresh list rather than a merge into a scalar.
+fn fold_edits(mut buf: Vec<(RecordId, ColEdit)>) -> Vec<(RecordId, ColEdit)> {
+    let (sorted, repeats) = shape_of(&buf);
+    if sorted && !repeats {
+        return buf;
+    }
+    if !sorted {
+        buf.sort_by_key(|entry| entry.0);
+    }
+    let mut out: Vec<(RecordId, ColEdit)> = Vec::with_capacity(buf.len());
+    for (record, edit) in buf {
+        match out.last_mut() {
+            Some((prev, held)) if *prev == record => held.absorb(edit),
+            _ => out.push((record, edit)),
+        }
+    }
+    out
+}
+
+/// A field resolved to what the setters need, so a caller writing many facts at one field pays
+/// for the catalog walk once instead of once per fact.
+///
+/// **The saving is the clone, more than the lookup.** [`resolve`] hands back an owned
+/// [`FieldDef`], which owns a name and a granularity list — so every setter call allocated twice
+/// to learn something that cannot change inside one transaction. A field's id, kind and declared
+/// width are fixed once it exists, and a replay does no DDL; the zone map and the bit depth that
+/// *do* move during a transaction live in the catalog's fragment entry, which is read at the
+/// flush rather than from here.
+#[derive(Clone, Debug)]
+pub struct At {
+    table: TableId,
+    def: FieldDef,
 }
 
 pub struct DbWrite<'db, P: PagerMut> {
@@ -183,10 +272,9 @@ impl<'db, P: PagerMut> DbWrite<'db, P> {
             // write saw. A record written before the depth grew still gets every plane
             // accounted for, so overwriting a large value with a small one cannot leave a
             // stale high bit behind.
-            let bsi = Bsi::new(depth as u32);
-            for (record, value) in &values {
-                bsi.bits_for(*record, *value, &mut set, &mut clear)?;
-            }
+            // Plane-major, which is what keeps the grouping downstream on one container at a
+            // time. See `Bsi::bits_for_all`.
+            Bsi::new(depth as u32).bits_for_all(&values, &mut set, &mut clear)?;
         }
         for ((row, record), on) in &bits {
             if *on {
@@ -197,7 +285,7 @@ impl<'db, P: PagerMut> DbWrite<'db, P> {
         }
 
         if !p.cells.is_empty() {
-            self.flush_cells(key, p.cells)?;
+            self.flush_cells(key, fold_edits(p.cells))?;
         }
 
         // A segment-only key has no bitmap half to write. Returning before `fragment_raw`
@@ -217,7 +305,7 @@ impl<'db, P: PagerMut> DbWrite<'db, P> {
     /// Grouped by block first, so a thousand records landing in one block cost one decode and
     /// one encode rather than a thousand of each. That grouping is the entire reason the edits
     /// were buffered instead of written where they were made.
-    fn flush_cells(&mut self, key: FragmentKey, cells: BTreeMap<RecordId, ColEdit>) -> Result<()> {
+    fn flush_cells(&mut self, key: FragmentKey, cells: Vec<(RecordId, ColEdit)>) -> Result<()> {
         let mut by_block: BTreeMap<u64, Vec<(usize, ColEdit)>> = BTreeMap::new();
         for (record, edit) in cells {
             let (block, slot) = column_site(record);
@@ -236,6 +324,13 @@ impl<'db, P: PagerMut> DbWrite<'db, P> {
                 for (slot, edit) in edits {
                     let next = match edit {
                         ColEdit::Replace(cell) => cell,
+                        ColEdit::AddOne(one) => {
+                            let mut all = b.get(slot).list().to_vec();
+                            all.push(one);
+                            all.sort_unstable();
+                            all.dedup();
+                            Cell::List(all)
+                        }
                         // The one edit that reads what is already there. A set field adds, so
                         // the stored list is part of the answer rather than something the
                         // write is replacing.
@@ -299,23 +394,7 @@ impl<'db, P: PagerMut> DbWrite<'db, P> {
     /// Merging matters for exactly one case and it is the case a set field is: two `set_key`
     /// calls for one record are two values it now holds, not the second replacing the first.
     fn buffer_cell(&mut self, key: FragmentKey, record: RecordId, edit: ColEdit) {
-        let slot = self.pending.entry(key).or_default().cells.entry(record);
-        use std::collections::btree_map::Entry;
-        match (slot, edit) {
-            (Entry::Occupied(mut e), ColEdit::Add(more)) => {
-                if let ColEdit::Add(have) = e.get_mut() {
-                    have.extend(more);
-                } else {
-                    e.insert(ColEdit::Add(more));
-                }
-            }
-            (Entry::Occupied(mut e), other) => {
-                e.insert(other);
-            }
-            (Entry::Vacant(e), edit) => {
-                e.insert(edit);
-            }
-        }
+        self.pending.entry(key).or_default().cells.push((record, edit));
     }
 
     /// Records a value in the zone map of whichever trees this table actually keeps.
@@ -362,6 +441,12 @@ impl<'db, P: PagerMut> DbWrite<'db, P> {
         Ok((t, def, key))
     }
 
+    /// Resolves a field once, for a caller about to write many facts at it.
+    pub fn at(&self, table: &str, field: &str) -> Result<At> {
+        let (t, def) = resolve(&self.catalog, table, field)?;
+        Ok(At { table: t, def })
+    }
+
     fn buffer_bit(&mut self, key: FragmentKey, row: RowId, record: RecordId, on: bool) {
         self.pending.entry(key).or_default().bits.push(((row, record), on));
     }
@@ -380,9 +465,19 @@ impl<'db, P: PagerMut> DbWrite<'db, P> {
             .table(table)
             .map(|t| t.id)
             .ok_or_else(|| DbError::UnknownTable(table.to_string()))?;
-        let key = self.key(t, EXISTS_FIELD, shard_of(record));
-        self.buffer_bit(key, EXISTS_ROW, record, true);
+        self.mark_exists_at(t, record);
         Ok(())
+    }
+
+    /// The same, for a caller that has already resolved the table.
+    ///
+    /// Every setter marks existence, and every setter had already resolved the table to reach
+    /// its field — so taking the name again meant a second walk of the catalog per column per
+    /// record for an id sitting in the caller's hand. It cannot fail here, which is the other
+    /// half of the point: the name was checked when it was resolved.
+    fn mark_exists_at(&mut self, table: TableId, record: RecordId) {
+        let key = self.key(table, EXISTS_FIELD, shard_of(record));
+        self.buffer_bit(key, EXISTS_ROW, record, true);
     }
 
     pub fn set_int(
@@ -392,11 +487,19 @@ impl<'db, P: PagerMut> DbWrite<'db, P> {
         record: RecordId,
         value: u64,
     ) -> Result<()> {
-        let (_, def, key) = self.target(table, field, record)?;
+        let at = self.at(table, field)?;
+        self.set_int_at(&at, record, value)
+    }
+
+    /// The same, at a field resolved once. See [`At`].
+    pub fn set_int_at(&mut self, at: &At, record: RecordId, value: u64) -> Result<()> {
+        let (t, def) = (at.table, &at.def);
+        let field = def.name.as_str();
+        let key = self.key(t, def.id, shard_of(record));
         // `is_bsi` now covers the signed kind too, and this setter must not: the value it takes
         // is already the stored value, so writing one to a signed field would store a number
         // that reads back as something else entirely. `set_signed` is the way in.
-        expect_kind(&def, field, |k| k.is_bsi() && !k.is_signed(), "int")?;
+        expect_kind(def, field, |k| k.is_bsi() && !k.is_signed(), "int")?;
 
         // A value wider than the field was declared for is refused, not truncated.
         let declared = if def.bit_depth == 0 { 64 } else { def.bit_depth };
@@ -410,13 +513,13 @@ impl<'db, P: PagerMut> DbWrite<'db, P> {
         //
         // The zone map is recorded whichever engine this is: a scan wants to skip a shard
         // whose range rules the predicate out every bit as much as an index does.
-        let t = self.catalog.table(table).map_or(0, |x| x.id);
-        self.observe(t, &def, record, value);
+        self.observe(t, def, record, value);
         if self.engine(t).has_bitmap() {
             self.pending.entry(key).or_default().values.push((record, value));
         }
-        self.buffer_value(t, &def, record, value);
-        self.mark_exists(table, record)
+        self.buffer_value(t, def, record, value);
+        self.mark_exists_at(t, record);
+        Ok(())
     }
 
     /// Writes a signed value, biased on the way in.
@@ -432,7 +535,7 @@ impl<'db, P: PagerMut> DbWrite<'db, P> {
         record: RecordId,
         value: i64,
     ) -> Result<()> {
-        let (_, def, key) = self.target(table, field, record)?;
+        let (t, def, key) = self.target(table, field, record)?;
         expect_kind(&def, field, FieldKind::is_signed, "signed int")?;
 
         let declared = if def.bit_depth == 0 { 64 } else { def.bit_depth };
@@ -445,13 +548,13 @@ impl<'db, P: PagerMut> DbWrite<'db, P> {
 
         // The zone map observes the *stored* value, which is what makes it work unchanged: the
         // encoding is monotonic, so a window in stored space is the same window in value space.
-        let t = self.catalog.table(table).map_or(0, |x| x.id);
         self.observe(t, &def, record, stored);
         if self.engine(t).has_bitmap() {
             self.pending.entry(key).or_default().values.push((record, stored));
         }
         self.buffer_value(t, &def, record, stored);
-        self.mark_exists(table, record)
+        self.mark_exists_at(t, record);
+        Ok(())
     }
 
     pub fn set_bool(
@@ -461,18 +564,25 @@ impl<'db, P: PagerMut> DbWrite<'db, P> {
         record: RecordId,
         value: bool,
     ) -> Result<()> {
-        let (_, def, key) = self.target(table, field, record)?;
-        expect_kind(&def, field, |k| k == FieldKind::Bool, "bool")?;
+        let at = self.at(table, field)?;
+        self.set_bool_at(&at, record, value)
+    }
 
-        let t = self.catalog.table(table).map_or(0, |x| x.id);
+    /// The same, at a field resolved once. See [`At`].
+    pub fn set_bool_at(&mut self, at: &At, record: RecordId, value: bool) -> Result<()> {
+        let (t, def) = (at.table, &at.def);
+        let key = self.key(t, def.id, shard_of(record));
+        expect_kind(def, &def.name, |k| k == FieldKind::Bool, "bool")?;
+
         if self.engine(t).has_bitmap() {
             self.buffer_bit(key, BoolField::row_of(value), record, true);
             self.buffer_bit(key, BoolField::row_of(!value), record, false);
         }
         // A boolean's column is one bit wide after the codec measures it, so this is close to
         // free next to the two rows the index spends.
-        self.buffer_value(t, &def, record, value as u64);
-        self.mark_exists(table, record)
+        self.buffer_value(t, def, record, value as u64);
+        self.mark_exists_at(t, record);
+        Ok(())
     }
 
     /// Interns the row key and sets the bit. Row keys are the one thing that must mean the same
@@ -484,8 +594,15 @@ impl<'db, P: PagerMut> DbWrite<'db, P> {
         record: RecordId,
         value: &str,
     ) -> Result<RowId> {
-        let (t, def, key) = self.target(table, field, record)?;
-        expect_kind(&def, field, FieldKind::is_keyed, "set, mutex or time quantum")?;
+        let at = self.at(table, field)?;
+        self.set_key_at(&at, record, value)
+    }
+
+    /// The same, at a field resolved once. See [`At`].
+    pub fn set_key_at(&mut self, at: &At, record: RecordId, value: &str) -> Result<RowId> {
+        let (t, def) = (at.table, &at.def);
+        let key = self.key(t, def.id, shard_of(record));
+        expect_kind(def, &def.name, FieldKind::is_keyed, "set, mutex or time quantum")?;
         let row = self.catalog.keys.intern(t, def.id, value)?;
 
         let engine = self.engine(t);
@@ -516,12 +633,12 @@ impl<'db, P: PagerMut> DbWrite<'db, P> {
             let edit = if def.kind == FieldKind::Mutex {
                 ColEdit::Replace(Cell::Value(row))
             } else {
-                ColEdit::Add(vec![row])
+                ColEdit::AddOne(row)
             };
             self.buffer_cell(col, record, edit);
         }
 
-        self.mark_exists(table, record)?;
+        self.mark_exists_at(t, record);
         Ok(row)
     }
 
@@ -565,10 +682,22 @@ impl<'db, P: PagerMut> DbWrite<'db, P> {
         value: &str,
         unix_seconds: i64,
     ) -> Result<RowId> {
-        let (t, def, _) = self.target(table, field, record)?;
-        expect_kind(&def, field, |k| k == FieldKind::TimeQuantum, "time quantum")?;
+        let at = self.at(table, field)?;
+        self.set_time_at(&at, record, value, unix_seconds)
+    }
 
-        let row = self.set_key(table, field, record, value)?;
+    /// The same, at a field resolved once. See [`At`].
+    pub fn set_time_at(
+        &mut self,
+        at: &At,
+        record: RecordId,
+        value: &str,
+        unix_seconds: i64,
+    ) -> Result<RowId> {
+        let (t, def) = (at.table, &at.def);
+        expect_kind(def, &def.name, |k| k == FieldKind::TimeQuantum, "time quantum")?;
+
+        let row = self.set_key_at(at, record, value)?;
 
         let granularity = if def.granularity.is_empty() {
             big_field::DEFAULT_GRANULARITY.to_vec()
