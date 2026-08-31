@@ -29,9 +29,9 @@
 //! It is the default for a new table - see [`crate::TableEngine::default`] - because a caller
 //! who does not choose wants the engine that answers the widest range of questions well.
 
-use crate::engine::Engine;
+use crate::base::engine::{Engine, Fact, Sink};
 
-/// The descriptor. See [`crate::engine`] for what a descriptor is and is not.
+/// The descriptor. See [`crate::base::engine`] for what a descriptor is and is not.
 pub struct HybridEngine;
 
 impl Engine for HybridEngine {
@@ -49,5 +49,15 @@ impl Engine for HybridEngine {
 
     fn has_columns(&self) -> bool {
         true
+    }
+
+    /// Both, and literally so.
+    ///
+    /// **This is the whole module in one method.** A hybrid table is not a third way of storing a
+    /// fact, it is the other two asked in turn - and writing it as the two calls rather than as a
+    /// copy of what they do is what keeps that true as they change.
+    fn place(&self, sink: &mut dyn Sink, fact: Fact<'_>) {
+        crate::bitmap::BitmapEngine.place(sink, fact);
+        crate::columnar::ColumnarEngine.place(sink, fact);
     }
 }

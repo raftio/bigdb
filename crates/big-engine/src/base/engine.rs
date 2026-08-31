@@ -36,6 +36,9 @@
 //! an engine storing something that is neither still needs code in the write path. The list
 //! buys the identity, the naming and the routing; it does not buy the storage.
 
+use crate::base::coords::RowId;
+use crate::base::field_kind::FieldKind;
+use crate::columnar::ColEdit;
 use core::fmt;
 
 /// One storage engine, as everything outside it needs to know it.
@@ -60,6 +63,96 @@ pub trait Engine: Send + Sync + 'static {
 
     /// Whether this engine maintains column segments.
     fn has_columns(&self) -> bool;
+
+    /// Records one fact in whatever stores this engine keeps.
+    ///
+    /// **This is the method that stops a new engine meaning edits to `big-db`.** Before it, the
+    /// write path asked [`Engine::has_bitmap`] and [`Engine::has_columns`] at nine separate
+    /// places and did the buffering itself - so the *description* of an engine lived here and the
+    /// *decision* lived up there, and adding a fourth engine meant finding all nine.
+    ///
+    /// The dependency is inverted instead: `big-db` owns the buffers and hands them over as a
+    /// [`Sink`]; the engine says what to put in them. Adding an engine is implementing this.
+    ///
+    /// **Deliberately infallible.** Everything here is a *decision* being recorded, and a
+    /// decision cannot fail - the writing happens later, in the caller, where the transaction is.
+    /// The one write that genuinely has to read first is a mutex, and [`Sink::mutex`] records
+    /// that it is needed rather than performing it, which keeps the whole trait free of an error
+    /// type no engine could do anything with.
+    fn place(&self, sink: &mut dyn Sink, fact: Fact<'_>);
+}
+
+/// Which half of a table's storage a zone map entry belongs to.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Half {
+    Bitmap,
+    Columns,
+}
+
+/// One fact, in the terms an engine routes by.
+///
+/// Resolved as far as it can be without an engine: a value is already biased if its field was
+/// signed, and a key is already an interned row id. What is left is the part that depends on
+/// where the fact is going, which is what [`Engine::place`] decides.
+#[derive(Clone, Copy, Debug)]
+pub enum Fact<'v> {
+    /// A bit-sliced value. `kind` distinguishes the signed convention for nothing below this
+    /// line, but a future engine may store the two differently and the fact should carry it.
+    Value {
+        value: u64,
+        kind: FieldKind,
+    },
+    Bool(bool),
+    /// An interned row key.
+    ///
+    /// `views` are the extra bitmap views a time quantum writes into, empty for every other
+    /// keyed field. They are *bitmap* views, so an engine with no bitmaps ignores them - which is
+    /// the bug this design removes: the old write path wrote them unconditionally, so a columnar
+    /// table grew per-day fragments nothing would ever read.
+    Row {
+        row: RowId,
+        kind: FieldKind,
+        views: &'v [u32],
+    },
+}
+
+impl Fact<'_> {
+    /// The number a zone map should observe, which every fact has: a key observes its row id,
+    /// because a row id is what a segment stores and what a scan compares.
+    pub fn observed(&self) -> u64 {
+        match self {
+            Self::Value { value, .. } => *value,
+            Self::Bool(b) => *b as u64,
+            Self::Row { row, .. } => *row,
+        }
+    }
+}
+
+/// The buffers a fact lands in.
+///
+/// `big-db` owns these; an engine only says which to reach for. Every method records and none
+/// writes, which is what lets [`Engine::place`] be infallible.
+pub trait Sink {
+    /// Records a value in the zone map of one half. A half an engine does not keep should not
+    /// be observed, or a reader would find a fragment on the list that has no tree.
+    fn observe(&mut self, half: Half, value: u64);
+
+    /// A bit-sliced value, in the standard view.
+    fn planes(&mut self, value: u64);
+
+    /// One bit of one row, in the standard view.
+    fn bit(&mut self, row: RowId, on: bool);
+
+    /// The same, in a named view. What a time quantum's granularities need.
+    fn bit_in(&mut self, view: u32, row: RowId, on: bool);
+
+    /// Asks for the mutex protocol: find what this record held and clear it before setting the
+    /// new row. **Recorded, not performed** - it is the one write that has to read the shadow
+    /// view first, and reading belongs to the caller that owns the transaction.
+    fn mutex(&mut self, row: RowId);
+
+    /// A column cell.
+    fn cell(&mut self, edit: ColEdit);
 }
 
 /// Every engine this build knows, in code order.

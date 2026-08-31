@@ -71,62 +71,15 @@ impl ColumnWrite {
         block: u64,
         value: &Block,
     ) -> Result<()> {
-        let parts = value.encode().map_err(|e| match e {
-            // `Block` cannot know its own index, so it names zero and this fills it in.
-            ColumnError::TooManyParts { .. } => ColumnError::TooManyParts { block },
-            other => other,
-        })?;
-        if parts.len() as u64 > MAX_PARTS {
-            return Err(ColumnError::TooManyParts { block });
-        }
+        let items = block_items(txn, 0, block, value)?;
 
         let existing = self.parts_at(txn, block)?;
-        for part in existing.into_iter().skip(parts.len()) {
+        for part in existing.into_iter().skip(items.len()) {
             self.remove_key(txn, part)?;
         }
-        if parts.is_empty() {
+        if items.is_empty() {
             self.collapse_if_empty(txn)?;
             return Ok(());
-        }
-
-        let mut items = Vec::with_capacity(parts.len());
-        for (n, part) in parts.iter().enumerate() {
-            let key = key_of(block, n as u64);
-            items.push(match &part.page {
-                None => LeafItem {
-                    key,
-                    ty: ContainerType::ValuesInline,
-                    // `elem_n` is a byte length for the values types, not a count of elements.
-                    elem_n: part.inline.len() as u16,
-                    cardinality: part.present,
-                    bitmap_checksum: 0,
-                    bitmap_pgno: 0,
-                    payload: part.inline.clone(),
-                },
-                Some(bytes) => {
-                    // The same arrangement a dense container uses: raw bytes on a page of their
-                    // own, with the checksum in the cell above them. That is what lets the free
-                    // walk, the scrub and the backup copy handle a values page already.
-                    let page = big_page::Page(bytes.as_slice().try_into().map_err(|_| {
-                        ColumnError::Truncated {
-                            need: crate::columnar::PAGE_BYTES,
-                            have: bytes.len(),
-                        }
-                    })?);
-                    let checksum = big_page::bitmap_page_checksum(&page);
-                    let pgno = txn.alloc().map_err(big_btree::BTreeError::from)?;
-                    txn.write(pgno, page).map_err(big_btree::BTreeError::from)?;
-                    LeafItem {
-                        key,
-                        ty: ContainerType::ValuesPtr,
-                        elem_n: part.inline.len() as u16,
-                        cardinality: part.present,
-                        bitmap_checksum: checksum,
-                        bitmap_pgno: pgno,
-                        payload: part.inline.clone(),
-                    }
-                }
-            });
         }
 
         self.root = Some(big_btree::put_many(txn, self.root, items)?);
@@ -202,4 +155,67 @@ impl ColumnWrite {
         }
         Ok(())
     }
+}
+
+/// One block, encoded into the leaf items a tree stores it as.
+///
+/// Free rather than a method, and taking `base`, because a block lives in two places: a segment
+/// of its own, where `base` is zero, and inside a [`crate::part`], where every field of a shard
+/// shares one tree and a field's keys start at its own offset. The encoding, the spill decision
+/// and the page arrangement are the same in both, so they are written once.
+///
+/// Empty when the block holds nothing: a block of nulls encodes to no parts at all, and the
+/// caller decides whether that means "remove what was there" or "write nothing".
+pub fn block_items<P: PagerMut>(
+    txn: &mut WriteTxn<'_, P>,
+    base: ContainerKey,
+    block: u64,
+    value: &Block,
+) -> Result<Vec<LeafItem>> {
+    let parts = value.encode().map_err(|e| match e {
+        // `Block` cannot know its own index, so it names zero and this fills it in.
+        ColumnError::TooManyParts { .. } => ColumnError::TooManyParts { block },
+        other => other,
+    })?;
+    if parts.len() as u64 > MAX_PARTS {
+        return Err(ColumnError::TooManyParts { block });
+    }
+
+    let mut items = Vec::with_capacity(parts.len());
+    for (n, part) in parts.iter().enumerate() {
+        let key = base + key_of(block, n as u64);
+        items.push(match &part.page {
+            None => LeafItem {
+                key,
+                ty: ContainerType::ValuesInline,
+                // `elem_n` is a byte length for the values types, not a count of elements.
+                elem_n: part.inline.len() as u16,
+                cardinality: part.present,
+                bitmap_checksum: 0,
+                bitmap_pgno: 0,
+                payload: part.inline.clone(),
+            },
+            Some(bytes) => {
+                // The same arrangement a dense container uses: raw bytes on a page of their own,
+                // with the checksum in the cell above them. That is what lets the free walk, the
+                // scrub and the backup copy handle a values page already.
+                let page = big_page::Page(bytes.as_slice().try_into().map_err(|_| {
+                    ColumnError::Truncated { need: crate::columnar::PAGE_BYTES, have: bytes.len() }
+                })?);
+                let checksum = big_page::bitmap_page_checksum(&page);
+                let pgno = txn.alloc().map_err(big_btree::BTreeError::from)?;
+                txn.write(pgno, page).map_err(big_btree::BTreeError::from)?;
+                LeafItem {
+                    key,
+                    ty: ContainerType::ValuesPtr,
+                    elem_n: part.inline.len() as u16,
+                    cardinality: part.present,
+                    bitmap_checksum: checksum,
+                    bitmap_pgno: pgno,
+                    payload: part.inline.clone(),
+                }
+            }
+        });
+    }
+    Ok(items)
 }

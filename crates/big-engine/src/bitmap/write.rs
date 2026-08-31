@@ -15,8 +15,8 @@
 //! Writing a fragment. Batch is the only sane granularity: a single bit costs a whole page
 //! rewrite plus the shadow path up to the root.
 
+use crate::base::coords::*;
 use crate::bitmap::rowset::RowSet;
-use crate::coords::*;
 use big_btree::{put_container, put_containers, remove, Result};
 use big_container::{apply, Container, ContainerRef, SetOp};
 use big_page::{ContainerKey, PageType, Pgno};

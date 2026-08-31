@@ -21,49 +21,51 @@
 //! knows the shape of the whole batch.
 
 use super::*;
+use big_engine::base::engine::{Fact, Half, Sink};
+use big_engine::columnar::ColEdit;
 
-/// What one record's column cell is about to become.
+/// What an engine decided about one fact.
 ///
-/// Keyed by record rather than appended, exactly as [`Pending`] is, so writing the same record
-/// twice in a transaction keeps the last decision rather than replaying both.
-#[derive(Clone, Debug)]
-enum ColEdit {
-    /// The cell becomes exactly this. Every scalar kind, and a mutex - which is a keyed field
-    /// that holds one value at a time, so a second write replaces the first.
-    Replace(Cell),
-    /// One row id joins whatever the record already holds.
-    ///
-    /// Split from [`ColEdit::Add`] because it is what every `set_key` produces and a `Vec` of one
-    /// is an allocation per fact — two per record for a table with two set fields, tens of
-    /// millions in a load, and the allocator was a quarter of it. The list shape is still needed:
-    /// a record written twice in one transaction holds both values, and that is where these are
-    /// promoted.
-    AddOne(RowId),
-    /// Several row ids join it. Only [`fold_edits`] builds these, by merging the above.
-    ///
-    /// There is deliberately no `Clear`: a delete does not go through the buffer at all. It
-    /// nulls slots a block at a time in [`DbWrite::clear_column_records`], because the records
-    /// of one delete are already grouped and the buffer would only regroup them.
-    Add(Vec<RowId>),
+/// A recorder rather than a writer, which is what lets [`big_engine::Engine::place`] be
+/// infallible: an engine says *what* should happen and [`DbWrite::route`] makes it happen, where
+/// the transaction and the catalog are.
+#[derive(Default)]
+struct Placed {
+    observe_bitmap: Option<u64>,
+    observe_columns: Option<u64>,
+    planes: Option<u64>,
+    bits: Vec<(RowId, bool)>,
+    bits_in: Vec<(u32, RowId, bool)>,
+    mutex: Option<RowId>,
+    cell: Option<ColEdit>,
 }
 
-impl ColEdit {
-    /// Merges `next` into an edit already buffered for the same record.
-    ///
-    /// A set field adds, so two `Add`s are both part of what the record holds. Anything else is
-    /// the caller's last word and replaces — an `Add` landing on a `Replace` included, which the
-    /// map-keyed buffer this replaced treated the same way.
-    fn absorb(&mut self, next: ColEdit) {
-        match (&mut *self, next) {
-            (ColEdit::AddOne(have), ColEdit::AddOne(one)) => *self = ColEdit::Add(vec![*have, one]),
-            (ColEdit::AddOne(have), ColEdit::Add(mut more)) => {
-                more.insert(0, *have);
-                *self = ColEdit::Add(more);
-            }
-            (ColEdit::Add(have), ColEdit::AddOne(one)) => have.push(one),
-            (ColEdit::Add(have), ColEdit::Add(more)) => have.extend(more),
-            (_, next) => *self = next,
+impl Sink for Placed {
+    fn observe(&mut self, half: Half, value: u64) {
+        match half {
+            Half::Bitmap => self.observe_bitmap = Some(value),
+            Half::Columns => self.observe_columns = Some(value),
         }
+    }
+
+    fn planes(&mut self, value: u64) {
+        self.planes = Some(value);
+    }
+
+    fn bit(&mut self, row: RowId, on: bool) {
+        self.bits.push((row, on));
+    }
+
+    fn bit_in(&mut self, view: u32, row: RowId, on: bool) {
+        self.bits_in.push((view, row, on));
+    }
+
+    fn mutex(&mut self, row: RowId) {
+        self.mutex = Some(row);
+    }
+
+    fn cell(&mut self, edit: ColEdit) {
+        self.cell = Some(edit);
     }
 }
 
@@ -397,35 +399,6 @@ impl<'db, P: PagerMut> DbWrite<'db, P> {
         self.pending.entry(key).or_default().cells.push((record, edit));
     }
 
-    /// Records a value in the zone map of whichever trees this table actually keeps.
-    ///
-    /// Both engines want it. An index uses it to skip a shard without reading a page; a scan
-    /// uses it to skip a segment for exactly the same reason. Registering the key is also what
-    /// puts the fragment or the segment on the list a reader discovers shards from, so a
-    /// segment that never observed anything would be invisible to a scan.
-    fn observe(&mut self, t: TableId, def: &FieldDef, record: RecordId, value: u64) {
-        let engine = self.engine(t);
-        let shard = shard_of(record);
-        if engine.has_bitmap() {
-            self.catalog.fragment_mut(self.key(t, def.id, shard)).observe(value);
-        }
-        if engine.has_columns() {
-            self.catalog.fragment_mut(self.column_key(t, def.id, shard)).observe(value);
-        }
-    }
-
-    /// Buffers a scalar column write when the table keeps columns at all.
-    ///
-    /// One call rather than a branch at every setter: the engine test belongs in one place, and
-    /// a setter that forgot it would be a field silently missing from its table's segments.
-    fn buffer_value(&mut self, t: TableId, def: &FieldDef, record: RecordId, value: u64) {
-        if !self.engine(t).has_columns() {
-            return;
-        }
-        let key = self.column_key(t, def.id, shard_of(record));
-        self.buffer_cell(key, record, ColEdit::Replace(Cell::Value(value)));
-    }
-
     /// Resolves a write to the field it names and the fragment it lands in.
     ///
     /// Every setter started with these three lines and then diverged, which is how `set_bool`
@@ -475,6 +448,65 @@ impl<'db, P: PagerMut> DbWrite<'db, P> {
     /// its field — so taking the name again meant a second walk of the catalog per column per
     /// record for an id sitting in the caller's hand. It cannot fail here, which is the other
     /// half of the point: the name was checked when it was resolved.
+    /// Hands one fact to the table's engine and applies whatever it decided.
+    ///
+    /// **The only place the write path asks an engine anything.** It used to ask
+    /// `has_bitmap()`/`has_columns()` at nine separate setters and buffer the halves itself,
+    /// which meant a fourth engine was nine edits in this file. Now the engine is handed a
+    /// [`Placed`] and says what to put in it; this applies the answer.
+    fn route(
+        &mut self,
+        t: TableId,
+        def: &FieldDef,
+        record: RecordId,
+        fact: big_engine::base::engine::Fact<'_>,
+    ) -> Result<()> {
+        let mut placed = Placed::default();
+        self.engine(t).spec().place(&mut placed, fact);
+
+        let shard = shard_of(record);
+        let key = self.key(t, def.id, shard);
+        if let Some(v) = placed.observe_bitmap {
+            self.catalog.fragment_mut(key).observe(v);
+        }
+        if let Some(v) = placed.observe_columns {
+            self.catalog.fragment_mut(self.column_key(t, def.id, shard)).observe(v);
+        }
+        if let Some(v) = placed.planes {
+            self.pending.entry(key).or_default().values.push((record, v));
+        }
+        for (row, on) in placed.bits {
+            self.buffer_bit(key, row, record, on);
+        }
+        for (view, row, on) in placed.bits_in {
+            self.buffer_bit(FragmentKey { view, ..key }, row, record, on);
+        }
+        if let Some(row) = placed.mutex {
+            self.apply_mutex(key, record, row)?;
+        }
+        if let Some(edit) = placed.cell {
+            self.buffer_cell(self.column_key(t, def.id, shard), record, edit);
+        }
+        Ok(())
+    }
+
+    /// The mutex protocol, which is the one write that has to read before it writes.
+    ///
+    /// Performed here rather than inside the engine because it needs the transaction: finding
+    /// the value a record is leaving means reading the shadow view, and `fragment` flushes
+    /// anything already buffered for these fragments first so it sees the transaction as it
+    /// stands.
+    fn apply_mutex(&mut self, key: FragmentKey, record: RecordId, row: RowId) -> Result<()> {
+        let shadow_key = FragmentKey { view: MUTEX_SHADOW_VIEW, ..key };
+        let m = MutexField::new(SHADOW_DEPTH);
+        let mut values = self.fragment(key);
+        let mut shadow = self.fragment(shadow_key);
+        m.put(&mut self.txn, &mut values, &mut shadow, record, row)?;
+        self.save_fragment(key, values);
+        self.save_fragment(shadow_key, shadow);
+        Ok(())
+    }
+
     fn mark_exists_at(&mut self, table: TableId, record: RecordId) {
         let key = self.key(table, EXISTS_FIELD, shard_of(record));
         self.buffer_bit(key, EXISTS_ROW, record, true);
@@ -495,7 +527,6 @@ impl<'db, P: PagerMut> DbWrite<'db, P> {
     pub fn set_int_at(&mut self, at: &At, record: RecordId, value: u64) -> Result<()> {
         let (t, def) = (at.table, &at.def);
         let field = def.name.as_str();
-        let key = self.key(t, def.id, shard_of(record));
         // `is_bsi` now covers the signed kind too, and this setter must not: the value it takes
         // is already the stored value, so writing one to a signed field would store a number
         // that reads back as something else entirely. `set_signed` is the way in.
@@ -511,17 +542,10 @@ impl<'db, P: PagerMut> DbWrite<'db, P> {
             .into());
         }
 
-        // Widen the fragment and record the zone map in the same breath. Depth only ever
-        // grows, and the buffered value is expanded at whatever depth the transaction ends
-        // on, so a record buffered now is not stranded at today's narrower depth.
-        //
-        // The zone map is recorded whichever engine this is: a scan wants to skip a shard
-        // whose range rules the predicate out every bit as much as an index does.
-        self.observe(t, def, record, value);
-        if self.engine(t).has_bitmap() {
-            self.pending.entry(key).or_default().values.push((record, value));
-        }
-        self.buffer_value(t, def, record, value);
+        // Widen the fragment and record the zone map in the same breath. Depth only ever grows,
+        // and the buffered value is expanded at whatever depth the transaction ends on, so a
+        // record buffered now is not stranded at today's narrower depth.
+        self.route(t, def, record, Fact::Value { value, kind: def.kind })?;
         self.mark_exists_at(t, record);
         Ok(())
     }
@@ -539,7 +563,7 @@ impl<'db, P: PagerMut> DbWrite<'db, P> {
         record: RecordId,
         value: i64,
     ) -> Result<()> {
-        let (t, def, key) = self.target(table, field, record)?;
+        let (t, def, _) = self.target(table, field, record)?;
         expect_kind(&def, field, FieldKind::is_signed, "signed int")?;
 
         let declared = if def.bit_depth == 0 { 64 } else { def.bit_depth };
@@ -550,13 +574,10 @@ impl<'db, P: PagerMut> DbWrite<'db, P> {
                 max: crate::signed::max_value(declared),
             })?;
 
-        // The zone map observes the *stored* value, which is what makes it work unchanged: the
-        // encoding is monotonic, so a window in stored space is the same window in value space.
-        self.observe(t, &def, record, stored);
-        if self.engine(t).has_bitmap() {
-            self.pending.entry(key).or_default().values.push((record, stored));
-        }
-        self.buffer_value(t, &def, record, stored);
+        // Everything below sees the *stored* value, which is what makes the zone map work
+        // unchanged: the encoding is monotonic, so a window in stored space is the same window in
+        // value space.
+        self.route(t, &def, record, Fact::Value { value: stored, kind: def.kind })?;
         self.mark_exists_at(t, record);
         Ok(())
     }
@@ -575,16 +596,9 @@ impl<'db, P: PagerMut> DbWrite<'db, P> {
     /// The same, at a field resolved once. See [`At`].
     pub fn set_bool_at(&mut self, at: &At, record: RecordId, value: bool) -> Result<()> {
         let (t, def) = (at.table, &at.def);
-        let key = self.key(t, def.id, shard_of(record));
         expect_kind(def, &def.name, |k| k == FieldKind::Bool, "bool")?;
 
-        if self.engine(t).has_bitmap() {
-            self.buffer_bit(key, BoolField::row_of(value), record, true);
-            self.buffer_bit(key, BoolField::row_of(!value), record, false);
-        }
-        // A boolean's column is one bit wide after the codec measures it, so this is close to
-        // free next to the two rows the index spends.
-        self.buffer_value(t, def, record, value as u64);
+        self.route(t, def, record, Fact::Bool(value))?;
         self.mark_exists_at(t, record);
         Ok(())
     }
@@ -605,43 +619,10 @@ impl<'db, P: PagerMut> DbWrite<'db, P> {
     /// The same, at a field resolved once. See [`At`].
     pub fn set_key_at(&mut self, at: &At, record: RecordId, value: &str) -> Result<RowId> {
         let (t, def) = (at.table, &at.def);
-        let key = self.key(t, def.id, shard_of(record));
         expect_kind(def, &def.name, FieldKind::is_keyed, "set, mutex or time quantum")?;
         let row = self.catalog.keys.intern(t, def.id, value)?;
 
-        let engine = self.engine(t);
-        if engine.has_bitmap() {
-            if def.kind == FieldKind::Mutex {
-                // A mutex has to read its shadow to find the value it is replacing, so it
-                // cannot wait with the rest of the batch. `fragment` flushes anything already
-                // buffered for these fragments first, so it still sees the transaction as it
-                // stands.
-                let shadow_key = FragmentKey { view: MUTEX_SHADOW_VIEW, ..key };
-                let m = MutexField::new(SHADOW_DEPTH);
-                let mut values = self.fragment(key);
-                let mut shadow = self.fragment(shadow_key);
-                m.put(&mut self.txn, &mut values, &mut shadow, record, row)?;
-                self.save_fragment(key, values);
-                self.save_fragment(shadow_key, shadow);
-            } else {
-                // A set field only ever turns bits on, so there is nothing to serialise
-                // against and the write can wait with the rest of the batch.
-                self.buffer_bit(key, row, record, true);
-            }
-        }
-        if engine.has_columns() {
-            let col = self.column_key(t, def.id, shard_of(record));
-            // A mutex holds one value at a time, so its column is a replace and needs no
-            // shadow at all - the segment already knows what the record held, which is the one
-            // place a column is strictly simpler than the index it sits beside.
-            let edit = if def.kind == FieldKind::Mutex {
-                ColEdit::Replace(Cell::Value(row))
-            } else {
-                ColEdit::AddOne(row)
-            };
-            self.buffer_cell(col, record, edit);
-        }
-
+        self.route(t, def, record, Fact::Row { row, kind: def.kind, views: &[] })?;
         self.mark_exists_at(t, record);
         Ok(row)
     }
@@ -701,18 +682,26 @@ impl<'db, P: PagerMut> DbWrite<'db, P> {
         let (t, def) = (at.table, &at.def);
         expect_kind(def, &def.name, |k| k == FieldKind::TimeQuantum, "time quantum")?;
 
-        let row = self.set_key_at(at, record, value)?;
+        let row = self.catalog.keys.intern(t, def.id, value)?;
 
+        // Interned before the fact is routed, because naming a view mutates the catalog and an
+        // engine is handed ids rather than strings.
         let granularity = if def.granularity.is_empty() {
             big_engine::bitmap::field::DEFAULT_GRANULARITY.to_vec()
         } else {
             def.granularity.clone()
         };
+        let mut views = Vec::with_capacity(granularity.len());
         for name in big_engine::bitmap::field::views(unix_seconds, &granularity) {
-            let view = self.catalog.intern_view(&name)?;
-            let key = FragmentKey { table: t, field: def.id, view, shard: shard_of(record) };
-            self.buffer_bit(key, row, record, true);
+            views.push(self.catalog.intern_view(&name)?);
         }
+
+        // **One route, views included, rather than a key write followed by loose bits.** The
+        // views are a bitmap construct, so an engine with no bitmaps drops them - which the old
+        // shape could not do, and a columnar table grew a fragment per day that no read of it
+        // could ever reach.
+        self.route(t, def, record, Fact::Row { row, kind: def.kind, views: &views })?;
+        self.mark_exists_at(t, record);
         Ok(row)
     }
 

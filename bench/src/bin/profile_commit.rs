@@ -3,7 +3,7 @@
 //! Not part of the harness. Temporary, for the P2 investigation. Every figure here is a page
 //! count, so it is deterministic and machine-independent.
 
-use big_bench::engines::big::BigEngine;
+use big_bench::engines::big::{BigEngine, Default_};
 use big_bench::*;
 
 const N: u64 = 10_000;
@@ -18,7 +18,7 @@ fn main() {
         for batch in [1usize, 100, 1_000] {
             let records = workload(N, layout, VALUE_CEILING);
             let dir = tempfile::tempdir().unwrap();
-            let mut e = BigEngine::open(dir.path(), Durability::Relaxed);
+            let mut e = BigEngine::<Default_>::open(dir.path(), Durability::Relaxed);
 
             let (mut commits, mut cat_dirty) = (0u64, 0u64);
             let (mut cat, mut roots, mut data, mut free, mut total) =

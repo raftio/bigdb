@@ -81,55 +81,12 @@ pub const EXISTS_FIELD: FieldId = u32::MAX;
 /// numbers. See [`TableEngine::default`].
 pub use big_engine::TableEngine;
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-#[repr(u8)]
-pub enum FieldKind {
-    Set = 0,
-    Mutex = 1,
-    Bool = 2,
-    Int = 3,
-    Decimal = 4,
-    TimeQuantum = 5,
-    /// A signed integer, stored in the same bit planes as [`FieldKind::Int`] under an offset
-    /// binary bias. See [`crate::signed`].
-    SignedInt = 6,
-}
-
-impl FieldKind {
-    /// Public because the number is not private: it is what the catalog stores and what a
-    /// peer is told when a field is created across a cluster, so the mapping has exactly one
-    /// definition and both readers use it.
-    pub fn from_u8(v: u8) -> Option<Self> {
-        Some(match v {
-            0 => Self::Set,
-            1 => Self::Mutex,
-            2 => Self::Bool,
-            3 => Self::Int,
-            4 => Self::Decimal,
-            5 => Self::TimeQuantum,
-            6 => Self::SignedInt,
-            _ => return None,
-        })
-    }
-
-    pub fn is_bsi(self) -> bool {
-        matches!(self, Self::Int | Self::Decimal | Self::SignedInt)
-    }
-
-    /// Whether values of this kind are biased on the way in and out.
-    ///
-    /// Only the sign convention needs it, and it is a property of the kind rather than of the
-    /// value, which is what keeps the bias out of every arithmetic path below the boundary.
-    pub fn is_signed(self) -> bool {
-        matches!(self, Self::SignedInt)
-    }
-
-    /// Kinds addressed by a row key rather than by a value. A mutex is one of them: it is a
-    /// set field that happens to allow only one row per record.
-    pub fn is_keyed(self) -> bool {
-        matches!(self, Self::Set | Self::Mutex | Self::TimeQuantum)
-    }
-}
+/// What a field stores, which is what decides where a fact about it goes.
+///
+/// Defined in `big-engine` beside the engines that place it - an engine cannot route a fact
+/// without knowing whether a second write to that field adds or replaces - and re-exported here
+/// because the catalog is what stores it. The byte on disk is the discriminant.
+pub use big_engine::FieldKind;
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct TableDef {

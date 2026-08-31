@@ -255,3 +255,68 @@ proptest! {
         }
     }
 }
+
+// ------------------------------------------------------------------------------------------
+// What a bulk load does not write
+// ------------------------------------------------------------------------------------------
+
+/// **A bulk load writes bitmap fragments and nothing else, and this records what that costs.**
+///
+/// Nothing in this file wrote a column before, and nothing in it checked for one - which is how a
+/// path that silently drops half of what the default engine stores went unnoticed. The three rows
+/// below are the whole picture, measured rather than argued:
+///
+/// | engine | loaded | `count_all` | `column_count` | predicate |
+/// |---|---|---|---|---|
+/// | `bitmap` | 1000 | 1000 | 0 | correct - it has no columns |
+/// | `bitmap+columnar` | 1000 | 1000 | **0** | correct, *from the index* |
+/// | `columnar` | 1000 | 1000 | **0** | **0 - wrong** |
+///
+/// The last row is refused outright now: a load that reports a thousand records and then answers
+/// nothing is the worst shape a failure can take. The middle row is **not** refused, because its
+/// answers are right and refusing it would break a path that has always been offered - but its
+/// segments really are empty, so a size taken from such a file is missing half the engine and a
+/// query the planner sends to a scan would answer wrongly.
+///
+/// If that is fixed - by teaching this path to write columns, or by refusing it too - this test
+/// is where the decision gets recorded.
+#[test]
+fn a_bulk_load_leaves_a_columnar_table_without_its_columns() {
+    // The engine that keeps only bitmaps is the one this path was written for.
+    let d = Db::in_memory().unwrap();
+    d.create_table_with("t", TableEngine::Bitmap).unwrap();
+    d.create_field("t", "v", FieldKind::Int, 20).unwrap();
+    let mut b = d.bulk_load("t").unwrap();
+    for id in 0..1000u64 {
+        b.set_int("v", id, id).unwrap();
+    }
+    assert_eq!(b.finish().unwrap(), 1000);
+    assert_eq!(d.read().matching("t", "v", RangeOp::Ge, 500).unwrap().cardinality(), 500);
+
+    // The default engine loads, answers from its index, and holds no columns at all.
+    let d = Db::in_memory().unwrap();
+    d.create_table_with("t", TableEngine::BitmapColumnar).unwrap();
+    d.create_field("t", "v", FieldKind::Int, 20).unwrap();
+    let mut b = d.bulk_load("t").unwrap();
+    for id in 0..1000u64 {
+        b.set_int("v", id, id).unwrap();
+    }
+    assert_eq!(b.finish().unwrap(), 1000);
+    let r = d.read();
+    assert_eq!(r.count_all("t").unwrap(), 1000);
+    assert_eq!(r.matching("t", "v", RangeOp::Ge, 500).unwrap().cardinality(), 500);
+    assert_eq!(
+        r.column_count("t", "v").unwrap(),
+        0,
+        "a bulk load has started writing columns - update this test and the note in `bulk.rs`"
+    );
+
+    // And the engine that has only columns is refused, because there it would answer nothing.
+    let d = Db::in_memory().unwrap();
+    d.create_table_with("t", TableEngine::Columnar).unwrap();
+    d.create_field("t", "v", FieldKind::Int, 20).unwrap();
+    match d.bulk_load("t") {
+        Ok(_) => panic!("a columnar table accepted a load it would answer nothing from"),
+        Err(e) => assert_eq!(e.code(), "engine_cannot_answer"),
+    };
+}

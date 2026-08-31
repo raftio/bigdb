@@ -75,7 +75,7 @@ fn stocked(engine: TableEngine) -> Db<big_pager::MemPager> {
     d
 }
 
-/// Runs `ask` under all three engines and requires one answer.
+/// Runs `ask` under every engine and requires one answer.
 fn agree<T: PartialEq + std::fmt::Debug>(
     what: &str,
     ask: impl Fn(&DbRead<'_, big_pager::MemPager>) -> T,
@@ -88,7 +88,7 @@ fn agree<T: PartialEq + std::fmt::Debug>(
     for pair in answers.windows(2) {
         assert_eq!(pair[0].1, pair[1].1, "{what}: {:?} and {:?} disagree", pair[0].0, pair[1].0);
     }
-    answers.pop().expect("three engines").1
+    answers.pop().expect("at least one engine").1
 }
 
 #[test]
@@ -201,7 +201,7 @@ fn groupings_agree() {
             .collect::<BTreeMap<_, _>>()
     });
 
-    agree("group_matches", |r| {
+    agree("group_matches (mutex)", |r| {
         let hits = r.matching("tx", "amount", RangeOp::Gt, 2000).unwrap();
         r.group_matches("tx", "tier", &hits)
             .unwrap()
@@ -311,7 +311,6 @@ fn a_time_window_is_refused_on_a_table_with_no_index() {
 /// the *window* needs the views.
 #[test]
 fn a_time_quantum_key_still_answers_without_its_views() {
-    agree("time quantum key", |_| ());
     let mut answers = Vec::new();
     for engine in engines() {
         let d = Db::in_memory().unwrap();

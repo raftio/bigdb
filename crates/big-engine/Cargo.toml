@@ -16,3 +16,4 @@ big-pager = { path = "../big-pager", version = "0.1.0" }
 
 [dev-dependencies]
 proptest = "1"
+big-container = { path = "../big-container", version = "0.1.0" }

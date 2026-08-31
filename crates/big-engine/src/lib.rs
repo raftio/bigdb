@@ -14,40 +14,40 @@
 
 //! The storage engines, and the registry that names them.
 //!
-//! Everything that decides *what a table writes for every fact it takes* lives here, and one
-//! module per engine:
+//! Everything that decides *what a table writes for every fact it takes* lives here, and the
+//! layout says which is which: [`base`] is what no engine owns, and every other module is one
+//! engine.
 //!
-//! - [`bitmap`] - fragments of roaring containers, plus the field conventions ([`bitmap::field`])
-//!   that decide which rows a value turns on. Answers *which records* without reading values.
+//! - [`bitmap`] - fragments of roaring containers, plus the field conventions
+//!   ([`bitmap::field`]) that decide which rows a value turns on. Answers *which records*
+//!   without reading values.
 //! - [`columnar`] - column segments, a field's values in record order, block-encoded. Answers
 //!   *what a record holds* without reconstructing it from bit planes.
 //! - [`hybrid`] - both, over the same facts. The default, and a composition rather than a third
 //!   implementation.
 //!
-//! Below all three sit the parts none of them owns: [`coords`], the shard and record arithmetic
-//! the cluster partitions on too, and the four crates this one is built over - `big-container`,
-//! `big-page`, `big-pager`, `big-btree`. Those stay outside because they are not engines. Every
-//! engine here uses all of them.
+//! [`base`] holds the two things every engine needs and none of them owns: [`base::coords`], the
+//! shard and record arithmetic the cluster partitions on too, and [`base::engine`], where an
+//! engine says what it is. **See [`base`] for how to add one.**
 //!
-//! # The registry
-//!
-//! [`engine`] holds the [`Engine`] trait and [`ENGINES`], the list of the ones this build has.
-//! [`TableEngine`] is a handle into that list - the value the catalog stores, the cluster wire
-//! carries and the write path branches on. Adding an engine is a module and one line in
-//! [`ENGINES`]; see [`engine`] for what that does and does not buy.
+//! Below all of it sit four crates this one is built over - `big-container`, `big-page`,
+//! `big-pager`, `big-btree`. Those stay outside because they are not engines: every engine here
+//! uses all of them.
 
 #![deny(unsafe_code)]
 
+pub mod base;
 pub mod bitmap;
 pub mod columnar;
-pub mod coords;
-pub mod engine;
 pub mod hybrid;
 
-pub use engine::{Engine, TableEngine, ENGINES};
+pub use base::engine::{Engine, TableEngine, ENGINES};
+pub use base::field_kind::FieldKind;
 
-// The addressing every engine and the cluster share, at the root rather than inside one of them.
-pub use coords::*;
+// The addressing every engine and the cluster share, at the root as well as under `base`, because
+// `big-cluster` partitions on a shard id without caring which engine produced it.
+pub use base::coords;
+pub use base::coords::*;
 
 // The vocabulary of a fragment's address, which is `big-page`'s byte layout given meaning here.
 // Re-exported at the root because it is what `big-db`, `big-cluster` and both engines all speak.

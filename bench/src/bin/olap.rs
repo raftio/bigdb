@@ -27,7 +27,7 @@
 //! Peers that were not compiled in, and servers that are not listening, are named as such. A row
 //! that is missing for a stated reason is worth more than a row that is quietly absent.
 
-use big_bench::engines::big_olap::{BigOlap, BigSqlOlap};
+use big_bench::engines::big_olap::{BigOlap, BigSqlOlap, Bitmap, Columnar};
 use big_bench::olap::{measure, Answer, Locality, Measured, Olap, Questions, REPEATS};
 use big_bench::wide::{self, wide_workload, WideRecord};
 use big_bench::Layout;
@@ -51,7 +51,19 @@ fn main() {
     // Both `big` columns, next to each other. They are the same engine over the same corpus and
     // differ only in the language the question arrives in, so the distance between them is what
     // the SQL front end costs - and the distance from either to a rival is what the engine does.
-    let mut in_process = vec![run::<BigOlap>(&records, q), run::<BigSqlOlap>(&records, q)];
+    let mut in_process = vec![
+        run::<BigOlap>(&records, q),
+        run::<BigSqlOlap>(&records, q),
+        // The part-based engines, on the same corpus and the same questions. They are `big` with
+        // a different write schedule rather than different storage, so what this table measures
+        // of them is what the schedule costs a *reader*: a compacted part-based table should
+        // answer like the default engine, and any distance is read amplification the merge did
+        // not fully pay off.
+        // Both halves of the default engine on their own, so the table shows what each brings:
+        // one answers from an index and the other from a scan, and the default is both at once.
+        run::<BigOlap<Columnar>>(&records, q),
+        run::<BigOlap<Bitmap>>(&records, q),
+    ];
     let mut over_http = Vec::new();
     let mut absent: Vec<String> = Vec::new();
 
@@ -86,10 +98,22 @@ fn main() {
     if over_http.is_empty() {
         println!("\n## Over HTTP\n\nNo server peer ran.");
     } else {
-        // `big` appears in both tables so the server table has a scale on it. It is not being
-        // ranked against them: it pays no round trip and they all do, which is exactly why the
-        // two tables are separate.
-        let mut with_reference = vec![in_process[0].clone()];
+        // **Every `big` engine appears here, not just the default one.** Which engine a table is
+        // created under decides what it can answer without scanning, and that is precisely the
+        // question a comparison against a column store is asking - a single reference column
+        // answers it for one engine and silently invites the reader to assume the rest.
+        //
+        // They are still not being *ranked* against the server: they pay no round trip and it
+        // does, which is why the two tables are separate and why the round trip is printed on its
+        // own row rather than subtracted here.
+        //
+        // `big-sql` is left out. It is the first column's engine asked in a different language,
+        // so it would be a second row for one engine rather than another engine.
+        let mut with_reference: Vec<_> = in_process
+            .iter()
+            .filter(|m| m.name != <BigSqlOlap as big_bench::olap::Olap>::name())
+            .cloned()
+            .collect();
         with_reference.extend(over_http.iter().cloned());
         table("over HTTP", &with_reference);
     }

@@ -100,6 +100,45 @@ impl<'db, P: PagerMut> BulkLoad<'db, P> {
             .table(table)
             .map(|t| t.id)
             .ok_or_else(|| DbError::UnknownTable(table.to_string()))?;
+
+        // **Refused rather than written wrong.** Everything below writes *bitmap fragments* and
+        // nothing else - `w.fragment(key)` and `set_bits`, and there is not a single column write
+        // in this file. An engine that stores anything else is loaded incompletely, and the shape
+        // of the failure is the worst one available: `finish` returns the number of records it
+        // loaded and the table reads back empty.
+        //
+        // Measured, on a thousand records:
+        //
+        //   engine            loaded  count_all  column_count  matching >= k
+        //   bitmap              1000       1000             0            500   correct
+        //   bitmap+columnar     1000       1000             0            500   columns missing
+        //   columnar            1000       1000             0              0   wrong answer
+        //
+        // The middle row is the dangerous one. Its answers are right because they come from the
+        // index, so nothing looks broken - but its segments are empty, so a query the planner
+        // routes to a scan answers wrongly, and a file measured for size is missing half of what
+        // the engine is supposed to store.
+        //
+        // **What is refused here is the two rows that answer wrongly, and not the middle one.**
+        // A `bitmap+columnar` load is incomplete rather than incorrect, and refusing it would be
+        // a breaking change to a path that has always been offered - so it is recorded (see
+        // `crates/big-db/tests/bulk.rs`) and left for a deliberate decision rather than taken
+        // now. A caller who needs its columns should use `Ingest`.
+        //
+        // The refusal rather than the fix because the fix is not small: a bulk load that wrote
+        // columns as well would need a second scheduler beside this one, and a part-based one a
+        // third. `Ingest` writes every engine correctly and is grouped the same way, so there is
+        // a right answer to point at.
+        let engine = db.catalog().table_by_id(t).map(|x| x.engine).unwrap_or_default();
+        if !engine.has_bitmap() {
+            return Err(DbError::EngineCannotAnswer {
+                table: table.to_string(),
+                what: "a bulk load, which writes only bitmap fragments",
+                engine: engine.as_str(),
+                instead: "load it with `Db::ingest`, which writes everything the engine stores",
+            });
+        }
+
         Ok(Self {
             db,
             table: t,

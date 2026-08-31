@@ -6,11 +6,11 @@ Everything that decides *what a table writes for every fact it takes* lives here
 engine. What sits below — `big-container`, `big-page`, `big-pager`, `big-btree` — is not an
 engine and stays outside: all three engines use all four.
 
-| module     | code | name              | keeps bitmaps | keeps columns |
-|------------|------|-------------------|---------------|---------------|
-| `bitmap`   | 0    | `bitmap`          | yes           | no            |
-| `hybrid`   | 1    | `bitmap+columnar` | yes           | yes           |
-| `columnar` | 2    | `columnar`        | no            | yes           |
+| module     | code | name              | bitmaps | columns |
+|------------|------|-------------------|---------|---------|
+| `bitmap`   | 0    | `bitmap`          | yes     | no      |
+| `hybrid`   | 1    | `bitmap+columnar` | yes     | yes     |
+| `columnar` | 2    | `columnar`        | no      | yes     |
 
 The code is the byte the catalog stores. It is part of the file format: codes are never reused
 and never renumbered, and zero has to stay `bitmap` because every file written before the engine
@@ -18,21 +18,27 @@ byte existed carries a zero there.
 
 ## The registry
 
-`engine.rs` holds the `Engine` trait and `ENGINES`, the list of the ones this build has.
+`base/engine.rs` holds the `Engine` trait and `ENGINES`, the list of the ones this build has.
 `TableEngine` is a handle into that list — a pointer-wide `Copy` value, not an enum, so the code,
 the name and the capabilities have exactly one definition and cannot drift from a second copy.
 `from_u8`, `parse`, `all`, `names` and the error message that lists the engines all read
 `ENGINES` rather than repeating it.
 
 **Adding an engine** is a module with a unit struct implementing `Engine`, and one line in
-`ENGINES`. Everything that identifies, names or routes by engine follows — including
-`big-db`'s round-trip through the catalog byte and the cluster wire's DDL.
+`ENGINES`. **Nothing in `big-db` changes**, and that is what `Engine::place` is for: the write
+path used to ask `has_bitmap()`/`has_columns()` at nine separate setters and buffer the halves
+itself, so a fourth engine was nine edits in someone else's crate. Now `big-db` owns the buffers
+and hands them over as a `Sink`; the engine says what to put in them. `hybrid` is then literally
+the other two called in turn.
 
-What the list cannot do for a genuinely new *format* is write it. `has_bitmap` and `has_columns`
-describe the two kinds of tree this build knows how to maintain, and the write path in `big-db`
-branches on exactly those two questions. An engine that stores something which is neither still
-needs code there. The registry buys the identity, the naming and the routing; it does not buy
-the storage.
+Three questions in `big-db` still ask an engine what it keeps — a point read from a column or
+from bit planes, a predicate from an index or from a scan, and whether a bulk load can write
+everything the table stores. Those are the planner reading a *description*; a new engine answers
+them rather than editing them.
+
+What none of it buys is a genuinely new *format*. `has_bitmap` and `has_columns` describe the two
+kinds of tree this build knows how to maintain, and an engine storing something that is neither
+needs code in `big-db` too. The registry buys the identity, the naming and the routing.
 
 ## `bitmap`
 
@@ -124,9 +130,9 @@ keys* and reading one a range scan: the same shape `coords::row_ckeys` uses for 
 over a chain of pages because a chain would be a second kind of page ownership that the free
 walk, the scrub and the copy would each have to learn.
 
-## `coords`
+## `base/coords`
 
-Shard and record arithmetic, at the crate root rather than inside `bitmap`, because it is not one
+Shard and record arithmetic, in `base` rather than inside `bitmap`, because it is not one
 engine's: the columnar block number is computed from a record's offset within its shard, and
 `big-cluster` partitions ownership on the same shard id.
 

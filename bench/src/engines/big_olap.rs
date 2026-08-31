@@ -28,7 +28,16 @@ use big_db::Db;
 use big_exec::Value;
 use big_pager::MmapPager;
 use big_sql::Sql;
+use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
+
+pub use crate::engines::big::{Bitmap, Columnar, Default_, Flavour};
+
+/// How many records `Ingest` buffers before it commits, for the part-based columns.
+///
+/// Large enough that a commit finishes a shard rather than visiting it - which is the property
+/// `BulkLoad` gets by construction and this has to get by buffering.
+const INGEST_CAPACITY: usize = 100_000;
 
 pub const TABLE: &str = "t";
 pub const AMOUNT: &str = "amount";
@@ -38,12 +47,13 @@ pub const ACTIVE: &str = "active";
 /// Amounts stay under 2^20 and the engine refuses anything wider than declared.
 pub const BIT_DEPTH: u32 = 20;
 
-pub struct BigOlap {
+pub struct BigOlap<F: Flavour = Default_> {
     db: Db<MmapPager>,
     dir: PathBuf,
+    flavour: PhantomData<F>,
 }
 
-impl BigOlap {
+impl<F: Flavour> BigOlap<F> {
     /// Runs one query through parser, planner and executor, exactly as the HTTP daemon would.
     fn query(&self, text: &str) -> Value {
         big_exec::query(&self.db.read(), TABLE, text)
@@ -72,9 +82,9 @@ impl BigOlap {
     }
 }
 
-impl Olap for BigOlap {
+impl<F: Flavour> Olap for BigOlap<F> {
     fn name() -> &'static str {
-        "big"
+        F::NAME
     }
 
     fn locality() -> Locality {
@@ -83,18 +93,41 @@ impl Olap for BigOlap {
 
     fn open(dir: &Path) -> Self {
         let db = Db::open(MmapPager::open_default(dir.join("big.db")).unwrap()).unwrap();
-        db.create_table(TABLE).unwrap();
+        db.create_table_with(TABLE, F::ENGINE).unwrap();
         db.create_field(TABLE, AMOUNT, FieldKind::Int, BIT_DEPTH).unwrap();
         db.create_field(TABLE, CATEGORY, FieldKind::Set, 0).unwrap();
         db.create_field(TABLE, COUNTRY, FieldKind::Set, 0).unwrap();
         db.create_field(TABLE, ACTIVE, FieldKind::Bool, 0).unwrap();
-        Self { db, dir: dir.to_path_buf() }
+        Self { db, dir: dir.to_path_buf(), flavour: PhantomData }
     }
 
     /// `bulk_load`, which is the path its own documentation points a first load of known size
     /// at. Every rival here is given its bulk path too - DuckDB gets the appender, ClickHouse
     /// gets one multi-row insert - so this is matching them rather than favouring itself.
+    ///
+    /// **Any engine that keeps columns is loaded through `Ingest` instead, and this is a
+    /// correction rather than a preference.** `BulkLoad` writes bitmap fragments and nothing
+    /// else - see the note and the table in `big_db::bulk` - so a `bitmap+columnar` table loaded
+    /// through it holds a complete index and **no columns at all**. Its answers still came out
+    /// right, because they came from the index, which is exactly why nobody noticed; what was
+    /// wrong was the `size` row, which had been reporting a file missing half of what the default
+    /// engine stores.
+    ///
+    /// `Ingest` writes everything the engine holds and is grouped the same way - by shard, with a
+    /// commit when the buffer fills - so it is the honest bulk path here rather than a slower
+    /// substitute for one.
     fn load(&mut self, records: &[WideRecord]) {
+        if F::ENGINE.has_columns() {
+            let mut load = self.db.ingest(INGEST_CAPACITY);
+            for r in records {
+                load.set_int(TABLE, AMOUNT, r.id, r.amount).unwrap();
+                load.set_key(TABLE, CATEGORY, r.id, &WideRecord::category_key(r.category)).unwrap();
+                load.set_key(TABLE, COUNTRY, r.id, &WideRecord::country_key(r.country)).unwrap();
+                load.set_bool(TABLE, ACTIVE, r.id, r.active).unwrap();
+            }
+            load.finish().unwrap();
+            return;
+        }
         let mut load = self.db.bulk_load(TABLE).unwrap();
         for r in records {
             load.set_int(AMOUNT, r.id, r.amount).unwrap();
@@ -169,7 +202,7 @@ impl Olap for BigOlap {
 /// into the query language rather than interpreting anything, so the extra work per query is one
 /// pass over a short string. If the gap is not small, that is a result too, and a more
 /// interesting one.
-pub struct BigSqlOlap(BigOlap);
+pub struct BigSqlOlap(BigOlap<Default_>);
 
 impl BigSqlOlap {
     /// Translates, plans and runs - which is what `POST /sql` does, minus the socket.
@@ -239,7 +272,7 @@ impl Olap for BigSqlOlap {
         let v = self.query(&format!(
             "SELECT {CATEGORY}, count(*) FROM {TABLE} GROUP BY {CATEGORY} ORDER BY {CATEGORY}"
         ));
-        let mut groups = BigOlap::groups(&v, "c");
+        let mut groups = BigOlap::<Default_>::groups(&v, "c");
         groups.sort_unstable();
         groups
     }
@@ -249,7 +282,7 @@ impl Olap for BigSqlOlap {
             "SELECT {CATEGORY}, count(*) AS n FROM {TABLE} GROUP BY {CATEGORY} \
              ORDER BY n DESC LIMIT {n}"
         ));
-        BigOlap::groups(&v, "c")
+        BigOlap::<Default_>::groups(&v, "c")
     }
 
     fn distinct(&self, k: u64) -> u64 {

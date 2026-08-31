@@ -47,10 +47,11 @@ the bottom.
               │ big-db     catalog, Matches, per_fragment / per_segment      │  one key, not five objects
               │            FragmentKey = (table, field, view, shard)         │  a segment is one view
               │            engine per table: bitmap │ both │ columnar        │  over its bitmaps
+              │              +merge: immutable parts, merged on read         │  a part is one view too
               └───────────────────────────────┬──────────────────────────────┘
                                               │
    storage    ┌───────────────────────────────▼──────────────────────────────┐
-              │ big-engine  bitmap │ columnar │ hybrid  + Engine registry  │
+              │ big-engine  bitmap│columnar│hybrid│merge│bitmap_merge│part   │
               │ big-btree │ big-pager │ big-page │ big-container │ big-keys  │
               │ no WAL — the meta page flip is the only atomic point         │
               └──────────────────────────────────────────────────────────────┘

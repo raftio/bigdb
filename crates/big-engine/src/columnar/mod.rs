@@ -46,12 +46,14 @@
 //! an increasing `part`. The key is `(block << PART_BITS) | part`, which makes a block a
 //! *contiguous span of keys* and reading one a range scan.
 //!
-//! That is the same shape `crate::coords::row_ckeys` already uses for a row, and it is chosen
+//! That is the same shape `crate::base::coords::row_ckeys` already uses for a row, and it is chosen
 //! over a chain of pages for one reason: a chain would be a second kind of page ownership, and
 //! the free walk, the scrub and the copy would each have to learn it. A span of keys is
 //! something the tree already understands.
 
-use crate::engine::Engine;
+use crate::base::coords::RowId;
+use crate::base::engine::{Engine, Fact, Half, Sink};
+use crate::base::field_kind::FieldKind;
 
 pub mod block;
 pub mod codec;
@@ -130,7 +132,52 @@ const _: () = assert!(BLOCK_RECORDS.is_power_of_two());
 // scalar block never needing a second page rests on this.
 const _: () = assert!(BLOCK_RECORDS * 8 == PAGE_BYTES as u64);
 
-/// The descriptor. See [`crate::engine`] for what a descriptor is and is not.
+/// What one record's column cell is about to become.
+///
+/// Keyed by record rather than appended, exactly as `big_db`'s write buffer is, so writing the same record
+/// twice in a transaction keeps the last decision rather than replaying both.
+#[derive(Clone, Debug)]
+pub enum ColEdit {
+    /// The cell becomes exactly this. Every scalar kind, and a mutex - which is a keyed field
+    /// that holds one value at a time, so a second write replaces the first.
+    Replace(Cell),
+    /// One row id joins whatever the record already holds.
+    ///
+    /// Split from [`ColEdit::Add`] because it is what every `set_key` produces and a `Vec` of one
+    /// is an allocation per fact — two per record for a table with two set fields, tens of
+    /// millions in a load, and the allocator was a quarter of it. The list shape is still needed:
+    /// a record written twice in one transaction holds both values, and that is where these are
+    /// promoted.
+    AddOne(RowId),
+    /// Several row ids join it. Only `big_db`'s fold builds these, by merging the above.
+    ///
+    /// There is deliberately no `Clear`: a delete does not go through the buffer at all. It
+    /// nulls slots a block at a time in `big_db`'s delete path, because the records
+    /// of one delete are already grouped and the buffer would only regroup them.
+    Add(Vec<RowId>),
+}
+
+impl ColEdit {
+    /// Merges `next` into an edit already buffered for the same record.
+    ///
+    /// A set field adds, so two `Add`s are both part of what the record holds. Anything else is
+    /// the caller's last word and replaces — an `Add` landing on a `Replace` included, which the
+    /// map-keyed buffer this replaced treated the same way.
+    pub fn absorb(&mut self, next: ColEdit) {
+        match (&mut *self, next) {
+            (ColEdit::AddOne(have), ColEdit::AddOne(one)) => *self = ColEdit::Add(vec![*have, one]),
+            (ColEdit::AddOne(have), ColEdit::Add(mut more)) => {
+                more.insert(0, *have);
+                *self = ColEdit::Add(more);
+            }
+            (ColEdit::Add(have), ColEdit::AddOne(one)) => have.push(one),
+            (ColEdit::Add(have), ColEdit::Add(more)) => have.extend(more),
+            (_, next) => *self = next,
+        }
+    }
+}
+
+/// The descriptor. See [`crate::base::engine`] for what a descriptor is and is not.
 pub struct ColumnarEngine;
 
 impl Engine for ColumnarEngine {
@@ -148,5 +195,29 @@ impl Engine for ColumnarEngine {
 
     fn has_columns(&self) -> bool {
         true
+    }
+
+    /// Every fact becomes one cell, and the only question is whether it replaces or adds.
+    ///
+    /// **A time quantum's extra views are dropped, and that is the fix rather than an omission.**
+    /// They are bitmap views; a table with no bitmaps that wrote them would grow one fragment per
+    /// day that no read of it can reach. The old write path wrote them unconditionally.
+    fn place(&self, sink: &mut dyn Sink, fact: Fact<'_>) {
+        sink.observe(Half::Columns, fact.observed());
+        let edit = match fact {
+            Fact::Value { value, .. } => ColEdit::Replace(Cell::Value(value)),
+            Fact::Bool(b) => ColEdit::Replace(Cell::Value(b as u64)),
+            // A mutex holds one value at a time, so its column is a replace and needs no shadow
+            // at all - the segment already knows what the record held, which is the one place a
+            // column is strictly simpler than the index beside it.
+            Fact::Row { row, kind, .. } => {
+                if kind == FieldKind::Mutex {
+                    ColEdit::Replace(Cell::Value(row))
+                } else {
+                    ColEdit::AddOne(row)
+                }
+            }
+        };
+        sink.cell(edit);
     }
 }

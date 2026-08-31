@@ -318,3 +318,152 @@ fn what_each_engine_costs_to_write() {
     assert!(both > bitmap, "adding columns has to cost something, or the choice is not real");
     assert!(columnar < bitmap, "columns alone have to be cheaper than an index, or why choose");
 }
+
+// ------------------------------------------------------------------------------------------
+// The cost model: what a commit is actually paying for
+// ------------------------------------------------------------------------------------------
+
+/// Where a commit's pages go, and what that says about which fix is the right one.
+///
+/// The tables above measure bytes per *record*, which is the number a user feels. This module
+/// measures the thing underneath it: **a commit's cost is set by how many fragments it touches,
+/// not by how many records it carries.** Every figure here is a page count from
+/// [`big_pager::Metrics::last_commit`], which splits a commit by what the pages were - and that
+/// split is the whole point, because "the commit wrote 1088 pages" admits two explanations that
+/// call for opposite fixes.
+///
+/// **This exists to say which of the two it is.** The fixed chains a commit rewrites whole - root
+/// records, catalog, freelist - are the obvious suspect and are the wrong one: they are under 1%
+/// of a commit at any realistic fan-out. What is left is the copy-on-write rewrite of one
+/// root-to-leaf path per fragment, paid whether that fragment received a thousand records or one.
+///
+/// So this is the baseline a part-based engine has to beat, stated as three properties rather
+/// than as a wish: a commit is flat in batch size, linear in field count, and does not spend its
+/// bytes on the fixed chains. An engine that collapses a shard's fields into one tree per commit
+/// breaks the second, which is what makes the first stop mattering.
+mod cost_model {
+    use super::*;
+    use big_pager::metrics::CommitBreakdown;
+
+    /// Fields per record, at the same layout the sparse table above uses.
+    const SHARDS: u64 = 64;
+
+    /// What the last commit of the run wrote, by class.
+    ///
+    /// The *last* commit rather than the total, because it is the steady state: by then every
+    /// fragment exists and every write is the read-modify-write this module is about. A total
+    /// would average that against the first commit, which builds its trees bottom-up and is the
+    /// one case the engine already does well.
+    fn last_commit(fields: usize, batch: usize) -> (CommitBreakdown, usize) {
+        let d = Db::open(CountingPager::new(MemPager::new())).unwrap();
+        d.create_table_with("t", TableEngine::Bitmap).unwrap();
+        let names: Vec<String> = (0..fields).map(|i| format!("f{i}")).collect();
+        for name in &names {
+            d.create_field("t", name, FieldKind::Int, BIT_DEPTH).unwrap();
+        }
+
+        let records = workload(N, Layout::Sparse { shards: SHARDS });
+        for chunk in records.chunks(batch) {
+            let mut w = d.write();
+            for (id, v) in chunk {
+                for name in &names {
+                    w.set_int("t", name, *id, *v).unwrap();
+                }
+            }
+            w.commit().unwrap();
+        }
+        let m = d.store().metrics();
+        (m.last_commit, m.fragments)
+    }
+
+    /// `(fields, data pages one steady-state commit writes)`.
+    ///
+    /// To change these: confirm the figure moved for a reason you can name, and say in the same
+    /// commit which of the three properties below it changes. A number here moving without one
+    /// of those tests failing means this table is being updated to match the code rather than
+    /// the code being measured against it.
+    const PAGES_BY_FIELD: [(usize, u64); 4] = [(1, 320), (2, 576), (4, 1_088), (8, 2_112)];
+
+    /// **The finding.** Ten times the records in one commit, to the page identical.
+    ///
+    /// Not "roughly the same" - byte-identical, at every field count, which is what makes it a
+    /// structural property rather than a measurement. A commit pays for the path it rewrites in
+    /// each fragment it touches; the records riding along in that path are free until they
+    /// overflow a container.
+    ///
+    /// This is the sentence a part-based engine exists to falsify. Until one lands, it is also
+    /// the reason the advice in `bench/results/REPORT.md` is "commit less often" rather than
+    /// anything about the shape of the data.
+    #[test]
+    fn a_commit_costs_the_same_at_100_records_as_at_1000() {
+        for (fields, _) in PAGES_BY_FIELD {
+            let (small, _) = last_commit(fields, 100);
+            let (large, _) = last_commit(fields, 1_000);
+            assert_eq!(
+                small.data, large.data,
+                "{fields} field(s): a commit of 100 records wrote {} data pages and one of \
+                 1,000 wrote {}.\nIf these have come apart, a commit's cost has moved from \
+                 per-fragment to per-record - which is the thing part-based engines are for, \
+                 so say so here rather than deleting this test.",
+                small.data, large.data,
+            );
+        }
+    }
+
+    /// The cost is linear in the field count, because each field is its own tree in each shard.
+    ///
+    /// **This is the line a part-based engine cuts.** A part holding every field of one shard is
+    /// one tree per commit instead of `fields` of them, so what is linear here becomes flat -
+    /// and at eight fields that is the difference between 2,112 pages and something near 320.
+    #[test]
+    fn a_commit_scales_with_the_field_count() {
+        for (fields, want) in PAGES_BY_FIELD {
+            let (c, frags) = last_commit(fields, 1_000);
+            assert_eq!(
+                c.data,
+                want,
+                "\n{fields} field(s), {frags} fragments: {} data pages, expected {want}.\n\
+                 That is {:.2} pages per fragment.",
+                c.data,
+                c.data as f64 / frags as f64,
+            );
+        }
+        // The shape, so a legitimate update to the table cannot quietly invert it: doubling the
+        // fields has to roughly double the pages, or the trees are no longer per field and the
+        // paragraph above is describing an engine that no longer exists.
+        for pair in PAGES_BY_FIELD.windows(2) {
+            let ((f0, p0), (f1, p1)) = (pair[0], pair[1]);
+            assert!(
+                p1 > p0,
+                "{f1} fields wrote {p1} pages against {f0} fields' {p0} - fields stopped costing"
+            );
+        }
+    }
+
+    /// **The hypothesis this kills.** The fixed chains are not where the bytes go.
+    ///
+    /// Root records and the catalog are each rewritten *whole* on every commit that touches
+    /// anything, and both grow with how many fragments the database holds rather than with how
+    /// many it touched - which makes them the obvious thing to blame and an expensive thing to
+    /// rebuild around. They are under 1% of a commit here.
+    ///
+    /// Asserted rather than reported because the wrong fix is a large one: making the root
+    /// records incremental is a format change touching backup, the freelist and the cluster,
+    /// and it would buy the single digit this test measures.
+    #[test]
+    fn the_fixed_chains_are_not_where_the_bytes_go() {
+        for (fields, _) in PAGES_BY_FIELD {
+            let (c, frags) = last_commit(fields, 1_000);
+            let fixed = c.roots + c.catalog + c.freelist + c.snapshots;
+            assert!(
+                fixed * 20 < c.data,
+                "\n{fields} field(s), {frags} fragments: fixed chains {fixed} pages against \
+                 {} data pages ({:.1}%).\nIf the fixed chains have become the cost, the fix is \
+                 an incremental root-record chain and not a new engine - which is a different \
+                 project, so change this test deliberately.",
+                c.data,
+                100.0 * fixed as f64 / c.data as f64,
+            );
+        }
+    }
+}

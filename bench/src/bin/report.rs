@@ -18,7 +18,7 @@
 //! Run with `cargo run -p big-bench --release --bin report`.
 
 use big_bench::cold::Coldness;
-use big_bench::engines::big::{BigEngine, FIELD, TABLE};
+use big_bench::engines::big::{BigEngine, Default_, FIELD, TABLE};
 use big_bench::engines::fjall::FjallEngine;
 use big_bench::engines::lmdb::LmdbEngine;
 use big_bench::engines::redb::RedbEngine;
@@ -174,7 +174,7 @@ fn main() {
     for layout in [Layout::Dense, Layout::Sparse { shards: 64 }] {
         let records = workload(RECORDS, layout, VALUE_CEILING);
         for durability in [Durability::Full, Durability::Relaxed] {
-            rows.push(measure::<BigEngine>(durability, layout, &records));
+            rows.push(measure::<BigEngine<Default_>>(durability, layout, &records));
             rows.push(measure::<RedbEngine>(durability, layout, &records));
             rows.push(measure::<LmdbEngine>(durability, layout, &records));
             rows.push(measure::<FjallEngine>(durability, layout, &records));
@@ -183,7 +183,7 @@ fn main() {
     }
 
     println!(
-        "{:<7} {:<9} {:<11} {:>10} {:>10} {:>9} {:>8} {:>10} {:>9} {:>12} {:>12} {:>9}",
+        "{:<14} {:<9} {:<11} {:>10} {:>10} {:>9} {:>8} {:>10} {:>9} {:>12} {:>12} {:>9}",
         "engine",
         "durable",
         "layout",
@@ -200,7 +200,7 @@ fn main() {
     for r in &rows {
         let written = r.written_mib.map_or("n/a".to_string(), |m| format!("{m:.1}"));
         println!(
-            "{:<7} {:<9} {:<11} {:>10} {:>10} {:>9} {:>8} {:>10} {:>9.1} {:>12.1} {:>12} {:>9}",
+            "{:<14} {:<9} {:<11} {:>10} {:>10} {:>9} {:>8} {:>10} {:>9.1} {:>12.1} {:>12} {:>9}",
             r.engine,
             r.durability,
             r.layout,
@@ -275,7 +275,7 @@ fn where_the_bytes_go() {
         for batch in [1usize, 100, 2_000] {
             let records = workload(N, layout, VALUE_CEILING);
             let dir = tempfile::tempdir().unwrap();
-            let mut e = BigEngine::open(dir.path(), Durability::Relaxed);
+            let mut e = BigEngine::<Default_>::open(dir.path(), Durability::Relaxed);
 
             let before = e.bytes_written().unwrap();
             let mut commits = 0u64;
@@ -388,7 +388,7 @@ fn threaded_reads() {
     }
     println!("{:>10}", "scaling");
 
-    threaded_row::<BigEngine>(&records, &probes, &THREADS);
+    threaded_row::<BigEngine<Default_>>(&records, &probes, &THREADS);
     threaded_row::<RedbEngine>(&records, &probes, &THREADS);
     threaded_row::<LmdbEngine>(&records, &probes, &THREADS);
     threaded_row::<FjallEngine>(&records, &probes, &THREADS);
@@ -489,7 +489,7 @@ fn sweep(n: u64, layout: Layout, batches: &[usize]) -> Vec<Amp> {
         let mut times = Vec::with_capacity(REPEATS);
         for _ in 0..REPEATS {
             let dir = tempfile::tempdir().unwrap();
-            let mut e = BigEngine::open(dir.path(), Durability::Full);
+            let mut e = BigEngine::<Default_>::open(dir.path(), Durability::Full);
             let before = e.bytes_written().unwrap();
             let t0 = Instant::now();
             for c in records.chunks(batch) {
@@ -842,7 +842,7 @@ fn bulk_load_against_a_smaller_buffer() {
 /// Everything at once, grouped by fragment before anything is written.
 fn through_bulk_load(records: &[Record]) -> (u64, u64, u128) {
     let dir = tempfile::tempdir().unwrap();
-    let e = BigEngine::open(dir.path(), Durability::Full);
+    let e = BigEngine::<Default_>::open(dir.path(), Durability::Full);
     let before = e.bytes_written().unwrap();
     let t0 = Instant::now();
     let mut bulk = e.db().bulk_load(TABLE).unwrap();
@@ -859,7 +859,7 @@ fn through_bulk_load(records: &[Record]) -> (u64, u64, u128) {
 /// `(commits, bytes written, elapsed)` for the same records committed once per caller batch.
 fn commit_per_batch(records: &[Record], batch: usize) -> (u64, u64, u128) {
     let dir = tempfile::tempdir().unwrap();
-    let mut e = BigEngine::open(dir.path(), Durability::Full);
+    let mut e = BigEngine::<Default_>::open(dir.path(), Durability::Full);
     let before = e.bytes_written().unwrap();
     let t0 = Instant::now();
     for c in records.chunks(batch) {
@@ -872,7 +872,7 @@ fn commit_per_batch(records: &[Record], batch: usize) -> (u64, u64, u128) {
 /// The same records, handed over in the same caller batches, but committed by the buffer.
 fn through_buffer(records: &[Record], batch: usize, capacity: usize) -> (u64, u64, u128) {
     let dir = tempfile::tempdir().unwrap();
-    let e = BigEngine::open(dir.path(), Durability::Full);
+    let e = BigEngine::<Default_>::open(dir.path(), Durability::Full);
     let before = e.bytes_written().unwrap();
     let t0 = Instant::now();
     let commits = {

@@ -23,7 +23,7 @@
 //! two million: the `count_ge` crossover sat between the two smallest sizes it used to measure,
 //! which made the old top end the start of the interesting region rather than the end of it.
 
-use big_bench::engines::big::BigEngine;
+use big_bench::engines::big::{BigEngine, Default_};
 use big_bench::engines::fjall::FjallEngine;
 use big_bench::engines::lmdb::LmdbEngine;
 use big_bench::engines::redb::RedbEngine;
@@ -142,7 +142,7 @@ fn point_get(c: &mut Criterion) {
     let records = workload(QUERY_RECORDS, Layout::Dense, VALUE_CEILING);
 
     let big_dir = tempfile::tempdir().unwrap();
-    let mut big = BigEngine::open(big_dir.path(), Durability::Full);
+    let mut big = BigEngine::<Default_>::open(big_dir.path(), Durability::Full);
     let redb_dir = tempfile::tempdir().unwrap();
     let mut redb = RedbEngine::open(redb_dir.path(), Durability::Relaxed);
     for chunk in records.chunks(1_000) {

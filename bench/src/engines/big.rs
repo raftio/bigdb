@@ -18,7 +18,9 @@ use crate::{dir_size, Durability, Engine, Record};
 use big_db::catalog::FieldKind;
 use big_db::Db;
 use big_db::RangeOp;
+use big_db::TableEngine;
 use big_pager::{CountingPager, MmapPager};
+use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 
 pub const TABLE: &str = "t";
@@ -26,15 +28,52 @@ pub const FIELD: &str = "v";
 /// Values are generated below 2^20, and the engine refuses anything wider than declared.
 pub const BIT_DEPTH: u32 = 20;
 
-pub struct BigEngine {
+/// Which storage engine a column of the report is measuring.
+///
+/// A type rather than a field, because `Engine::name` and `Engine::open` are associated
+/// functions: the harness names a column before it has one to ask. Three implementations, one
+/// per column, and the report lists them.
+pub trait Flavour: Send + Sync {
+    const ENGINE: TableEngine;
+    const NAME: &'static str;
+}
+
+/// The default engine, which is what every earlier run of this report measured.
+pub struct Default_;
+impl Flavour for Default_ {
+    const ENGINE: TableEngine = TableEngine::BitmapColumnar;
+    const NAME: &'static str = "big";
+}
+
+/// The engine `ColumnarMerge` schedules differently, so the two sit next to each other.
+///
+/// **Without this column the comparison is wrong**, and wrong in a way that flatters nothing: the
+/// default engine answers a group-by from its index and a columnar one has to scan for it, so
+/// putting `columnar+merge` beside `big` would charge the scheduling for the whole
+/// index-versus-scan difference.
+pub struct Columnar;
+impl Flavour for Columnar {
+    const ENGINE: TableEngine = TableEngine::Columnar;
+    const NAME: &'static str = "big/columnar";
+}
+
+/// The same, for the bitmap merge tree.
+pub struct Bitmap;
+impl Flavour for Bitmap {
+    const ENGINE: TableEngine = TableEngine::Bitmap;
+    const NAME: &'static str = "big/bitmap";
+}
+
+pub struct BigEngine<F: Flavour = Default_> {
     db: Db<CountingPager<MmapPager>>,
     dir: PathBuf,
     /// Whether `compact` has already rewritten the file, so `checkpoint` does not try to
     /// truncate a copy that was just written compact.
     compacted: bool,
+    flavour: PhantomData<F>,
 }
 
-impl BigEngine {
+impl<F: Flavour> BigEngine<F> {
     /// The handle underneath, so a benchmark can drive `big` through an API the comparison
     /// trait deliberately does not have. Buffered ingest has no counterpart in `redb`, so
     /// putting it on the trait would mean inventing one side of the comparison.
@@ -43,9 +82,9 @@ impl BigEngine {
     }
 }
 
-impl Engine for BigEngine {
+impl<F: Flavour> Engine for BigEngine<F> {
     fn name() -> &'static str {
-        "big"
+        F::NAME
     }
 
     /// `Relaxed` maps to `Durability::None`, which is the level that matches what the rivals
@@ -62,9 +101,9 @@ impl Engine for BigEngine {
             Durability::Relaxed => big_db::Durability::None,
         })
         .unwrap();
-        db.create_table(TABLE).unwrap();
+        db.create_table_with(TABLE, F::ENGINE).unwrap();
         db.create_field(TABLE, FIELD, FieldKind::Int, BIT_DEPTH).unwrap();
-        Self { db, dir: dir.to_path_buf(), compacted: false }
+        Self { db, dir: dir.to_path_buf(), compacted: false, flavour: PhantomData }
     }
 
     fn ingest(&mut self, batch: &[Record]) {
@@ -109,7 +148,7 @@ impl Engine for BigEngine {
             Durability::Relaxed => big_db::Durability::None,
         })
         .unwrap();
-        Self { db, dir: dir.to_path_buf(), compacted }
+        Self { db, dir: dir.to_path_buf(), compacted, flavour: PhantomData }
     }
 
     fn remove(&mut self, ids: &[u64]) -> u64 {

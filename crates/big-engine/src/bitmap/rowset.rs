@@ -18,7 +18,7 @@
 //! Two rows never share an absolute key, so keying by that would make every cross-row set
 //! operation trivially empty.
 
-use crate::coords::*;
+use crate::base::coords::*;
 use big_container::{apply, Container, ContainerRef, SetOp};
 
 /// Sparse by construction: a row of a wide field is mostly empty containers.
