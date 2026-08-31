@@ -120,7 +120,13 @@ type Scope = (TableId, FieldId);
 /// value all the bits of the old one.
 #[derive(Clone, Default, Debug)]
 pub struct KeyStore {
-    ids: BTreeMap<(Scope, String), RowId>,
+    /// Nested rather than keyed on `(Scope, String)`, and that shape is load-bearing.
+    ///
+    /// A flat map cannot be probed without building the whole key, so every lookup allocated a
+    /// `String` just to *find* one — on an ingest that is once per keyed field per record, for
+    /// a name the store almost always already holds. Nesting lets the inner map take `&str`
+    /// through `String: Borrow<str>`, so the hit path allocates nothing.
+    ids: BTreeMap<Scope, BTreeMap<String, RowId>>,
     names: BTreeMap<(Scope, RowId), String>,
     next: BTreeMap<Scope, RowId>,
     /// Running total of what the two maps hold, kept rather than computed.
@@ -130,6 +136,9 @@ pub struct KeyStore {
     /// costs one addition per key and makes the reading free, which is the right way round for
     /// a number whose entire purpose is to be watched.
     bytes: usize,
+    /// How many keys the store holds, kept for the same reason `bytes` is: with `ids` nested,
+    /// counting them means walking every scope, and the ceiling below consults it per new key.
+    count: usize,
     /// How many keys this store will *invent*. `None` is no ceiling, which is what every
     /// existing caller gets and what the format has always allowed.
     limit: Option<usize>,
@@ -141,7 +150,7 @@ impl KeyStore {
     }
 
     pub fn id(&self, table: TableId, field: FieldId, name: &str) -> Option<RowId> {
-        self.ids.get(&((table, field), name.to_string())).copied()
+        self.ids.get(&(table, field)).and_then(|by_name| by_name.get(name)).copied()
     }
 
     pub fn name(&self, table: TableId, field: FieldId, row: RowId) -> Option<&str> {
@@ -154,23 +163,24 @@ impl KeyStore {
             return Err(KeyError::TooLong { len: name.len() });
         }
         let scope = (table, field);
-        if let Some(id) = self.ids.get(&(scope, name.to_string())) {
+        if let Some(id) = self.ids.get(&scope).and_then(|by_name| by_name.get(name)) {
             return Ok(*id);
         }
         // Checked here rather than at the caller because this is the only line in the engine
         // that decides a string is worth remembering for ever. A key that already exists costs
         // nothing new and is returned above, so the ceiling never refuses a repeat.
         if let Some(limit) = self.limit {
-            if self.ids.len() >= limit {
+            if self.count >= limit {
                 return Err(KeyError::TooManyKeys { limit });
             }
         }
         let slot = self.next.entry(scope).or_insert(0);
         let id = *slot;
         *slot += 1;
-        self.ids.insert((scope, name.to_string()), id);
+        self.ids.entry(scope).or_default().insert(name.to_string(), id);
         self.names.insert((scope, id), name.to_string());
         self.bytes += entry_bytes(name);
+        self.count += 1;
         Ok(id)
     }
 
@@ -192,7 +202,7 @@ impl KeyStore {
             return Err(KeyError::TooLong { len: name.len() });
         }
         let scope = (table, field);
-        match self.ids.get(&(scope, name.to_string())) {
+        match self.ids.get(&scope).and_then(|by_name| by_name.get(name)) {
             Some(held) if *held == row => return Ok(()),
             Some(held) => {
                 return Err(KeyError::Conflict { name_len: name.len(), assigned: row, held: *held })
@@ -205,9 +215,10 @@ impl KeyStore {
             return Err(KeyError::RowTaken { row });
         }
 
-        self.ids.insert((scope, name.to_string()), row);
+        self.ids.entry(scope).or_default().insert(name.to_string(), row);
         self.names.insert((scope, row), name.to_string());
         self.bytes += entry_bytes(name);
+        self.count += 1;
         let slot = self.next.entry(scope).or_insert(0);
         *slot = (*slot).max(row + 1);
         Ok(())
@@ -229,23 +240,25 @@ impl KeyStore {
     /// fresh id and therefore a fresh scope, so it cannot inherit row ids whose bits are gone.
     pub fn remove_scope(&mut self, table: TableId, field: FieldId) {
         let scope = (table, field);
-        self.ids.retain(|(s, name), _| {
-            let keep = *s != scope;
-            if !keep {
+        if let Some(by_name) = self.ids.remove(&scope) {
+            for name in by_name.keys() {
                 self.bytes -= entry_bytes(name);
             }
-            keep
-        });
+            self.count -= by_name.len();
+        }
         self.names.retain(|(s, _), _| *s != scope);
         self.next.remove(&scope);
     }
 
     /// Forgets every key of every field of one table.
     pub fn remove_table(&mut self, table: TableId) {
-        self.ids.retain(|((t, _), name), _| {
+        self.ids.retain(|(t, _), by_name| {
             let keep = *t != table;
             if !keep {
-                self.bytes -= entry_bytes(name);
+                for name in by_name.keys() {
+                    self.bytes -= entry_bytes(name);
+                }
+                self.count -= by_name.len();
             }
             keep
         });
@@ -260,11 +273,11 @@ impl KeyStore {
     }
 
     pub fn len(&self) -> usize {
-        self.ids.len()
+        self.count
     }
 
     pub fn is_empty(&self) -> bool {
-        self.ids.is_empty()
+        self.count == 0
     }
 
     /// Roughly what this store holds in memory, in bytes.
@@ -326,9 +339,10 @@ impl KeyStore {
                 continue;
             };
             let scope = (table, field);
-            s.ids.insert((scope, name.to_string()), row);
+            s.ids.entry(scope).or_default().insert(name.to_string(), row);
             s.names.insert((scope, row), name.to_string());
             s.bytes += entry_bytes(name);
+            s.count += 1;
             let slot = s.next.entry(scope).or_insert(0);
             *slot = (*slot).max(row + 1);
         }

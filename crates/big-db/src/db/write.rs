@@ -43,21 +43,59 @@ enum ColEdit {
 
 /// Facts waiting to reach one fragment.
 ///
-/// Every map is keyed rather than appended, so writing the same place twice in a transaction
-/// keeps only the last write. That is what makes deferring safe: the tree is shown the final
-/// state of the transaction, never an intermediate one it would have to undo.
+/// Writing the same place twice in a transaction keeps only the last write, however the buffer
+/// below is spelled. That is what makes deferring safe: the tree is shown the final state of the
+/// transaction, never an intermediate one it would have to undo.
 #[derive(Default)]
 struct Pending {
     /// BSI fragments, as record and value. Kept unexpanded because the bit depth can still
     /// grow later in the transaction, and expanding early would write a record at a depth
     /// that turns out to be too narrow.
-    values: BTreeMap<RecordId, u64>,
-    /// Everything else, as a bit and whether it ends up set.
-    bits: BTreeMap<(RowId, RecordId), bool>,
+    ///
+    /// A `Vec` in arrival order rather than a map keyed by record, and the flush collapses it
+    /// with [`last_per_key`]. Same answer, and see that function for why the ordering is bought
+    /// once for the batch instead of once per write.
+    values: Vec<(RecordId, u64)>,
+    /// Everything else, as a bit and whether it ends up set. Also arrival order; also collapsed
+    /// at the flush.
+    bits: Vec<((RowId, RecordId), bool)>,
     /// Column cells, for a table whose engine keeps them. Buffered for the same reason the bits
     /// are: a block holds a thousand records, so a write that reached storage per record would
     /// re-encode a thousand values to change one of them.
+    ///
+    /// Keyed, unlike the two above, and measured that way: a set field *adds*, so collapsing a
+    /// buffer of these means folding rather than dropping all but the last, and the fold has to
+    /// sort a `Vec` whose elements own a `Vec` of their own. Records arrive ascending in a load,
+    /// which is the case a `BTreeMap` appends into its rightmost leaf for almost nothing, so the
+    /// sort lost to it by 1.3x. The bits above are keyed on `(row, record)` and cycle through
+    /// rows, which is why the same change wins there and loses here.
     cells: BTreeMap<RecordId, ColEdit>,
+}
+
+/// Collapses a buffer of writes to one entry per key, keeping the last — which is exactly what
+/// a map keyed on the same thing would have held.
+///
+/// **A `Vec` and one sort, rather than a map kept ordered all along.** A commit buffers a fact
+/// per field per record and a bit per plane on top of that, so this is tens of millions of
+/// writes; a `BTreeMap` pays a descent and, whenever a node fills, an allocation for every one
+/// of them, and the allocator traffic that produces was a fifth of an import. A push is a
+/// bounds check. The order still has to be paid for, but once for the batch rather than once
+/// per write — and the flush was going to walk the whole buffer anyway.
+///
+/// The sort is stable, so entries for one key keep their arrival order; reversing before the
+/// dedup is what makes the survivor the *last* arrival rather than the first.
+fn last_per_key<K: Ord, V>(buf: Vec<(K, V)>) -> Vec<(K, V)> {
+    let mut buf = last_sorted(buf);
+    buf.reverse();
+    buf.dedup_by(|a, b| a.0 == b.0);
+    buf.reverse();
+    buf
+}
+
+/// Ascending by key, with entries for one key left in arrival order.
+fn last_sorted<K: Ord, V>(mut buf: Vec<(K, V)>) -> Vec<(K, V)> {
+    buf.sort_by(|a, b| a.0.cmp(&b.0));
+    buf
 }
 
 pub struct DbWrite<'db, P: PagerMut> {
@@ -122,21 +160,35 @@ impl<'db, P: PagerMut> DbWrite<'db, P> {
     /// Applies everything buffered for one fragment in a single pass over its tree.
     fn flush_fragment(&mut self, key: FragmentKey) -> Result<()> {
         let Some(p) = self.pending.remove(&key) else { return Ok(()) };
-        let mut set = Vec::new();
-        let mut clear = Vec::new();
+        let values = last_per_key(p.values);
+        let bits = last_per_key(p.bits);
 
-        if !p.values.is_empty() {
+        // Reserved rather than grown from empty, because the size is known here and the batch is
+        // large: a twenty-bit field over a million records pushes twenty-one million pairs, and
+        // a `Vec` doubling its way there memmoves roughly its own final length in the process.
+        //
+        // Half the total in each, not the whole of it in both. `bits_for` sends every plane to
+        // exactly one of the two, so together they receive `depth + 1` per record and neither
+        // alone can be predicted — but a value sets about half its bits, so half is the estimate
+        // that costs one doubling in the worst case instead of twenty-five, without reserving
+        // twice the memory the pair will ever hold.
+        let depth = self.catalog.fragment(&key).map_or(1, |m| m.bit_depth.max(1)) as usize;
+        let planes = if values.is_empty() { 0 } else { values.len() * (depth + 1) };
+        let each = (planes + bits.len()).div_ceil(2);
+        let mut set = Vec::with_capacity(each);
+        let mut clear = Vec::with_capacity(each);
+
+        if !values.is_empty() {
             // The depth the catalog ended the transaction on, not the depth each individual
             // write saw. A record written before the depth grew still gets every plane
             // accounted for, so overwriting a large value with a small one cannot leave a
             // stale high bit behind.
-            let depth = self.catalog.fragment(&key).map_or(1, |m| m.bit_depth.max(1));
-            let bsi = Bsi::new(depth);
-            for (record, value) in &p.values {
+            let bsi = Bsi::new(depth as u32);
+            for (record, value) in &values {
                 bsi.bits_for(*record, *value, &mut set, &mut clear)?;
             }
         }
-        for ((row, record), on) in &p.bits {
+        for ((row, record), on) in &bits {
             if *on {
                 set.push((*row, *record));
             } else {
@@ -151,7 +203,7 @@ impl<'db, P: PagerMut> DbWrite<'db, P> {
         // A segment-only key has no bitmap half to write. Returning before `fragment_raw`
         // matters: registering it would put a standard-view fragment in the catalog that holds
         // nothing, and every scan would then visit a tree that does not exist.
-        if set.is_empty() && clear.is_empty() && p.values.is_empty() {
+        if set.is_empty() && clear.is_empty() && values.is_empty() {
             return Ok(());
         }
         let mut f = self.fragment_raw(key);
@@ -311,10 +363,17 @@ impl<'db, P: PagerMut> DbWrite<'db, P> {
     }
 
     fn buffer_bit(&mut self, key: FragmentKey, row: RowId, record: RecordId, on: bool) {
-        self.pending.entry(key).or_default().bits.insert((row, record), on);
+        self.pending.entry(key).or_default().bits.push(((row, record), on));
     }
 
     /// Marks a record as existing. Without this, `NOT` would match every id never written.
+    ///
+    /// Every setter calls this, so a four-field record buffers the same bit four times. Skipping
+    /// the repeats was tried, with a memo of the last bit buffered: it measured *slower* once
+    /// `bits` became a `Vec`, because comparing a `FragmentKey` costs more than the push it
+    /// avoids — and the memo had to be invalidated everywhere `pending` shrinks, which is not
+    /// only `flush_fragment` but `discard` too. Paying for three pushes is the cheaper and the
+    /// safer of the two.
     pub fn mark_exists(&mut self, table: &str, record: RecordId) -> Result<()> {
         let t = self
             .catalog
@@ -354,7 +413,7 @@ impl<'db, P: PagerMut> DbWrite<'db, P> {
         let t = self.catalog.table(table).map_or(0, |x| x.id);
         self.observe(t, &def, record, value);
         if self.engine(t).has_bitmap() {
-            self.pending.entry(key).or_default().values.insert(record, value);
+            self.pending.entry(key).or_default().values.push((record, value));
         }
         self.buffer_value(t, &def, record, value);
         self.mark_exists(table, record)
@@ -389,7 +448,7 @@ impl<'db, P: PagerMut> DbWrite<'db, P> {
         let t = self.catalog.table(table).map_or(0, |x| x.id);
         self.observe(t, &def, record, stored);
         if self.engine(t).has_bitmap() {
-            self.pending.entry(key).or_default().values.insert(record, stored);
+            self.pending.entry(key).or_default().values.push((record, stored));
         }
         self.buffer_value(t, &def, record, stored);
         self.mark_exists(table, record)

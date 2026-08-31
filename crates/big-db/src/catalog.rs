@@ -261,7 +261,13 @@ pub struct Catalog {
     tables: BTreeMap<TableId, TableDef>,
     table_ids: BTreeMap<String, TableId>,
     fields: BTreeMap<(TableId, FieldId), FieldDef>,
-    field_ids: BTreeMap<(TableId, String), FieldId>,
+    /// Nested rather than keyed on `(TableId, String)`, and that shape is load-bearing.
+    ///
+    /// A flat map cannot be probed without building the whole key, so every `field` lookup
+    /// allocated a `String` just to *find* one — and `field` runs once per setter, which is once
+    /// per column per record on an ingest. Nesting lets the inner map take `&str` through
+    /// `String: Borrow<str>`, so the common case allocates nothing at all.
+    field_ids: BTreeMap<TableId, BTreeMap<String, FieldId>>,
     views: BTreeMap<ViewId, String>,
     view_ids: BTreeMap<String, ViewId>,
     fragments: BTreeMap<FragmentKey, FragmentMeta>,
@@ -368,7 +374,10 @@ impl Catalog {
     }
 
     pub fn field(&self, table: TableId, name: &str) -> Option<&FieldDef> {
-        self.field_ids.get(&(table, name.to_string())).and_then(|id| self.fields.get(&(table, *id)))
+        self.field_ids
+            .get(&table)
+            .and_then(|by_name| by_name.get(name))
+            .and_then(|id| self.fields.get(&(table, *id)))
     }
 
     pub fn field_by_id(&self, table: TableId, id: FieldId) -> Option<&FieldDef> {
@@ -459,7 +468,7 @@ impl Catalog {
     /// up later as a write into the wrong shape.
     pub fn add_field(&mut self, mut def: FieldDef) -> Result<FieldId> {
         check_name(&def.name)?;
-        if let Some(id) = self.field_ids.get(&(def.table, def.name.clone())) {
+        if let Some(id) = self.field_ids.get(&def.table).and_then(|m| m.get(&def.name)) {
             let existing = &self.fields[&(def.table, *id)];
             let same = existing.kind == def.kind
                 && existing.bit_depth == def.bit_depth
@@ -485,7 +494,7 @@ impl Catalog {
         }
         *slot += 1;
         def.id = id;
-        self.field_ids.insert((def.table, def.name.clone()), id);
+        self.field_ids.entry(def.table).or_default().insert(def.name.clone(), id);
         self.fields.insert((def.table, id), def);
         Ok(id)
     }
@@ -524,7 +533,9 @@ impl Catalog {
             self.fields.range((id, 0)..=(id, FieldId::MAX)).map(|((_, f), _)| *f).collect();
         for f in fields {
             if let Some(def) = self.fields.remove(&(id, f)) {
-                self.field_ids.remove(&(id, def.name));
+                if let Some(by_name) = self.field_ids.get_mut(&id) {
+                    by_name.remove(&def.name);
+                }
             }
         }
         self.keys.remove_table(id);
@@ -544,7 +555,7 @@ impl Catalog {
     /// The reserved `EXISTS_FIELD` is not reachable through this: it is not a field anybody
     /// declared, and dropping it would make `NOT` answer with every id never written.
     pub fn drop_field(&mut self, table: TableId, name: &str) -> Option<Vec<FragmentKey>> {
-        let id = self.field_ids.remove(&(table, name.to_string()))?;
+        let id = self.field_ids.get_mut(&table).and_then(|m| m.remove(name))?;
         self.fields.remove(&(table, id));
         self.keys.remove_scope(table, id);
 
@@ -753,7 +764,7 @@ impl Catalog {
                         scale: e[16] as i8,
                         granularity: gran_from_mask(e[17]),
                     };
-                    c.field_ids.insert((def.table, name), def.id);
+                    c.field_ids.entry(def.table).or_default().insert(name, def.id);
                     c.fields.insert((def.table, def.id), def);
                 }
                 KIND_FRAGMENT => {
