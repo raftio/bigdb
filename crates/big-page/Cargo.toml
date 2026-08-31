@@ -1,0 +1,17 @@
+[package]
+name = "big-page"
+description = "On-disk page layout, parse and checksum for big"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "readme.md"
+
+[dependencies]
+big-container = { path = "../big-container", version = "0.1.0" }
+bytemuck = "1"
+crc32fast = "1"
+
+[dev-dependencies]
+proptest = "1"

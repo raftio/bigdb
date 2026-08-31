@@ -1,0 +1,74 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="788" height="450" viewBox="0 0 788 450" role="img" aria-label="Ingest, removals, uncompacted file size and single-thread point reads for big, redb, lmdb, fjall and sqlite" font-family='system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif'>
+<text x="12.0" y="25.0" font-size="13" fill="#6e6d68" font-weight="600" text-anchor="start">Ingest, 100k records at full durability</text>
+<text x="12.0" y="42.0" font-size="11" fill="#86857e" font-weight="400" text-anchor="start">milliseconds · lower is better</text>
+<path d="M24.0,176.0 H364.0" stroke="#8f8e88" stroke-opacity="0.45" stroke-width="1" shape-rendering="crispEdges"/>
+<path d="M47.0,176.0 V133.4 A4.0,4.0 0 0 1 51.0,129.4 H65.0 A4.0,4.0 0 0 1 69.0,133.4 V176.0 Z" fill="#2a78d6"/>
+<text x="58.0" y="121.4" font-size="11" fill="#6e6d68" font-weight="400" text-anchor="middle" style="font-variant-numeric:tabular-nums">1,415 ms</text>
+<text x="58.0" y="194.0" font-size="11" fill="#6e6d68" font-weight="600" text-anchor="middle">big</text>
+<path d="M115.0,176.0 V76.2 A4.0,4.0 0 0 1 119.0,72.2 H133.0 A4.0,4.0 0 0 1 137.0,76.2 V176.0 Z" fill="#8f8e88"/>
+<text x="126.0" y="64.2" font-size="11" fill="#7f7e77" font-weight="400" text-anchor="middle" style="font-variant-numeric:tabular-nums">3,150 ms</text>
+<text x="126.0" y="194.0" font-size="11" fill="#7f7e77" font-weight="400" text-anchor="middle">redb</text>
+<path d="M183.0,176.0 V76.0 A4.0,4.0 0 0 1 187.0,72.0 H201.0 A4.0,4.0 0 0 1 205.0,76.0 V176.0 Z" fill="#8f8e88"/>
+<text x="194.0" y="64.0" font-size="11" fill="#7f7e77" font-weight="400" text-anchor="middle" style="font-variant-numeric:tabular-nums">3,157 ms</text>
+<text x="194.0" y="194.0" font-size="11" fill="#7f7e77" font-weight="400" text-anchor="middle">lmdb</text>
+<path d="M251.0,176.0 V103.1 A4.0,4.0 0 0 1 255.0,99.1 H269.0 A4.0,4.0 0 0 1 273.0,103.1 V176.0 Z" fill="#8f8e88"/>
+<text x="262.0" y="91.1" font-size="11" fill="#7f7e77" font-weight="400" text-anchor="middle" style="font-variant-numeric:tabular-nums">2,335 ms</text>
+<text x="262.0" y="194.0" font-size="11" fill="#7f7e77" font-weight="400" text-anchor="middle">fjall</text>
+<path d="M319.0,176.0 V92.3 A4.0,4.0 0 0 1 323.0,88.3 H337.0 A4.0,4.0 0 0 1 341.0,92.3 V176.0 Z" fill="#8f8e88"/>
+<text x="330.0" y="80.3" font-size="11" fill="#7f7e77" font-weight="400" text-anchor="middle" style="font-variant-numeric:tabular-nums">2,663 ms</text>
+<text x="330.0" y="194.0" font-size="11" fill="#7f7e77" font-weight="400" text-anchor="middle">sqlite</text>
+<text x="412.0" y="25.0" font-size="13" fill="#6e6d68" font-weight="600" text-anchor="start">Removals, 10k of 100k records</text>
+<text x="412.0" y="42.0" font-size="11" fill="#86857e" font-weight="400" text-anchor="start">milliseconds · lower is better</text>
+<path d="M424.0,176.0 H764.0" stroke="#8f8e88" stroke-opacity="0.45" stroke-width="1" shape-rendering="crispEdges"/>
+<path d="M447.0,176.0 V174.7 A1.3,1.3 0 0 1 448.3,173.3 H467.7 A1.3,1.3 0 0 1 469.0,174.7 V176.0 Z" fill="#2a78d6"/>
+<text x="458.0" y="165.3" font-size="11" fill="#6e6d68" font-weight="400" text-anchor="middle" style="font-variant-numeric:tabular-nums">25 ms</text>
+<text x="458.0" y="194.0" font-size="11" fill="#6e6d68" font-weight="600" text-anchor="middle">big</text>
+<path d="M515.0,176.0 V76.0 A4.0,4.0 0 0 1 519.0,72.0 H533.0 A4.0,4.0 0 0 1 537.0,76.0 V176.0 Z" fill="#8f8e88"/>
+<text x="526.0" y="64.0" font-size="11" fill="#7f7e77" font-weight="400" text-anchor="middle" style="font-variant-numeric:tabular-nums">967 ms</text>
+<text x="526.0" y="194.0" font-size="11" fill="#7f7e77" font-weight="400" text-anchor="middle">redb</text>
+<path d="M583.0,176.0 V142.8 A4.0,4.0 0 0 1 587.0,138.8 H601.0 A4.0,4.0 0 0 1 605.0,142.8 V176.0 Z" fill="#8f8e88"/>
+<text x="594.0" y="130.8" font-size="11" fill="#7f7e77" font-weight="400" text-anchor="middle" style="font-variant-numeric:tabular-nums">346 ms</text>
+<text x="594.0" y="194.0" font-size="11" fill="#7f7e77" font-weight="400" text-anchor="middle">lmdb</text>
+<path d="M651.0,176.0 V156.8 A4.0,4.0 0 0 1 655.0,152.8 H669.0 A4.0,4.0 0 0 1 673.0,156.8 V176.0 Z" fill="#8f8e88"/>
+<text x="662.0" y="144.8" font-size="11" fill="#7f7e77" font-weight="400" text-anchor="middle" style="font-variant-numeric:tabular-nums">216 ms</text>
+<text x="662.0" y="194.0" font-size="11" fill="#7f7e77" font-weight="400" text-anchor="middle">fjall</text>
+<path d="M719.0,176.0 V141.4 A4.0,4.0 0 0 1 723.0,137.4 H737.0 A4.0,4.0 0 0 1 741.0,141.4 V176.0 Z" fill="#8f8e88"/>
+<text x="730.0" y="129.4" font-size="11" fill="#7f7e77" font-weight="400" text-anchor="middle" style="font-variant-numeric:tabular-nums">359 ms</text>
+<text x="730.0" y="194.0" font-size="11" fill="#7f7e77" font-weight="400" text-anchor="middle">sqlite</text>
+<text x="12.0" y="253.0" font-size="13" fill="#6e6d68" font-weight="600" text-anchor="start">Uncompacted file size</text>
+<text x="12.0" y="270.0" font-size="11" fill="#86857e" font-weight="400" text-anchor="start">MiB · lower is better</text>
+<path d="M24.0,404.0 H364.0" stroke="#8f8e88" stroke-opacity="0.45" stroke-width="1" shape-rendering="crispEdges"/>
+<path d="M47.0,404.0 V403.2 A0.8,0.8 0 0 1 47.8,402.5 H68.2 A0.8,0.8 0 0 1 69.0,403.2 V404.0 Z" fill="#2a78d6"/>
+<text x="58.0" y="395.4" font-size="11" fill="#6e6d68" font-weight="400" text-anchor="middle" style="font-variant-numeric:tabular-nums">0.6 MiB</text>
+<text x="58.0" y="422.0" font-size="11" fill="#6e6d68" font-weight="600" text-anchor="middle">big</text>
+<path d="M115.0,404.0 V398.9 A4.0,4.0 0 0 1 119.0,394.9 H133.0 A4.0,4.0 0 0 1 137.0,398.9 V404.0 Z" fill="#8f8e88"/>
+<text x="126.0" y="386.9" font-size="11" fill="#7f7e77" font-weight="400" text-anchor="middle" style="font-variant-numeric:tabular-nums">8.5 MiB</text>
+<text x="126.0" y="422.0" font-size="11" fill="#7f7e77" font-weight="400" text-anchor="middle">redb</text>
+<path d="M183.0,404.0 V396.6 A4.0,4.0 0 0 1 187.0,392.6 H201.0 A4.0,4.0 0 0 1 205.0,396.6 V404.0 Z" fill="#8f8e88"/>
+<text x="194.0" y="384.6" font-size="11" fill="#7f7e77" font-weight="400" text-anchor="middle" style="font-variant-numeric:tabular-nums">10.6 MiB</text>
+<text x="194.0" y="422.0" font-size="11" fill="#7f7e77" font-weight="400" text-anchor="middle">lmdb</text>
+<path d="M251.0,404.0 V304.0 A4.0,4.0 0 0 1 255.0,300.0 H269.0 A4.0,4.0 0 0 1 273.0,304.0 V404.0 Z" fill="#8f8e88"/>
+<text x="262.0" y="292.0" font-size="11" fill="#7f7e77" font-weight="400" text-anchor="middle" style="font-variant-numeric:tabular-nums">97.1 MiB</text>
+<text x="262.0" y="422.0" font-size="11" fill="#7f7e77" font-weight="400" text-anchor="middle">fjall</text>
+<path d="M319.0,404.0 V402.5 A1.5,1.5 0 0 1 320.5,401.0 H339.5 A1.5,1.5 0 0 1 341.0,402.5 V404.0 Z" fill="#8f8e88"/>
+<text x="330.0" y="393.0" font-size="11" fill="#7f7e77" font-weight="400" text-anchor="middle" style="font-variant-numeric:tabular-nums">2.8 MiB</text>
+<text x="330.0" y="422.0" font-size="11" fill="#7f7e77" font-weight="400" text-anchor="middle">sqlite</text>
+<text x="412.0" y="253.0" font-size="13" fill="#6e6d68" font-weight="600" text-anchor="start">Point reads, single thread</text>
+<text x="412.0" y="270.0" font-size="11" fill="#86857e" font-weight="400" text-anchor="start">thousands/sec · HIGHER is better</text>
+<path d="M424.0,404.0 H764.0" stroke="#8f8e88" stroke-opacity="0.45" stroke-width="1" shape-rendering="crispEdges"/>
+<path d="M447.0,404.0 V397.0 A4.0,4.0 0 0 1 451.0,393.0 H465.0 A4.0,4.0 0 0 1 469.0,397.0 V404.0 Z" fill="#2a78d6"/>
+<text x="458.0" y="385.0" font-size="11" fill="#6e6d68" font-weight="400" text-anchor="middle" style="font-variant-numeric:tabular-nums">59k/s</text>
+<text x="458.0" y="422.0" font-size="11" fill="#6e6d68" font-weight="600" text-anchor="middle">big</text>
+<path d="M515.0,404.0 V321.5 A4.0,4.0 0 0 1 519.0,317.5 H533.0 A4.0,4.0 0 0 1 537.0,321.5 V404.0 Z" fill="#8f8e88"/>
+<text x="526.0" y="309.5" font-size="11" fill="#7f7e77" font-weight="400" text-anchor="middle" style="font-variant-numeric:tabular-nums">464k/s</text>
+<text x="526.0" y="422.0" font-size="11" fill="#7f7e77" font-weight="400" text-anchor="middle">redb</text>
+<path d="M583.0,404.0 V304.0 A4.0,4.0 0 0 1 587.0,300.0 H601.0 A4.0,4.0 0 0 1 605.0,304.0 V404.0 Z" fill="#8f8e88"/>
+<text x="594.0" y="292.0" font-size="11" fill="#7f7e77" font-weight="400" text-anchor="middle" style="font-variant-numeric:tabular-nums">558k/s</text>
+<text x="594.0" y="422.0" font-size="11" fill="#7f7e77" font-weight="400" text-anchor="middle">lmdb</text>
+<path d="M651.0,404.0 V328.6 A4.0,4.0 0 0 1 655.0,324.6 H669.0 A4.0,4.0 0 0 1 673.0,328.6 V404.0 Z" fill="#8f8e88"/>
+<text x="662.0" y="316.6" font-size="11" fill="#7f7e77" font-weight="400" text-anchor="middle" style="font-variant-numeric:tabular-nums">426k/s</text>
+<text x="662.0" y="422.0" font-size="11" fill="#7f7e77" font-weight="400" text-anchor="middle">fjall</text>
+<path d="M719.0,404.0 V389.4 A4.0,4.0 0 0 1 723.0,385.4 H737.0 A4.0,4.0 0 0 1 741.0,389.4 V404.0 Z" fill="#8f8e88"/>
+<text x="730.0" y="377.4" font-size="11" fill="#7f7e77" font-weight="400" text-anchor="middle" style="font-variant-numeric:tabular-nums">100k/s</text>
+<text x="730.0" y="422.0" font-size="11" fill="#7f7e77" font-weight="400" text-anchor="middle">sqlite</text>
+</svg>

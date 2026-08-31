@@ -1,0 +1,43 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/big-container",
+    "crates/big-page",
+    "crates/big-pager",
+    "crates/big-btree",
+    "crates/big-fragment",
+    "crates/big-column",
+    "crates/big-field",
+    "crates/big-keys",
+    "crates/big-db",
+    "crates/big-plan",
+    "crates/big-sql",
+    "crates/big-exec",
+    "crates/big-api",
+    "crates/big-cli",
+    "crates/big-ingest",
+    "crates/big-cluster",
+    "crates/big-http",
+    "crates/big-e2e",
+    # Not part of the engine: it pulls in rival engines to measure against.
+    "bench",
+]
+# cargo-fuzz needs nightly; the engine itself stays on stable.
+exclude = ["fuzz"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+license = "Apache-2.0"
+repository = "https://github.com/9bany/big"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = 1
+
+[profile.bench]
+lto = "thin"
+codegen-units = 1

@@ -1,0 +1,25 @@
+# The binaries, run as an operator runs them.
+#
+# A crate of its own because the four binaries live in four packages and cargo only hands a
+# package its *own* `CARGO_BIN_EXE_*`. Nothing here is published and nothing links the engine:
+# a test that could call `big_db` would stop being a test of what ships.
+[package]
+name = "big-e2e"
+description = "End-to-end tests: the shipped binaries, as processes, against files on disk"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+# Deliberately empty. The engine is reached through a socket and a file, never through a link.
+[dependencies]
+
+[dev-dependencies]
+tempfile = "3"
+
+[[test]]
+name = "e2e"
+path = "tests/e2e/main.rs"
+harness = true

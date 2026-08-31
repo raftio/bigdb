@@ -1,0 +1,18 @@
+[package]
+name = "big-field"
+description = "Field types for big: BSI, set, mutex, bool, time quantum"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "readme.md"
+
+[dependencies]
+big-fragment = { path = "../big-fragment", version = "0.1.0" }
+big-pager = { path = "../big-pager", version = "0.1.0" }
+big-btree = { path = "../big-btree", version = "0.1.0" }
+
+[dev-dependencies]
+big-page = { path = "../big-page", version = "0.1.0" }
+proptest = "1"

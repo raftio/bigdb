@@ -1,0 +1,233 @@
+// Copyright 2026 Bany
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! The coordinator, driven against peers that never open a socket.
+//!
+//! **This is the seam [`Peers`] exists for.** Every claim here used to need real servers on
+//! real ports with one of them arranged to misbehave, which made a refusing peer, an
+//! unreachable peer and a peer running a different build the *expensive* cases to test - when
+//! they are precisely what this code is for. A fake peer table answers in microseconds and can
+//! be told to fail on demand, so the interesting cases are now the cheap ones.
+//!
+//! What this cannot claim is anything about sockets: pooling, keep-alive, or a deadline against
+//! a real clock. Those stay in `big-http/tests/cluster.rs`, over real ports, where they belong.
+
+use big_api::{Api, FieldKind, MemPager, QueryOptions, Value};
+use big_cluster::client::{ClientError, PeerResponse, Peers, Repeatable};
+use big_cluster::{
+    raft, wire, Cluster, ClusterConfig, ClusterError, ClusterFile, FactValue, OwnedFact,
+};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+const TWO: &str = r#"
+schema_leader = "a"
+
+[[node]]
+name   = "a"
+addr   = "10.0.0.1:7654"
+shards = "0..64"
+
+[[node]]
+name   = "b"
+addr   = "10.0.0.2:7654"
+shards = "64.."
+"#;
+
+/// How the fake answers one request.
+#[derive(Clone)]
+enum Reply {
+    /// A count, encoded the way an owner encodes one.
+    Count(u64),
+    /// A refusal with a status and a stable code, the way `bigd` writes one.
+    Refuse(u16, &'static str, &'static str),
+    /// Nothing is listening.
+    Unreachable,
+    /// Bytes from a build that does not agree with this one.
+    Garbage,
+}
+
+/// A peer table that answers from a script instead of a socket.
+struct Fake {
+    /// One reply per node index. `None` at this node's own index, which is never asked.
+    replies: Vec<Option<Reply>>,
+    /// Every request that was made, in the order it was made.
+    seen: Mutex<Vec<(usize, String)>>,
+    calls: AtomicUsize,
+}
+
+impl Fake {
+    fn new(replies: Vec<Option<Reply>>) -> Arc<Self> {
+        Arc::new(Self { replies, seen: Mutex::new(Vec::new()), calls: AtomicUsize::new(0) })
+    }
+
+    fn asked(&self) -> Vec<(usize, String)> {
+        self.seen.lock().unwrap().clone()
+    }
+
+    fn call_count(&self) -> usize {
+        self.calls.load(Ordering::Relaxed)
+    }
+}
+
+impl Peers for Fake {
+    fn post(
+        &self,
+        node: usize,
+        path: &str,
+        _body: &[u8],
+        _budget: Option<Duration>,
+        _repeatable: Repeatable,
+    ) -> Result<PeerResponse, ClientError> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        self.seen.lock().unwrap().push((node, path.to_string()));
+        match self.replies[node].clone().expect("this node is never asked over the table") {
+            Reply::Count(n) => {
+                Ok(PeerResponse { status: 200, body: wire::encode_value(&Value::Count(n)) })
+            }
+            Reply::Refuse(status, code, message) => Ok(PeerResponse {
+                status,
+                body: format!("{{\"error\":\"{message}\",\"code\":\"{code}\"}}").into_bytes(),
+            }),
+            Reply::Unreachable => Err(ClientError::Unreachable(std::io::Error::other("refused"))),
+            Reply::Garbage => Ok(PeerResponse { status: 200, body: vec![0xff, 0xff, 0xff] }),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.replies.len()
+    }
+
+    fn addr(&self, node: usize) -> Option<&str> {
+        self.replies[node].as_ref().map(|_| "fake")
+    }
+}
+
+/// A two-node cluster in which this node is `a`, against the peer table given.
+fn cluster(peers: Arc<Fake>) -> Cluster<MemPager> {
+    let api = Api::in_memory().unwrap();
+    api.create_table("tx").unwrap();
+    api.create_field("tx", "country", FieldKind::Set, 0).unwrap();
+    let config: ClusterConfig = ClusterFile::parse(TWO).unwrap().for_node(Some("a"), "").unwrap();
+    Cluster::with_peers(
+        api,
+        config,
+        peers,
+        Box::new(raft::Forgetful),
+        raft::Timing::default(),
+        Default::default(),
+    )
+}
+
+fn count(c: &Cluster<MemPager>) -> Result<Value, ClusterError> {
+    c.query("tx", "Count(All())", &QueryOptions::default())
+}
+
+#[test]
+fn a_query_asks_the_owner_of_every_range_it_does_not_hold() {
+    let peers = Fake::new(vec![None, Some(Reply::Count(7))]);
+    let c = cluster(Arc::clone(&peers));
+
+    // This node owns 0..64 and holds nothing; the other owns 64.. and says seven.
+    assert_eq!(count(&c).unwrap().as_count(), Some(7));
+    assert_eq!(peers.asked(), vec![(1, "/internal/query".to_string())]);
+}
+
+#[test]
+fn an_owner_that_refuses_fails_the_query_rather_than_answering_partially() {
+    // The CAP choice, and the one no number can show: an answer here is an aggregate, so a
+    // count missing one node's contribution looks exactly like a correct count.
+    let peers =
+        Fake::new(vec![None, Some(Reply::Refuse(503, "not_serving", "b lost the agreement"))]);
+    let c = cluster(peers);
+
+    let e = count(&c).unwrap_err();
+    assert!(matches!(e, ClusterError::Peer { status: 503, .. }), "got {e:?}");
+    assert!(e.to_string().contains("not_serving"), "the peer's own code survives: {e}");
+}
+
+#[test]
+fn an_owner_that_cannot_be_reached_names_the_node_and_its_shards() {
+    // "Which part of the space went quiet" is the first thing an operator needs and the one
+    // thing they cannot work out from a bare 503.
+    let peers = Fake::new(vec![None, Some(Reply::Unreachable)]);
+    let c = cluster(peers);
+
+    let e = count(&c).unwrap_err();
+    let said = e.to_string();
+    assert!(matches!(e, ClusterError::Unreachable { .. }), "got {e:?}");
+    assert!(said.contains("64.."), "names the range that went quiet: {said}");
+}
+
+#[test]
+fn bytes_from_a_build_that_does_not_agree_are_refused_rather_than_decoded() {
+    // Decoding what it can and skipping the rest would make a newer peer indistinguishable from
+    // one that simply has no data, and the two call for opposite actions.
+    let peers = Fake::new(vec![None, Some(Reply::Garbage)]);
+    let c = cluster(peers);
+
+    let e = count(&c).unwrap_err();
+    assert!(matches!(e, ClusterError::Wire { .. }), "got {e:?}");
+    assert!(e.to_string().contains('b'), "the node that sent them is named: {e}");
+}
+
+#[test]
+fn a_write_that_lands_here_and_is_refused_there_is_reported_half_applied() {
+    // There is no transaction across nodes. What makes that safe is that the error says which
+    // shards landed, rather than reporting a batch as everywhere when it is not.
+    let peers = Fake::new(vec![None, Some(Reply::Refuse(503, "not_serving", "b is not there"))]);
+    let c = cluster(peers);
+
+    let facts = vec![
+        OwnedFact {
+            field: "country".to_string(),
+            record: 1,
+            value: FactValue::Key("GB".to_string()),
+        },
+        OwnedFact {
+            field: "country".to_string(),
+            record: 64 << 20,
+            value: FactValue::Key("US".to_string()),
+        },
+    ];
+    let e = c.import("tx", &facts).unwrap_err();
+
+    assert!(matches!(e, ClusterError::Partial { .. }), "got {e:?}");
+    let said = e.to_string();
+    assert!(said.contains("half applied"), "says the batch is half applied: {said}");
+}
+
+#[test]
+fn a_query_this_node_answers_alone_asks_nobody() {
+    // A range this node owns is answered in-process. Every leg that goes over the table is one
+    // this node could not have answered, which is what makes the fan-out's cost readable.
+    let peers = Fake::new(vec![None, Some(Reply::Count(0))]);
+    let c = cluster(Arc::clone(&peers));
+
+    c.local().count("tx").unwrap();
+
+    assert_eq!(peers.call_count(), 0, "nothing was asked before the first query");
+}
+
+#[test]
+fn a_cluster_of_one_runs_the_same_coordinator_and_asks_nobody() {
+    // `bigd` without --cluster is a cluster of one. A second path for the un-clustered case
+    // would be the path nobody tests, so this checks it is not a second path.
+    let api = Api::in_memory().unwrap();
+    api.create_table("tx").unwrap();
+    let c = Cluster::solo(api);
+
+    assert_eq!(count(&c).unwrap().as_count(), Some(0));
+}

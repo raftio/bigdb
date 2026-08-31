@@ -1,0 +1,1 @@
+Union(Not(Row(a=1)), Difference(All(), Row(b=2)))

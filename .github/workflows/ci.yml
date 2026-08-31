@@ -1,0 +1,105 @@
+# Nothing ran on a change before this file existed.
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # `big-bench`, not `bench`. The package name is what --exclude matches, and cargo only
+      # warns when it matches nothing - so for as long as this said `bench`, CI was quietly
+      # building the rival engines it was written to skip.
+      - run: cargo test --workspace --exclude big-bench
+
+  # Two real `bigd` processes and a failover decided by wall-clock heartbeats. Out of the job
+  # above because a timing test in the default run is a test that eventually fails for reasons
+  # nobody changed - and its own job so that when it does, it says so rather than reddening the
+  # suite that has nothing to do with it.
+  e2e-cluster:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p big-e2e -- --ignored cluster::
+
+  # The tree was not rustfmt-clean when this file was written, which is why this job did not
+  # exist: gating on `cargo fmt` would have failed on the first push for files nobody touched.
+  # `rustfmt.toml` now says what the house style is and the tree was reformatted once to match,
+  # so the gate is real rather than a trap.
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --exclude big-bench --all-targets
+
+  # A dead doc link is a broken promise in the one place a reader cannot check it for
+  # themselves, and `big-api` and `big-http` deny `missing_docs`, so this also catches a public
+  # item added without a word about it.
+  docs:
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo doc --workspace --exclude big-bench --no-deps
+
+  # The declared `rust-version` is a promise. Without this job it is a comment.
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace --exclude big-bench
+
+  # `big-api` and `big-http` are the only two crates that promise anything, so they are the only
+  # two checked. Nothing is on crates.io yet, so this has no baseline to compare against and
+  # passes trivially; it is wired in now so that it does not have to be remembered later, when
+  # the first accidental breaking change is the thing that would have prompted it.
+  semver:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: obi1kenobi/cargo-semver-checks-action@v2
+        continue-on-error: true
+        with:
+          package: big-api, big-http
+
+  # The crash tests drive real failpoints and are the reason a commit can be trusted to be
+  # atomic. They run behind a feature flag, so a plain `cargo test` misses them.
+  crash:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p big-pager --features crash-injection,counting-pager

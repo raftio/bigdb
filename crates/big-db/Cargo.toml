@@ -1,0 +1,23 @@
+[package]
+name = "big-db"
+description = "Schema, catalog and the top-level big database handle"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "readme.md"
+
+[dependencies]
+big-btree = { path = "../big-btree", version = "0.1.0" }
+big-column = { path = "../big-column", version = "0.1.0" }
+big-field = { path = "../big-field", version = "0.1.0" }
+big-fragment = { path = "../big-fragment", version = "0.1.0" }
+big-keys = { path = "../big-keys", version = "0.1.0" }
+big-pager = { path = "../big-pager", version = "0.1.0" }
+
+[dev-dependencies]
+big-exec = { path = "../big-exec", version = "0.1.0" }
+big-pager = { path = "../big-pager", version = "0.1.0", features = ["counting-pager"] }
+proptest = "1"
+tempfile = "3"

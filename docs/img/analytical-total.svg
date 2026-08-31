@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="408" height="302" viewBox="0 0 408 302" role="img" aria-label="All six analytical queries summed: big 21,019µs, duckdb 21,323µs, datafusion 51,034µs, clickhouse 97,866µs" font-family='system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif'>
+<text x="28.0" y="28.0" font-size="15" fill="#6e6d68" font-weight="600" text-anchor="start">All six analytical queries, summed</text>
+<text x="28.0" y="50.0" font-size="12" fill="#86857e" font-weight="400" text-anchor="start">microseconds · lower is better</text>
+<path d="M28.0,264.0 H380.0" stroke="#8f8e88" stroke-opacity="0.45" stroke-width="1" shape-rendering="crispEdges"/>
+<path d="M60.0,264.0 V234.1 A4.0,4.0 0 0 1 64.0,230.1 H80.0 A4.0,4.0 0 0 1 84.0,234.1 V264.0 Z" fill="#2a78d6"/>
+<text x="72.0" y="221.1" font-size="12" fill="#6e6d68" font-weight="400" text-anchor="middle" style="font-variant-numeric:tabular-nums">21,019µs</text>
+<text x="72.0" y="284.0" font-size="12" fill="#6e6d68" font-weight="600" text-anchor="middle">big</text>
+<path d="M148.0,264.0 V233.6 A4.0,4.0 0 0 1 152.0,229.6 H168.0 A4.0,4.0 0 0 1 172.0,233.6 V264.0 Z" fill="#8f8e88"/>
+<text x="160.0" y="220.6" font-size="12" fill="#7f7e77" font-weight="400" text-anchor="middle" style="font-variant-numeric:tabular-nums">21,323µs</text>
+<text x="160.0" y="284.0" font-size="12" fill="#7f7e77" font-weight="400" text-anchor="middle">duckdb</text>
+<path d="M236.0,264.0 V185.6 A4.0,4.0 0 0 1 240.0,181.6 H256.0 A4.0,4.0 0 0 1 260.0,185.6 V264.0 Z" fill="#8f8e88"/>
+<text x="248.0" y="172.6" font-size="12" fill="#7f7e77" font-weight="400" text-anchor="middle" style="font-variant-numeric:tabular-nums">51,034µs</text>
+<text x="248.0" y="284.0" font-size="12" fill="#7f7e77" font-weight="400" text-anchor="middle">datafusion</text>
+<path d="M324.0,264.0 V110.0 A4.0,4.0 0 0 1 328.0,106.0 H344.0 A4.0,4.0 0 0 1 348.0,110.0 V264.0 Z" fill="#8f8e88"/>
+<text x="336.0" y="97.0" font-size="12" fill="#7f7e77" font-weight="400" text-anchor="middle" style="font-variant-numeric:tabular-nums">97,866µs</text>
+<text x="336.0" y="284.0" font-size="12" fill="#7f7e77" font-weight="400" text-anchor="middle">clickhouse</text>
+</svg>

@@ -1,0 +1,67 @@
+# `cargo deny check` runs in CI. Four questions, and the answers are deliberately strict
+# because the engine has almost no dependencies: a tree this small can afford to be.
+
+[advisories]
+yanked = "deny"
+ignore = [
+    # bincode 1.3.3 is unmaintained by decision, not by neglect: the team stopped after a
+    # harassment incident and considers 1.3.3 finished. There is no upgrade to move to, and the
+    # crate reaches us only through `heed`, which the benchmark crate pulls in to measure a rival
+    # engine - it is not in anything the engine ships. Revisit if heed drops bincode or if a real
+    # vulnerability lands against it.
+    { id = "RUSTSEC-2025-0141", reason = "unmaintained, no upgrade exists; reached only via heed in the never-published bench crate" },
+]
+
+[licenses]
+# Apache-2.0 is what this repository publishes under; the rest are what a permissive
+# dependency of it is allowed to be. Anything copyleft is a decision, not a default, so it
+# fails here and gets discussed.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    # Both arrived with the benchmark's rival engines and both are permissive - 0BSD is BSD with
+    # the attribution clause removed, and the Boost licence drops attribution for binaries. The
+    # policy above is about copyleft, and neither of these is; they are listed rather than
+    # excepted because that is what "allowed to be permissive" means.
+    "0BSD",
+    "BSL-1.0",
+    # The same again, for the analytical peers, and reachable only with their features enabled.
+    # `bzip2-1.0.6` is a BSD-style licence on the bzip2 sources, and comes in under DataFusion
+    # through `async-compression`. `CC0-1.0` is a public-domain dedication - the FSF classes it
+    # as free - and comes in under DuckDB through `ahash`'s `const-random`. Neither is copyleft,
+    # so neither is a decision the policy above wanted flagged; both are listed for the same
+    # reason the two lines before them are.
+    "bzip2-1.0.6",
+    "CC0-1.0",
+    # `CDLA-Permissive-2.0` covers the Mozilla CA bundle in `webpki-roots`, which reaches the
+    # graph through `libduckdb-sys`'s *build script* - it fetches the DuckDB sources over TLS.
+    # Nothing links it: with `resolver = "2"` a build dependency does not unify features with a
+    # normal one, so the benchmark's own `ureq` stays TLS-free and the binary has no TLS in it.
+    # It is allowed anyway, because a build script that downloads code is exactly the thing a
+    # supply-chain policy should be looking at rather than excluding from the question.
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.9
+
+[bans]
+# Two versions of the same crate means two copies of its bugs and two things to audit.
+#
+# With the analytical benchmark's features enabled there are two whole Arrow trees - DuckDB
+# brings 58.4.0 and DataFusion brings 59.2.0 - which is the largest instance of this in the
+# repository and the reason the `olap` binary is as big as it is. It stays a warning rather than
+# an error because neither engine can be made to move: each vendors the Arrow it was built and
+# tested against, and pinning them together would mean building a rival engine differently from
+# how its own users build it, which is the one thing this benchmark must not do.
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

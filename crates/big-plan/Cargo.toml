@@ -1,0 +1,16 @@
+[package]
+name = "big-plan"
+description = "Query language and planner for big: parse, resolve against a schema, type check"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "readme.md"
+
+# No big dependencies on purpose. A planner that has to link a memory-mapped file to run its
+# tests is a planner nobody tests.
+[dependencies]
+
+[dev-dependencies]
+proptest = "1"

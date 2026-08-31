@@ -1,0 +1,351 @@
+    Finished `bench` profile [optimized + debuginfo] target(s) in 1.43s
+     Running unittests src/lib.rs (target/release/deps/big_bench-9f3cd83d50b1f0b1)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/profile_commit.rs (target/release/deps/profile_commit-3cb0a922b8e17cf5)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/profile_get.rs (target/release/deps/profile_get-51e2ca13ec34f158)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/report.rs (target/release/deps/report-e205f162ba1765ba)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running benches/compare.rs (target/release/deps/compare-4653cb6f498ea5d2)
+Benchmarking ingest/big/full/100
+Benchmarking ingest/big/full/100: Warming up for 3.0000 s
+
+Warning: Unable to complete 10 samples in 10.0s. You may wish to increase target time to 16.3s or enable flat sampling.
+Benchmarking ingest/big/full/100: Collecting 10 samples in estimated 16.325 s (55 iterations)
+Benchmarking ingest/big/full/100: Analyzing
+ingest/big/full/100     time:   [140.15 ms 153.15 ms 165.49 ms]
+                        change: [−44.453% −29.751% −7.1332%] (p = 0.03 < 0.05)
+                        Performance has improved.
+Benchmarking ingest/redb/full/100
+Benchmarking ingest/redb/full/100: Warming up for 3.0000 s
+
+Warning: Unable to complete 10 samples in 10.0s. You may wish to increase target time to 12.4s or enable flat sampling.
+Benchmarking ingest/redb/full/100: Collecting 10 samples in estimated 12.393 s (55 iterations)
+Benchmarking ingest/redb/full/100: Analyzing
+ingest/redb/full/100    time:   [186.74 ms 227.44 ms 277.77 ms]
+                        change: [−26.304% −10.457% +7.2558%] (p = 0.28 > 0.05)
+                        No change in performance detected.
+Found 2 outliers among 10 measurements (20.00%)
+  1 (10.00%) high mild
+  1 (10.00%) high severe
+Benchmarking ingest/redb/relaxed/100
+Benchmarking ingest/redb/relaxed/100: Warming up for 3.0000 s
+
+Warning: Unable to complete 10 samples in 10.0s. You may wish to increase target time to 15.7s or enable flat sampling.
+Benchmarking ingest/redb/relaxed/100: Collecting 10 samples in estimated 15.666 s (55 iterations)
+Benchmarking ingest/redb/relaxed/100: Analyzing
+ingest/redb/relaxed/100 time:   [164.49 ms 191.05 ms 237.82 ms]
+                        change: [−31.164% −18.323% −1.3428%] (p = 0.05 > 0.05)
+                        No change in performance detected.
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high mild
+Benchmarking ingest/big/full/1000
+Benchmarking ingest/big/full/1000: Warming up for 3.0000 s
+Benchmarking ingest/big/full/1000: Collecting 10 samples in estimated 10.754 s (165 iterations)
+Benchmarking ingest/big/full/1000: Analyzing
+ingest/big/full/1000    time:   [20.605 ms 24.114 ms 26.530 ms]
+                        change: [−32.267% −16.288% +2.9613%] (p = 0.13 > 0.05)
+                        No change in performance detected.
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high mild
+Benchmarking ingest/redb/full/1000
+Benchmarking ingest/redb/full/1000: Warming up for 3.0000 s
+Benchmarking ingest/redb/full/1000: Collecting 10 samples in estimated 10.557 s (110 iterations)
+Benchmarking ingest/redb/full/1000: Analyzing
+ingest/redb/full/1000   time:   [70.026 ms 76.069 ms 82.073 ms]
+                        change: [−33.559% −21.017% −7.6750%] (p = 0.01 < 0.05)
+                        Performance has improved.
+Benchmarking ingest/redb/relaxed/1000
+Benchmarking ingest/redb/relaxed/1000: Warming up for 3.0000 s
+Benchmarking ingest/redb/relaxed/1000: Collecting 10 samples in estimated 12.770 s (110 iterations)
+Benchmarking ingest/redb/relaxed/1000: Analyzing
+ingest/redb/relaxed/1000
+                        time:   [72.528 ms 82.651 ms 105.14 ms]
+                        change: [−12.772% +3.4955% +25.407%] (p = 0.76 > 0.05)
+                        No change in performance detected.
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high severe
+
+Benchmarking count_ge/big/20000
+Benchmarking count_ge/big/20000: Warming up for 3.0000 s
+Benchmarking count_ge/big/20000: Collecting 100 samples in estimated 6.6562 s (10k iterations)
+Benchmarking count_ge/big/20000: Analyzing
+count_ge/big/20000      time:   [635.27 µs 653.97 µs 674.88 µs]
+                        change: [−0.0529% +3.7188% +7.9574%] (p = 0.06 > 0.05)
+                        No change in performance detected.
+Benchmarking count_ge/redb/20000
+Benchmarking count_ge/redb/20000: Warming up for 3.0000 s
+Benchmarking count_ge/redb/20000: Collecting 100 samples in estimated 6.0651 s (10k iterations)
+Benchmarking count_ge/redb/20000: Analyzing
+count_ge/redb/20000     time:   [574.74 µs 581.14 µs 587.83 µs]
+                        change: [+1.0926% +2.8664% +4.6101%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+Found 1 outliers among 100 measurements (1.00%)
+  1 (1.00%) high mild
+Benchmarking count_ge/lmdb/20000
+Benchmarking count_ge/lmdb/20000: Warming up for 3.0000 s
+Benchmarking count_ge/lmdb/20000: Collecting 100 samples in estimated 5.5845 s (35k iterations)
+Benchmarking count_ge/lmdb/20000: Analyzing
+count_ge/lmdb/20000     time:   [162.41 µs 165.98 µs 169.67 µs]
+                        change: [−5.1640% −1.8954% +1.2700%] (p = 0.25 > 0.05)
+                        No change in performance detected.
+Found 1 outliers among 100 measurements (1.00%)
+  1 (1.00%) high mild
+Benchmarking count_ge/fjall/20000
+Benchmarking count_ge/fjall/20000: Warming up for 3.0000 s
+Benchmarking count_ge/fjall/20000: Collecting 100 samples in estimated 9.1523 s (10k iterations)
+Benchmarking count_ge/fjall/20000: Analyzing
+count_ge/fjall/20000    time:   [1.0567 ms 1.0748 ms 1.0918 ms]
+                        change: [+2.4358% +4.9156% +7.4347%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+Benchmarking count_ge/sqlite/20000
+Benchmarking count_ge/sqlite/20000: Warming up for 3.0000 s
+Benchmarking count_ge/sqlite/20000: Collecting 100 samples in estimated 5.3429 s (25k iterations)
+Benchmarking count_ge/sqlite/20000: Analyzing
+count_ge/sqlite/20000   time:   [224.33 µs 233.22 µs 241.78 µs]
+                        change: [+6.8199% +14.327% +22.382%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+Benchmarking count_ge/big/100000
+Benchmarking count_ge/big/100000: Warming up for 3.0000 s
+
+Warning: Unable to complete 100 samples in 5.0s. You may wish to increase target time to 8.3s, enable flat sampling, or reduce sample count to 50.
+Benchmarking count_ge/big/100000: Collecting 100 samples in estimated 8.3138 s (5050 iterations)
+Benchmarking count_ge/big/100000: Analyzing
+count_ge/big/100000     time:   [1.4719 ms 1.5291 ms 1.5918 ms]
+                        change: [+0.3585% +6.1084% +12.042%] (p = 0.04 < 0.05)
+                        Change within noise threshold.
+Benchmarking count_ge/redb/100000
+Benchmarking count_ge/redb/100000: Warming up for 3.0000 s
+Benchmarking count_ge/redb/100000: Collecting 100 samples in estimated 5.1456 s (1800 iterations)
+Benchmarking count_ge/redb/100000: Analyzing
+count_ge/redb/100000    time:   [2.7640 ms 2.7983 ms 2.8331 ms]
+                        change: [−3.6791% −2.1578% −0.5146%] (p = 0.01 < 0.05)
+                        Change within noise threshold.
+Benchmarking count_ge/lmdb/100000
+Benchmarking count_ge/lmdb/100000: Warming up for 3.0000 s
+Benchmarking count_ge/lmdb/100000: Collecting 100 samples in estimated 7.8017 s (10k iterations)
+Benchmarking count_ge/lmdb/100000: Analyzing
+count_ge/lmdb/100000    time:   [769.31 µs 792.74 µs 814.25 µs]
+                        change: [−6.3950% −3.3585% −0.2793%] (p = 0.03 < 0.05)
+                        Change within noise threshold.
+Found 2 outliers among 100 measurements (2.00%)
+  1 (1.00%) low severe
+  1 (1.00%) low mild
+Benchmarking count_ge/fjall/100000
+Benchmarking count_ge/fjall/100000: Warming up for 3.0000 s
+Benchmarking count_ge/fjall/100000: Collecting 100 samples in estimated 5.2558 s (900 iterations)
+Benchmarking count_ge/fjall/100000: Analyzing
+count_ge/fjall/100000   time:   [5.3312 ms 5.4452 ms 5.5563 ms]
+                        change: [−7.1085% −4.5596% −2.1207%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 1 outliers among 100 measurements (1.00%)
+  1 (1.00%) low mild
+Benchmarking count_ge/sqlite/100000
+Benchmarking count_ge/sqlite/100000: Warming up for 3.0000 s
+Benchmarking count_ge/sqlite/100000: Collecting 100 samples in estimated 9.3553 s (10k iterations)
+Benchmarking count_ge/sqlite/100000: Analyzing
+count_ge/sqlite/100000  time:   [841.22 µs 892.86 µs 945.21 µs]
+                        change: [−10.562% −4.6315% +1.5628%] (p = 0.16 > 0.05)
+                        No change in performance detected.
+Benchmarking count_ge/big/400000
+Benchmarking count_ge/big/400000: Warming up for 3.0000 s
+Benchmarking count_ge/big/400000: Collecting 100 samples in estimated 5.0948 s (800 iterations)
+Benchmarking count_ge/big/400000: Analyzing
+count_ge/big/400000     time:   [6.7453 ms 7.0216 ms 7.3016 ms]
+                        change: [+1.8800% +7.3325% +12.984%] (p = 0.01 < 0.05)
+                        Performance has regressed.
+Benchmarking count_ge/redb/400000
+Benchmarking count_ge/redb/400000: Warming up for 3.0000 s
+Benchmarking count_ge/redb/400000: Collecting 100 samples in estimated 5.7621 s (500 iterations)
+Benchmarking count_ge/redb/400000: Analyzing
+count_ge/redb/400000    time:   [11.199 ms 11.326 ms 11.454 ms]
+                        change: [−4.4002% −2.8974% −1.3363%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 3 outliers among 100 measurements (3.00%)
+  1 (1.00%) low mild
+  2 (2.00%) high mild
+Benchmarking count_ge/lmdb/400000
+Benchmarking count_ge/lmdb/400000: Warming up for 3.0000 s
+Benchmarking count_ge/lmdb/400000: Collecting 100 samples in estimated 5.1249 s (1200 iterations)
+Benchmarking count_ge/lmdb/400000: Analyzing
+count_ge/lmdb/400000    time:   [4.0873 ms 4.1761 ms 4.2607 ms]
+                        change: [−2.5370% +0.2180% +3.1392%] (p = 0.88 > 0.05)
+                        No change in performance detected.
+Found 2 outliers among 100 measurements (2.00%)
+  2 (2.00%) low mild
+Benchmarking count_ge/fjall/400000
+Benchmarking count_ge/fjall/400000: Warming up for 3.0000 s
+Benchmarking count_ge/fjall/400000: Collecting 100 samples in estimated 7.1923 s (300 iterations)
+Benchmarking count_ge/fjall/400000: Analyzing
+count_ge/fjall/400000   time:   [20.041 ms 20.384 ms 20.740 ms]
+                        change: [−9.0435% −6.5715% −4.1653%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 1 outliers among 100 measurements (1.00%)
+  1 (1.00%) high mild
+Benchmarking count_ge/sqlite/400000
+Benchmarking count_ge/sqlite/400000: Warming up for 3.0000 s
+Benchmarking count_ge/sqlite/400000: Collecting 100 samples in estimated 5.2036 s (1200 iterations)
+Benchmarking count_ge/sqlite/400000: Analyzing
+count_ge/sqlite/400000  time:   [3.2613 ms 3.2715 ms 3.2822 ms]
+                        change: [−29.696% −27.234% −24.560%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 5 outliers among 100 measurements (5.00%)
+  5 (5.00%) high mild
+Benchmarking count_ge/big/1000000
+Benchmarking count_ge/big/1000000: Warming up for 3.0000 s
+Benchmarking count_ge/big/1000000: Collecting 100 samples in estimated 5.9134 s (400 iterations)
+Benchmarking count_ge/big/1000000: Analyzing
+count_ge/big/1000000    time:   [14.814 ms 15.358 ms 15.939 ms]
+                        change: [−7.1564% −2.2973% +2.7371%] (p = 0.37 > 0.05)
+                        No change in performance detected.
+Found 15 outliers among 100 measurements (15.00%)
+  15 (15.00%) high mild
+Benchmarking count_ge/redb/1000000
+Benchmarking count_ge/redb/1000000: Warming up for 3.0000 s
+Benchmarking count_ge/redb/1000000: Collecting 100 samples in estimated 5.7298 s (200 iterations)
+Benchmarking count_ge/redb/1000000: Analyzing
+count_ge/redb/1000000   time:   [27.160 ms 27.454 ms 27.749 ms]
+                        change: [−10.093% −8.2496% −6.4304%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 1 outliers among 100 measurements (1.00%)
+  1 (1.00%) high mild
+Benchmarking count_ge/lmdb/1000000
+Benchmarking count_ge/lmdb/1000000: Warming up for 3.0000 s
+Benchmarking count_ge/lmdb/1000000: Collecting 100 samples in estimated 5.3588 s (500 iterations)
+Benchmarking count_ge/lmdb/1000000: Analyzing
+count_ge/lmdb/1000000   time:   [11.431 ms 11.654 ms 11.868 ms]
+                        change: [−11.102% −8.6871% −6.4364%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 5 outliers among 100 measurements (5.00%)
+  5 (5.00%) low mild
+Benchmarking count_ge/fjall/1000000
+Benchmarking count_ge/fjall/1000000: Warming up for 3.0000 s
+
+Warning: Unable to complete 100 samples in 5.0s. You may wish to increase target time to 6.3s, or reduce sample count to 70.
+Benchmarking count_ge/fjall/1000000: Collecting 100 samples in estimated 6.3203 s (100 iterations)
+Benchmarking count_ge/fjall/1000000: Analyzing
+count_ge/fjall/1000000  time:   [52.007 ms 52.880 ms 53.760 ms]
+                        change: [−2.6964% −0.3422% +1.9948%] (p = 0.77 > 0.05)
+                        No change in performance detected.
+Found 6 outliers among 100 measurements (6.00%)
+  2 (2.00%) low mild
+  4 (4.00%) high mild
+Benchmarking count_ge/sqlite/1000000
+Benchmarking count_ge/sqlite/1000000: Warming up for 3.0000 s
+Benchmarking count_ge/sqlite/1000000: Collecting 100 samples in estimated 5.4199 s (400 iterations)
+Benchmarking count_ge/sqlite/1000000: Analyzing
+count_ge/sqlite/1000000 time:   [13.310 ms 13.739 ms 14.177 ms]
+                        change: [+9.8165% +14.501% +19.148%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+Benchmarking count_ge/big/2000000
+Benchmarking count_ge/big/2000000: Warming up for 3.0000 s
+Benchmarking count_ge/big/2000000: Collecting 100 samples in estimated 7.4324 s (200 iterations)
+Benchmarking count_ge/big/2000000: Analyzing
+count_ge/big/2000000    time:   [34.919 ms 36.084 ms 37.262 ms]
+                        change: [+6.1443% +11.274% +16.483%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+Benchmarking count_ge/redb/2000000
+Benchmarking count_ge/redb/2000000: Warming up for 3.0000 s
+
+Warning: Unable to complete 100 samples in 5.0s. You may wish to increase target time to 5.8s, or reduce sample count to 80.
+Benchmarking count_ge/redb/2000000: Collecting 100 samples in estimated 5.7669 s (100 iterations)
+Benchmarking count_ge/redb/2000000: Analyzing
+count_ge/redb/2000000   time:   [57.662 ms 58.198 ms 58.721 ms]
+                        change: [−2.3963% −1.2057% +0.0409%] (p = 0.06 > 0.05)
+                        No change in performance detected.
+Found 6 outliers among 100 measurements (6.00%)
+  1 (1.00%) low severe
+  3 (3.00%) low mild
+  2 (2.00%) high mild
+Benchmarking count_ge/lmdb/2000000
+Benchmarking count_ge/lmdb/2000000: Warming up for 3.0000 s
+Benchmarking count_ge/lmdb/2000000: Collecting 100 samples in estimated 6.9179 s (300 iterations)
+Benchmarking count_ge/lmdb/2000000: Analyzing
+count_ge/lmdb/2000000   time:   [23.056 ms 23.357 ms 23.647 ms]
+                        change: [+12.300% +13.706% +15.218%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+Found 3 outliers among 100 measurements (3.00%)
+  2 (2.00%) low mild
+  1 (1.00%) high mild
+Benchmarking count_ge/fjall/2000000
+Benchmarking count_ge/fjall/2000000: Warming up for 3.0000 s
+
+Warning: Unable to complete 100 samples in 5.0s. You may wish to increase target time to 20.4s, or reduce sample count to 20.
+Benchmarking count_ge/fjall/2000000: Collecting 100 samples in estimated 20.350 s (100 iterations)
+Benchmarking count_ge/fjall/2000000: Analyzing
+count_ge/fjall/2000000  time:   [128.98 ms 132.09 ms 135.07 ms]
+                        change: [−10.474% −7.9415% −5.1344%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 3 outliers among 100 measurements (3.00%)
+  3 (3.00%) low mild
+Benchmarking count_ge/sqlite/2000000
+Benchmarking count_ge/sqlite/2000000: Warming up for 3.0000 s
+Benchmarking count_ge/sqlite/2000000: Collecting 100 samples in estimated 6.1657 s (200 iterations)
+Benchmarking count_ge/sqlite/2000000: Analyzing
+count_ge/sqlite/2000000 time:   [25.078 ms 25.782 ms 26.548 ms]
+                        change: [−10.040% −5.2899% −0.3528%] (p = 0.04 < 0.05)
+                        Change within noise threshold.
+Found 19 outliers among 100 measurements (19.00%)
+  7 (7.00%) high mild
+  12 (12.00%) high severe
+
+Benchmarking get/big
+Benchmarking get/big: Warming up for 3.0000 s
+Benchmarking get/big: Collecting 100 samples in estimated 5.0120 s (960k iterations)
+Benchmarking get/big: Analyzing
+get/big                 time:   [4.9307 µs 5.0236 µs 5.1128 µs]
+                        change: [−67.894% −67.092% −66.265%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 7 outliers among 100 measurements (7.00%)
+  6 (6.00%) low mild
+  1 (1.00%) high mild
+Benchmarking get/redb
+Benchmarking get/redb: Warming up for 3.0000 s
+Benchmarking get/redb: Collecting 100 samples in estimated 5.0056 s (3.4M iterations)
+Benchmarking get/redb: Analyzing
+get/redb                time:   [1.3156 µs 1.3529 µs 1.3918 µs]
+                        change: [−0.4794% +1.7937% +4.0487%] (p = 0.11 > 0.05)
+                        No change in performance detected.
+Found 4 outliers among 100 measurements (4.00%)
+  4 (4.00%) low mild
+Benchmarking get/lmdb
+Benchmarking get/lmdb: Warming up for 3.0000 s
+Benchmarking get/lmdb: Collecting 100 samples in estimated 5.0019 s (6.9M iterations)
+Benchmarking get/lmdb: Analyzing
+get/lmdb                time:   [650.33 ns 675.57 ns 698.82 ns]
+                        change: [−15.700% −11.763% −7.4533%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Benchmarking get/fjall
+Benchmarking get/fjall: Warming up for 3.0000 s
+Benchmarking get/fjall: Collecting 100 samples in estimated 5.0006 s (7.6M iterations)
+Benchmarking get/fjall: Analyzing
+get/fjall               time:   [585.73 ns 607.27 ns 628.79 ns]
+                        change: [−9.8535% −6.9086% −3.8857%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 5 outliers among 100 measurements (5.00%)
+  5 (5.00%) low mild
+Benchmarking get/sqlite
+Benchmarking get/sqlite: Warming up for 3.0000 s
+Benchmarking get/sqlite: Collecting 100 samples in estimated 5.0302 s (712k iterations)
+Benchmarking get/sqlite: Analyzing
+get/sqlite              time:   [5.8340 µs 6.0837 µs 6.3618 µs]
+                        change: [−18.545% −15.359% −12.265%] (p = 0.00 < 0.05)
+                        Performance has improved.
+

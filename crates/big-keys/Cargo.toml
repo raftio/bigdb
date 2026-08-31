@@ -1,0 +1,15 @@
+[package]
+name = "big-keys"
+description = "Row key translation for big"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "readme.md"
+
+[dependencies]
+big-page = { path = "../big-page", version = "0.1.0" }
+
+[dev-dependencies]
+proptest = "1"

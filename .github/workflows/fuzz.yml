@@ -1,0 +1,86 @@
+# A fuzz target that nothing builds is a fuzz target that rots. The one that existed before
+# this file was never compiled by CI, so nothing would have noticed it failing to build against
+# an API that had moved underneath it.
+#
+# Two jobs, because they answer different questions. `build` runs on every push and only asks
+# whether the targets still compile - seconds, and it is what stops the rot. `run` is on a
+# schedule and actually fuzzes, because a minute per target on every push finds nothing and an
+# hour per target on every push is not a thing anyone will keep.
+name: fuzz
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  schedule:
+    # Weekly. Corpus is committed, so each run starts from where the last one got to.
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - run: cargo install cargo-fuzz --locked
+      - run: cargo fuzz build
+        working-directory: fuzz
+      # A seed that no longer parses as the thing it was written to be is a seed that stopped
+      # testing anything. One run over the seeds alone is cheap and catches that.
+      - run: |
+          for t in parse_pql parse_page; do
+            cargo fuzz run "$t" "seeds/$t" -- -runs=0
+          done
+        working-directory: fuzz
+
+  run:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    strategy:
+      # Every target runs even when one of them finds something. A crash in the parser should
+      # not hide a crash in the b-tree for another week.
+      fail-fast: false
+      matrix:
+        target: [parse_page, parse_pql, container_ops, btree_program]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - run: cargo install cargo-fuzz --locked
+      # `seeds/` is passed as a second, read-only corpus so a scheduled run always starts from
+      # the hand-written shapes even though the generated corpus is not committed.
+      #
+      # Only two targets have seeds, and the `if` is why rather than an oversight: `parse_page`
+      # and `parse_pql` take bytes and text, so a seed is a page or a query and stays readable.
+      # `container_ops` and `btree_program` take `Arbitrary`-derived structs, where a seed is
+      # whatever byte string that derive currently decodes into the shape you wanted - which
+      # silently becomes a different shape the next time a field is added. A seed that quietly
+      # stops meaning what it says is worse than no seed.
+      #
+      # libFuzzer does not skip a missing directory, it exits 1, so this is a real guard.
+      - run: |
+          # The corpus is gitignored, so on a fresh checkout it does not exist - and libFuzzer
+          # refuses a corpus path that is missing rather than creating it.
+          mkdir -p "corpus/${{ matrix.target }}"
+          extra=""
+          if [ -d "seeds/${{ matrix.target }}" ]; then extra="seeds/${{ matrix.target }}"; fi
+          cargo fuzz run ${{ matrix.target }} \
+            "corpus/${{ matrix.target }}" $extra \
+            -- -max_total_time=300
+        working-directory: fuzz
+      # The input, not the whole corpus: it is what someone has to reproduce with, and it is
+      # small enough to look at.
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/

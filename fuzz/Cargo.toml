@@ -1,0 +1,71 @@
+# One fuzz crate for the whole workspace rather than one per crate under test.
+#
+# Excluded from the workspace on purpose: cargo-fuzz needs nightly, the engine itself is stable.
+# The `[workspace]` table below is not redundant with that exclusion - without it, cargo run from
+# inside this directory walks up, finds the root manifest, and refuses.
+#
+#   cargo +nightly fuzz run parse_page
+#   cargo +nightly fuzz run parse_pql
+#   cargo +nightly fuzz run container_ops
+#   cargo +nightly fuzz run btree_program
+[workspace]
+
+[package]
+name = "big-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+big-btree = { path = "../crates/big-btree" }
+big-column = { path = "../crates/big-column" }
+big-container = { path = "../crates/big-container" }
+big-page = { path = "../crates/big-page" }
+big-pager = { path = "../crates/big-pager" }
+big-plan = { path = "../crates/big-plan" }
+
+# A fuzzer that spends its time in debug assertions finds fewer inputs per hour, but the
+# assertions are a large part of what these targets are checking.
+[profile.release]
+debug = 1
+debug-assertions = true
+overflow-checks = true
+
+[[bin]]
+name = "parse_page"
+path = "fuzz_targets/parse_page.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "parse_block"
+path = "fuzz_targets/parse_block.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_pql"
+path = "fuzz_targets/parse_pql.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "container_ops"
+path = "fuzz_targets/container_ops.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "btree_program"
+path = "fuzz_targets/btree_program.rs"
+test = false
+doc = false
+bench = false

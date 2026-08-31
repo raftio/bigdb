@@ -1,0 +1,1 @@
+GroupBy(All(), field=country, aggregate=Sum)

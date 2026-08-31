@@ -1,0 +1,16 @@
+[package]
+name = "big-container"
+description = "Roaring container representations (array/bitmap/run) for big"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "readme.md"
+
+[dependencies]
+bytemuck = "1"
+
+[dev-dependencies]
+proptest = "1"
+croaring = "2.3"

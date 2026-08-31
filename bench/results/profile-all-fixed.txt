@@ -1,0 +1,11 @@
+Every column is microseconds, median of 3.
+
+  records        all()  matching(>=0)   count_all()     group/all()    group/pred     TopN(All())
+    50000           50           1439            35             457           839             641
+   100000           41           3461            52             840          1785            1041
+   200000           39           4854            48            1691          4355            1889
+   400000           49          14026            42            3866          5519            3186
+
+`all()` and `matching(>=0)` return the same set by different means - one reads the stored exists row, the other computes it from 20 bit planes.
+`group/all()` and `group/pred` are the same call over those two bitmaps, with the bitmap built outside the timed region.
+If `all()` dominates, the report's suspect is confirmed. If the two `group/` columns differ instead, it is not.

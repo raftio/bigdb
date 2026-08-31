@@ -1,0 +1,11 @@
+# The tree was written before this file existed, and `cargo fmt` disagreed with it in 598 places.
+# Almost three quarters of those were rustfmt's small-construct heuristics, not the code: the
+# house style keeps a short struct literal, a short `assert_eq!` and a short `if` on one line and
+# lets the line run to 100 columns. Saying so here turns 598 disagreements into 163, and those
+# 163 were genuine drift - imports out of order, wrapping done by hand - so they were reformatted
+# once rather than encoded as more style.
+#
+# `use_small_heuristics = "Max"` is what expresses that: every width heuristic (fn calls, struct
+# literals, arrays, chains) rises to `max_width` instead of sitting at a fraction of it.
+max_width = 100
+use_small_heuristics = "Max"

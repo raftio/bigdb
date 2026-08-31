@@ -1,0 +1,192 @@
+// Copyright 2026 Bany
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Declaring and dropping, which are ordinary transactions.
+//!
+//! Every one of these opens a write, changes the catalog and commits, so a schema change is
+//! atomic against the data it describes for the same reason a fact is: there is one commit
+//! point and it is the meta page flip. Nothing here is a separate DDL path, and that is why a
+//! dropped field's fragments go out in the same transaction that forgets its name.
+
+use super::*;
+
+impl<P: PagerMut> Db<P> {
+    /// Schema changes are ordinary transactions; there is no separate DDL path.
+    ///
+    /// Takes the default engine. See [`Db::create_table_with`] to choose one, and
+    /// [`TableEngine`] for what the choice costs.
+    pub fn create_table(&self, name: &str) -> Result<TableId> {
+        self.create_table_with(name, TableEngine::default())
+    }
+
+    /// The same, with the storage engine named.
+    ///
+    /// Fixed at creation and never changed afterwards: switching would mean rewriting every
+    /// fragment and every segment the table owns, which is a migration and not a setting. A
+    /// second call naming a different engine is refused rather than ignored.
+    pub fn create_table_with(&self, name: &str, engine: TableEngine) -> Result<TableId> {
+        let mut w = self.write();
+        let id = w.catalog.intern_table_with(name, engine)?;
+        w.commit()?;
+        Ok(id)
+    }
+
+    /// A decimal field: stored as an integer, read back as a value with `scale` digits after
+    /// the point.
+    ///
+    /// Nothing in storage knows about the point. The scale lives in the catalog so the query
+    /// layer can turn `price > 5.25` into the integer comparison that means the same thing.
+    pub fn create_decimal(
+        &self,
+        table: &str,
+        name: &str,
+        bit_depth: u32,
+        scale: i8,
+    ) -> Result<FieldId> {
+        self.declare(table, name, FieldKind::Decimal, bit_depth, scale, Vec::new())
+    }
+
+    /// A signed integer field.
+    ///
+    /// `bit_depth` counts the **whole** width including the sign, so a depth of 8 holds
+    /// `-128..=127`. Zero means the full 64 bits.
+    ///
+    /// Worth knowing before choosing a depth: a signed field always uses every plane it
+    /// declared, because the top one is the sign bit and every non-negative value sets it. An
+    /// unsigned field of the same declared depth only pays for the planes its data reaches.
+    pub fn create_signed(&self, table: &str, name: &str, bit_depth: u32) -> Result<FieldId> {
+        self.declare(table, name, FieldKind::SignedInt, bit_depth, 0, Vec::new())
+    }
+
+    /// A time quantum field: a keyed field that also writes into one view per granularity.
+    pub fn create_time_quantum(
+        &self,
+        table: &str,
+        name: &str,
+        granularity: Vec<Granularity>,
+    ) -> Result<FieldId> {
+        self.declare(table, name, FieldKind::TimeQuantum, 0, 0, granularity)
+    }
+
+    pub fn create_field(
+        &self,
+        table: &str,
+        name: &str,
+        kind: FieldKind,
+        bit_depth: u32,
+    ) -> Result<FieldId> {
+        self.declare(table, name, kind, bit_depth, 0, Vec::new())
+    }
+
+    fn declare(
+        &self,
+        table: &str,
+        name: &str,
+        kind: FieldKind,
+        bit_depth: u32,
+        scale: i8,
+        granularity: Vec<Granularity>,
+    ) -> Result<FieldId> {
+        let mut w = self.write();
+        let table_id = w
+            .catalog
+            .table(table)
+            .map(|t| t.id)
+            .ok_or_else(|| DbError::UnknownTable(table.to_string()))?;
+        let id = w.catalog.add_field(FieldDef {
+            id: 0,
+            table: table_id,
+            name: name.to_string(),
+            kind,
+            bit_depth,
+            scale,
+            granularity,
+        })?;
+        w.commit()?;
+        Ok(id)
+    }
+
+    /// Removes a table, everything in it, and the pages holding it.
+    ///
+    /// `Ok(false)` means there was no such table. Schema and data go in one transaction, so
+    /// there is no window where the table is gone but its fragments are still reachable.
+    pub fn drop_table(&self, name: &str) -> Result<bool> {
+        let mut w = self.write();
+        let Some(keys) = w.catalog.drop_table(name) else { return Ok(false) };
+        w.discard(&keys)?;
+        w.commit()?;
+        Ok(true)
+    }
+
+    /// Removes one field of a table, its row keys, and the pages holding it.
+    /// Drops every per-day view of a time quantum field older than `unix_seconds`, and returns
+    /// how many fragments went.
+    ///
+    /// **Retention, which is the thing a time quantum field was missing.** A field with a day
+    /// granularity writes a copy of each fact into the view for its day, and nothing ever
+    /// removed one - so a table that has been ingesting for two years holds two years of day
+    /// views whether or not anybody will ask about the first one. This is how they go.
+    ///
+    /// The day `unix_seconds` falls in is **kept**: an operator saying "keep thirty days" means
+    /// thirty, and a boundary that quietly took one more would be off by a day in the direction
+    /// nobody checks.
+    ///
+    /// The standard view is untouched, so questions that carry no time still see every record.
+    /// That is the honest shape of this operation and worth stating: it drops the *index by
+    /// day*, not the records. A query with a `BETWEEN` stops finding them; a `count(*)` does
+    /// not change. Deleting records is [`crate::db::DbWrite::delete_records`].
+    pub fn drop_days_before(&self, table: &str, field: &str, unix_seconds: i64) -> Result<usize> {
+        let cutoff = big_field::day_view(unix_seconds);
+        let mut w = self.write();
+        let table_id = w
+            .catalog
+            .table(table)
+            .map(|t| t.id)
+            .ok_or_else(|| DbError::UnknownTable(table.to_string()))?;
+        let def = w.catalog.field(table_id, field).ok_or_else(|| DbError::UnknownField {
+            table: table.to_string(),
+            field: field.to_string(),
+        })?;
+        // Refused rather than answering zero. Against a plain set field there are no day views
+        // at all, so "nothing was dropped" and "this field never had days to drop" would be the
+        // same answer - and they call for opposite actions. The same collapse is what
+        // `Rows::KeyBetween` used to make.
+        if def.kind != FieldKind::TimeQuantum {
+            return Err(DbError::WrongFieldKind {
+                field: field.to_string(),
+                expected: "time quantum",
+            });
+        }
+        let field_id = def.id;
+
+        let keys = w.catalog.drop_days_before(table_id, field_id, &cutoff);
+        let dropped = keys.len();
+        w.discard(&keys)?;
+        w.commit()?;
+        Ok(dropped)
+    }
+
+    pub fn drop_field(&self, table: &str, field: &str) -> Result<bool> {
+        let mut w = self.write();
+        let table_id = w
+            .catalog
+            .table(table)
+            .map(|t| t.id)
+            .ok_or_else(|| DbError::UnknownTable(table.to_string()))?;
+        let Some(keys) = w.catalog.drop_field(table_id, field) else { return Ok(false) };
+        w.discard(&keys)?;
+        w.commit()?;
+        Ok(true)
+    }
+}

@@ -1,0 +1,1 @@
+Intersect(Row(country="GB"), Row(amount >= -5))

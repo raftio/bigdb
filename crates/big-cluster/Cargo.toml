@@ -1,0 +1,27 @@
+[package]
+name = "big-cluster"
+description = "Static shard ownership, the fan-out over it, and the wire it travels on"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "readme.md"
+
+# Above `big-api` and below `big-http`, which is the whole reason this is its own crate: the
+# merge has to be written somewhere that has never heard of a socket handler and somewhere
+# `big-db` has never heard of. Neither of those places existed.
+[dependencies]
+big-api = { path = "../big-api", version = "0.1.0" }
+big-container = { path = "../big-container", version = "0.1.0" }
+big-db = { path = "../big-db", version = "0.1.0" }
+big-exec = { path = "../big-exec", version = "0.1.0" }
+big-fragment = { path = "../big-fragment", version = "0.1.0" }
+big-pager = { path = "../big-pager", version = "0.1.0" }
+big-plan = { path = "../big-plan", version = "0.1.0" }
+bytemuck = "1"
+
+[dev-dependencies]
+proptest = "1"
+# The agreement writes its state to a file, and a test of that needs somewhere to put one.
+tempfile = "3"

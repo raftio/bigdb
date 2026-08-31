@@ -1,0 +1,1463 @@
+// Copyright 2026 Bany
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Two nodes, two loopback ports, and nothing mocked.
+//!
+//! Every request here goes out over TCP, is planned on one machine, executed on two and merged
+//! back. The point of doing it this way rather than against a `Cluster` in one process is that
+//! the encoding, the fan-out, the row-key agreement and the merge are each capable of being
+//! individually right and collectively wrong, and only a real socket exercises all four.
+//!
+//! Records below `SHARD_WIDTH` belong to `a` and everything above to `b`, so a batch that
+//! crosses that line is a batch that crosses machines.
+
+use big_api::Api;
+use big_cluster::controller::Leases;
+use big_cluster::raft::{Forgetful, Timing};
+use big_cluster::{Cluster, ClusterFile};
+use big_http::{Server, ServerConfig};
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
+
+/// One shard's worth of record ids. A record id names its shard, so this is also the line
+/// between the two nodes.
+const WIDTH: u64 = 1 << 20;
+
+/// A port nothing is listening on yet.
+///
+/// Bound and released rather than guessed. The window between releasing and re-binding is a
+/// race in principle; a listener that never accepted anything leaves no `TIME_WAIT` behind it,
+/// so in practice the port is free and the alternative is a hard-coded number that collides
+/// with whatever else is on the machine.
+fn free_port() -> SocketAddr {
+    TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap()
+}
+
+/// A two-node cluster on loopback, `a` owning shard 0 and leading the schema.
+fn two_nodes() -> (SocketAddr, SocketAddr) {
+    let (a, b) = (free_port(), free_port());
+    let file = format!(
+        "schema_leader = \"a\"\n\
+         [[node]]\nname = \"a\"\naddr = \"{a}\"\nshards = \"0..1\"\n\
+         [[node]]\nname = \"b\"\naddr = \"{b}\"\nshards = \"1..\"\n"
+    );
+    start(&file, &[("a", a), ("b", b)]);
+    (a, b)
+}
+
+/// The fingerprint of the file [`a_replicated_group`] writes, for a test that has to send a
+/// request the way a peer would.
+fn a_replicated_group_fingerprint() -> u64 {
+    LAST_FILE.with(|f| {
+        ClusterFile::parse(&f.borrow()).unwrap().for_node(Some("a"), "").unwrap().fingerprint()
+    })
+}
+
+thread_local! {
+    /// The cluster file the harness most recently started. Kept so a test can compute the
+    /// fingerprint the nodes are using without the fixture having to hand it back through
+    /// every caller.
+    static LAST_FILE: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
+/// One primary and two copies of it, over the whole shard space.
+///
+/// Three rather than two, and not for symmetry: failing over is a decision a majority has to
+/// agree on, and a majority of two is two - so a cluster of two can never use its copy, and
+/// the file is refused for saying so.
+fn a_replicated_group() -> (SocketAddr, SocketAddr, SocketAddr) {
+    let (a, spare, third) = (free_port(), free_port(), free_port());
+    let file = format!(
+        "schema_leader = \"a\"\n\
+         [[node]]\nname = \"a\"\naddr = \"{a}\"\nshards = \"0..\"\n\
+         [[node]]\nname = \"a-spare\"\naddr = \"{spare}\"\nreplica = \"a\"\n\
+         [[node]]\nname = \"a-third\"\naddr = \"{third}\"\nreplica = \"a\"\n"
+    );
+    start(&file, &[("a", a), ("a-spare", spare), ("a-third", third)]);
+    (a, spare, third)
+}
+
+/// Starts one node per name, each on its own in-memory database, all reading one config file.
+///
+/// A name may be left out, which is how a test has a node that is configured and not running.
+fn start(file: &str, names: &[(&str, SocketAddr)]) {
+    LAST_FILE.with(|f| *f.borrow_mut() = file.to_string());
+    for (name, addr) in names {
+        let config = ClusterFile::parse(file).unwrap().for_node(Some(name), "").unwrap();
+        let cluster = Cluster::new(Api::in_memory().unwrap(), config, None, Box::new(Forgetful));
+        let server = Server::bind_cluster(cluster, *addr, ServerConfig::default())
+            .expect("the port was free");
+        std::thread::spawn(move || {
+            let _ = server.serve();
+        });
+    }
+    // Every listener is bound by the time `bind_cluster` returned, so a request sent now is
+    // accepted even if no worker has reached the queue yet.
+}
+
+/// Sends a request and returns `(status, body)`.
+fn send(addr: SocketAddr, method: &str, target: &str, body: &str) -> (u16, String) {
+    let mut stream = TcpStream::connect(addr).unwrap();
+    let request = format!(
+        "{method} {target} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(request.as_bytes()).unwrap();
+    stream.flush().unwrap();
+
+    let mut raw = String::new();
+    stream.read_to_string(&mut raw).unwrap();
+    let status = raw
+        .split(' ')
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| panic!("no status in {raw:?}"));
+    (status, raw.split("\r\n\r\n").nth(1).unwrap_or_default().to_string())
+}
+
+fn ok(addr: SocketAddr, method: &str, target: &str, body: &str) -> String {
+    let (status, out) = send(addr, method, target, body);
+    assert_eq!(status, 200, "{method} {target}: {out}");
+    out
+}
+
+/// Schema on one node, facts on both, answers merged.
+///
+/// The `Sum` and the `Count` are the whole shape of the thing: neither node holds the answer,
+/// and neither knows that.
+#[test]
+fn a_query_is_answered_by_both_nodes_and_merged() {
+    let (a, b) = two_nodes();
+
+    ok(a, "POST", "/table/tx", "");
+    ok(a, "POST", "/table/tx/field/amount?kind=int&bit_depth=32", "");
+    ok(a, "POST", "/table/tx/field/country?kind=set", "");
+
+    // A schema change goes to the leader first and then everywhere else, so the node that
+    // never saw the request has the table.
+    let schema = ok(b, "GET", "/schema", "");
+    assert!(schema.contains(r#""name":"tx""#), "{schema}");
+    assert!(schema.contains(r#""name":"country""#), "{schema}");
+
+    // Records 1 and 2 belong to `a`; the two above `WIDTH` belong to `b`.
+    let facts = format!(
+        "amount 1 100\ncountry 1 GB\n\
+         amount 2 900\ncountry 2 US\n\
+         amount {r3} 300\ncountry {r3} GB\n\
+         amount {r4} 700\ncountry {r4} FR\n",
+        r3 = WIDTH + 1,
+        r4 = WIDTH + 2,
+    );
+    assert_eq!(ok(a, "POST", "/table/tx/import", &facts), r#"{"imported":8}"#);
+
+    assert_eq!(ok(a, "POST", "/table/tx/query", "Count(All())"), r#"{"count":4}"#);
+    assert_eq!(
+        ok(a, "POST", "/table/tx/query", r#"Sum(All(), field="amount")"#),
+        r#"{"sum":2000}"#
+    );
+    // A key written on both nodes is one row on both nodes, which is the schema leader's
+    // entire job. If it were not, this would answer 1.
+    assert_eq!(ok(a, "POST", "/table/tx/query", r#"Count(Row(country="GB"))"#), r#"{"count":2}"#);
+
+    // Any node is a coordinator. The one that owns none of the GB records answers the same.
+    assert_eq!(ok(b, "POST", "/table/tx/query", r#"Count(Row(country="GB"))"#), r#"{"count":2}"#);
+    assert_eq!(ok(b, "POST", "/table/tx/query", "Count(All())"), r#"{"count":4}"#);
+
+    // A set of records crosses the wire as containers and comes back in order.
+    let rows = ok(b, "POST", "/table/tx/query", r#"Row(country="GB")"#);
+    assert_eq!(rows, format!("{{\"records\":[1,{}],\"next\":null}}", WIDTH + 1));
+
+    assert_eq!(
+        ok(a, "POST", "/table/tx/query", r#"Min(Row(country="GB"), field="amount")"#),
+        r#"{"value":100}"#
+    );
+    assert_eq!(
+        ok(a, "POST", "/table/tx/query", r#"Max(All(), field="amount")"#),
+        r#"{"value":900}"#
+    );
+}
+
+/// The ranking one. A group that leads no single node still wins the cluster.
+///
+/// `US` leads node `a` with three and holds nothing on `b`. `GB` has two on each. A `TopN`
+/// that truncated at the owners would answer `US`; the answer is `GB`, because every node's
+/// contribution to a group is summed before anything is ranked or cut.
+#[test]
+fn top_n_ranks_after_every_node_has_contributed() {
+    let (a, b) = two_nodes();
+    ok(a, "POST", "/table/tx", "");
+    ok(a, "POST", "/table/tx/field/country?kind=set", "");
+
+    let mut facts = String::new();
+    for i in 0..3 {
+        facts.push_str(&format!("country {} US\n", i + 1));
+    }
+    for i in 0..2 {
+        facts.push_str(&format!("country {} GB\n", 100 + i));
+        facts.push_str(&format!("country {} GB\n", WIDTH + 100 + i));
+    }
+    ok(a, "POST", "/table/tx/import", &facts);
+
+    let top = ok(b, "POST", "/table/tx/query", r#"TopN(All(), field="country", n=1)"#);
+    assert_eq!(top, r#"{"groups":[{"key":"GB","row":0,"value":{"count":4}}]}"#, "{top}");
+
+    // The same sum, seen through the aggregate that does not rank.
+    let all = ok(a, "POST", "/table/tx/query", r#"Distinct(All(), field="country")"#);
+    assert_eq!(
+        all,
+        r#"{"groups":[{"key":"GB","row":0,"value":{"count":4}},{"key":"US","row":1,"value":{"count":3}}]}"#,
+        "{all}"
+    );
+}
+
+/// The same questions in SQL, across two nodes, answered identically to their PQL twins.
+///
+/// **`count(DISTINCT country)` is the one that would catch the bug this design exists to
+/// avoid.** Its plan is a `Distinct`, and the counting is not part of the plan - it is the
+/// shape, applied by the coordinator *after* the merge. Counted at each owner and summed, the
+/// answer below would be 4: two countries on `a` and two on `b`, with `GB` double-counted
+/// because both hold some of it. It is 3, because the merge folds a group that two nodes both
+/// hold into one group before anything counts them.
+///
+/// Nothing else here is new machinery, and that is the point being asserted: `Cluster::sql`
+/// plans locally and hands the plan to the fan-out that already existed, so a SQL statement is
+/// merged by the code that merges PQL.
+#[test]
+fn sql_is_answered_across_nodes_and_merged() {
+    let (a, b) = two_nodes();
+
+    ok(a, "POST", "/table/tx", "");
+    ok(a, "POST", "/table/tx/field/amount?kind=int&bit_depth=32", "");
+    ok(a, "POST", "/table/tx/field/country?kind=set", "");
+
+    let facts = format!(
+        "amount 1 100\ncountry 1 GB\n\
+         amount 2 900\ncountry 2 US\n\
+         amount {r3} 300\ncountry {r3} GB\n\
+         amount {r4} 700\ncountry {r4} FR\n",
+        r3 = WIDTH + 1,
+        r4 = WIDTH + 2,
+    );
+    assert_eq!(ok(a, "POST", "/table/tx/import", &facts), r#"{"imported":8}"#);
+
+    // Scalars, from the node that owns half the records and from the node that owns the rest.
+    assert_eq!(
+        ok(a, "POST", "/sql", "SELECT count(*) FROM tx"),
+        r#"{"columns":["count"],"rows":[[4]]}"#
+    );
+    assert_eq!(
+        ok(b, "POST", "/sql", "SELECT sum(amount) FROM tx"),
+        r#"{"columns":["sum"],"rows":[[2000]]}"#
+    );
+    assert_eq!(
+        ok(b, "POST", "/sql", "SELECT count(*) FROM tx WHERE country = 'GB'"),
+        r#"{"columns":["count"],"rows":[[2]]}"#
+    );
+    assert_eq!(
+        ok(a, "POST", "/sql", "SELECT max(amount) FROM tx"),
+        r#"{"columns":["max"],"rows":[[900]]}"#
+    );
+
+    // Groups, merged across owners before they are rendered.
+    assert_eq!(
+        ok(a, "POST", "/sql", "SELECT country, count(*) FROM tx GROUP BY country"),
+        r#"{"columns":["country","count"],"rows":[["FR",1],["GB",2],["US",1]]}"#
+    );
+
+    // Three countries, not four. See this test's header.
+    assert_eq!(
+        ok(b, "POST", "/sql", "SELECT count(DISTINCT country) FROM tx"),
+        r#"{"columns":["count"],"rows":[[3]]}"#
+    );
+
+    // Record ids come back from both owners, in order.
+    assert_eq!(
+        ok(b, "POST", "/sql", "SELECT * FROM tx WHERE country = 'GB'"),
+        format!("{{\"columns\":[\"id\"],\"rows\":[[1],[{}]]}}", WIDTH + 1)
+    );
+}
+
+/// A ranking, in SQL, over a group that leads no single node.
+///
+/// The PQL twin of this is `top_n_ranks_after_every_node_has_contributed`. Both statements plan
+/// to the same `TopN`, so both are cut only after every node's contribution to each group has
+/// been summed - which is what makes the answer `GB` rather than the `US` that leads node `a`.
+#[test]
+fn a_sql_ranking_is_cut_after_the_merge_not_at_the_owners() {
+    let (a, b) = two_nodes();
+    ok(a, "POST", "/table/tx", "");
+    ok(a, "POST", "/table/tx/field/country?kind=set", "");
+
+    let mut facts = String::new();
+    for i in 0..3 {
+        facts.push_str(&format!("country {} US\n", i + 1));
+    }
+    for i in 0..2 {
+        facts.push_str(&format!("country {} GB\n", 100 + i));
+        facts.push_str(&format!("country {} GB\n", WIDTH + 100 + i));
+    }
+    ok(a, "POST", "/table/tx/import", &facts);
+
+    let top = ok(
+        b,
+        "POST",
+        "/sql",
+        "SELECT country, count(*) AS n FROM tx GROUP BY country ORDER BY n DESC LIMIT 1",
+    );
+    assert_eq!(top, r#"{"columns":["country","n"],"rows":[["GB",4]]}"#, "{top}");
+}
+
+/// A projection across two nodes, merged into one page.
+///
+/// **This is the test the new merge arm exists for.** Each owner is asked for the whole page,
+/// because the first `n` records overall can all live on one node - so `a` answers with its
+/// records and `b` with its own, and neither of them is the answer. The coordinator interleaves
+/// them by record id and cuts once. A merge that concatenated instead would answer with `a`'s
+/// records followed by `b`'s, which for `LIMIT 3` below would be the wrong three rows in the
+/// wrong order, and nothing in the result set could show it.
+#[test]
+fn a_projection_is_merged_across_owners_and_cut_once() {
+    let (a, b) = two_nodes();
+    ok(a, "POST", "/table/tx", "");
+    ok(a, "POST", "/table/tx/field/amount?kind=int&bit_depth=32", "");
+
+    // Two records on each node, interleaved by id so that neither node's own answer is a
+    // prefix of the right one.
+    let facts = format!(
+        "amount 1 100\namount {r2} 200\namount 3 300\namount {r4} 400\n",
+        r2 = WIDTH + 2,
+        r4 = WIDTH + 4,
+    );
+    assert_eq!(ok(a, "POST", "/table/tx/import", &facts), r#"{"imported":4}"#);
+
+    // The whole page, in record order, across both owners.
+    assert_eq!(
+        ok(b, "POST", "/sql", "SELECT amount FROM tx LIMIT 10"),
+        r#"{"columns":["amount"],"rows":[[100],[300],[200],[400]]}"#
+    );
+
+    // Cut to three. `a` holds records 1 and 3, `b` holds the other two: the right answer takes
+    // two rows from one node and one from the other, which only the merge can do.
+    assert_eq!(
+        ok(b, "POST", "/sql", "SELECT amount FROM tx LIMIT 3"),
+        r#"{"columns":["amount"],"rows":[[100],[300],[200]]}"#
+    );
+
+    // And narrowed, so the records read are only the ones that matched.
+    assert_eq!(
+        ok(b, "POST", "/sql", "SELECT amount FROM tx WHERE amount >= 300 LIMIT 10"),
+        r#"{"columns":["amount"],"rows":[[300],[400]]}"#
+    );
+}
+
+/// A join across two nodes, paired after both sides have been merged.
+///
+/// **This is the test the whole design of joins rests on.** `GB` holds two orders on node `a`
+/// and one on `b`, and two shops split one apiece. The join has `(2+1) · (1+1) = 6` rows.
+/// Multiplying at each owner and summing the products would give `2·1 + 1·1 = 3` — a plausible
+/// number, off by half, that no client could tell from the right one. The multiplication
+/// therefore cannot happen anywhere but at the coordinator, after each side's per-key counts
+/// have been summed across every node holding them, which is why a join is a `Shape` and not a
+/// `Plan`.
+#[test]
+fn a_join_multiplies_after_the_merge_not_at_the_owners() {
+    let (a, b) = two_nodes();
+    ok(a, "POST", "/table/orders", "");
+    ok(a, "POST", "/table/orders/field/country?kind=set", "");
+    ok(a, "POST", "/table/orders/field/amount?kind=int&bit_depth=32", "");
+    ok(a, "POST", "/table/shops", "");
+    ok(a, "POST", "/table/shops/field/country?kind=set", "");
+
+    // Two orders on `a`, one on `b`; one shop on each.
+    let orders = format!(
+        "country 1 GB\namount 1 100\ncountry 2 GB\namount 2 200\n\
+         country {r} GB\namount {r} 300\n",
+        r = WIDTH + 1,
+    );
+    assert_eq!(ok(a, "POST", "/table/orders/import", &orders), r#"{"imported":6}"#);
+    let shops = format!("country 1 GB\ncountry {} GB\n", WIDTH + 1);
+    assert_eq!(ok(a, "POST", "/table/shops/import", &shops), r#"{"imported":2}"#);
+
+    // Six, not three.
+    assert_eq!(
+        ok(
+            b,
+            "POST",
+            "/sql",
+            "SELECT count(*) FROM orders o JOIN shops s ON o.country = s.country"
+        ),
+        r#"{"columns":["count"],"rows":[[6]]}"#
+    );
+
+    // The same for a total: 600 across both nodes, seen once per shop.
+    assert_eq!(
+        ok(
+            a,
+            "POST",
+            "/sql",
+            "SELECT sum(o.amount) FROM orders o JOIN shops s ON o.country = s.country"
+        ),
+        r#"{"columns":["sum"],"rows":[[1200]]}"#
+    );
+
+    // And the key is one key, not one per node that holds it.
+    assert_eq!(
+        ok(
+            b,
+            "POST",
+            "/sql",
+            "SELECT o.country, count(*) FROM orders o JOIN shops s ON o.country = s.country \
+             GROUP BY o.country"
+        ),
+        r#"{"columns":["country","count"],"rows":[["GB",6]]}"#
+    );
+}
+
+/// A pair grouping across two nodes, folded on the pair before anything is ordered.
+///
+/// **The pair split across both nodes is the test.** `GB/a` holds two records on `a` and one on
+/// `b`; merging by concatenation would answer with two rows for it, and merging by the left key
+/// alone would fuse `GB/a` with `GB/b`. It is one row, and it counts three.
+#[test]
+fn a_pair_grouping_is_folded_across_owners() {
+    let (a, b) = two_nodes();
+    ok(a, "POST", "/table/tx", "");
+    ok(a, "POST", "/table/tx/field/country?kind=set", "");
+    ok(a, "POST", "/table/tx/field/category?kind=set", "");
+
+    let facts = format!(
+        "country 1 GB\ncategory 1 a\ncountry 2 GB\ncategory 2 a\n\
+         country {r3} GB\ncategory {r3} a\ncountry {r4} GB\ncategory {r4} b\n\
+         country {r5} US\ncategory {r5} a\n",
+        r3 = WIDTH + 1,
+        r4 = WIDTH + 2,
+        r5 = WIDTH + 3,
+    );
+    assert_eq!(ok(a, "POST", "/table/tx/import", &facts), r#"{"imported":10}"#);
+
+    // GB/a is three: two from `a`, one from `b`.
+    assert_eq!(
+        ok(
+            b,
+            "POST",
+            "/sql",
+            "SELECT country, category, count(*) FROM tx GROUP BY country, category"
+        ),
+        r#"{"columns":["country","category","count"],"rows":[["GB","a",3],["GB","b",1],["US","a",1]]}"#
+    );
+
+    // And the pair counts still sum to the table.
+    assert_eq!(
+        ok(a, "POST", "/sql", "SELECT count(*) FROM tx"),
+        r#"{"columns":["count"],"rows":[[5]]}"#
+    );
+}
+
+/// A quantile across two nodes, where the bound moves on the merged count.
+///
+/// **A quantile is not mergeable from per-node quantiles**, and this is the test that says so.
+/// Node `a` holds 10, 20 and 30; node `b` holds 40 and 50. Their medians are 20 and 40, and
+/// neither of those - nor anything derived from the pair alone - is the answer. The median of
+/// all five is 30, which only a search over the merged counts finds.
+#[test]
+fn a_quantile_moves_its_bound_on_the_merged_count() {
+    let (a, b) = two_nodes();
+    ok(a, "POST", "/table/tx", "");
+    ok(a, "POST", "/table/tx/field/amount?kind=int&bit_depth=32", "");
+
+    let facts = format!(
+        "amount 1 10\namount 2 20\namount 3 30\namount {r4} 40\namount {r5} 50\n",
+        r4 = WIDTH + 1,
+        r5 = WIDTH + 2,
+    );
+    assert_eq!(ok(a, "POST", "/table/tx/import", &facts), r#"{"imported":5}"#);
+
+    for node in [a, b] {
+        assert_eq!(
+            ok(node, "POST", "/sql", "SELECT median(amount) FROM tx"),
+            r#"{"columns":["quantile"],"rows":[[30]]}"#
+        );
+    }
+
+    // The ends, which are the min and the max of everything rather than of one node.
+    assert_eq!(
+        ok(b, "POST", "/sql", "SELECT quantile(0)(amount), quantile(1)(amount) FROM tx"),
+        r#"{"columns":["quantile","quantile"],"rows":[[10,50]]}"#
+    );
+}
+
+/// A refusal is refused by the coordinator, before any node is asked.
+///
+/// Planning is pure, so a statement that cannot be answered never reaches the network - the
+/// same property `Cluster::query` relies on, and the reason a bad statement costs a round trip
+/// to nobody.
+#[test]
+fn a_refused_statement_never_reaches_a_peer() {
+    let (a, _b) = two_nodes();
+    ok(a, "POST", "/table/tx", "");
+    ok(a, "POST", "/table/tx/field/k?kind=set", "");
+
+    let (status, body) = send(a, "POST", "/sql", "SELECT count(*) FROM tx, t2");
+    assert_eq!(status, 400);
+    assert!(body.contains(r#""code":"sql_no_joins""#), "{body}");
+
+    // And a join that *is* answered still refuses before the network when its second table is
+    // not there: planning resolves every call, so the statement fails whole.
+    let (status, body) =
+        send(a, "POST", "/sql", "SELECT count(*) FROM tx t JOIN nope n ON t.k = n.k");
+    assert_eq!(status, 404, "{body}");
+    assert!(body.contains(r#""code":"unknown_table""#), "{body}");
+}
+
+/// A listing walks the whole space in order, one page at a time, across both nodes.
+#[test]
+fn records_are_listed_and_paged_across_nodes() {
+    let (a, b) = two_nodes();
+    ok(a, "POST", "/table/tx", "");
+    ok(a, "POST", "/table/tx/field/amount?kind=int&bit_depth=32", "");
+
+    let ids = [1u64, 2, WIDTH, WIDTH + 5];
+    let facts: String = ids.iter().map(|i| format!("amount {i} 1\n")).collect();
+    ok(a, "POST", "/table/tx/import", &facts);
+
+    let all = ok(b, "GET", "/table/tx/records", "");
+    assert_eq!(all, format!("{{\"records\":[1,2,{},{}],\"next\":null}}", WIDTH, WIDTH + 5));
+
+    // A page that ends inside the first node's range, and the page after it, which starts in
+    // the first node's range and finishes in the second's.
+    let first = ok(a, "GET", "/table/tx/records?limit=2", "");
+    assert_eq!(first, r#"{"records":[1,2],"next":2}"#);
+    let second = ok(a, "GET", "/table/tx/records?after=2&limit=2", "");
+    assert_eq!(second, format!("{{\"records\":[{},{}],\"next\":{}}}", WIDTH, WIDTH + 5, WIDTH + 5));
+    let third = ok(a, "GET", &format!("/table/tx/records?after={}&limit=2", WIDTH + 5), "");
+    assert_eq!(third, r#"{"records":[],"next":null}"#);
+}
+
+/// A delete is split by owner like an import, and answers with the total it removed.
+#[test]
+fn a_delete_reaches_the_node_that_holds_the_record() {
+    let (a, b) = two_nodes();
+    ok(a, "POST", "/table/tx", "");
+    ok(a, "POST", "/table/tx/field/amount?kind=int&bit_depth=32", "");
+    ok(a, "POST", "/table/tx/import", &format!("amount 1 1\namount {} 1\n", WIDTH + 3));
+
+    assert_eq!(ok(b, "POST", "/table/tx/query", "Count(All())"), r#"{"count":2}"#);
+    assert_eq!(
+        ok(b, "POST", "/table/tx/delete", &format!("1\n{}\n", WIDTH + 3)),
+        r#"{"deleted":2}"#
+    );
+    assert_eq!(ok(a, "POST", "/table/tx/query", "Count(All())"), r#"{"count":0}"#);
+}
+
+/// Dropping schema reaches every node, not only the leader.
+#[test]
+fn dropping_a_table_reaches_every_node() {
+    let (a, b) = two_nodes();
+    ok(a, "POST", "/table/tx", "");
+    ok(a, "POST", "/table/tx/field/amount?kind=int&bit_depth=32", "");
+    ok(b, "DELETE", "/table/tx", "");
+
+    for node in [a, b] {
+        let schema = ok(node, "GET", "/schema", "");
+        assert_eq!(schema, r#"{"tables":[]}"#, "{schema}");
+    }
+}
+
+/// **The whole query fails.** A count that is missing a node's contribution looks exactly like
+/// a correct count, and there is no downstream check that would catch it - so an owner that
+/// cannot be reached is a `503` naming the shards, never a partial answer.
+#[test]
+fn an_unreachable_owner_fails_the_whole_query() {
+    let a = free_port();
+    // Nothing is ever started here. A node that is down at startup is not a configuration
+    // error; it is a node that is down.
+    let gone = free_port();
+    let file = format!(
+        "schema_leader = \"a\"\n\
+         [[node]]\nname = \"a\"\naddr = \"{a}\"\nshards = \"0..1\"\n\
+         [[node]]\nname = \"gone\"\naddr = \"{gone}\"\nshards = \"1..\"\n"
+    );
+    let config = ClusterFile::parse(&file).unwrap().for_node(Some("a"), "").unwrap();
+    let cluster = Cluster::new(Api::in_memory().unwrap(), config, None, Box::new(Forgetful));
+    let server = Server::bind_cluster(cluster, a, ServerConfig::default()).unwrap();
+    std::thread::spawn(move || {
+        let _ = server.serve();
+    });
+
+    // The schema leader is this node, so a table can still be created - and the peer that
+    // could not be told about it is named, rather than the change being reported as done.
+    let (status, body) = send(a, "POST", "/table/tx", "");
+    assert_eq!(status, 500, "{body}");
+    assert!(body.contains(r#""code":"partially_applied""#), "{body}");
+    assert!(body.contains("gone"), "{body}");
+
+    let (status, body) = send(a, "POST", "/table/tx/query", "Count(All())");
+    assert_eq!(status, 503, "{body}");
+    assert!(body.contains(r#""code":"owner_unreachable""#), "{body}");
+    // The shard range is the part an operator cannot work out from a 503 on its own.
+    assert!(body.contains("1.."), "{body}");
+}
+
+/// A node that is not the leader cannot invent a row id, and says so rather than assigning one
+/// locally and reconciling later. Two row ids for one string is the failure that has no
+/// downstream symptom.
+#[test]
+fn a_new_key_is_refused_when_the_leader_is_unreachable() {
+    let b = free_port();
+    let gone = free_port();
+    let file = format!(
+        "schema_leader = \"gone\"\n\
+         [[node]]\nname = \"gone\"\naddr = \"{gone}\"\nshards = \"0..1\"\n\
+         [[node]]\nname = \"b\"\naddr = \"{b}\"\nshards = \"1..\"\n"
+    );
+    let config = ClusterFile::parse(&file).unwrap().for_node(Some("b"), "").unwrap();
+    let api = Api::in_memory().unwrap();
+    // The schema exists locally: this test is about the row key, not about the table.
+    api.create_table("tx").unwrap();
+    api.create_field("tx", "country", big_api::FieldKind::Set, 0).unwrap();
+    let cluster = Cluster::new(api, config, None, Box::new(Forgetful));
+    let server = Server::bind_cluster(cluster, b, ServerConfig::default()).unwrap();
+    std::thread::spawn(move || {
+        let _ = server.serve();
+    });
+
+    let (status, body) =
+        send(b, "POST", "/table/tx/import", &format!("country {} GB\n", WIDTH + 1));
+    assert_eq!(status, 503, "{body}");
+    assert!(body.contains(r#""code":"schema_leader_unreachable""#), "{body}");
+
+    // Reads are unaffected by the leader being gone, as long as no owner is.
+    let (status, body) = send(b, "POST", "/table/tx/query", r#"Count(Row(country="GB"))"#);
+    assert_eq!(status, 503, "{body}");
+    assert!(body.contains(r#""code":"owner_unreachable""#), "{body}");
+}
+
+/// Readiness is about this node, not about the cluster. A node whose peer is down is still
+/// able to serve its own shards, and a probe that failed for somebody else's outage would take
+/// a healthy node out of rotation.
+#[test]
+fn readiness_reports_this_node_and_ignores_its_peers() {
+    let (a, _b) = two_nodes();
+    let body = ok(a, "GET", "/ready", "");
+    assert!(body.contains(r#""node":"a""#), "{body}");
+    assert!(body.contains(r#""shards":"0..1""#), "{body}");
+}
+
+/// The fan-out reuses its connections.
+///
+/// Twenty queries through `a`, each one reaching `b`, and `b` should have accepted far fewer
+/// than twenty connections. This is the only place the reuse is observable from outside: the
+/// answers are identical either way, and the difference is a handshake per leg.
+#[test]
+fn the_fan_out_reuses_its_connections() {
+    let (a, b) = two_nodes();
+    ok(a, "POST", "/table/tx", "");
+    ok(a, "POST", "/table/tx/field/amount?kind=int&bit_depth=32", "");
+
+    const QUERIES: u64 = 20;
+    for _ in 0..QUERIES {
+        ok(a, "POST", "/table/tx/query", "Count(All())");
+    }
+
+    // Scraped over a connection of its own, which is one of the ones being counted.
+    let metrics = ok(b, "GET", "/metrics", "");
+    let accepted = metrics
+        .lines()
+        .find_map(|l| l.strip_prefix("big_http_connections_accepted_total "))
+        .and_then(|n| n.trim().parse::<u64>().ok())
+        .unwrap_or_else(|| panic!("no connection counter in {metrics}"));
+
+    // Not `== 1`: the schema changes reached `b` first, and this scrape is a connection too.
+    // What matters is that twenty queries did not cost twenty connections.
+    // Three would be the honest floor: the two schema changes and this scrape. A little slack
+    // for a connection the pool happened to find closed, and nothing like twenty.
+    assert!(accepted <= 6, "{accepted} connections for {QUERIES} queries:\n{metrics}");
+}
+
+// -------------------------------------------------------------------------------------------
+// Replication
+// -------------------------------------------------------------------------------------------
+
+/// A write reaches both copies, and the copy is a real database rather than a log of
+/// intentions: the spare answers the same query with the same numbers.
+#[test]
+fn a_write_reaches_every_copy_of_a_range() {
+    let (a, spare, _third) = a_replicated_group();
+    ok(a, "POST", "/table/tx", "");
+    ok(a, "POST", "/table/tx/field/amount?kind=int&bit_depth=32", "");
+    ok(a, "POST", "/table/tx/field/country?kind=set", "");
+    ok(a, "POST", "/table/tx/import", "amount 1 100\ncountry 1 GB\namount 2 900\ncountry 2 US\n");
+
+    // The schema reached the spare too: it is a database, not a queue of intentions.
+    for node in [a, spare] {
+        let schema = ok(node, "GET", "/schema", "");
+        assert!(schema.contains(r#""name":"country""#), "{schema}");
+    }
+
+    // The digests are what actually compares the two, field by field and row by row.
+    let report = ok(a, "GET", "/verify", "");
+    assert!(report.contains(r#""agree":true"#), "{report}");
+    assert!(report.contains(r#""node":"a-spare""#), "{report}");
+    assert!(!report.contains(r#""digest":null"#), "{report}");
+}
+
+/// **Reads go to the primary, never to a replica.** A replica holds the same records, so
+/// asking both would double every count - and asking the replica *instead* would answer from a
+/// copy this node cannot know is current.
+#[test]
+fn a_replica_does_not_double_a_count() {
+    let (a, spare, _third) = a_replicated_group();
+    ok(a, "POST", "/table/tx", "");
+    ok(a, "POST", "/table/tx/field/amount?kind=int&bit_depth=32", "");
+    ok(a, "POST", "/table/tx/import", "amount 1 5\namount 2 5\n");
+
+    for node in [a, spare] {
+        assert_eq!(ok(node, "POST", "/table/tx/query", "Count(All())"), r#"{"count":2}"#);
+        assert_eq!(
+            ok(node, "POST", "/table/tx/query", r#"Sum(All(), field="amount")"#),
+            r#"{"sum":10}"#
+        );
+    }
+}
+
+/// **A copy that is down does not fail the write**, and the answer says which copy is behind.
+///
+/// This is the hole automatic failover does not plug on its own: failover replaces a dead node
+/// that reads go to, and this is a dead *spare*. Refusing the write would mean one machine
+/// nobody reads from can stop the whole range being written to.
+///
+/// What makes it safe is the other half: the agreement marks that copy behind, and a copy
+/// marked behind is one it will not promote. Nothing ever reads from a copy that missed a
+/// write.
+#[test]
+fn a_write_that_misses_a_copy_stands_and_says_so() {
+    let (a, spare, third) = (free_port(), free_port(), free_port());
+    let file = format!(
+        "schema_leader = \"a\"\n\
+         [[node]]\nname = \"a\"\naddr = \"{a}\"\nshards = \"0..\"\n\
+         [[node]]\nname = \"a-spare\"\naddr = \"{spare}\"\nreplica = \"a\"\n\
+         [[node]]\nname = \"a-third\"\naddr = \"{third}\"\nreplica = \"a\"\n"
+    );
+    // `a-third` is configured and never started, so a majority is still two of three and the
+    // agreement works - it is one copy that is missing, not the quorum.
+    start(&file, &[("a", a), ("a-spare", spare)]);
+
+    // A schema change reaches the copies it can and names the one it cannot.
+    let (status, body) = send(a, "POST", "/table/tx", "");
+    assert_eq!(status, 500, "{body}");
+    assert!(body.contains(r#""code":"partially_applied""#), "{body}");
+    let (status, body) = send(a, "POST", "/table/tx/field/amount?kind=int&bit_depth=32", "");
+    assert_eq!(status, 500, "{body}");
+
+    // The write stands. It landed on the copy reads go to and on one spare, and the answer
+    // names the copy it did not reach.
+    let (status, body) = send(a, "POST", "/table/tx/import", "amount 1 5\n");
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains(r#""imported":1"#), "{body}");
+    assert!(body.contains("a-third"), "{body}");
+
+    assert_eq!(ok(a, "POST", "/table/tx/query", "Count(All())"), r#"{"count":1}"#);
+
+    // And `verify` says what an operator needs before promoting anything: one copy could not
+    // be asked, so nothing here is agreement.
+    let report = ok(a, "GET", "/verify", "");
+    assert!(report.contains(r#""agree":false"#), "{report}");
+    assert!(report.contains(r#""digest":null"#), "{report}");
+}
+
+/// The digest notices a difference. Two copies are fed different facts behind the
+/// coordinator's back - by writing to the spare directly, which is what a repair or a bug
+/// looks like from the outside - and `verify` stops saying they agree.
+#[test]
+fn the_digest_notices_when_two_copies_differ() {
+    let (a, spare, _third) = a_replicated_group();
+    let fingerprint = a_replicated_group_fingerprint();
+    ok(a, "POST", "/table/tx", "");
+    ok(a, "POST", "/table/tx/field/amount?kind=int&bit_depth=32", "");
+    ok(a, "POST", "/table/tx/import", "amount 1 5\n");
+    assert!(ok(a, "GET", "/verify", "").contains(r#""agree":true"#));
+
+    // Straight at the spare's own database, bypassing the fan-out: the spare is a primary of
+    // nothing, so `/internal/import` is the only door, and this is what a write that reached
+    // one copy and not the other leaves behind.
+    let body = big_cluster::wire::ImportRequest {
+        table: "tx".to_string(),
+        keys: Vec::new(),
+        facts: vec![big_cluster::wire::OwnedFact {
+            field: "amount".to_string(),
+            record: 99,
+            value: big_cluster::wire::FactValue::Int(7),
+        }],
+    }
+    .encode();
+    let (status, _) = send_bytes(spare, "/internal/import", &body, fingerprint);
+    assert_eq!(status, 200);
+
+    let report = ok(a, "GET", "/verify", "");
+    assert!(report.contains(r#""agree":false"#), "{report}");
+    // Both answered; they simply do not hold the same facts.
+    assert!(!report.contains(r#""digest":null"#), "{report}");
+}
+
+/// A binary POST, for the tests that have to reach an `/internal/` route the way a peer does.
+///
+/// Including the two stamps, because a peer sends them and a request without them is refused
+/// before it is decoded. A test that skipped them would be testing the refusal.
+fn send_bytes(addr: SocketAddr, target: &str, body: &[u8], fingerprint: u64) -> (u16, Vec<u8>) {
+    let mut stream = TcpStream::connect(addr).unwrap();
+    let head = format!(
+        "POST {target} HTTP/1.1\r\nHost: localhost\r\n{}: {}\r\n{}: {fingerprint:x}\r\n\
+         Content-Length: {}\r\n\r\n",
+        big_cluster::WIRE_HEADER,
+        big_cluster::WIRE_VERSION,
+        big_cluster::CLUSTER_HEADER,
+        body.len()
+    );
+    stream.write_all(head.as_bytes()).unwrap();
+    stream.write_all(body).unwrap();
+    stream.flush().unwrap();
+
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).unwrap();
+    let split = raw.windows(4).position(|w| w == b"\r\n\r\n").expect("a header block");
+    let head = String::from_utf8_lossy(&raw[..split]).to_string();
+    let status = head.split(' ').nth(1).and_then(|s| s.parse().ok()).expect("a status");
+    (status, raw[split + 4..].to_vec())
+}
+
+// -------------------------------------------------------------------------------------------
+// Failing over on its own
+// -------------------------------------------------------------------------------------------
+
+/// The clocks a test can afford to wait for.
+///
+/// A datacentre's defaults are seconds, because an election held over a garbage collector pause
+/// costs more than a second of waiting. A test cannot spend those seconds, so it says so out
+/// loud: the *rules* are what these tests are about, and they do not depend on the numbers.
+fn brisk() -> (Timing, Leases) {
+    (
+        Timing { election_min: 150, election_spread: 150, heartbeat: 50 },
+        Leases {
+            serve_for: std::time::Duration::from_millis(300),
+            promote_after: std::time::Duration::from_millis(900),
+        },
+    )
+}
+
+/// One range, three copies, all of them running the agreement.
+fn a_group_of_three() -> (String, Vec<SocketAddr>) {
+    let ports: Vec<SocketAddr> = (0..3).map(|_| free_port()).collect();
+    let file = format!(
+        "schema_leader = \"a\"\n\
+         [[node]]\nname = \"a\"\naddr = \"{}\"\nshards = \"0..\"\n\
+         [[node]]\nname = \"b\"\naddr = \"{}\"\nreplica = \"a\"\n\
+         [[node]]\nname = \"c\"\naddr = \"{}\"\nreplica = \"a\"\n",
+        ports[0], ports[1], ports[2]
+    );
+    (file, ports)
+}
+
+/// A node a test can take away.
+///
+/// `close` drops the listener rather than only stopping the loop: a port that accepts and never
+/// answers is not a dead node, it is a slow one, and the two fail differently.
+struct Node {
+    running: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    done: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Node {
+    fn close(&mut self) {
+        self.running.store(false, std::sync::atomic::Ordering::Relaxed);
+        if let Some(h) = self.done.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+impl Node {
+    /// Leaves the node running for the life of the test process.
+    ///
+    /// For the nodes a test needs up and never takes away: holding the handle would mean
+    /// naming it, and a name that is only there to avoid a drop is a name that reads as a
+    /// mistake.
+    fn forget(mut self) {
+        self.done = None;
+        std::mem::forget(self);
+    }
+}
+
+impl Drop for Node {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+/// Starts one node of an agreeing group, on the brisk clocks above.
+fn start_agreeing(file: &str, name: &str, addr: SocketAddr) -> Node {
+    let (timing, leases) = brisk();
+    start_with(file, name, addr, timing, leases, None)
+}
+
+/// The same, with the clocks and the state file spelled out.
+///
+/// `state` is where the agreement keeps the three things a restart may not lose. `None` is
+/// [`Forgetful`], which is right for a node no test restarts and wrong for one that does - a
+/// node that forgets its vote can cast a second one in the same term.
+fn start_with(
+    file: &str,
+    name: &str,
+    addr: SocketAddr,
+    timing: Timing,
+    leases: Leases,
+    state: Option<std::path::PathBuf>,
+) -> Node {
+    let config = ClusterFile::parse(file).unwrap().for_node(Some(name), "").unwrap();
+    let store: Box<dyn big_cluster::raft::Store> = match state {
+        Some(path) => Box::new(big_cluster::raft::FileStore::new(path)),
+        None => Box::new(Forgetful),
+    };
+    let cluster =
+        Cluster::with_timing(Api::in_memory().unwrap(), config, None, store, timing, leases);
+    let server =
+        Server::bind_cluster(cluster, addr, ServerConfig::default()).expect("the port was free");
+    let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let flag = std::sync::Arc::clone(&running);
+    let done = std::thread::spawn(move || {
+        let _ = server.serve_while(&flag);
+        // `server` is dropped here, which is what closes the port.
+    });
+    Node { running, done: Some(done) }
+}
+
+/// Waits for a condition, or gives up and says what it saw last.
+fn until(what: &str, check: impl FnMut() -> bool) {
+    waiting(what, std::time::Duration::from_secs(15), check)
+}
+
+/// The same, for a test that is waiting on the clocks a deployment actually runs.
+fn waiting(what: &str, budget: std::time::Duration, mut check: impl FnMut() -> bool) {
+    let started = std::time::Instant::now();
+    while started.elapsed() < budget {
+        if check() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    panic!("gave up waiting for {what} after {:?}", started.elapsed());
+}
+
+fn ready(addr: SocketAddr) -> String {
+    send(addr, "GET", "/ready", "").1
+}
+
+/// **The whole point.** The node that was serving a range dies, and the range keeps being
+/// served - by a node that already held every record, decided by an agreement rather than by a
+/// person editing a file.
+#[test]
+fn a_range_fails_over_when_its_primary_dies() {
+    let (file, ports) = a_group_of_three();
+    let mut a = start_agreeing(&file, "a", ports[0]);
+    let _b = start_agreeing(&file, "b", ports[1]);
+    let _c = start_agreeing(&file, "c", ports[2]);
+
+    // The agreement settles before anything is asked of it.
+    until("an elected leader", || ready(ports[1]).contains(r#""leader":""#));
+
+    ok(ports[0], "POST", "/table/tx", "");
+    ok(ports[0], "POST", "/table/tx/field/amount?kind=int&bit_depth=32", "");
+    ok(ports[0], "POST", "/table/tx/import", "amount 1 5\namount 2 5\n");
+    assert_eq!(ok(ports[1], "POST", "/table/tx/query", "Count(All())"), r#"{"count":2}"#);
+
+    // `a` goes away. Nothing else is touched: no config is edited and nobody is told.
+    a.close();
+
+    // `b` and `c` are a majority. One of them notices `a` has stopped answering, and the
+    // agreement moves the range to whichever of them is still there.
+    until("the range to move", || {
+        let (status, body) = send(ports[1], "POST", "/table/tx/query", "Count(All())");
+        status == 200 && body == r#"{"count":2}"#
+    });
+
+    // Every node that is left agrees who serves it now. A coordinator learns on the next
+    // heartbeat, so this is a wait rather than an assertion: the map is agreed at once and
+    // arrives in its own time.
+    until("both survivors to route to the new primary", || {
+        [ports[1], ports[2]]
+            .iter()
+            .all(|p| send(*p, "POST", "/table/tx/query", "Count(All())").1 == r#"{"count":2}"#)
+    });
+}
+
+/// **A node cut off from the agreement stops answering for its range.**
+///
+/// This is the half that makes the other half safe. A failure detector alone cannot tell a
+/// dead node from an unreachable one, so the node that might have been replaced has to be the
+/// one that stops - and it stops on its own clock, without being told.
+#[test]
+fn a_node_that_loses_the_agreement_stops_serving() {
+    let (file, ports) = a_group_of_three();
+    let a = start_agreeing(&file, "a", ports[0]);
+    let mut b = start_agreeing(&file, "b", ports[1]);
+    let mut c = start_agreeing(&file, "c", ports[2]);
+
+    until("an elected leader", || ready(ports[0]).contains(r#""leader":""#));
+    ok(ports[0], "POST", "/table/tx", "");
+    ok(ports[0], "POST", "/table/tx/field/amount?kind=int&bit_depth=32", "");
+
+    // Everybody except `a` stops. `a` is alone: it cannot be a majority, so it cannot know
+    // whether the other two have given its range to somebody else.
+    b.close();
+    c.close();
+
+    until("`a` to stand down", || !ready(ports[0]).contains(r#""serving":true"#));
+
+    // And it says so rather than answering from a copy it can no longer vouch for.
+    let (status, body) = send(ports[0], "POST", "/table/tx/query", "Count(All())");
+    assert_eq!(status, 503, "{body}");
+    assert!(body.contains(r#""code":"not_serving""#), "{body}");
+    let _ = a;
+}
+
+/// A range with no copy is not fenced. There is nothing to fail over to, so a node that stops
+/// hearing from anybody has not lost anything - and stopping would be an outage invented
+/// rather than avoided.
+#[test]
+fn a_range_with_no_copy_keeps_serving_alone() {
+    let (a, b) = two_nodes();
+    ok(a, "POST", "/table/tx", "");
+    ok(a, "POST", "/table/tx/field/amount?kind=int&bit_depth=32", "");
+    ok(a, "POST", "/table/tx/import", "amount 1 5\n");
+
+    // No agreement is running at all, so there is no lease to lose.
+    let body = ok(a, "GET", "/ready", "");
+    assert!(!body.contains(r#""term""#), "{body}");
+    assert_eq!(ok(a, "POST", "/table/tx/query", "Count(All())"), r#"{"count":1}"#);
+    let _ = b;
+}
+
+/// **A copy that is behind is not promoted, even when it is the only one left.**
+///
+/// This is the load-bearing half of letting a write stand when a spare is unreachable. Without
+/// it, the copy that missed the write is exactly the copy that would answer after the next
+/// failure - which would turn a write everybody was told succeeded into a read nobody can tell
+/// is wrong.
+///
+/// The copy is brought back *empty*, which is the worst case and also the realistic one: a
+/// machine that was replaced.
+#[test]
+fn a_copy_that_is_behind_is_never_promoted() {
+    let (a, spare, other) = (free_port(), free_port(), free_port());
+    // `other` holds a range of its own, so a majority survives losing both nodes of the first
+    // range - the agreement stays able to decide, and what it decides is nothing.
+    let file = format!(
+        "schema_leader = \"other\"\n\
+         [[node]]\nname = \"a\"\naddr = \"{a}\"\nshards = \"0..1\"\n\
+         [[node]]\nname = \"other\"\naddr = \"{other}\"\nshards = \"1..\"\n\
+         [[node]]\nname = \"a-spare\"\naddr = \"{spare}\"\nreplica = \"a\"\n"
+    );
+    let mut a_node = start_agreeing(&file, "a", a);
+    let mut spare_node = start_agreeing(&file, "a-spare", spare);
+    let _other = start_agreeing(&file, "other", other);
+
+    until("an elected leader", || ready(other).contains(r#""leader":""#));
+    ok(a, "POST", "/table/tx", "");
+    ok(a, "POST", "/table/tx/field/amount?kind=int&bit_depth=32", "");
+
+    // The spare goes away, and a write lands without it. The write stands and says so.
+    spare_node.close();
+    until("the spare to be marked behind", || ready(other).contains(r#""a-spare""#));
+    let (status, body) = send(a, "POST", "/table/tx/import", "amount 1 5\n");
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains("a-spare"), "{body}");
+
+    // It comes back with nothing in it, which is what a replaced machine looks like.
+    let _spare_again = start_agreeing(&file, "a-spare", spare);
+    until("the spare to be answering again", || send(spare, "GET", "/ready", "").0 == 200);
+
+    // Now the node that was serving the range dies. The only other copy of it is the one that
+    // missed the write, so the range does not move - and says so rather than answering from a
+    // database that is missing a record.
+    a_node.close();
+    until("the range to be reported unreachable", || {
+        send(other, "POST", "/table/tx/query", "Count(All())").0 == 503
+    });
+    for _ in 0..8 {
+        let (status, body) = send(other, "POST", "/table/tx/query", "Count(All())");
+        assert_eq!(status, 503, "the range was given to a copy that had missed a write: {body}");
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+
+    // The other range is untouched by any of it.
+    assert_eq!(
+        send(other, "GET", "/ready", "").0,
+        200,
+        "a range with its own primary was taken down by somebody else's failure"
+    );
+}
+
+/// **A repair puts a copy back into service.**
+///
+/// The other half of letting a write stand when a spare is unreachable. Without it one blip
+/// costs a cluster its redundancy for good, because a copy marked behind is a copy that will
+/// never be promoted - so the mark has to be clearable, and clearing it has to mean something.
+#[test]
+fn a_repair_catches_a_copy_up_and_lets_it_serve_again() {
+    let (a, spare, other) = (free_port(), free_port(), free_port());
+    let file = format!(
+        "schema_leader = \"other\"\n\
+         [[node]]\nname = \"a\"\naddr = \"{a}\"\nshards = \"0..1\"\n\
+         [[node]]\nname = \"other\"\naddr = \"{other}\"\nshards = \"1..\"\n\
+         [[node]]\nname = \"a-spare\"\naddr = \"{spare}\"\nreplica = \"a\"\n"
+    );
+    let mut a_node = start_agreeing(&file, "a", a);
+    let mut spare_node = start_agreeing(&file, "a-spare", spare);
+    let _other = start_agreeing(&file, "other", other);
+
+    until("an elected leader", || ready(other).contains(r#""leader":""#));
+    ok(a, "POST", "/table/tx", "");
+    ok(a, "POST", "/table/tx/field/amount?kind=int&bit_depth=32", "");
+    ok(a, "POST", "/table/tx/field/country?kind=set", "");
+    ok(a, "POST", "/table/tx/import", "amount 1 5\ncountry 1 GB\n");
+
+    // The spare goes away and misses a write, including a row key it has never heard of.
+    spare_node.close();
+    until("the spare to be marked behind", || ready(other).contains(r#""a-spare""#));
+    let (status, body) = send(a, "POST", "/table/tx/import", "amount 2 9\ncountry 2 FR\n");
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains("a-spare"), "{body}");
+
+    // It comes back empty, and the copies do not agree.
+    let _spare_again = start_agreeing(&file, "a-spare", spare);
+    until("the spare to be answering again", || send(spare, "GET", "/ready", "").0 == 200);
+    let report = ok(a, "GET", "/verify", "");
+    assert!(report.contains(r#""agree":false"#), "{report}");
+
+    // The repair copies what differs, and only what differs.
+    let repaired = ok(a, "POST", "/repair", "");
+    assert!(repaired.contains(r#""node":"a-spare""#), "{repaired}");
+    assert!(repaired.contains(r#""outcome":"caught up""#), "{repaired}");
+
+    // Now they agree, digest for digest - which includes the row keys, so the copy answers
+    // `GroupBy` with names rather than nulls.
+    until("the copies to agree", || ok(a, "GET", "/verify", "").contains(r#""agree":true"#));
+    until("the mark to be cleared", || ready(other).contains(r#""behind":[]"#));
+
+    // And the proof that it means something: the range now fails over to the copy that was
+    // behind, holding every record including the one it had missed.
+    a_node.close();
+    until("the range to move to the repaired copy", || {
+        send(other, "POST", "/table/tx/query", "Count(All())").1 == r#"{"count":2}"#
+    });
+    assert_eq!(
+        ok(other, "POST", "/table/tx/query", r#"Count(Row(country="FR"))"#),
+        r#"{"count":1}"#,
+        "the repaired copy is missing the row key it was told about"
+    );
+}
+
+/// Two batches with different keys, through a coordinator that is not the schema leader.
+///
+/// The shape that matters: the node planning the write is not the node handing out row ids, so
+/// every key it has not seen costs a round trip and comes back as a number it has to accept.
+/// A second batch must not be able to collide with the first.
+#[test]
+fn a_second_batch_of_keys_does_not_collide_with_the_first() {
+    let (a, b, spare) = (free_port(), free_port(), free_port());
+    let file = format!(
+        "schema_leader = \"b\"\n\
+         [[node]]\nname = \"a\"\naddr = \"{a}\"\nshards = \"0..1\"\n\
+         [[node]]\nname = \"b\"\naddr = \"{b}\"\nshards = \"1..\"\n\
+         [[node]]\nname = \"a-spare\"\naddr = \"{spare}\"\nreplica = \"a\"\n"
+    );
+    let mut a_spare = start_agreeing(&file, "a-spare", spare);
+    start_agreeing(&file, "a", a).forget();
+    start_agreeing(&file, "b", b).forget();
+
+    ok(a, "POST", "/table/tx", "");
+    ok(a, "POST", "/table/tx/field/amount?kind=int&bit_depth=32", "");
+    ok(a, "POST", "/table/tx/field/country?kind=set", "");
+    ok(a, "POST", "/table/tx/import", "amount 1 100\ncountry 1 GB\n");
+
+    // The copy goes away between the batches, which is the shape that found this.
+    a_spare.close();
+    let (status, body) = send(a, "POST", "/table/tx/import", "amount 2 900\ncountry 2 FR\n");
+    assert_eq!(status, 200, "{body}");
+
+    // And both keys mean what they were told they mean, on the node that holds them.
+    let groups = ok(a, "POST", "/table/tx/query", r#"Distinct(All(), field="country")"#);
+    assert_eq!(
+        groups,
+        r#"{"groups":[{"key":"FR","row":1,"value":{"count":1}},{"key":"GB","row":0,"value":{"count":1}}]}"#,
+        "{groups}"
+    );
+}
+
+/// `/metrics` says what an operator needs to alert on, and `copies_behind` is the one that
+/// matters: it is redundancy this cluster has lost and will not get back on its own.
+#[test]
+fn metrics_report_the_cluster() {
+    let (a, b) = two_nodes();
+    let text = ok(a, "GET", "/metrics", "");
+    assert!(text.contains("big_cluster_nodes 2"), "{text}");
+    assert!(text.contains("big_cluster_copies_behind 0"), "{text}");
+    // A range with no copy is never fenced, so this node is serving whatever happens elsewhere.
+    assert!(text.contains("big_cluster_serving 1"), "{text}");
+
+    // A fan-out is visible as peer traffic, and a peer that is not there is visible as
+    // something else. Both are counted, because an operator's next move differs.
+    ok(a, "POST", "/table/tx", "");
+    let before = text.contains("big_cluster_peer_requests_total 0");
+    let after = ok(a, "GET", "/metrics", "");
+    assert!(before, "{text}");
+    assert!(!after.contains("big_cluster_peer_requests_total 0"), "{after}");
+    let _ = b;
+}
+
+/// **A peer running a different build is refused before anything is decoded.**
+///
+/// Two builds that disagree about the encoding read each other's messages as something else - a
+/// length where a tag was - and the result is not a refusal, it is an answer that is quietly
+/// wrong. That is the one failure this whole layer exists to avoid, so it costs a header.
+#[test]
+fn a_peer_speaking_a_different_wire_version_is_refused() {
+    let (a, _b) = two_nodes();
+    let body = big_cluster::wire::FragmentsRequest { table: "tx".to_string() }.encode();
+    let fingerprint = LAST_FILE.with(|f| {
+        ClusterFile::parse(&f.borrow()).unwrap().for_node(Some("a"), "").unwrap().fingerprint()
+    });
+
+    // The right version: refused for a different reason, which is that there is no such table.
+    let (status, _) = send_bytes(a, "/internal/fragments", &body, fingerprint);
+    assert_ne!(status, 409, "a peer that agrees should get past the check");
+
+    // No stamps at all, which is what an older build sends.
+    let mut stream = TcpStream::connect(a).unwrap();
+    let head = format!(
+        "POST /internal/fragments HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(head.as_bytes()).unwrap();
+    stream.write_all(&body).unwrap();
+    let mut raw = String::new();
+    stream.read_to_string(&mut raw).unwrap();
+    assert!(raw.starts_with("HTTP/1.1 409"), "{raw}");
+    assert!(raw.contains(r#""code":"wire_version""#), "{raw}");
+}
+
+/// **Two nodes reading cluster files that disagree cannot serve each other.**
+///
+/// This is the failure ownership-by-configuration could not see: a range moved on one machine
+/// and not the other, each answering part of every query, neither saying so. They cannot meet
+/// without exchanging a fingerprint, so now they meet and stop.
+#[test]
+fn a_peer_reading_a_different_cluster_file_is_refused() {
+    let (a, _b) = two_nodes();
+    let body = big_cluster::wire::FragmentsRequest { table: "tx".to_string() }.encode();
+
+    let (status, out) = send_bytes(a, "/internal/fragments", &body, 0xdead_beef);
+    assert_eq!(status, 409, "{}", String::from_utf8_lossy(&out));
+    let text = String::from_utf8_lossy(&out);
+    assert!(text.contains(r#""code":"cluster_mismatch""#), "{text}");
+    // The message names what this node expected, because whoever reads it is looking at two
+    // machines and has to know which one to correct.
+    assert!(text.contains("deadbeef"), "{text}");
+}
+
+// -------------------------------------------------------------------------------------------
+// The clocks and the state file a deployment actually uses
+// -------------------------------------------------------------------------------------------
+
+/// **The same failover, on the clocks that ship**, over real sockets.
+///
+/// Every other test here runs the agreement fast so that it can watch it. This one runs it at
+/// the speed a datacentre does - an election of one and a half to three seconds, a promotion
+/// after four and a half - because numbers that are only ever exercised by hand are numbers
+/// that drift. It is the slowest test in the tree and it earns it.
+#[test]
+fn a_range_fails_over_on_the_clocks_it_ships_with() {
+    let (file, ports) = a_group_of_three();
+    let mut a = start_with(&file, "a", ports[0], Timing::default(), Leases::default(), None);
+    let _b = start_with(&file, "b", ports[1], Timing::default(), Leases::default(), None);
+    let _c = start_with(&file, "c", ports[2], Timing::default(), Leases::default(), None);
+
+    // An election is at most `election_min + election_spread`, twice over if the first splits.
+    waiting("an elected leader", std::time::Duration::from_secs(15), || {
+        ready(ports[1]).contains(r#""leader":""#)
+    });
+
+    ok(ports[0], "POST", "/table/tx", "");
+    ok(ports[0], "POST", "/table/tx/field/amount?kind=int&bit_depth=32", "");
+    ok(ports[0], "POST", "/table/tx/import", "amount 1 5\namount 2 5\n");
+
+    a.close();
+
+    // `promote_after` plus an election, plus room for a loaded machine.
+    waiting("the range to move", std::time::Duration::from_secs(30), || {
+        send(ports[1], "POST", "/table/tx/query", "Count(All())").1 == r#"{"count":2}"#
+    });
+
+    let (status, body) = send(ports[1], "POST", "/table/tx/import", "amount 3 5\n");
+    assert_eq!(status, 200, "{body}");
+}
+
+/// **A node that restarts remembers what it voted.**
+///
+/// A vote forgotten in a restart is a vote that can be cast twice, which is two leaders in one
+/// term. The encoding of that state is unit-tested; this is the other half - that a running
+/// node writes it and reads it back, which nothing else here exercises because every other test
+/// uses `Forgetful`.
+///
+/// The node taken away is a *copy*, not the one serving the range: this test is about the
+/// agreement's state surviving, and restarting the serving node would drag in a different
+/// question - see `a_serving_node_that_comes_back_empty_is_not_repaired`.
+#[test]
+fn a_node_that_restarts_keeps_what_it_agreed() {
+    let dir = tempfile::tempdir().unwrap();
+    let (file, ports) = a_group_of_three();
+    let state = |name: &str| Some(dir.path().join(format!("{name}.raft")));
+    let (timing, leases) = brisk();
+
+    let _a = start_with(&file, "a", ports[0], timing, leases, state("a"));
+    let _b = start_with(&file, "b", ports[1], timing, leases, state("b"));
+    let mut c = start_with(&file, "c", ports[2], timing, leases, state("c"));
+
+    until("an elected leader", || ready(ports[0]).contains(r#""leader":""#));
+    ok(ports[0], "POST", "/table/tx", "");
+    ok(ports[0], "POST", "/table/tx/field/amount?kind=int&bit_depth=32", "");
+    ok(ports[0], "POST", "/table/tx/import", "amount 1 5\n");
+
+    let term_before = term_of(ready(ports[2]));
+    assert!(term_before > 0, "nothing was agreed before the restart");
+    c.close();
+
+    // **The mark is earned while it is away, not when it comes back.** Nothing inspects a
+    // returning node's records - the only thing that marks a copy behind is the leader not
+    // hearing from it for `promote_after` - so the test waits for that to have happened
+    // rather than assuming a restart takes longer than the lease. Without this wait the
+    // node is back inside the window, is never marked, and the assertion below is left
+    // waiting on something no mechanism will ever do.
+    until("the copy that went away to be marked behind", || {
+        ready(ports[0]).contains(r#""behind":["c"]"#)
+    });
+
+    // The same node, the same file. It has to come back knowing what it knew: a node that
+    // restarts at term zero has forgotten a vote it may already have cast.
+    let _c_again = start_with(&file, "c", ports[2], timing, leases, state("c"));
+    until("the restarted node to answer", || send(ports[2], "GET", "/ready", "").0 == 200);
+    until("it to rejoin the agreement", || {
+        term_of(ready(ports[2])) >= term_before && ready(ports[2]).contains(r#""leader":""#)
+    });
+
+    // The file was read rather than started fresh: the state on disk says so.
+    let written = std::fs::read(dir.path().join("c.raft")).unwrap();
+    assert!(written.starts_with(b"BIGRAFT1"), "the agreement wrote no state for `c`");
+
+    // Reads never stopped: the copy serving the range was never the one taken away.
+    assert_eq!(ok(ports[0], "POST", "/table/tx/query", "Count(All())"), r#"{"count":1}"#);
+
+    // **Its database did not come back with it.** The agreement state persisted and the
+    // records did not, which is what a replaced machine looks like - and it goes through the
+    // same two mechanisms as any other copy that is behind: it is marked, so it cannot be
+    // promoted, and a repair is what clears that. Coming back does not clear the mark:
+    // rejoining proves the node is answering again, not that it holds what it missed.
+    assert!(
+        ready(ports[0]).contains(r#""behind":["c"]"#),
+        "rejoining cleared the mark; only a repair may"
+    );
+    assert!(ok(ports[0], "GET", "/verify", "").contains(r#""agree":false"#));
+
+    let repaired = ok(ports[0], "POST", "/repair", "");
+    assert!(repaired.contains(r#""outcome":"caught up""#), "{repaired}");
+    until("the copies to agree again", || {
+        ok(ports[0], "GET", "/verify", "").contains(r#""agree":true"#)
+    });
+}
+
+/// **The copy serving a range is the truth, even when its disk was replaced.**
+///
+/// This is what choosing consistency costs, pinned rather than discovered. Every write reaches
+/// the copy serving a range before any other, so nothing in the cluster is in a position to
+/// contradict it - and a node that comes back with an empty disk fast enough that nothing was
+/// promoted goes on serving a range it no longer holds.
+///
+/// **Nothing automatic notices.** It was not gone long enough to be marked behind, so there is
+/// no flag and no failover; there is nothing to fail over *to*, because as far as the
+/// agreement can tell the right node is answering. `GET /verify` is the only thing that finds
+/// it, which is exactly why that route exists and why the runbook says to run it - and
+/// `POST /repair` says plainly that this is the one it cannot fix.
+#[test]
+fn a_serving_node_that_comes_back_empty_is_only_found_by_verify() {
+    let (file, ports) = a_group_of_three();
+    // Elections stay brisk so the test is quick; the *promotion* window is long, so that a
+    // node restarting inside it is not replaced - which is the case being pinned.
+    let timing = Timing { election_min: 150, election_spread: 150, heartbeat: 50 };
+    let leases = Leases {
+        serve_for: std::time::Duration::from_secs(5),
+        promote_after: std::time::Duration::from_secs(30),
+    };
+    let mut a = start_with(&file, "a", ports[0], timing, leases, None);
+    let _b = start_with(&file, "b", ports[1], timing, leases, None);
+    let _c = start_with(&file, "c", ports[2], timing, leases, None);
+
+    until("an elected leader", || ready(ports[1]).contains(r#""leader":""#));
+    ok(ports[0], "POST", "/table/tx", "");
+    ok(ports[0], "POST", "/table/tx/field/amount?kind=int&bit_depth=32", "");
+    ok(ports[0], "POST", "/table/tx/import", "amount 1 5\n");
+    assert_eq!(ok(ports[1], "POST", "/table/tx/query", "Count(All())"), r#"{"count":1}"#);
+
+    // Away and back well inside the promotion window, with nothing on its disk.
+    a.close();
+    let _a_again = start_with(&file, "a", ports[0], timing, leases, None);
+    until("the replaced node to answer", || send(ports[0], "GET", "/ready", "").0 == 200);
+
+    // **It refuses rather than answers**, and that is worth more than it looks: the schema
+    // went with the data, so the first thing any client sees is a node saying it does not
+    // have the table - naming itself. The silent version of this failure would be a node that
+    // kept its schema and lost its records, answering a smaller number than the truth.
+    until("the query to fail on the emptied node", || {
+        send(ports[1], "POST", "/table/tx/query", "Count(All())").0 == 404
+    });
+    let (status, body) = send(ports[1], "POST", "/table/tx/query", "Count(All())");
+    assert_eq!(status, 404, "{body}");
+    assert!(body.contains(r#""code":"peer_refused""#), "{body}");
+    assert!(body.contains("`a`"), "the refusal does not name the node that lost its data: {body}");
+
+    // And nothing *flagged* it. It was never unreachable for long enough to be marked, and no
+    // other copy was ever a better answer, so the agreement had nothing to decide. The loud
+    // failure above is the engine refusing a question it cannot answer, not the cluster
+    // noticing a node is behind.
+    assert!(ready(ports[1]).contains(r#""behind":[]"#), "{}", ready(ports[1]));
+
+    // `verify` is the only thing that finds it, and `repair` says which copy it cannot take
+    // from rather than claiming to have fixed something.
+    let report = ok(ports[1], "GET", "/verify", "");
+    assert!(report.contains(r#""agree":false"#), "{report}");
+    let repaired = ok(ports[1], "POST", "/repair", "");
+    assert!(
+        repaired.contains("this copy is the one serving its range")
+            || repaired == r#"{"repaired":[]}"#,
+        "the repair claimed to have fixed something it cannot: {repaired}"
+    );
+}
+
+/// The agreement's term out of a `/ready` body.
+fn term_of(ready: String) -> u64 {
+    ready
+        .split(r#""term":"#)
+        .nth(1)
+        .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("no term in {ready}"))
+}

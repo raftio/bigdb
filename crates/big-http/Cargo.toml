@@ -1,0 +1,35 @@
+[package]
+name = "big-http"
+description = "HTTP edge for big: queries and ingest over one small hand-written server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "readme.md"
+keywords = ["bitmap","index","database","server","http"]
+categories = ["database-implementations","web-programming::http-server"]
+
+# No web framework. The surface is a dozen routes and a JSON writer; pulling in an async
+# runtime for that would be a larger commitment than the whole engine has made so far.
+[dependencies]
+big-api = { path = "../big-api", version = "0.1.0" }
+# The coordinator. Every route goes through it, including on a node with no peers: a second
+# path for the un-clustered case would be the path nobody tests.
+big-cluster = { path = "../big-cluster", version = "0.1.0" }
+big-db = { path = "../big-db", version = "0.1.0" }
+big-exec = { path = "../big-exec", version = "0.1.0" }
+big-pager = { path = "../big-pager", version = "0.1.0" }
+# For `status`, and only for it. Turning an error into an HTTP status means matching on the
+# whole error tree, and the tree is the engine's - a crate lower down cannot do the mapping
+# without learning about HTTP, which is the one thing the layering is trying to prevent.
+big-field = { path = "../big-field", version = "0.1.0" }
+big-plan = { path = "../big-plan", version = "0.1.0" }
+# For the status a refused SQL statement deserves. `status.rs` is the one place that knows both
+# HTTP and the whole error tree, so it is the one place that has to name this error.
+big-sql = { path = "../big-sql", version = "0.1.0" }
+
+[dev-dependencies]
+# `auth` writes a token file and then checks its mode, and the cluster tests give a restarting
+# node somewhere to keep the state a restart may not lose.
+tempfile = "3"

@@ -1,0 +1,58 @@
+# One node. What `bigd` is without --cluster: every shard, no peers, and the same coordinator
+# a four-machine deployment runs.
+#
+#   cd deploy/single
+#   mkdir -p secrets && printf 'change-me-please admin\n' > secrets/tokens
+#   docker compose up -d
+#   curl -H 'Authorization: Bearer change-me-please' localhost:7654/ready
+
+services:
+  big:
+    build:
+      context: ../..
+    # Published to loopback only. There is no TLS here and there is not going to be - put a
+    # reverse proxy in front of it if this has to be reachable from anywhere else, and see
+    # runbook.md for one that works.
+    ports:
+      - "127.0.0.1:7654:7654"
+    volumes:
+      - data:/data
+      # The directory, never the file. A single-file bind mount breaks the first time anything
+      # replaces the file rather than writing through it, which is what every editor does. The
+      # entrypoint stages what is in here into a private copy - see deploy/entrypoint.sh.
+      - ./secrets:/etc/big/secrets:ro
+    command:
+      - /data/big.db
+      - 0.0.0.0:7654
+      - --tokens
+      # Staged from the mount by the entrypoint, which reads it as root and writes a private
+      # copy: a bind mount carries the host's ownership, which the image cannot predict.
+      - /run/big/tokens
+      # **Set it on a new deployment.** There is no default, on purpose - a query that used to
+      # finish must not start failing because the server was upgraded - but a daemon with no
+      # ceiling is a daemon one expensive query can hold a worker on for as long as it likes.
+      - --query-timeout
+      - "30"
+      # Full durability is the default and is stated anyway: an operator reading this file
+      # should not have to know what the default is to know what they are running.
+      - --durability
+      - full
+    restart: unless-stopped
+    # No memory limit here, and that is a decision rather than an omission. Reads come out of
+    # the mapping, so most of what this process appears to use is page cache the kernel will
+    # give back; a hard limit turns that into an OOM kill under load. What bounds a *query* is
+    # the engine's own ceiling, not the container's. Set one if you have measured your
+    # workload, not because a template had one.
+    #
+    # deploy:
+    #   resources:
+    #     limits:
+    #       memory: 2g
+    # `bigd` has no signal handler, and it does not need one: the meta page flip is the only
+    # atomic point in a commit, so a process that is killed outright leaves a file that is
+    # either before that flip or after it. There is nothing to replay and nothing to lose, so
+    # the default ten seconds is nine and a half more than this needs.
+    stop_grace_period: 2s
+
+volumes:
+  data:

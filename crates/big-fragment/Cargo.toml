@@ -1,0 +1,18 @@
+[package]
+name = "big-fragment"
+description = "Fragment coordinates and row access for big"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "readme.md"
+
+[dependencies]
+big-btree = { path = "../big-btree", version = "0.1.0" }
+big-container = { path = "../big-container", version = "0.1.0" }
+big-page = { path = "../big-page", version = "0.1.0" }
+big-pager = { path = "../big-pager", version = "0.1.0" }
+
+[dev-dependencies]
+proptest = "1"

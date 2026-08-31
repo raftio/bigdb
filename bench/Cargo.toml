@@ -1,0 +1,65 @@
+[package]
+name = "big-bench"
+description = "Comparative benchmarks against other embedded storage engines"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+# Never goes to crates.io: it exists to pull in competitors, not to be depended on.
+publish = false
+
+[dependencies]
+big-db = { path = "../crates/big-db", version = "0.1.0" }
+big-pager = { path = "../crates/big-pager", version = "0.1.0", features = ["counting-pager"] }
+big-page = { path = "../crates/big-page", version = "0.1.0" }
+big-container = { path = "../crates/big-container", version = "0.1.0" }
+# The analytical comparison asks `big` its questions in its own query language, the way every
+# rival is asked in SQL, so it needs the planner and executor rather than just the storage.
+big-exec = { path = "../crates/big-exec", version = "0.1.0" }
+# And the SQL surface, so the same six questions can be put to `big` as the same text every
+# rival is given. The two `big` columns that produces are the measurement of what a query
+# language costs, which is otherwise a thing everyone assumes and nobody has weighed.
+big-plan = { path = "../crates/big-plan", version = "0.1.0" }
+big-sql = { path = "../crates/big-sql", version = "0.1.0" }
+fjall = "2.11.2"
+heed = "0.22.1"
+redb = "2"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+tempfile = "3"
+
+# The analytical peers, every one of them optional and off by default.
+#
+# Not because they are second-class, but because of what they cost to build. DuckDB bundles a
+# C++ source tree that takes minutes and gigabytes of RAM to compile, and DataFusion brings the
+# whole Arrow stack. Making either unconditional would put that on every `cargo test` in CI, for
+# a crate CI otherwise builds in seconds. The report binary names the features it needs.
+duckdb = { version = "1.10505", features = ["bundled"], optional = true }
+# Arrow and Parquet come through DataFusion's own re-exports rather than as dependencies of
+# their own, so there is no way for the three versions to drift apart.
+datafusion = { version = "55", optional = true }
+tokio = { version = "1", optional = true, features = ["rt-multi-thread"] }
+# ClickHouse speaks HTTP and nothing else, and is reached over loopback, so this asks for no TLS.
+# `resolver = "2"` is what makes that stick: DuckDB's build script depends on `ureq` with rustls
+# to fetch its own sources, and under resolver 1 that would unify with this line and link a TLS
+# stack into a binary that never opens a TLS connection.
+ureq = { version = "3", optional = true, default-features = false }
+serde_json = { version = "1", optional = true }
+
+[features]
+default = []
+# DuckDB: the embedded OLAP engine, and the closest thing to `big` in deployment shape.
+duckdb-peer = ["dep:duckdb"]
+# DataFusion over Parquet: a query engine with no storage engine of its own.
+datafusion-peer = ["dep:datafusion", "dep:tokio"]
+# ClickHouse, which the harness talks to over HTTP and does not start. See `bench/readme.md`.
+http-peers = ["dep:ureq", "dep:serde_json"]
+# Everything, which is what the analytical report is run with.
+olap-peers = ["duckdb-peer", "datafusion-peer", "http-peers"]
+
+[dev-dependencies]
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "compare"
+harness = false

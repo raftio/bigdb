@@ -1,0 +1,20 @@
+# Supply chain. Runs on a schedule as well as on a change, because an advisory can land
+# against a dependency that has not moved.
+name: audit
+
+on:
+  push:
+    paths: ["**/Cargo.toml", "**/Cargo.lock", "deny.toml", ".github/workflows/audit.yml"]
+  pull_request:
+    paths: ["**/Cargo.toml", "**/Cargo.lock", "deny.toml"]
+  schedule:
+    - cron: "17 6 * * 1"
+
+jobs:
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories bans licenses sources

@@ -1,0 +1,30 @@
+# Three nodes: two ranges and a copy of one of them.
+#
+# Three is the minimum once anything has a copy, and `bigd` refuses fewer: failing over is a
+# decision a majority has to agree on, and a majority of two is two. `b` counts towards that
+# majority even though it holds a different range.
+#
+# The addresses are the compose service names. Inside the network each node listens on
+# 0.0.0.0:7654 and reaches the others by name, which is why each one is started with --node:
+# the address it binds is not the address the others use to find it.
+
+schema_leader   = "a"
+# Staged from the mount by the entrypoint: see deploy/entrypoint.sh.
+peer_token_file = "/run/big/peer.token"
+
+[[node]]
+name   = "a"
+addr   = "a:7654"
+shards = "0..64"
+
+[[node]]
+name   = "b"
+addr   = "b:7654"
+shards = "64.."
+
+# A copy of everything `a` holds. No range of its own: it takes `a`'s. If the node serving that
+# range stops answering, the agreement gives the range to this one.
+[[node]]
+name    = "a-spare"
+addr    = "a-spare:7654"
+replica = "a"

@@ -1,0 +1,16 @@
+# Everything the build does not read. `target` is the big one: copying a local build into the
+# context can be gigabytes, and it would be thrown away by the build anyway.
+target
+.git
+.github
+archived
+bench/results
+docs
+*.md
+!bench/readme.md
+fuzz
+# `deploy/entrypoint.sh` is copied into the image, so the directory cannot be excluded whole.
+deploy/single
+deploy/cluster
+Dockerfile
+.dockerignore

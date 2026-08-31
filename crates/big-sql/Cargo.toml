@@ -1,0 +1,14 @@
+[package]
+name = "big-sql"
+description = "A single-table SQL surface for big, translated into the query language the planner already resolves"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "readme.md"
+
+# One dependency, and it is the AST this crate writes into. Nothing here links a pager, so a
+# translation test costs what a parser test costs.
+[dependencies]
+big-plan = { path = "../big-plan", version = "0.1.0" }

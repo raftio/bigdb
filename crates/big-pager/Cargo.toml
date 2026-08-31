@@ -1,0 +1,36 @@
+[package]
+name = "big-pager"
+description = "The file and the transactions over it: mmap reads, pwrite writes, copy-on-write"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "readme.md"
+
+[dependencies]
+big-page = { path = "../big-page", version = "0.1.0" }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+memmap2 = "0.9"
+
+[features]
+crash-injection = []
+# Test support, like `crash-injection`: a pager decorator that tallies I/O, used by the
+# regression tests here and in `big-db`. Off by default.
+counting-pager = []
+
+[dev-dependencies]
+tempfile = "3"
+big-pager = { path = ".", features = ["crash-injection", "counting-pager"] }
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
+
+# Benchmarks are separate binaries with their own harness; criterion supplies it.
+[[bench]]
+name = "write"
+harness = false
+
+[[bench]]
+name = "read"
+harness = false
