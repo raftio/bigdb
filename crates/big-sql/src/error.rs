@@ -76,8 +76,13 @@ pub enum Refused {
     InsertSize,
     /// `DELETE FROM`, which asks for a row this engine does not store.
     DeleteRows,
-    /// `CREATE DATABASE`, `USE`, or anything else naming a level above a table.
-    Database,
+    /// `USE`, which asks a stateless surface to remember something between statements.
+    ///
+    /// Databases exist; a *session* does not. `POST /sql` answers one statement and keeps
+    /// nothing, so `USE` is the client's to hold - `bigc` does, and sends it as `?database=`.
+    SessionUse,
+    /// `sales.orders.amount`: a column qualified by more than an alias.
+    ThreePartName,
     /// A view, materialised or not: nothing here stores a statement.
     View,
     /// `CASE WHEN`, `if`, `multiIf`, `coalesce` — choosing between two values per record.
@@ -129,7 +134,7 @@ impl Refused {
     /// Kept honest by [`Refused::rank`] below, whose exhaustive match will not compile until a
     /// new variant is named - and by a test asserting that every rank appears here exactly once,
     /// which is what catches naming one and forgetting to add it.
-    pub const ALL: [Self; 40] = [
+    pub const ALL: [Self; 41] = [
         Self::Joins,
         Self::OuterJoin,
         Self::JoinOn,
@@ -152,7 +157,7 @@ impl Refused {
         Self::InsertSelect,
         Self::InsertSize,
         Self::DeleteRows,
-        Self::Database,
+        Self::SessionUse,
         Self::View,
         Self::Case,
         Self::Cast,
@@ -170,6 +175,7 @@ impl Refused {
         Self::Format,
         Self::Union,
         Self::Quantile,
+        Self::ThreePartName,
     ];
 
     /// Where this refusal sits in [`Refused::ALL`], and the reason that list can be trusted.
@@ -203,7 +209,7 @@ impl Refused {
             Self::InsertSelect => 19,
             Self::InsertSize => 20,
             Self::DeleteRows => 21,
-            Self::Database => 22,
+            Self::SessionUse => 22,
             Self::View => 23,
             Self::Case => 24,
             Self::Cast => 25,
@@ -221,6 +227,7 @@ impl Refused {
             Self::Format => 37,
             Self::Union => 38,
             Self::Quantile => 39,
+            Self::ThreePartName => 40,
         }
     }
 
@@ -234,7 +241,7 @@ impl Refused {
             Self::Joins => "sql_no_joins",
             Self::OuterJoin => "sql_no_outer_joins",
             Self::JoinOn => "sql_join_condition",
-            Self::Ambiguous => "sql_ambiguous_column",
+            Self::Ambiguous | Self::ThreePartName => "sql_ambiguous_column",
             Self::JoinFilter => "sql_join_filter",
             Self::Order => "sql_unsupported_order",
             Self::Null => "sql_no_nulls",
@@ -246,7 +253,7 @@ impl Refused {
             Self::InsertColumns | Self::InsertId => "sql_insert_shape",
             Self::IdColumn => "sql_id_column",
             Self::InsertSize => "sql_insert_too_large",
-            Self::Database => "sql_no_database",
+            Self::SessionUse => "sql_use_unsupported",
             Self::View => "sql_no_views",
             Self::AlterKind => "sql_no_alter_column",
             Self::Rename => "sql_no_rename",
@@ -416,11 +423,17 @@ impl Refused {
                  takes the record ids to clear, one per line - which is the `SELECT *` of the \
                  same `WHERE`, written back"
             }
-            Self::Database => {
-                "there is no database above a table here. A node holds one catalog, and a \
-                 table's name is what resolves a fact from a client all the way to a bitmap, so \
-                 `db.t` would name a level nothing below this has. `CREATE TABLE`, `DROP TABLE` \
-                 and `SHOW TABLES` are the whole of the namespace"
+            Self::SessionUse => {
+                "`USE` asks this surface to remember a database between statements, and it \
+                 remembers nothing: one statement is one request, answered and forgotten. The \
+                 database is per request - send `?database=sales`, or qualify the name as \
+                 `sales.orders`. `bigc` accepts `USE` and does exactly that for you"
+            }
+            Self::ThreePartName => {
+                "a column is qualified by an alias and nothing else, so `sales.orders.amount` \
+                 has one name too many. A table is qualified - `FROM sales.orders` - and a \
+                 column then reaches it through an alias: \
+                 `FROM sales.orders o WHERE o.amount > 5`"
             }
             Self::View => {
                 "a view is a statement kept under a name and re-planned at every read, and \

@@ -28,6 +28,8 @@
 //! POST   /table/{t}?engine=bitmap|bitmap+columnar|columnar             admin
 //! POST   /table/{t}/field/{f}?kind=...&bit_depth=N&scale=N               admin
 //! DELETE /table/{t}                drop the table                        admin
+//! POST   /database/{d}             create the database                   admin
+//! DELETE /database/{d}?cascade=true                                      admin
 //! DELETE /table/{t}/field/{f}      drop the field                        admin
 //! POST   /admin/backup?name=<name> an online copy of this node's file    admin
 //! ```
@@ -190,6 +192,8 @@ enum Target<'a> {
     CreateField(&'a str, &'a str),
     DropTable(&'a str),
     DropField(&'a str, &'a str),
+    CreateDatabase(&'a str),
+    DropDatabase(&'a str),
     PeerQuery,
     PeerRecords,
     PeerImport,
@@ -254,7 +258,12 @@ impl Target<'_> {
             Self::CreateTable(_)
             | Self::CreateField(..)
             | Self::DropTable(_)
-            | Self::DropField(..) => Some(Role::Admin),
+            | Self::DropField(..)
+            // A database is a schema change like any other. The powers have to move together:
+            // a weaker one that could drop a database would be a way round the stronger one
+            // that guards dropping the tables in it.
+            | Self::CreateDatabase(_)
+            | Self::DropDatabase(_) => Some(Role::Admin),
 
             // A peer is a client with a token, not a trusted origin. Each of these needs what
             // the public route it serves needs, and interning is a write because it commits: a
@@ -309,6 +318,8 @@ fn resolve<'a>(method: &str, segments: &[&'a str]) -> Option<Target<'a>> {
         ("POST", ["table", t]) => Target::CreateTable(t),
         ("POST", ["table", t, "field", f]) => Target::CreateField(t, f),
         ("DELETE", ["table", t]) => Target::DropTable(t),
+        ("POST", ["database", d]) => Target::CreateDatabase(d),
+        ("DELETE", ["database", d]) => Target::DropDatabase(d),
         ("DELETE", ["table", t, "field", f]) => Target::DropField(t, f),
         ("POST", ["internal", "query"]) => Target::PeerQuery,
         ("POST", ["internal", "records"]) => Target::PeerRecords,
@@ -398,6 +409,8 @@ pub fn dispatch<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request) -> Response
         Target::CreateTable(t) => create_table(ctx, req, t),
         Target::CreateField(t, f) => create_field(ctx, req, t, f),
         Target::DropTable(t) => drop_table(ctx, t),
+        Target::CreateDatabase(d) => create_database(ctx, d),
+        Target::DropDatabase(d) => drop_database(ctx, req, d),
         Target::DropField(t, f) => drop_field(ctx, t, f),
         Target::PeerQuery => peer_query(ctx, req),
         Target::PeerRecords => peer_records(ctx, req),

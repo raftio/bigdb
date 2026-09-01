@@ -283,27 +283,30 @@ ALTER TABLE t ADD COLUMN _record_id UINT(32)
 sql_id_column
 
 
-## Databases, views and the objects this engine does not have.
+## Views and the objects this engine does not have.
+##
+## Databases are no longer among them - see `database.test`. What is still refused is a
+## *session*: `POST /sql` answers one statement and keeps nothing, so the database is per
+## request rather than something `USE` can leave behind.
 
 error
-CREATE DATABASE d
+USE sales
 ----
-sql_no_database
+sql_use_unsupported
+
+## A column is qualified by an alias and nothing else, so a third part is one name too many.
+## Two would make `a.b` ambiguous between "alias a, column b" and "database a, table b", and
+## the select list is parsed before `FROM` - so there is nothing here to disambiguate with.
 
 error
-DROP DATABASE d
+SELECT sales.orders.amount FROM sales.orders
 ----
-sql_no_database
+sql_ambiguous_column
 
 error
-SHOW DATABASES
+SELECT count(*) FROM sales.orders.extra
 ----
-sql_no_database
-
-error
-SHOW SCHEMAS
-----
-sql_no_database
+sql_ambiguous_column
 
 error
 CREATE VIEW v AS SELECT count(*) FROM t
@@ -367,6 +370,12 @@ error
 ALTER TABLE t ENGINE = columnar
 ----
 sql_no_alter_engine
+
+# A database carries a name and nothing else, so there is nothing about one to alter.
+error
+ALTER DATABASE d RENAME TO e
+----
+sql_read_only
 
 ## Constraints, and the widths that are not bit depths.
 

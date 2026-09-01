@@ -55,13 +55,18 @@ type Side = usize;
 /// brought in from one already here.
 struct Scope<'a> {
     sources: Vec<&'a Source>,
+    /// `database.table` per source, in the same order. See [`Source::qualified`].
+    qualified: Vec<String>,
 }
 
 impl<'a> Scope<'a> {
     fn of(select: &'a Select) -> Self {
-        let sources =
+        let sources: Vec<&Source> =
             std::iter::once(&select.from).chain(select.joins.iter().map(|j| &j.source)).collect();
-        Self { sources }
+        // Held rather than built per call: `table` hands out a borrow, and a qualified name
+        // formatted on demand would have nothing to borrow from.
+        let qualified = sources.iter().map(|s| s.qualified()).collect();
+        Self { sources, qualified }
     }
 
     /// Which table a column belongs to.
@@ -75,8 +80,8 @@ impl<'a> Scope<'a> {
         self.sources.iter().position(|s| s.label() == q).ok_or_else(refuse)
     }
 
-    fn table(&self, side: Side) -> &'a str {
-        &self.sources[side].table
+    fn table(&self, side: Side) -> &str {
+        &self.qualified[side]
     }
 
     /// Refuses two tables in scope under one name, which no qualifier could tell apart.

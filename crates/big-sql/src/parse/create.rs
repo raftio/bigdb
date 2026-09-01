@@ -37,12 +37,21 @@ impl Parser<'_> {
     /// table that already exists. A column list is the way to say the whole shape in one
     /// statement.
     pub(super) fn create_table(&mut self) -> Result<crate::ddl::Ddl> {
-        if !self.word_is("TABLE") {
-            // Every other `CREATE` is refused by name, and the two that have their own sentence
-            // say it: there is no database above a table here, and nothing stores a statement.
-            if self.word_is("DATABASE") || self.word_is("SCHEMA") {
-                return Err(self.refuse(Refused::Database));
+        // `DATASET` is BigQuery's word for the same thing and `SCHEMA` is the standard's;
+        // `DATABASE` is what ClickHouse, Doris and StarRocks call it, and what every JDBC
+        // driver introspects with. One meaning, so one statement.
+        if self.word_is("DATABASE") || self.word_is("SCHEMA") || self.word_is("DATASET") {
+            self.i += 1;
+            let if_not_exists = self.if_exists(true)?;
+            let name = self.bare_ident("a database name")?;
+            if self.peek().is_some() {
+                return Err(self.syntax("the end of the statement"));
             }
+            return Ok(crate::ddl::Ddl::CreateDatabase { name, if_not_exists });
+        }
+        if !self.word_is("TABLE") {
+            // Every other `CREATE` is refused by name, and the one that has its own sentence
+            // says it: nothing here stores a statement.
             if self.word_is("VIEW") || self.word_is("MATERIALIZED") {
                 return Err(self.refuse(Refused::View));
             }
@@ -50,7 +59,7 @@ impl Parser<'_> {
         }
         self.i += 1;
         let if_not_exists = self.if_exists(true)?;
-        let table = self.bare_ident("a table name")?;
+        let (database, table) = self.table_ref("a table name")?;
 
         let columns = if self.eat(&Tok::LParen) { self.column_list()? } else { Vec::new() };
 
@@ -70,7 +79,7 @@ impl Parser<'_> {
         if self.peek().is_some() {
             return Err(self.syntax("the end of the statement"));
         }
-        Ok(crate::ddl::Ddl::CreateTable { table, engine, columns, if_not_exists })
+        Ok(crate::ddl::Ddl::CreateTable { database, table, engine, columns, if_not_exists })
     }
 
     /// `IF [NOT] EXISTS`, or nothing.

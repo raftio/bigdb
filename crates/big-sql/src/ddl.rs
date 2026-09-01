@@ -42,6 +42,26 @@
 /// chose.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Ddl {
+    /// `CREATE DATABASE [IF NOT EXISTS] <name>`, also spelled `SCHEMA` and `DATASET`.
+    ///
+    /// A database here is a **namespace**, and the natural place to hang retention and access
+    /// on later - not a storage boundary. Nothing below the catalog knows there is one: a
+    /// `TableId` is unique across every database, so no fragment, row key or root record
+    /// mentions one. Which is why cross-database questions are free, and why this statement
+    /// writes a single catalog record.
+    CreateDatabase { name: String, if_not_exists: bool },
+    /// `DROP DATABASE [IF EXISTS] <name> [CASCADE | RESTRICT]`.
+    ///
+    /// `RESTRICT` is the default and the absence of `CASCADE` means it: a database still
+    /// holding tables is refused rather than emptied. `DROP DATABASE` is one word away from
+    /// being the most expensive typo on this surface, and Postgres and BigQuery both make you
+    /// say the word.
+    DropDatabase {
+        name: String,
+        if_exists: bool,
+        /// `CASCADE` was written: drop every table in it too.
+        cascade: bool,
+    },
     /// `CREATE TABLE [IF NOT EXISTS] <name> [(<column>, ...)] [ENGINE = <engine>]`.
     ///
     /// The column list is optional, and an empty one is not the same statement as an absent
@@ -50,6 +70,9 @@ pub enum Ddl {
     /// the layer that owns the schema, exactly the changes `POST /table/{t}/field/{f}` makes -
     /// see [`Column`] for why that is not a transaction.
     CreateTable {
+        /// `sales` in `sales.orders`. `None` means the request's default database,
+        /// which is what an unqualified name asks for.
+        database: Option<String>,
         table: String,
         /// `None` when the statement did not say, which means the server's default rather than
         /// any particular engine.
@@ -70,6 +93,9 @@ pub enum Ddl {
     /// Two changes, because two is what the engine below has: a field is created or a field is
     /// dropped, and there is no operation that alters one in place. See [`Alter`].
     AlterTable {
+        /// `sales` in `sales.orders`. `None` means the request's default database,
+        /// which is what an unqualified name asks for.
+        database: Option<String>,
         table: String,
         /// In the order written, and never empty - `ALTER TABLE t` on its own is a syntax
         /// error rather than a statement that changes nothing.
@@ -83,11 +109,32 @@ pub enum Ddl {
     /// travelling to the schema leader and then to every node, and a list would promise an
     /// atomicity nothing below here has.
     DropTable {
+        /// `sales` in `sales.orders`. `None` means the request's default database,
+        /// which is what an unqualified name asks for.
+        database: Option<String>,
         table: String,
         /// `IF EXISTS`: a table that is not there is a request already satisfied, answered with
         /// nothing dropped rather than with an error.
         if_exists: bool,
     },
+}
+
+impl Ddl {
+    /// Fills in the database a table this statement names did not carry. See
+    /// [`crate::translate_in`].
+    ///
+    /// A `CREATE DATABASE` names a database rather than being in one, so it is untouched -
+    /// creating `sales` from a request against `ops` creates `sales`.
+    pub fn fill_database(&mut self, database: &str) {
+        match self {
+            Self::CreateTable { database: d, .. }
+            | Self::AlterTable { database: d, .. }
+            | Self::DropTable { database: d, .. } => {
+                d.get_or_insert_with(|| database.to_string());
+            }
+            Self::CreateDatabase { .. } | Self::DropDatabase { .. } => {}
+        }
+    }
 }
 
 /// One change an `ALTER TABLE` makes.

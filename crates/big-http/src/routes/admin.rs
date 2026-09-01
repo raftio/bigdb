@@ -98,6 +98,40 @@ pub(super) fn drop_table<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, table: &str) -> R
     }
 }
 
+/// `POST /database/{d}` - the namespace a table's name is unique within.
+///
+/// Idempotent, like `POST /table/{t}`: a database that is already there answers `200` with
+/// nothing created, because a caller running a setup script twice asked for the same state
+/// twice and got it.
+pub(super) fn create_database<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, database: &str) -> Response {
+    match ctx.cluster.create_database(database) {
+        Ok(created) => {
+            Response::ok(format!("{{\"database\":\"{database}\",\"created\":{created}}}"))
+        }
+        Err(e) => from_cluster(&e),
+    }
+}
+
+/// `DELETE /database/{d}?cascade=true` - the database, and with `cascade` its tables.
+///
+/// **Without `cascade` a database that still holds tables is `409`, not a mass drop.** The
+/// same default Postgres and BigQuery take, and for the same reason: this is one word away
+/// from being the most expensive request on this surface.
+pub(super) fn drop_database<P: PagerMut + Sync>(
+    ctx: &Ctx<'_, P>,
+    req: &Request,
+    database: &str,
+) -> Response {
+    let cascade = req.param("cascade").is_some_and(|v| v == "true" || v == "1");
+    match ctx.cluster.drop_database_if_empty(database, cascade) {
+        Ok(true) => Response::ok(format!("{{\"dropped\":\"{database}\"}}")),
+        Ok(false) => {
+            Response::failure(404, "unknown_database", &format!("no database named `{database}`"))
+        }
+        Err(e) => from_cluster(&e),
+    }
+}
+
 pub(super) fn drop_field<P: PagerMut + Sync>(
     ctx: &Ctx<'_, P>,
     table: &str,

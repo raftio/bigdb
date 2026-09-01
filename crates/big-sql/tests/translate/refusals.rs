@@ -118,12 +118,10 @@ fn every_refusal_names_itself() {
     assert_eq!(code("CREATE TABLE t (a DECIMAL)"), "sql_decimal_scale");
     assert_eq!(code("CREATE TABLE t (a UINT(0))"), "sql_bit_depth");
     assert_eq!(code("CREATE INDEX i ON t (a)"), "sql_read_only");
-    // A table is dropped now - see `schema` - so what is refused is the two levels of naming
-    // that do not exist here, on whichever verb they were written with.
-    assert_eq!(code("DROP DATABASE d"), "sql_no_database");
-    assert_eq!(code("CREATE DATABASE d"), "sql_no_database");
-    assert_eq!(code("SHOW DATABASES"), "sql_no_database");
-    assert_eq!(code("USE d"), "sql_no_database");
+    // Databases are answered now - see `database.test`. What is still refused is a *session*:
+    // one statement is one request, so the database arrives with the request rather than being
+    // something `USE` can leave behind for the next one.
+    assert_eq!(code("USE d"), "sql_use_unsupported");
     assert_eq!(code("DROP VIEW v"), "sql_no_views");
     assert_eq!(code("CREATE VIEW v AS SELECT count(*) FROM t"), "sql_no_views");
     assert_eq!(code("CREATE MATERIALIZED VIEW v AS SELECT count(*) FROM t"), "sql_no_views");

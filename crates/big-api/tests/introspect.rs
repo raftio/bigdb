@@ -30,6 +30,7 @@ fn field(name: &str, kind: FieldKind, bit_depth: u32, scale: i8) -> FieldInfo {
 fn schema() -> Vec<TableInfo> {
     vec![
         TableInfo {
+            database: "default".to_string(),
             name: "tx".to_string(),
             engine: TableEngine::default(),
             fields: vec![
@@ -42,7 +43,12 @@ fn schema() -> Vec<TableInfo> {
                 },
             ],
         },
-        TableInfo { name: "empty".to_string(), engine: TableEngine::default(), fields: Vec::new() },
+        TableInfo {
+            database: "default".to_string(),
+            name: "empty".to_string(),
+            engine: TableEngine::default(),
+            fields: Vec::new(),
+        },
     ]
 }
 
@@ -77,7 +83,7 @@ fn describing_a_table_is_one_row_per_field() {
 /// The listing, and the statement that recreates one table.
 #[test]
 fn the_catalog_lists_itself_and_writes_itself_back_out() {
-    let set = introspect::show_tables(&schema());
+    let set = introspect::show_tables(&schema(), None);
     assert_eq!(set.columns, ["name", "engine", "fields"]);
     assert_eq!(set.rows[0][0], Datum::Text("tx".to_string()));
     assert_eq!(set.rows[0][2], Datum::Int(4));

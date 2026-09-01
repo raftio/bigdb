@@ -81,11 +81,16 @@ pub fn describe(tables: &[TableInfo], table: &str) -> Result<ResultSet> {
 /// The engine is a column of its own because it is not derivable from anything else a client
 /// can see - the same argument `GET /schema` makes for reporting it - and the field count
 /// because the question after "which tables are there" is always "how big is this one".
-pub fn show_tables(tables: &[TableInfo]) -> ResultSet {
+pub fn show_tables(tables: &[TableInfo], database: Option<&str>) -> ResultSet {
+    // `SHOW TABLES` with no `FROM` lists the request's own database, which the caller has
+    // already resolved into `database`. Listing every database's tables under bare names would
+    // answer with names that do not resolve from where they were asked.
+    let database = database.unwrap_or(big_db::DEFAULT_DATABASE_NAME);
     ResultSet {
         columns: ["name", "engine", "fields"].map(str::to_string).to_vec(),
         rows: tables
             .iter()
+            .filter(|t| t.database == database)
             .map(|t| {
                 vec![
                     Datum::Text(t.name.clone()),
@@ -93,6 +98,26 @@ pub fn show_tables(tables: &[TableInfo]) -> ResultSet {
                     Datum::Int(t.fields.len() as i128),
                 ]
             })
+            .collect(),
+    }
+}
+
+/// `SHOW DATABASES`: one row per database, with how many tables it holds.
+///
+/// The question every JDBC driver and BI tool opens with. The default database is always in
+/// the answer, whether or not it holds anything: it is the one a request lands in when nothing
+/// says otherwise, so a client that could not see it could not explain where its tables went.
+pub fn show_databases(tables: &[TableInfo]) -> ResultSet {
+    let mut counts: std::collections::BTreeMap<&str, usize> =
+        [(big_db::DEFAULT_DATABASE_NAME, 0)].into_iter().collect();
+    for t in tables {
+        *counts.entry(t.database.as_str()).or_default() += 1;
+    }
+    ResultSet {
+        columns: ["name", "tables"].map(str::to_string).to_vec(),
+        rows: counts
+            .into_iter()
+            .map(|(name, n)| vec![Datum::Text(name.to_string()), Datum::Int(n as i128)])
             .collect(),
     }
 }
@@ -113,7 +138,11 @@ pub fn show_create(tables: &[TableInfo], table: &str) -> Result<ResultSet> {
             scale: (f.kind == FieldKind::Decimal).then_some(f.scale),
         })
         .collect();
-    let statement = big_sql::render::create_table(&info.name, Some(info.engine.as_str()), &columns);
+    // Qualified whenever the table is not in the default database, so the statement this
+    // answers with recreates the table *where it is*. An unqualified one would recreate it in
+    // whichever database the next request happened to be against.
+    let name = big_db::TableRef::new(&info.database, &info.name).to_string();
+    let statement = big_sql::render::create_table(&name, Some(info.engine.as_str()), &columns);
     Ok(ResultSet {
         columns: vec!["statement".to_string()],
         rows: vec![vec![Datum::Text(statement)]],
@@ -142,8 +171,9 @@ fn field_row(f: &FieldInfo) -> Vec<Datum> {
 /// The table, or the error naming it - which is the same error a query against it would give,
 /// so that a client branches on one code rather than two.
 fn find<'a>(tables: &'a [TableInfo], table: &str) -> Result<&'a TableInfo> {
+    let r = big_db::TableRef::parse(table);
     tables
         .iter()
-        .find(|t| t.name == table)
+        .find(|t| t.name == r.table && t.database == r.database)
         .ok_or_else(|| ApiError::Db(DbError::UnknownTable(table.to_string())))
 }

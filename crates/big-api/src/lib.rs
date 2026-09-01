@@ -92,6 +92,24 @@ pub struct QueryOptions {
     /// A flag anyone may set to stop the query. Read cooperatively, at the same points the
     /// memory budget is charged.
     pub cancel: Option<Arc<AtomicBool>>,
+    /// Which database an unqualified name in the statement means.
+    ///
+    /// **A property of the request, not of the text.** `POST /sql` answers one statement and
+    /// remembers nothing, so there is no session for a `USE` to leave a database in - it
+    /// arrives as `?database=`, and `bigc` is what turns a typed `USE` into one. `None` means
+    /// [`big_db::DEFAULT_DATABASE_NAME`], which is what every statement written before
+    /// databases existed asked for.
+    ///
+    /// A name the statement qualified itself is untouched: `sales.orders` in a request against
+    /// `ops` means `sales`.
+    pub database: Option<String>,
+}
+
+impl QueryOptions {
+    /// The database an unqualified name in this request means.
+    pub fn database(&self) -> &str {
+        self.database.as_deref().unwrap_or(big_db::DEFAULT_DATABASE_NAME)
+    }
 }
 
 /// The options for the next plan of a statement, with the wall-clock already spent taken off.
@@ -111,6 +129,7 @@ pub fn remaining(opts: &QueryOptions, started: Instant) -> QueryOptions {
         limits: opts.limits,
         timeout: opts.timeout.map(|t| t.saturating_sub(started.elapsed())),
         cancel: opts.cancel.clone(),
+        database: opts.database.clone(),
     }
 }
 
@@ -519,6 +538,29 @@ impl<P: PagerMut + Sync> Api<P> {
         Ok(n)
     }
 
+    /// Creates a database, or returns `false` if it was already there.
+    pub fn create_database(&self, name: &str) -> Result<bool> {
+        let before = self.db.catalog().database(name).is_some();
+        self.db.create_database(name)?;
+        Ok(!before)
+    }
+
+    /// Removes a database and, with `cascade`, every table in it. See
+    /// [`big_db::Db::drop_database`].
+    pub fn drop_database(&self, name: &str, cascade: bool) -> Result<bool> {
+        Ok(self.db.drop_database(name, cascade)?)
+    }
+
+    /// Whether a database of this name exists.
+    pub fn databases_named(&self, name: &str) -> bool {
+        self.db.catalog().database(name).is_some()
+    }
+
+    /// Every database, with the tables each holds.
+    pub fn databases(&self) -> ResultSet {
+        introspect::show_databases(&self.schema())
+    }
+
     /// Removes a table, its fields, its row keys and the pages behind them.
     ///
     /// `Ok(false)` means there was no such table.
@@ -566,7 +608,10 @@ impl<P: PagerMut + Sync> Api<P> {
     /// answers before anything is rendered, and `count(DISTINCT ...)` counts groups that only
     /// exist once the merge is done.
     pub fn sql(&self, text: &str, opts: &QueryOptions) -> Result<(Vec<Value>, Answer)> {
-        let (plans, probes, answer) = self.plan_sql(text)?;
+        // Against the request's database, so an unqualified name means what `?database=` said.
+        // Taken from `opts` rather than from a second parameter because it belongs with the
+        // other things that are true of the request and not of the text.
+        let (plans, probes, answer) = self.plan_sql_in(text, opts.database())?;
         // One answer per plan, in the order the shape names them. Run in sequence rather than
         // concurrently: each already fans out across every fragment this node holds, and a
         // second layer of parallelism would contend with the first for the same threads.
@@ -596,7 +641,16 @@ impl<P: PagerMut + Sync> Api<P> {
     /// node answering a fanned-out SQL statement never sees SQL - and cannot disagree with the
     /// coordinator about what was asked.
     pub fn plan_sql(&self, text: &str) -> Result<(Vec<Plan>, Vec<SqlProbe>, Answer)> {
-        match big_sql::translate(text)? {
+        self.plan_sql_in(text, big_sql::DEFAULT_DATABASE)
+    }
+
+    /// The same, against the database an unqualified name in this request means.
+    pub fn plan_sql_in(
+        &self,
+        text: &str,
+        database: &str,
+    ) -> Result<(Vec<Plan>, Vec<SqlProbe>, Answer)> {
+        match big_sql::translate_in(text, database)? {
             big_sql::Sql::Query(s) => self.plan_statement(s),
             // The three statements that are not questions have no plan to resolve: a schema
             // change goes to the leader, an insert goes to the shard owners, and a listing is
@@ -621,7 +675,7 @@ impl<P: PagerMut + Sync> Api<P> {
 
     /// `SHOW TABLES`: every table this node holds.
     pub fn show_tables(&self) -> ResultSet {
-        introspect::show_tables(&self.schema())
+        introspect::show_tables(&self.schema(), None)
     }
 
     /// `SHOW CREATE TABLE t`: the statement that would recreate one table.
@@ -634,6 +688,12 @@ impl<P: PagerMut + Sync> Api<P> {
     /// The door a coordinator uses, because what to *do* with a statement depends on which kind
     /// it is: a query is planned here and fanned out, a schema change goes to the leader. Doing
     /// it in one place means neither caller decides that by looking at the text.
+    pub fn translate_in(&self, text: &str, database: &str) -> Result<big_sql::Sql> {
+        Ok(big_sql::translate_in(text, database)?)
+    }
+
+    /// The same, against the default database. See [`Api::translate_in`] for the request-scoped
+    /// form, which is what an edge with a `?database=` uses.
     pub fn translate(&self, text: &str) -> Result<big_sql::Sql> {
         Ok(big_sql::translate(text)?)
     }

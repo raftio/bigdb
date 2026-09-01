@@ -140,8 +140,10 @@ fn sql(e: &SqlError) -> u16 {
 
 fn db(e: &DbError) -> u16 {
     match e {
-        // The table is what a URI names, so a missing one is a missing resource.
-        DbError::UnknownTable(_) => 404,
+        // The table is what a URI names, so a missing one is a missing resource. A database
+        // names one the same way and answers the same, which is also what makes the two
+        // distinguishable to a client: same status, different code.
+        DbError::UnknownTable(_) | DbError::UnknownDatabase(_) => 404,
         // A field is named in a body far more often than in a path - `/import` and `/query`
         // both do - so the error-derived answer is `422`. The two routes that *do* put a
         // field in the URI (`POST` and `DELETE` on `/table/{t}/field/{f}`) answer `404`
@@ -160,10 +162,18 @@ fn db(e: &DbError) -> u16 {
         | DbError::BackupDestinationNotEmpty
         // Same shape as the two above it: the request was well formed and would have worked
         // against an empty table, so what has to change is the state, not the request.
-        | DbError::BulkLoadNotEmpty { .. } => 409,
+        | DbError::BulkLoadNotEmpty { .. }
+        // A `DROP DATABASE` that would have worked while the database was empty. Same shape as
+        // the three above: the request is well formed, and what has to change is the state -
+        // either drop the tables, or say `CASCADE` and mean it.
+        | DbError::DatabaseNotEmpty { .. } => 409,
 
         DbError::WrongFieldKind { .. }
         | DbError::NameTooLong { .. }
+        // Both are a name the caller typed that no name is allowed to be, which is the same
+        // class as a name too long: the request has to change, not the state.
+        | DbError::NameSeparator(_)
+        | DbError::DropDefaultDatabase
         // A name the caller typed and no engine has. `400`, like every other malformed value
         // in a statement.
         | DbError::UnknownEngineName(_) => 400,

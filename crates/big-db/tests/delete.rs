@@ -264,7 +264,7 @@ fn a_table_id_is_never_handed_out_twice() {
     // fragment or row key that outlived the drop.
     let d = db();
     d.create_table("second").unwrap();
-    let dropped = d.catalog().table("second").unwrap().id;
+    let dropped = d.catalog().lookup("second").unwrap().id;
 
     assert!(d.drop_table("second").unwrap());
     let fresh = d.create_table("third").unwrap();
@@ -277,7 +277,7 @@ fn a_field_id_is_never_handed_out_twice() {
     let d = db();
     let dropped = {
         let c = d.catalog();
-        c.field(c.table("tx").unwrap().id, "active").unwrap().id
+        c.field(c.lookup("tx").unwrap().id, "active").unwrap().id
     };
 
     assert!(d.drop_field("tx", "active").unwrap());
@@ -350,7 +350,7 @@ fn a_dropped_table_does_not_come_back_after_a_reopen() {
     }
 
     let d = Db::open_path(&path).unwrap();
-    assert!(d.catalog().table("tx").is_none());
+    assert!(d.catalog().lookup("tx").is_none());
     assert!(matches!(d.read().all("tx"), Err(DbError::UnknownTable(_))));
 }
 

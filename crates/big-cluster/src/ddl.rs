@@ -100,6 +100,34 @@ impl<P: PagerMut + Sync> Cluster<P> {
         })
     }
 
+    pub fn create_database(&self, name: &str) -> Result<bool> {
+        self.ddl(&Ddl::CreateDatabase { name: name.to_string() }).map(|n| n == 1)
+    }
+
+    /// Removes a database everywhere, with `cascade` to take its tables with it.
+    ///
+    /// `Ok(false)` means there was no such database.
+    ///
+    /// **The emptiness check happens here, at the leader, and only here.** A peer applying the
+    /// change re-deciding it against its own table count would be a second opinion on a
+    /// question that already has an answer - and if the two ever differed, half the cluster
+    /// would drop the database and half would refuse. So what travels is always the cascading
+    /// form: a change already ruled legal. See [`Ddl::DropDatabase`].
+    pub fn drop_database_if_empty(&self, name: &str, cascade: bool) -> Result<bool> {
+        if name == big_db::DEFAULT_DATABASE_NAME {
+            return Err(ClusterError::Local(big_api::ApiError::Db(
+                big_db::DbError::DropDefaultDatabase,
+            )));
+        }
+        let held = self.schema().iter().filter(|t| t.database == name).count();
+        if held > 0 && !cascade {
+            return Err(ClusterError::Local(big_api::ApiError::Db(
+                big_db::DbError::DatabaseNotEmpty { database: name.to_string(), tables: held },
+            )));
+        }
+        self.ddl(&Ddl::DropDatabase { name: name.to_string() }).map(|n| n == 1)
+    }
+
     /// `Ok(false)` means there was no such table - at the leader, which is the node whose
     /// answer is the cluster's answer.
     pub fn drop_table(&self, table: &str) -> Result<bool> {
@@ -212,5 +240,10 @@ pub fn apply_ddl<P: PagerMut + Sync>(api: &Api<P>, op: &Ddl) -> big_api::Result<
         }
         Ddl::DropTable { table } => api.drop_table(table)? as u64,
         Ddl::DropField { table, field } => api.drop_field(table, field)? as u64,
+        Ddl::CreateDatabase { name } => api.create_database(name)? as u64,
+        // Always cascading here: whether `CASCADE` was written was judged at the leader, and
+        // what reaches a peer is a change already ruled legal. A peer re-deciding it against
+        // its own table count would be a second opinion, and the two could differ.
+        Ddl::DropDatabase { name } => api.drop_database(name, true)? as u64,
     })
 }

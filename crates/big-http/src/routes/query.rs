@@ -33,8 +33,12 @@ pub(super) fn query<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request, table: 
     // The only route that can run long, so the only one carrying a deadline and a flag. Both
     // are `None` unless the server was configured with them, which keeps the default behaviour
     // of a query exactly what it always was.
-    let opts =
-        QueryOptions { limits: None, timeout: ctx.query_timeout, cancel: ctx.cancel.clone() };
+    let opts = QueryOptions {
+        limits: None,
+        timeout: ctx.query_timeout,
+        cancel: ctx.cancel.clone(),
+        database: req.param("database").map(|d| d.into_owned()),
+    };
     match ctx.cluster.query(table, text, &opts) {
         // Refused rather than ignored. `Count(All())&limit=10` is a client that believes it is
         // paging and is not; answering it with an unpaged count would be answering a question
@@ -86,8 +90,16 @@ pub(super) fn sql<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request) -> Respon
         }
     }
 
-    let opts =
-        QueryOptions { limits: None, timeout: ctx.query_timeout, cancel: ctx.cancel.clone() };
+    // `?database=sales` says which database an unqualified name in the statement means. A
+    // property of the request rather than of the text, because this route answers one statement
+    // and remembers nothing - there is no session for a `USE` to leave one in. `bigc` holds a
+    // typed `USE` on the caller's behalf and sends it here.
+    let opts = QueryOptions {
+        limits: None,
+        timeout: ctx.query_timeout,
+        cancel: ctx.cancel.clone(),
+        database: req.param("database").map(|d| d.into_owned()),
+    };
     match ctx.cluster.sql(text, &opts) {
         // The statement's `FORMAT` decides both the bytes and the type they are declared as: a
         // client that asked for TSV and was told `application/json` was answered twice, once

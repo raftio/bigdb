@@ -159,8 +159,11 @@ impl<P: PagerMut> Db<P> {
     /// data, use [`ingest`] - this refuses rather than merging.
     ///
     /// [`ingest`]: Db::ingest
-    pub fn bulk_load(&self, table: &str) -> Result<crate::bulk::BulkLoad<'_, P>> {
-        crate::bulk::BulkLoad::new(self, table)
+    pub fn bulk_load<'a>(
+        &self,
+        table: impl Into<TableRef<'a>>,
+    ) -> Result<crate::bulk::BulkLoad<'_, P>> {
+        crate::bulk::BulkLoad::new(self, table.into())
     }
 
     /// A buffered writer that decides for itself when to commit.
@@ -252,8 +255,11 @@ fn declared_depth(def: &FieldDef) -> u32 {
 }
 
 /// Resolves a name pair to the ids the storage layer actually uses.
-fn resolve(catalog: &Catalog, table: &str, field: &str) -> Result<(TableId, FieldDef)> {
-    let t = catalog.table(table).ok_or_else(|| DbError::UnknownTable(table.to_string()))?;
+///
+/// The one place a `(database, table, field)` becomes a `(TableId, FieldId)`, which is the
+/// whole of what a database costs below the catalog: past here nothing knows there is one.
+fn resolve(catalog: &Catalog, table: TableRef<'_>, field: &str) -> Result<(TableId, FieldDef)> {
+    let t = catalog.require(table)?;
     let f = catalog.field(t.id, field).ok_or_else(|| DbError::UnknownField {
         table: table.to_string(),
         field: field.to_string(),
@@ -286,6 +292,8 @@ fn expect_kind(
 /// name and the same number on every node.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct FragmentAddr {
+    /// Qualified as `database.table` when the database is not the default one, which is the
+    /// single string form every table travels as. See [`crate::catalog::TableRef::parse`].
     pub table: String,
     /// `None` for the reserved existence field, which is not a field anybody named.
     pub field: Option<String>,
@@ -296,6 +304,13 @@ pub struct FragmentAddr {
     /// Only read when `view` is `None`.
     pub view_id: ViewId,
     pub shard: ShardId,
+}
+
+impl FragmentAddr {
+    /// The table this addresses.
+    pub fn table_ref(&self) -> crate::catalog::TableRef<'_> {
+        crate::catalog::TableRef::parse(&self.table)
+    }
 }
 
 /// Reserved view holding the shadow BSI of a mutex field, so the value row space stays exactly

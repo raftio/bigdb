@@ -36,7 +36,7 @@
 //!
 //! [`Ingest`]: crate::Ingest
 
-use crate::catalog::{FieldDef, FieldKind, TableId, EXISTS_FIELD, STANDARD_VIEW};
+use crate::catalog::{FieldDef, FieldKind, TableId, TableRef, EXISTS_FIELD, STANDARD_VIEW};
 use crate::db::Db;
 use crate::error::{DbError, Result};
 use big_engine::bitmap::field::bsi::EXISTS_ROW;
@@ -113,12 +113,8 @@ pub struct BulkLoad<'db, P: PagerMut> {
 }
 
 impl<'db, P: PagerMut> BulkLoad<'db, P> {
-    pub(crate) fn new(db: &'db Db<P>, table: &str) -> Result<Self> {
-        let t = db
-            .catalog()
-            .table(table)
-            .map(|t| t.id)
-            .ok_or_else(|| DbError::UnknownTable(table.to_string()))?;
+    pub(crate) fn new(db: &'db Db<P>, table: TableRef<'_>) -> Result<Self> {
+        let t = db.catalog().require(table)?.id;
 
         // **Refused rather than written wrong.** Everything below writes *bitmap fragments* and
         // nothing else - `w.fragment(key)` and `set_bits`, and there is not a single column write

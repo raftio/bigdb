@@ -26,6 +26,21 @@ pub enum DbError {
     /// A column segment could not be read or written. See [`big_engine::columnar::ColumnError`].
     Column(big_engine::columnar::ColumnError),
     UnknownTable(String),
+    /// A database named in a qualified table reference, or as a request's default, that no
+    /// `CREATE DATABASE` ever made.
+    ///
+    /// Distinct from [`DbError::UnknownTable`] on purpose: `sales.orders` failing because there
+    /// is no `sales` and failing because `sales` holds no `orders` call for different fixes,
+    /// and answering both with "no such table" hides which one happened.
+    UnknownDatabase(String),
+    /// A `DROP DATABASE` without `CASCADE`, aimed at one that still holds tables.
+    DatabaseNotEmpty {
+        database: String,
+        tables: usize,
+    },
+    /// `DROP DATABASE default`. Every table is in some database and this is the one that is
+    /// always there, so it is the one database that cannot go.
+    DropDefaultDatabase,
     UnknownField {
         table: String,
         field: String,
@@ -44,6 +59,11 @@ pub enum DbError {
     },
     /// Renaming onto a name already in use would leave the other holder unreachable by name.
     NameTaken(String),
+    /// A name holding a `.`, which is the separator in a qualified `database.table`. Refused
+    /// rather than accepted, because a table called `a.b` and table `b` in database `a` would
+    /// be the same string everywhere a table travels as one - see
+    /// [`crate::catalog::TableRef::parse`].
+    NameSeparator(String),
     /// A backup was aimed at a path that already holds something. Never overwritten: the
     /// caller who typed the wrong name is the one who needed the old file.
     BackupDestinationExists(std::path::PathBuf),
@@ -185,6 +205,23 @@ impl core::fmt::Display for DbError {
             Self::Tree(e) => write!(f, "tree: {e}"),
             Self::Column(e) => write!(f, "segment: {e}"),
             Self::UnknownTable(t) => write!(f, "no table named `{t}`"),
+            Self::UnknownDatabase(d) => write!(f, "no database named `{d}`"),
+            Self::NameSeparator(n) => write!(
+                f,
+                "`{n}` cannot be a name here: `.` separates a database from a table, so a name \
+                 holding one would be indistinguishable from a qualified pair"
+            ),
+            Self::DatabaseNotEmpty { database, tables } => write!(
+                f,
+                "database `{database}` still holds {tables} table{}; write \
+                 `DROP DATABASE {database} CASCADE` to drop them with it",
+                if *tables == 1 { "" } else { "s" }
+            ),
+            Self::DropDefaultDatabase => write!(
+                f,
+                "the `default` database cannot be dropped: every table is in some database, \
+                 and this is the one that is always there"
+            ),
             Self::UnknownField { table, field } => {
                 write!(f, "table `{table}` has no field named `{field}`")
             }
@@ -267,6 +304,10 @@ impl DbError {
             Self::Tree(e) => e.code(),
             Self::Column(e) => e.code(),
             Self::UnknownTable(_) => "unknown_table",
+            Self::UnknownDatabase(_) => "unknown_database",
+            Self::NameSeparator(_) => "name_separator",
+            Self::DatabaseNotEmpty { .. } => "database_not_empty",
+            Self::DropDefaultDatabase => "drop_default_database",
             Self::UnknownField { .. } => "unknown_field",
             Self::WrongFieldKind { .. } => "wrong_field_kind",
             Self::NameTooLong { .. } => "name_too_long",

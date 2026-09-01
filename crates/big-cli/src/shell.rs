@@ -48,8 +48,24 @@ impl Lang {
     }
 }
 
+/// Where `USE` is answered.
+///
+/// **The server has no session to put it in.** `POST /sql` answers one statement and remembers
+/// nothing, which is what lets any node answer any request - so a database that persisted
+/// across statements would have to be state somewhere, and the somewhere that costs nothing is
+/// here. The shell holds it and sends it as `?database=` on every line, which is exactly what
+/// ClickHouse's HTTP interface does with the same word.
+fn used_database(line: &str) -> Option<&str> {
+    let rest = line.strip_prefix("USE ").or_else(|| line.strip_prefix("use "))?;
+    let name = rest.trim().trim_end_matches(';').trim();
+    // One bare word. `USE sales.orders` is not a database, and passing it on would produce a
+    // `?database=` nothing can resolve.
+    (!name.is_empty() && !name.contains(|c: char| c.is_whitespace() || c == '.')).then_some(name)
+}
+
 const HELP: &str = "\
 .lang sql|pql      which surface a line is sent to
+USE <database>     which database an unqualified table name means
 .table <name>      the table PQL calls are asked of; prints it when given no name
 .schema            every table and field
 .format table|tsv|json
@@ -69,10 +85,21 @@ pub fn run(
     let mut lang = Lang::Sql;
     let mut table: Option<String> = None;
     let mut timing = false;
+    let mut database: Option<String> = None;
 
     loop {
         if interactive {
-            let _ = write!(out, "{}", lang.prompt());
+            // The database is in the prompt because it silently changes what every unqualified
+            // name in the next line means, and a shell that hid it would let somebody drop the
+            // wrong table for the right reason.
+            match &database {
+                Some(d) => {
+                    let _ = write!(out, "{}({d})> ", lang.prompt().trim_end_matches("> "));
+                }
+                None => {
+                    let _ = write!(out, "{}", lang.prompt());
+                }
+            }
             let _ = out.flush();
         }
         let mut line = String::new();
@@ -111,10 +138,25 @@ pub fn run(
             }
         }
 
+        // `USE` is answered here rather than sent: the server refuses it, with a sentence
+        // saying the database is per request - and this is the client that makes it so.
+        if lang == Lang::Sql {
+            if let Some(name) = used_database(line) {
+                database = Some(name.to_string());
+                continue;
+            }
+        }
+
         // A PQL call is asked *of* a table, and the route puts it in the path. Refused here
         // rather than sent to a URL with a hole in it.
         let (method, target) = match lang {
-            Lang::Sql => ("POST", "/sql".to_string()),
+            Lang::Sql => (
+                "POST",
+                match &database {
+                    Some(d) => format!("/sql?database={d}"),
+                    None => "/sql".to_string(),
+                },
+            ),
             Lang::Pql => match &table {
                 Some(t) => ("POST", format!("/table/{t}/query")),
                 None => {
@@ -238,5 +280,33 @@ fn meta(
         ("timing", _) => Meta::Complain(".timing takes on or off".to_string()),
 
         (other, _) => Meta::Complain(format!("no such meta-command `.{other}`; try `.help`")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::used_database;
+
+    /// `USE` is the one statement this shell answers itself, so what counts as one is worth
+    /// pinning: the server has no session to hold a database in, and this is what makes the
+    /// word work anyway.
+    #[test]
+    fn use_names_a_database_and_nothing_else_does() {
+        assert_eq!(used_database("USE sales"), Some("sales"));
+        assert_eq!(used_database("use sales"), Some("sales"));
+        // A trailing semicolon is how half of everybody types SQL.
+        assert_eq!(used_database("USE sales;"), Some("sales"));
+        assert_eq!(used_database("USE   sales  ;  "), Some("sales"));
+
+        // Not a `USE`. Each of these has to reach the server, which has its own answer for it.
+        assert_eq!(used_database("SELECT count(*) FROM tx"), None);
+        assert_eq!(used_database("USE"), None);
+        assert_eq!(used_database("USE "), None);
+        // A database is one bare word: `USE sales.orders` names a table, and passing it on
+        // would produce a `?database=` nothing can resolve.
+        assert_eq!(used_database("USE sales.orders"), None);
+        assert_eq!(used_database("USE sales orders"), None);
+        // `USED` is not `USE`, and a table called `used` is a real thing to select from.
+        assert_eq!(used_database("USED sales"), None);
     }
 }

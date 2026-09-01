@@ -46,9 +46,33 @@ pub enum Shown {
     ///
     /// Three spellings and one meaning, because they are three dialects' words for the same
     /// question and there is nothing to be gained by knowing which one was typed.
-    Columns { table: String },
-    /// `SHOW TABLES`: one row per table.
-    Tables,
+    Columns { database: Option<String>, table: String },
+    /// `SHOW TABLES [FROM <database>]`: one row per table, in one database.
+    Tables { database: Option<String> },
+    /// `SHOW DATABASES`, also spelled `SCHEMAS` and `DATASETS`: one row per database.
+    ///
+    /// The question every JDBC driver and BI tool opens with, which is most of why a database
+    /// level exists at all - a client cannot draw a table tree without it.
+    Databases,
     /// `SHOW CREATE [TABLE] t`: one row, holding the statement that would recreate it.
-    Create { table: String },
+    Create { database: Option<String>, table: String },
+}
+
+impl Shown {
+    /// Fills in the database this question did not name. See [`crate::translate_in`].
+    ///
+    /// `SHOW DATABASES` and a bare `SHOW TABLES` are deliberately untouched: neither is a
+    /// question *about* one database. `SHOW TABLES` against a request means that request's
+    /// database, which the layer answering it already knows.
+    pub fn fill_database(&mut self, database: &str) {
+        match self {
+            Self::Columns { database: d, .. } | Self::Create { database: d, .. } => {
+                d.get_or_insert_with(|| database.to_string());
+            }
+            Self::Tables { database: d } => {
+                d.get_or_insert_with(|| database.to_string());
+            }
+            Self::Databases => {}
+        }
+    }
 }

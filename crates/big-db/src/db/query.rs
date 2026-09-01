@@ -27,7 +27,14 @@ impl<'db, P: Pager + Sync> DbRead<'db, P> {
     /// This is the composable form: two of these can be intersected or unioned without either
     /// one naming a record. Everything below is a way of asking this and then collapsing the
     /// answer, which is why they are three lines each.
-    pub fn matching(&self, table: &str, field: &str, op: RangeOp, k: u64) -> Result<Matches> {
+    pub fn matching<'a>(
+        &self,
+        table: impl Into<TableRef<'a>>,
+        field: &str,
+        op: RangeOp,
+        k: u64,
+    ) -> Result<Matches> {
+        let table = table.into();
         let (t, def) = resolve(&self.catalog, table, field)?;
         if self.scans(t) {
             return self.scan_matching(t, def.id, op, k);
@@ -51,13 +58,14 @@ impl<'db, P: Pager + Sync> DbRead<'db, P> {
     /// schema. Clamping alone would get it wrong, though: `> max` and `>= max` clamp to the same
     /// stored bound, and the first must match nothing where the second matches the largest
     /// records. So an out-of-range bound is decided here, before any fragment is read.
-    pub fn matching_signed(
+    pub fn matching_signed<'a>(
         &self,
-        table: &str,
+        table: impl Into<TableRef<'a>>,
         field: &str,
         op: RangeOp,
         k: i64,
     ) -> Result<Matches> {
+        let table = table.into();
         let (_, def) = resolve(&self.catalog, table, field)?;
         expect_kind(&def, field, FieldKind::is_signed, "signed int")?;
         let declared = declared_depth(&def);
@@ -82,23 +90,25 @@ impl<'db, P: Pager + Sync> DbRead<'db, P> {
     }
 
     /// Smallest value of a signed field over a set of records.
-    pub fn min_signed_where(
+    pub fn min_signed_where<'a>(
         &self,
-        table: &str,
+        table: impl Into<TableRef<'a>>,
         field: &str,
         rows: &Matches,
     ) -> Result<Option<i64>> {
+        let table = table.into();
         let declared = self.signed_depth(table, field)?;
         Ok(self.min_where(table, field, rows)?.map(|v| crate::signed::decode(v, declared)))
     }
 
     /// Largest value of a signed field over a set of records.
-    pub fn max_signed_where(
+    pub fn max_signed_where<'a>(
         &self,
-        table: &str,
+        table: impl Into<TableRef<'a>>,
         field: &str,
         rows: &Matches,
     ) -> Result<Option<i64>> {
+        let table = table.into();
         let declared = self.signed_depth(table, field)?;
         Ok(self.max_where(table, field, rows)?.map(|v| crate::signed::decode(v, declared)))
     }
@@ -113,7 +123,13 @@ impl<'db, P: Pager + Sync> DbRead<'db, P> {
     ///
     /// `i128` because the sum of `u64`-wide values minus `n` biases needs more than 64 bits in
     /// either direction, and because refusing to overflow is cheaper than explaining it.
-    pub fn sum_signed_where(&self, table: &str, field: &str, rows: &Matches) -> Result<i128> {
+    pub fn sum_signed_where<'a>(
+        &self,
+        table: impl Into<TableRef<'a>>,
+        field: &str,
+        rows: &Matches,
+    ) -> Result<i128> {
+        let table = table.into();
         let declared = self.signed_depth(table, field)?;
         let stored = self.sum_where(table, field, rows)? as i128;
         let n = self.count_values(table, field, rows)? as i128;
@@ -124,7 +140,13 @@ impl<'db, P: Pager + Sync> DbRead<'db, P> {
     ///
     /// Not the same as `rows.cardinality()`: a record can be in the filter and have nothing
     /// stored for this field, which is exactly what the exists row of a bit-sliced index is for.
-    pub fn count_values(&self, table: &str, field: &str, rows: &Matches) -> Result<u64> {
+    pub fn count_values<'a>(
+        &self,
+        table: impl Into<TableRef<'a>>,
+        field: &str,
+        rows: &Matches,
+    ) -> Result<u64> {
+        let table = table.into();
         let (t, def) = resolve(&self.catalog, table, field)?;
         if self.scans(t) {
             return self.scan_count_values(t, def.id, rows);
@@ -139,7 +161,8 @@ impl<'db, P: Pager + Sync> DbRead<'db, P> {
     }
 
     /// The declared depth of a field that must be signed.
-    fn signed_depth(&self, table: &str, field: &str) -> Result<u32> {
+    fn signed_depth<'a>(&self, table: impl Into<TableRef<'a>>, field: &str) -> Result<u32> {
+        let table = table.into();
         let (_, def) = resolve(&self.catalog, table, field)?;
         expect_kind(&def, field, FieldKind::is_signed, "signed int")?;
         Ok(declared_depth(&def))
@@ -150,12 +173,9 @@ impl<'db, P: Pager + Sync> DbRead<'db, P> {
     /// `Not` has no meaning without this. A bitmap says which records matched, never how many
     /// records there could have been, so complementing one needs the universe stated
     /// explicitly - which is the whole reason `EXISTS_FIELD` is written on every insert.
-    pub fn all(&self, table: &str) -> Result<Matches> {
-        let t = self
-            .catalog
-            .table(table)
-            .map(|t| t.id)
-            .ok_or_else(|| DbError::UnknownTable(table.to_string()))?;
+    pub fn all<'a>(&self, table: impl Into<TableRef<'a>>) -> Result<Matches> {
+        let table = table.into();
+        let t = self.catalog.require(table)?.id;
 
         let per_shard = self.per_fragment(t, EXISTS_FIELD, (None, None), |frag, key, _| {
             let rows = frag.row(EXISTS_ROW)?;
@@ -176,12 +196,9 @@ impl<'db, P: Pager + Sync> DbRead<'db, P> {
     /// Nothing is charged against the memory budget because nothing is held: the peak is one
     /// leaf page, which the pager owns whether this is called or not. The deadline and the
     /// cancellation flag are still honoured - `per_fragment` checkpoints once per fragment.
-    pub fn count_all(&self, table: &str) -> Result<u64> {
-        let t = self
-            .catalog
-            .table(table)
-            .map(|t| t.id)
-            .ok_or_else(|| DbError::UnknownTable(table.to_string()))?;
+    pub fn count_all<'a>(&self, table: impl Into<TableRef<'a>>) -> Result<u64> {
+        let table = table.into();
+        let t = self.catalog.require(table)?.id;
 
         let counts = self.per_fragment(t, EXISTS_FIELD, (None, None), |frag, _, _| {
             Ok(frag.row_count(EXISTS_ROW)?)
@@ -200,12 +217,9 @@ impl<'db, P: Pager + Sync> DbRead<'db, P> {
     /// This node's own view. In a cluster a table's shards are spread over its owners, so the
     /// highest id anywhere is the highest of these - see `big_cluster::Cluster::max_record`,
     /// which is where that fan-out lives.
-    pub fn max_record(&self, table: &str) -> Result<Option<RecordId>> {
-        let t = self
-            .catalog
-            .table(table)
-            .map(|t| t.id)
-            .ok_or_else(|| DbError::UnknownTable(table.to_string()))?;
+    pub fn max_record<'a>(&self, table: impl Into<TableRef<'a>>) -> Result<Option<RecordId>> {
+        let table = table.into();
+        let t = self.catalog.require(table)?.id;
 
         // Descending, and it stops at the first shard that holds a record: a shard whose
         // fragment exists but whose exists row is empty is possible after a delete, so "the
@@ -249,12 +263,14 @@ impl<'db, P: Pager + Sync> DbRead<'db, P> {
     /// version would have to do every shard's work in order to throw most of it away.
     ///
     /// [`all`]: DbRead::all
-    pub fn scan_records(&self, table: &str, from: RecordId, limit: usize) -> Result<Vec<RecordId>> {
-        let t = self
-            .catalog
-            .table(table)
-            .map(|t| t.id)
-            .ok_or_else(|| DbError::UnknownTable(table.to_string()))?;
+    pub fn scan_records<'a>(
+        &self,
+        table: impl Into<TableRef<'a>>,
+        from: RecordId,
+        limit: usize,
+    ) -> Result<Vec<RecordId>> {
+        let table = table.into();
+        let t = self.catalog.require(table)?.id;
 
         let candidates: Vec<FragmentKey> = self
             .catalog
@@ -288,7 +304,13 @@ impl<'db, P: Pager + Sync> DbRead<'db, P> {
     ///
     /// The primitive under every set-shaped read: a key lookup is this plus a name to resolve,
     /// a boolean is this plus knowing which of two rows means true.
-    pub fn matching_row(&self, table: &str, field: &str, row: RowId) -> Result<Matches> {
+    pub fn matching_row<'a>(
+        &self,
+        table: impl Into<TableRef<'a>>,
+        field: &str,
+        row: RowId,
+    ) -> Result<Matches> {
+        let table = table.into();
         let (t, def) = resolve(&self.catalog, table, field)?;
         if self.scans(t) {
             // The exists row of a bit-sliced index has no segment twin: a scan answers "which
@@ -308,13 +330,14 @@ impl<'db, P: Pager + Sync> DbRead<'db, P> {
     }
 
     /// Records in one row of a field, in a named view.
-    pub fn matching_row_in(
+    pub fn matching_row_in<'a>(
         &self,
-        table: &str,
+        table: impl Into<TableRef<'a>>,
         field: &str,
         view: ViewId,
         row: RowId,
     ) -> Result<Matches> {
+        let table = table.into();
         let (t, def) = resolve(&self.catalog, table, field)?;
         if self.scans(t) {
             return Err(DbError::EngineCannotAnswer {
@@ -337,14 +360,15 @@ impl<'db, P: Pager + Sync> DbRead<'db, P> {
     ///
     /// The union of the day views the range covers. A range is answered by reading only the
     /// days in it, which is the entire reason a time quantum field pays to write them.
-    pub fn matching_key_between(
+    pub fn matching_key_between<'a>(
         &self,
-        table: &str,
+        table: impl Into<TableRef<'a>>,
         field: &str,
         value: &str,
         from: Option<i64>,
         to: Option<i64>,
     ) -> Result<Matches> {
+        let table = table.into();
         let (t, def) = resolve(&self.catalog, table, field)?;
         // Refused rather than answered empty. A segment records which keys a record holds and
         // never when it held them, so there is nothing here to read - and "no records in that
@@ -372,7 +396,13 @@ impl<'db, P: Pager + Sync> DbRead<'db, P> {
     }
 
     /// Records carrying a given row key, unmaterialised and per shard.
-    pub fn matching_key(&self, table: &str, field: &str, value: &str) -> Result<Matches> {
+    pub fn matching_key<'a>(
+        &self,
+        table: impl Into<TableRef<'a>>,
+        field: &str,
+        value: &str,
+    ) -> Result<Matches> {
+        let table = table.into();
         let (t, def) = resolve(&self.catalog, table, field)?;
         // An unknown key matched nothing, which is not the same as an error: asking for a
         // value that was never written is a legitimate query with an empty answer.
@@ -381,7 +411,13 @@ impl<'db, P: Pager + Sync> DbRead<'db, P> {
     }
 
     /// Records whose boolean field holds `value`.
-    pub fn matching_bool(&self, table: &str, field: &str, value: bool) -> Result<Matches> {
+    pub fn matching_bool<'a>(
+        &self,
+        table: impl Into<TableRef<'a>>,
+        field: &str,
+        value: bool,
+    ) -> Result<Matches> {
+        let table = table.into();
         let (t, def) = resolve(&self.catalog, table, field)?;
         // A boolean is two rows in an index and one value in a segment, so this is the one
         // predicate that cannot be spelled as a row lookup on both sides.
@@ -400,12 +436,13 @@ impl<'db, P: Pager + Sync> DbRead<'db, P> {
     ///
     /// Only rows a fragment actually holds are probed, so a field with a large key space
     /// costs what its data costs rather than what its schema allows.
-    pub fn group_counts(
+    pub fn group_counts<'a>(
         &self,
-        table: &str,
+        table: impl Into<TableRef<'a>>,
         field: &str,
         filter: &Matches,
     ) -> Result<Vec<(RowId, u64)>> {
+        let table = table.into();
         let (t, def) = resolve(&self.catalog, table, field)?;
         if self.scans(t) {
             return self.scan_group_counts(t, def.id, filter);
@@ -431,12 +468,13 @@ impl<'db, P: Pager + Sync> DbRead<'db, P> {
     ///
     /// Strictly more expensive than `group_counts` and only worth it when something is going
     /// to be aggregated per group, because a `Matches` per row is built either way.
-    pub fn group_matches(
+    pub fn group_matches<'a>(
         &self,
-        table: &str,
+        table: impl Into<TableRef<'a>>,
         field: &str,
         filter: &Matches,
     ) -> Result<Vec<(RowId, Matches)>> {
+        let table = table.into();
         let (t, def) = resolve(&self.catalog, table, field)?;
         if self.scans(t) {
             return self.scan_group_matches(t, def.id, filter);
@@ -467,8 +505,14 @@ impl<'db, P: Pager + Sync> DbRead<'db, P> {
     }
 
     /// The string a row id was interned from, when the field has one.
-    pub fn row_key(&self, table: &str, field: &str, row: RowId) -> Option<&str> {
-        let t = self.catalog.table(table)?.id;
+    pub fn row_key<'a>(
+        &self,
+        table: impl Into<TableRef<'a>>,
+        field: &str,
+        row: RowId,
+    ) -> Option<&str> {
+        let table = table.into();
+        let t = self.catalog.table_ref(table).ok().flatten()?.id;
         let def = self.catalog.field(t, field)?;
         self.catalog.keys.name(t, def.id, row)
     }
@@ -481,12 +525,12 @@ impl<'db, P: Pager + Sync> DbRead<'db, P> {
     /// that is behind holds a strict subset of what the serving copy holds - and a subset with
     /// the same cardinality is the same set. Two fragments with equal counts therefore need no
     /// further comparison, and a repair walks only what actually differs.
-    pub fn fragments(&self, table: &str) -> Result<Vec<(FragmentAddr, u64)>> {
-        let t = self
-            .catalog
-            .table(table)
-            .map(|t| t.id)
-            .ok_or_else(|| DbError::UnknownTable(table.to_string()))?;
+    pub fn fragments<'a>(
+        &self,
+        table: impl Into<TableRef<'a>>,
+    ) -> Result<Vec<(FragmentAddr, u64)>> {
+        let table = table.into();
+        let t = self.catalog.require(table)?.id;
         let keys: Vec<FragmentKey> = self.catalog.fragments_of_table(t).map(|(k, _)| *k).collect();
         let mut out = Vec::with_capacity(keys.len());
         for key in keys {
@@ -547,9 +591,12 @@ impl<'db, P: Pager + Sync> DbRead<'db, P> {
     }
 
     /// Every row key of a table, so a copy that was away can be told what it missed.
-    pub fn row_keys(&self, table: &str) -> Result<Vec<(String, String, RowId)>> {
-        let t =
-            self.catalog.table(table).ok_or_else(|| DbError::UnknownTable(table.to_string()))?;
+    pub fn row_keys<'a>(
+        &self,
+        table: impl Into<TableRef<'a>>,
+    ) -> Result<Vec<(String, String, RowId)>> {
+        let table = table.into();
+        let t = self.catalog.require(table)?;
         let mut out = Vec::new();
         for field in self.catalog.fields_of(t.id) {
             for (row, name) in self.catalog.keys.rows(t.id, field.id) {
@@ -560,7 +607,8 @@ impl<'db, P: Pager + Sync> DbRead<'db, P> {
     }
 
     /// A fragment key, as a name every node can resolve for itself.
-    fn address(&self, table: &str, key: &FragmentKey) -> FragmentAddr {
+    fn address<'a>(&self, table: impl Into<TableRef<'a>>, key: &FragmentKey) -> FragmentAddr {
+        let table = table.into();
         FragmentAddr {
             table: table.to_string(),
             field: self
@@ -577,7 +625,7 @@ impl<'db, P: Pager + Sync> DbRead<'db, P> {
 
     /// The other way, against this node's own numbering.
     fn locate(&self, addr: &FragmentAddr) -> Option<FragmentKey> {
-        let t = self.catalog.table(&addr.table)?.id;
+        let t = self.catalog.table_ref(addr.table_ref()).ok().flatten()?.id;
         let field = match &addr.field {
             Some(name) => self.catalog.field(t, name)?.id,
             // A reserved field - the existence row - has no name and the same id everywhere.
@@ -594,8 +642,14 @@ impl<'db, P: Pager + Sync> DbRead<'db, P> {
     ///
     /// The inverse of [`DbRead::row_key`], and the read half of the cache a schema leader
     /// fills: a node that already knows what a key means does not have to ask.
-    pub fn key_row(&self, table: &str, field: &str, key: &str) -> Option<RowId> {
-        let t = self.catalog.table(table)?.id;
+    pub fn key_row<'a>(
+        &self,
+        table: impl Into<TableRef<'a>>,
+        field: &str,
+        key: &str,
+    ) -> Option<RowId> {
+        let table = table.into();
+        let t = self.catalog.table_ref(table).ok().flatten()?.id;
         let def = self.catalog.field(t, field)?;
         self.catalog.keys.id(t, def.id, key)
     }
@@ -604,21 +658,34 @@ impl<'db, P: Pager + Sync> DbRead<'db, P> {
     ///
     /// `None` when nothing in `rows` holds a value. Like `sum_where`, the filter is applied
     /// inside the bit-sliced index, so this never names a record id.
-    pub fn min_where(&self, table: &str, field: &str, rows: &Matches) -> Result<Option<u64>> {
+    pub fn min_where<'a>(
+        &self,
+        table: impl Into<TableRef<'a>>,
+        field: &str,
+        rows: &Matches,
+    ) -> Result<Option<u64>> {
+        let table = table.into();
         self.extreme(table, field, rows, Extreme::Min)
     }
 
-    pub fn max_where(&self, table: &str, field: &str, rows: &Matches) -> Result<Option<u64>> {
+    pub fn max_where<'a>(
+        &self,
+        table: impl Into<TableRef<'a>>,
+        field: &str,
+        rows: &Matches,
+    ) -> Result<Option<u64>> {
+        let table = table.into();
         self.extreme(table, field, rows, Extreme::Max)
     }
 
-    fn extreme(
+    fn extreme<'a>(
         &self,
-        table: &str,
+        table: impl Into<TableRef<'a>>,
         field: &str,
         rows: &Matches,
         which: Extreme,
     ) -> Result<Option<u64>> {
+        let table = table.into();
         let (t, def) = resolve(&self.catalog, table, field)?;
         if self.scans(t) {
             return self.scan_extreme(t, def.id, Some(rows), which == Extreme::Max);
@@ -645,7 +712,13 @@ impl<'db, P: Pager + Sync> DbRead<'db, P> {
     ///
     /// The filter is applied plane by plane inside the bit-sliced index, so a sum over a
     /// selection costs the same as a sum over everything and never materialises a record id.
-    pub fn sum_where(&self, table: &str, field: &str, rows: &Matches) -> Result<u128> {
+    pub fn sum_where<'a>(
+        &self,
+        table: impl Into<TableRef<'a>>,
+        field: &str,
+        rows: &Matches,
+    ) -> Result<u128> {
+        let table = table.into();
         let (t, def) = resolve(&self.catalog, table, field)?;
         if self.scans(t) {
             return self.scan_sum(t, def.id, Some(rows));
@@ -660,7 +733,14 @@ impl<'db, P: Pager + Sync> DbRead<'db, P> {
     }
 
     /// Runs a range predicate over every shard, skipping any whose zone map rules it out.
-    pub fn range(&self, table: &str, field: &str, op: RangeOp, k: u64) -> Result<Vec<RecordId>> {
+    pub fn range<'a>(
+        &self,
+        table: impl Into<TableRef<'a>>,
+        field: &str,
+        op: RangeOp,
+        k: u64,
+    ) -> Result<Vec<RecordId>> {
+        let table = table.into();
         self.materialise(self.matching(table, field, op, k)?)
     }
 
@@ -675,11 +755,19 @@ impl<'db, P: Pager + Sync> DbRead<'db, P> {
     }
 
     /// How many records match, without materialising which ones.
-    pub fn count(&self, table: &str, field: &str, op: RangeOp, k: u64) -> Result<u64> {
+    pub fn count<'a>(
+        &self,
+        table: impl Into<TableRef<'a>>,
+        field: &str,
+        op: RangeOp,
+        k: u64,
+    ) -> Result<u64> {
+        let table = table.into();
         Ok(self.matching(table, field, op, k)?.cardinality())
     }
 
-    pub fn sum(&self, table: &str, field: &str) -> Result<u128> {
+    pub fn sum<'a>(&self, table: impl Into<TableRef<'a>>, field: &str) -> Result<u128> {
+        let table = table.into();
         let (t, def) = resolve(&self.catalog, table, field)?;
         if self.scans(t) {
             return self.scan_sum(t, def.id, None);
@@ -691,16 +779,19 @@ impl<'db, P: Pager + Sync> DbRead<'db, P> {
     }
 
     /// Records carrying a given row key, across every shard.
-    pub fn by_key(&self, table: &str, field: &str, value: &str) -> Result<Vec<RecordId>> {
+    pub fn by_key<'a>(
+        &self,
+        table: impl Into<TableRef<'a>>,
+        field: &str,
+        value: &str,
+    ) -> Result<Vec<RecordId>> {
+        let table = table.into();
         self.materialise(self.matching_key(table, field, value)?)
     }
 
-    pub fn exists(&self, table: &str, record: RecordId) -> Result<bool> {
-        let t = self
-            .catalog
-            .table(table)
-            .map(|t| t.id)
-            .ok_or_else(|| DbError::UnknownTable(table.to_string()))?;
+    pub fn exists<'a>(&self, table: impl Into<TableRef<'a>>, record: RecordId) -> Result<bool> {
+        let table = table.into();
+        let t = self.catalog.require(table)?.id;
         let key = FragmentKey {
             table: t,
             field: EXISTS_FIELD,

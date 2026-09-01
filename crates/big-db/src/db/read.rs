@@ -209,7 +209,13 @@ impl<'db, P: Pager + Sync> DbRead<'db, P> {
     /// `None` when the table keeps no columns, so a caller can fall back to the index without
     /// having to ask the catalog itself. `Some(Cell::Null)` is a different answer: the table has
     /// columns and this record holds nothing in that one.
-    pub fn column_cell(&self, table: &str, field: &str, record: RecordId) -> Result<Option<Cell>> {
+    pub fn column_cell<'a>(
+        &self,
+        table: impl Into<TableRef<'a>>,
+        field: &str,
+        record: RecordId,
+    ) -> Result<Option<Cell>> {
+        let table = table.into();
         let (t, def) = resolve(&self.catalog, table, field)?;
         if !self.catalog.table_by_id(t).is_some_and(|x| x.engine.has_columns()) {
             return Ok(None);
@@ -224,7 +230,8 @@ impl<'db, P: Pager + Sync> DbRead<'db, P> {
     ///
     /// Off the cached cardinality in each leaf cell, so it reads no payload at all - the same
     /// trick `count_all` plays on the exists row.
-    pub fn column_count(&self, table: &str, field: &str) -> Result<u64> {
+    pub fn column_count<'a>(&self, table: impl Into<TableRef<'a>>, field: &str) -> Result<u64> {
+        let table = table.into();
         let (t, def) = resolve(&self.catalog, table, field)?;
         let mut total = 0;
         for (key, _) in self.catalog.fragments_of_field(t, def.id, COLUMN_VIEW) {
@@ -240,14 +247,26 @@ impl<'db, P: Pager + Sync> DbRead<'db, P> {
     /// The bias comes from the field's **declared** depth, never from the fragment's. A
     /// fragment's depth grows as wider values arrive; a bias that moved with it would decode
     /// the same stored bits to different numbers in different shards.
-    pub fn get_signed(&self, table: &str, field: &str, record: RecordId) -> Result<Option<i64>> {
+    pub fn get_signed<'a>(
+        &self,
+        table: impl Into<TableRef<'a>>,
+        field: &str,
+        record: RecordId,
+    ) -> Result<Option<i64>> {
+        let table = table.into();
         let (_, def) = resolve(&self.catalog, table, field)?;
         expect_kind(&def, field, FieldKind::is_signed, "signed int")?;
         let declared = declared_depth(&def);
         Ok(self.get_int(table, field, record)?.map(|v| crate::signed::decode(v, declared)))
     }
 
-    pub fn get_int(&self, table: &str, field: &str, record: RecordId) -> Result<Option<u64>> {
+    pub fn get_int<'a>(
+        &self,
+        table: impl Into<TableRef<'a>>,
+        field: &str,
+        record: RecordId,
+    ) -> Result<Option<u64>> {
+        let table = table.into();
         let (t, def) = resolve(&self.catalog, table, field)?;
         let key =
             FragmentKey { table: t, field: def.id, view: STANDARD_VIEW, shard: shard_of(record) };

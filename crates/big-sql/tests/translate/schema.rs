@@ -27,6 +27,7 @@ fn a_table_is_still_a_name_and_an_engine() {
     assert_eq!(
         ddl("CREATE TABLE events"),
         Ddl::CreateTable {
+            database: None,
             table: "events".to_string(),
             engine: None,
             columns: Vec::new(),
@@ -36,6 +37,7 @@ fn a_table_is_still_a_name_and_an_engine() {
     assert_eq!(
         ddl("CREATE TABLE events ENGINE = columnar"),
         Ddl::CreateTable {
+            database: None,
             table: "events".to_string(),
             engine: Some("columnar".to_string()),
             columns: Vec::new(),
@@ -46,6 +48,7 @@ fn a_table_is_still_a_name_and_an_engine() {
     assert_eq!(
         ddl("CREATE TABLE events ENGINE = 'bitmap+columnar'"),
         Ddl::CreateTable {
+            database: None,
             table: "events".to_string(),
             engine: Some("bitmap+columnar".to_string()),
             columns: Vec::new(),
@@ -217,7 +220,8 @@ fn a_malformed_list_is_a_syntax_error() {
 /// The whole statement, in the order somebody writes it.
 #[test]
 fn a_column_list_comes_before_the_engine() {
-    let Ddl::CreateTable { table, engine, columns, if_not_exists } = ddl("CREATE TABLE events (
+    let Ddl::CreateTable { database: None, table, engine, columns, if_not_exists } =
+        ddl("CREATE TABLE events (
            country TEXT,
            amount  INT,
            price   DECIMAL(10, 2),
@@ -250,6 +254,7 @@ fn alter_table_adds_and_drops_fields() {
     assert_eq!(
         ddl("ALTER TABLE events ADD COLUMN region TEXT"),
         Ddl::AlterTable {
+            database: None,
             table: "events".to_string(),
             changes: vec![Alter::Add(Column {
                 name: "region".to_string(),
@@ -263,7 +268,7 @@ fn alter_table_adds_and_drops_fields() {
     assert_eq!(ddl("ALTER TABLE t ADD a SET"), ddl("ALTER TABLE t ADD COLUMN a SET"));
     assert_eq!(ddl("ALTER TABLE t DROP a"), ddl("ALTER TABLE t DROP COLUMN a"));
 
-    let Ddl::AlterTable { table, changes } = ddl("ALTER TABLE events
+    let Ddl::AlterTable { database: None, table, changes } = ddl("ALTER TABLE events
            ADD COLUMN price DECIMAL(10, 2),
            ADD COLUMN visit TIMEQUANTUM,
            DROP COLUMN legacy")
@@ -316,7 +321,9 @@ fn the_alters_the_engine_cannot_make() {
     assert_eq!(code("ALTER USER bob SET PASSWORD 'x'"), "sql_read_only");
     // A database is not a level this catalog has, which is a different sentence from "this
     // surface does not write".
-    assert_eq!(code("ALTER DATABASE d OWNER TO bob"), "sql_no_database");
+    // A database carries a name and nothing else, so there is nothing about one to alter -
+    // which is the same answer every other change this surface does not make gets.
+    assert_eq!(code("ALTER DATABASE d OWNER TO bob"), "sql_read_only");
     // A type name in an `ADD` is judged by the rule the column list is judged by.
     assert_eq!(code("ALTER TABLE t ADD COLUMN a FLOAT"), "sql_unknown_column_type");
     assert_eq!(code("ALTER TABLE t ADD COLUMN a DECIMAL"), "sql_decimal_scale");
@@ -332,11 +339,11 @@ fn the_alters_the_engine_cannot_make() {
 fn a_table_is_dropped_by_name_and_at_most_one_at_a_time() {
     assert_eq!(
         ddl("DROP TABLE events"),
-        Ddl::DropTable { table: "events".to_string(), if_exists: false }
+        Ddl::DropTable { database: None, table: "events".to_string(), if_exists: false }
     );
     assert_eq!(
         ddl("DROP TABLE IF EXISTS events"),
-        Ddl::DropTable { table: "events".to_string(), if_exists: true }
+        Ddl::DropTable { database: None, table: "events".to_string(), if_exists: true }
     );
     // Two drops are two changes, each travelling to the leader and then to every node, and a
     // list would promise an atomicity nothing below here has.
@@ -367,6 +374,7 @@ fn a_field_cannot_be_called_record_id() {
     assert_eq!(
         ddl("ALTER TABLE t DROP COLUMN _record_id"),
         Ddl::AlterTable {
+            database: None,
             table: "t".to_string(),
             changes: vec![Alter::Drop("_record_id".to_string())],
         }
@@ -381,7 +389,7 @@ fn a_field_cannot_be_called_record_id() {
 /// `IF NOT EXISTS`, which is about the fields as much as about the table.
 #[test]
 fn if_not_exists_is_part_of_the_statement() {
-    let Ddl::CreateTable { table, if_not_exists, columns, .. } =
+    let Ddl::CreateTable { database: None, table, if_not_exists, columns, .. } =
         ddl("CREATE TABLE IF NOT EXISTS events (a SET)")
     else {
         panic!("a CREATE is a CreateTable")

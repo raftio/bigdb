@@ -262,9 +262,18 @@ fn cut_of(cut: &Cut) -> Option<String> {
 /// A schema change, as one line and - for a column list - a line per column.
 pub fn ddl(ddl: &Ddl) -> String {
     match ddl {
-        Ddl::CreateTable { table, engine, columns, if_not_exists } => {
+        Ddl::CreateDatabase { name, if_not_exists } => {
+            format!("CreateDatabase {name}{}", if *if_not_exists { " if_not_exists" } else { "" })
+        }
+        Ddl::DropDatabase { name, if_exists, cascade } => format!(
+            "DropDatabase {name}{}{}",
+            if *if_exists { " if_exists" } else { "" },
+            if *cascade { " cascade" } else { "" },
+        ),
+        Ddl::CreateTable { database, table, engine, columns, if_not_exists } => {
             let mut out = format!(
-                "CreateTable {table}{}{}",
+                "CreateTable {}{}{}",
+                qualified(database, table),
                 if *if_not_exists { " if_not_exists" } else { "" },
                 opt(" engine=", engine.as_ref()),
             );
@@ -272,8 +281,8 @@ pub fn ddl(ddl: &Ddl) -> String {
             write_lines(&mut out, &kids, "");
             out
         }
-        Ddl::AlterTable { table, changes } => {
-            let mut out = format!("AlterTable {table}");
+        Ddl::AlterTable { database, table, changes } => {
+            let mut out = format!("AlterTable {}", qualified(database, table));
             let kids: Vec<Line> = changes
                 .iter()
                 .map(|c| {
@@ -286,9 +295,25 @@ pub fn ddl(ddl: &Ddl) -> String {
             write_lines(&mut out, &kids, "");
             out
         }
-        Ddl::DropTable { table, if_exists } => {
-            format!("DropTable {table}{}", if *if_exists { " if_exists" } else { "" })
+        Ddl::DropTable { database, table, if_exists } => {
+            format!(
+                "DropTable {}{}",
+                qualified(database, table),
+                if *if_exists { " if_exists" } else { "" }
+            )
         }
+    }
+}
+
+/// `database.table`, or just the table when the statement did not name one.
+///
+/// Printed rather than defaulted to `default`, so a corpus case shows what was *written*: a
+/// statement that named no database and one that named the default one are different
+/// statements, and only the first follows the request's `?database=`.
+fn qualified(database: &Option<String>, table: &str) -> String {
+    match database {
+        Some(d) => format!("{d}.{table}"),
+        None => table.to_string(),
     }
 }
 
@@ -311,7 +336,7 @@ fn column(column: &Column) -> String {
 pub fn insert(insert: &Insert) -> String {
     let mut out = format!(
         "Insert {} ({}){}",
-        insert.table,
+        qualified(&insert.database, &insert.table),
         insert.columns.join(", "),
         // Which column is the record id is the whole difference between the two forms of this
         // statement - the other one leaves the layer above to allocate - so it is named.
@@ -332,9 +357,13 @@ pub fn insert(insert: &Insert) -> String {
 /// A question about the catalog.
 pub fn show(show: &Show) -> String {
     let what = match &show.what {
-        Shown::Columns { table } => format!("Columns {table}"),
-        Shown::Tables => "Tables".to_string(),
-        Shown::Create { table } => format!("Create {table}"),
+        Shown::Columns { database, table } => format!("Columns {}", qualified(database, table)),
+        Shown::Tables { database } => match database {
+            Some(d) => format!("Tables {d}"),
+            None => "Tables".to_string(),
+        },
+        Shown::Databases => "Databases".to_string(),
+        Shown::Create { database, table } => format!("Create {}", qualified(database, table)),
     };
     match show.format {
         f if f == Format::default() => what,

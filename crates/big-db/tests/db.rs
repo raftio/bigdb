@@ -183,7 +183,7 @@ fn renaming_a_table_leaves_the_data_alone() {
     let root_before = d.store().roots().get(&key).expect("the write created a fragment");
 
     let mut w = d.write();
-    assert!(w.catalog_mut().rename_table("tx", "transactions").unwrap());
+    assert!(w.catalog_mut().rename_table(big_db::DEFAULT_DATABASE, "tx", "transactions").unwrap());
     w.commit().unwrap();
 
     assert_eq!(d.store().roots().get(&key), Some(root_before), "no data pages rewritten");
@@ -222,7 +222,7 @@ fn everything_survives_a_reopen() {
     }
 
     let d = Db::open_path(&path).unwrap();
-    assert!(d.catalog().table("tx").is_some());
+    assert!(d.catalog().lookup("tx").is_some());
     assert_eq!(d.catalog().field(0, "amount").unwrap().bit_depth, 37);
 
     let r = d.read();
@@ -548,7 +548,7 @@ fn an_over_long_name_is_refused_rather_than_truncated() {
 
     // Everything accepted must survive a round trip through the catalog chain.
     let back = Catalog::from_entries(&d.catalog().encode()).unwrap();
-    assert!(back.table(&ok).is_some(), "an accepted name must reload");
+    assert!(back.lookup(&ok).is_some(), "an accepted name must reload");
 }
 
 #[test]
@@ -559,14 +559,17 @@ fn renaming_onto_an_existing_name_is_refused() {
 
     let mut w = d.write();
     assert!(
-        matches!(w.catalog_mut().rename_table("a", "b"), Err(DbError::NameTaken(_))),
+        matches!(
+            w.catalog_mut().rename_table(big_db::DEFAULT_DATABASE, "a", "b"),
+            Err(DbError::NameTaken(_))
+        ),
         "renaming onto a live name would leave one of the two tables unreachable"
     );
     w.commit().unwrap();
 
     let c = d.catalog();
-    assert!(c.table("a").is_some() && c.table("b").is_some());
-    assert_ne!(c.table("a").unwrap().id, c.table("b").unwrap().id);
+    assert!(c.lookup("a").is_some() && c.lookup("b").is_some());
+    assert_ne!(c.lookup("a").unwrap().id, c.lookup("b").unwrap().id);
 }
 
 #[test]
@@ -838,7 +841,7 @@ fn a_table_remembers_its_engine_across_a_reopen() {
         drop(d);
 
         let d = Db::open_path(&path).unwrap();
-        assert_eq!(d.catalog().table(name).unwrap().engine, engine, "{name}");
+        assert_eq!(d.catalog().lookup(name).unwrap().engine, engine, "{name}");
     }
 }
 
@@ -846,7 +849,7 @@ fn a_table_remembers_its_engine_across_a_reopen() {
 fn a_table_created_without_an_engine_gets_both() {
     let d = Db::in_memory().unwrap();
     d.create_table("tx").unwrap();
-    assert_eq!(d.catalog().table("tx").unwrap().engine, TableEngine::BitmapColumnar);
+    assert_eq!(d.catalog().lookup("tx").unwrap().engine, TableEngine::BitmapColumnar);
 }
 
 /// The one thing about the encoding that is not obvious from reading it: zero on disk is
@@ -856,14 +859,14 @@ fn a_table_created_without_an_engine_gets_both() {
 #[test]
 fn a_zero_engine_byte_decodes_as_bitmap_only() {
     let mut c = Catalog::new();
-    c.intern_table_with("old", TableEngine::Bitmap).unwrap();
+    c.intern_table_with(big_db::DEFAULT_DATABASE, "old", TableEngine::Bitmap).unwrap();
     let entries = c.encode();
 
     let table = entries.iter().find(|e| e[0] == big_db::catalog::KIND_TABLE).unwrap();
     assert_eq!(table[1], 0, "bitmap is the zero, which is what an older file holds");
 
     let back = Catalog::from_entries(&entries).unwrap();
-    assert_eq!(back.table("old").unwrap().engine, TableEngine::Bitmap);
+    assert_eq!(back.lookup("old").unwrap().engine, TableEngine::Bitmap);
     assert_ne!(TableEngine::default(), TableEngine::Bitmap);
 }
 
@@ -873,7 +876,7 @@ fn a_zero_engine_byte_decodes_as_bitmap_only() {
 #[test]
 fn an_unknown_engine_is_refused_rather_than_defaulted() {
     let mut c = Catalog::new();
-    c.intern_table_with("future", TableEngine::Columnar).unwrap();
+    c.intern_table_with(big_db::DEFAULT_DATABASE, "future", TableEngine::Columnar).unwrap();
     let mut entries = c.encode();
     for e in &mut entries {
         if e[0] == big_db::catalog::KIND_TABLE {
@@ -897,7 +900,7 @@ fn recreating_a_table_under_another_engine_is_refused() {
 
     let err = d.create_table_with("tx", TableEngine::Columnar).unwrap_err();
     assert_eq!(err.code(), "table_redefined");
-    assert_eq!(d.catalog().table("tx").unwrap().engine, TableEngine::Bitmap);
+    assert_eq!(d.catalog().lookup("tx").unwrap().engine, TableEngine::Bitmap);
 }
 
 /// Round-trips through the spelling every surface outside the engine uses.
@@ -1140,4 +1143,142 @@ fn segments_survive_a_reopen() {
     for record in [0u64, 1023, 1024, 2999] {
         assert_eq!(r.column_cell("tx", "amount", record).unwrap(), Some(Cell::Value(record)));
     }
+}
+
+// ----------------------------------------------------------------------------------------
+// Databases
+//
+// A namespace above tables, and nothing below the catalog knows there is one: a `TableId` is
+// unique across every database, so no fragment, row key or root record mentions a database.
+// These are the tests for the two claims that makes - that old files still read, and that two
+// databases can hold the same name without holding the same data.
+// ----------------------------------------------------------------------------------------
+
+/// **The backward-compatibility test, and the one that matters most.**
+///
+/// Every table record written before databases existed has zeroes in the word that now names
+/// the database. Zero is `DEFAULT_DATABASE`, which is the database those tables have always
+/// been in - so an old file reads back with every table exactly where it was, and there is no
+/// migration. The same argument the engine byte's zero carries, one field over.
+#[test]
+fn a_table_record_with_no_database_word_decodes_into_the_default_one() {
+    let mut c = Catalog::new();
+    c.intern_table_with(big_db::DEFAULT_DATABASE, "tx", TableEngine::Bitmap).unwrap();
+    let mut entries = c.encode();
+
+    // Exactly what an older build wrote: the database word never touched.
+    for e in &mut entries {
+        if e[0] == big_db::catalog::KIND_TABLE {
+            assert_eq!(&e[8..12], &[0, 0, 0, 0], "the default database is the zero");
+            e[8..12].fill(0);
+        }
+    }
+
+    let back = Catalog::from_entries(&entries).unwrap();
+    let table = back.table(big_db::DEFAULT_DATABASE, "tx").expect("still in the default database");
+    assert_eq!(table.database, big_db::DEFAULT_DATABASE);
+    // And it is reachable by the bare name somebody has always written.
+    assert_eq!(back.lookup("tx").unwrap().id, table.id);
+}
+
+/// A database entry from a build that has none is skipped, not fatal - which is what the format
+/// promises about an unrecognised kind, and why this one could be added at all.
+#[test]
+fn a_database_survives_being_written_back_out() {
+    let mut c = Catalog::new();
+    let sales = c.intern_database("sales").unwrap();
+    c.intern_table_with(sales, "orders", TableEngine::Bitmap).unwrap();
+
+    let back = Catalog::from_entries(&c.encode()).unwrap();
+    assert_eq!(back.database("sales"), Some(sales));
+    assert_eq!(back.lookup("sales.orders").unwrap().database, sales);
+    assert_eq!(back.database_name(sales), Some("sales"));
+}
+
+/// The point of a namespace: the same table name in two of them is two tables, with two ids and
+/// therefore two disjoint sets of fragments.
+#[test]
+fn the_same_table_name_in_two_databases_is_two_tables() {
+    let mut c = Catalog::new();
+    let sales = c.intern_database("sales").unwrap();
+    let ops = c.intern_database("ops").unwrap();
+
+    let a = c.intern_table_with(sales, "events", TableEngine::Bitmap).unwrap();
+    let b = c.intern_table_with(ops, "events", TableEngine::Bitmap).unwrap();
+    assert_ne!(a, b, "a TableId is unique across databases, which is what keeps data apart");
+
+    assert_eq!(c.table(sales, "events").unwrap().id, a);
+    assert_eq!(c.table(ops, "events").unwrap().id, b);
+    assert_eq!(c.lookup("sales.events").unwrap().id, a);
+    assert_eq!(c.lookup("ops.events").unwrap().id, b);
+    // And neither is reachable unqualified, because neither is in the default database.
+    assert!(c.lookup("events").is_none());
+}
+
+/// The default database is always there, is never written to disk, and cannot be dropped: every
+/// table has to be in some database, and this is the one that is always available to be in.
+#[test]
+fn the_default_database_is_not_a_record_and_cannot_be_dropped() {
+    let mut c = Catalog::new();
+    c.intern_table_with(big_db::DEFAULT_DATABASE, "tx", TableEngine::Bitmap).unwrap();
+
+    assert!(
+        !c.encode().iter().any(|e| e[0] == big_db::catalog::KIND_DATABASE),
+        "the default database is implied, not stored"
+    );
+    assert_eq!(c.database(big_db::DEFAULT_DATABASE_NAME), Some(big_db::DEFAULT_DATABASE));
+    assert_eq!(c.drop_database(big_db::DEFAULT_DATABASE_NAME), None);
+
+    // And interning it by name hands back the reserved id rather than allocating a second one.
+    assert_eq!(c.intern_database(big_db::DEFAULT_DATABASE_NAME).unwrap(), big_db::DEFAULT_DATABASE);
+}
+
+/// A database still holding tables is not dropped by the catalog. Emptiness is the caller's to
+/// arrange, because each `drop_table` hands back fragment keys whose pages have to be freed -
+/// and a drop that swallowed its tables here would strand every one of those pages.
+#[test]
+fn a_database_holding_tables_is_not_dropped_by_the_catalog() {
+    let mut c = Catalog::new();
+    let sales = c.intern_database("sales").unwrap();
+    c.intern_table_with(sales, "orders", TableEngine::Bitmap).unwrap();
+
+    assert_eq!(c.table_count(sales), 1);
+    assert_eq!(c.drop_database("sales"), None, "still holds a table");
+
+    c.drop_table(sales, "orders").unwrap();
+    assert_eq!(c.drop_database("sales"), Some(sales));
+    assert_eq!(c.database("sales"), None);
+}
+
+/// A `.` is the separator in a qualified name, so a name holding one is refused rather than
+/// stored. A table actually called `a.b` would be the same string as table `b` in database `a`
+/// everywhere a table travels as one - a plan, a fragment address, a message between nodes.
+#[test]
+fn a_name_holding_the_separator_is_refused() {
+    let mut c = Catalog::new();
+    assert_eq!(
+        c.intern_table_with(big_db::DEFAULT_DATABASE, "a.b", TableEngine::Bitmap)
+            .unwrap_err()
+            .code(),
+        "name_separator"
+    );
+    assert_eq!(c.intern_database("a.b").unwrap_err().code(), "name_separator");
+}
+
+/// `TableRef` writes and reads the one string form a table travels as, and the two are
+/// inverses - which is what lets a plan, a fragment address and a DDL message all carry a
+/// table as a single `String` without a second field to disagree with.
+#[test]
+fn a_qualified_name_round_trips_through_the_string_form() {
+    for (database, table) in
+        [(big_db::DEFAULT_DATABASE_NAME, "tx"), ("sales", "orders"), ("ops", "events")]
+    {
+        let r = big_db::TableRef::new(database, table);
+        let printed = r.to_string();
+        assert_eq!(big_db::TableRef::parse(&printed), r, "{printed}");
+    }
+    // A bare name prints bare and reads back as the default database, so every name written
+    // before databases existed still means what it meant.
+    assert_eq!(big_db::TableRef::parse("tx"), big_db::TableRef::bare("tx"));
+    assert_eq!(big_db::TableRef::bare("tx").to_string(), "tx");
 }

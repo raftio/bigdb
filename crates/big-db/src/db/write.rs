@@ -724,7 +724,8 @@ impl<'db, P: PagerMut> DbWrite<'db, P> {
     }
 
     /// Resolves a field once, for a caller about to write many facts at it.
-    pub fn at(&self, table: &str, field: &str) -> Result<At> {
+    pub fn at<'a>(&self, table: impl Into<TableRef<'a>>, field: &str) -> Result<At> {
+        let table = table.into();
         let (t, def) = resolve(&self.catalog, table, field)?;
         Ok(At { table: t, def })
     }
@@ -741,12 +742,13 @@ impl<'db, P: PagerMut> DbWrite<'db, P> {
     /// avoids — and the memo had to be invalidated everywhere `pending` shrinks, which is not
     /// only `flush_fragment` but `discard` too. Paying for three pushes is the cheaper and the
     /// safer of the two.
-    pub fn mark_exists(&mut self, table: &str, record: RecordId) -> Result<()> {
-        let t = self
-            .catalog
-            .table(table)
-            .map(|t| t.id)
-            .ok_or_else(|| DbError::UnknownTable(table.to_string()))?;
+    pub fn mark_exists<'a>(
+        &mut self,
+        table: impl Into<TableRef<'a>>,
+        record: RecordId,
+    ) -> Result<()> {
+        let table = table.into();
+        let t = self.catalog.require(table)?.id;
         self.mark_exists_at(t, record);
         Ok(())
     }
@@ -880,13 +882,14 @@ impl<'db, P: PagerMut> DbWrite<'db, P> {
         }
     }
 
-    pub fn set_int(
+    pub fn set_int<'a>(
         &mut self,
-        table: &str,
+        table: impl Into<TableRef<'a>>,
         field: &str,
         record: RecordId,
         value: u64,
     ) -> Result<()> {
+        let table = table.into();
         let at = self.at(table, field)?;
         self.set_int_at(&at, record, value)
     }
@@ -924,13 +927,14 @@ impl<'db, P: PagerMut> DbWrite<'db, P> {
     /// [`crate::signed`] and nowhere else. Refused rather than wrapped when the value does not
     /// fit the declared range, for the same reason `set_int` refuses a value too wide: a number
     /// that comes back as a different number is worse than a write that failed.
-    pub fn set_signed(
+    pub fn set_signed<'a>(
         &mut self,
-        table: &str,
+        table: impl Into<TableRef<'a>>,
         field: &str,
         record: RecordId,
         value: i64,
     ) -> Result<()> {
+        let table = table.into();
         let at = self.at(table, field)?;
         self.set_signed_at(&at, record, value)
     }
@@ -956,13 +960,14 @@ impl<'db, P: PagerMut> DbWrite<'db, P> {
         Ok(())
     }
 
-    pub fn set_bool(
+    pub fn set_bool<'a>(
         &mut self,
-        table: &str,
+        table: impl Into<TableRef<'a>>,
         field: &str,
         record: RecordId,
         value: bool,
     ) -> Result<()> {
+        let table = table.into();
         let at = self.at(table, field)?;
         self.set_bool_at(&at, record, value)
     }
@@ -979,13 +984,14 @@ impl<'db, P: PagerMut> DbWrite<'db, P> {
 
     /// Interns the row key and sets the bit. Row keys are the one thing that must mean the same
     /// in every shard, which is why they go through the catalog rather than being derived.
-    pub fn set_key(
+    pub fn set_key<'a>(
         &mut self,
-        table: &str,
+        table: impl Into<TableRef<'a>>,
         field: &str,
         record: RecordId,
         value: &str,
     ) -> Result<RowId> {
+        let table = table.into();
         let at = self.at(table, field)?;
         self.set_key_at(&at, record, value)
     }
@@ -1038,7 +1044,13 @@ impl<'db, P: PagerMut> DbWrite<'db, P> {
     /// already mean the same thing everywhere. Interning is a catalog write, so this takes a
     /// transaction like any other - and it is a *separate* transaction from the import,
     /// because the import happens on other machines.
-    pub fn intern_key(&mut self, table: &str, field: &str, value: &str) -> Result<RowId> {
+    pub fn intern_key<'a>(
+        &mut self,
+        table: impl Into<TableRef<'a>>,
+        field: &str,
+        value: &str,
+    ) -> Result<RowId> {
+        let table = table.into();
         let (t, def) = resolve(&self.catalog, table, field)?;
         expect_kind(&def, field, FieldKind::is_keyed, "set, mutex or time quantum")?;
         Ok(self.catalog.keys.intern(t, def.id, value)?)
@@ -1052,7 +1064,14 @@ impl<'db, P: PagerMut> DbWrite<'db, P> {
     ///
     /// In the same transaction as the facts that use it, so a batch that is refused leaves
     /// neither the fact nor the mapping behind.
-    pub fn assign_key(&mut self, table: &str, field: &str, value: &str, row: RowId) -> Result<()> {
+    pub fn assign_key<'a>(
+        &mut self,
+        table: impl Into<TableRef<'a>>,
+        field: &str,
+        value: &str,
+        row: RowId,
+    ) -> Result<()> {
+        let table = table.into();
         let (t, def) = resolve(&self.catalog, table, field)?;
         expect_kind(&def, field, FieldKind::is_keyed, "set, mutex or time quantum")?;
         Ok(self.catalog.keys.assign(t, def.id, value, row)?)
@@ -1063,14 +1082,15 @@ impl<'db, P: PagerMut> DbWrite<'db, P> {
     /// The fact goes into the standard view exactly as `set_key` would, and additionally into
     /// one view per granularity the field declared. Those extra views are what make a range
     /// query read only the days it asks about instead of every record ever written.
-    pub fn set_time(
+    pub fn set_time<'a>(
         &mut self,
-        table: &str,
+        table: impl Into<TableRef<'a>>,
         field: &str,
         record: RecordId,
         value: &str,
         unix_seconds: i64,
     ) -> Result<RowId> {
+        let table = table.into();
         let at = self.at(table, field)?;
         self.set_time_at(&at, record, value, unix_seconds)
     }
@@ -1174,11 +1194,7 @@ impl<'db, P: PagerMut> DbWrite<'db, P> {
     /// interned rather than refused: a copy that was away when a time quantum first wrote a
     /// day's view has to be able to take it now.
     fn locate_for_write(&mut self, addr: &FragmentAddr) -> Result<FragmentKey> {
-        let t = self
-            .catalog
-            .table(&addr.table)
-            .map(|t| t.id)
-            .ok_or_else(|| DbError::UnknownTable(addr.table.clone()))?;
+        let t = self.catalog.require(addr.table_ref())?.id;
         let field = match &addr.field {
             Some(name) => {
                 self.catalog
@@ -1229,12 +1245,13 @@ impl<'db, P: PagerMut> DbWrite<'db, P> {
     ///
     /// The count is of records that existed, so deleting the same record twice, or one that
     /// was never written, is not an error and does not inflate the answer.
-    pub fn delete(&mut self, table: &str, records: &[RecordId]) -> Result<u64> {
-        let t = self
-            .catalog
-            .table(table)
-            .map(|t| t.id)
-            .ok_or_else(|| DbError::UnknownTable(table.to_string()))?;
+    pub fn delete<'a>(
+        &mut self,
+        table: impl Into<TableRef<'a>>,
+        records: &[RecordId],
+    ) -> Result<u64> {
+        let table = table.into();
+        let t = self.catalog.require(table)?.id;
 
         // Everything buffered lands first. A fragment that has only been written to in this
         // transaction is not in the catalog yet - `buffer_bit` defers registering it until the
@@ -1261,7 +1278,12 @@ impl<'db, P: PagerMut> DbWrite<'db, P> {
 
     /// The same, over the answer to a query. This is the shape of undoing a wrong import:
     /// name the records with a predicate, then remove exactly those.
-    pub fn delete_where(&mut self, table: &str, rows: &Matches) -> Result<u64> {
+    pub fn delete_where<'a>(
+        &mut self,
+        table: impl Into<TableRef<'a>>,
+        rows: &Matches,
+    ) -> Result<u64> {
+        let table = table.into();
         let records: Vec<RecordId> = rows.records().collect();
         self.delete(table, &records)
     }
