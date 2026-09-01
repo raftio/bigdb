@@ -134,7 +134,7 @@ pub fn parse(input: &str) -> Result<Parsed> {
         // `POST /table/{t}/delete`, and the reason it is not a statement here is that a record
         // is not a row.
         "DELETE" => return Err(p.refuse(Refused::DeleteRows)),
-        "USE" => return Err(p.refuse(Refused::Database)),
+        "USE" => return Err(p.refuse(Refused::SessionUse)),
         "UPDATE" | "TRUNCATE" | "REPLACE" | "MERGE" | "UPSERT" => {
             return Err(p.refuse(Refused::Write))
         }
@@ -321,9 +321,16 @@ impl Parser<'_> {
     /// `FROM` - so which table it names cannot be decided here. The lowering decides, where
     /// both sources are known, and a qualifier that names neither is refused there.
     pub(super) fn name(&mut self, want: &'static str) -> Result<Name> {
+        let at = self.at();
         let first = self.bare_ident(want)?;
         if self.eat(&Tok::Dot) {
             let column = self.bare_ident("a column name after the qualifier")?;
+            // `sales.orders.amount`. Refused by name rather than as "expected a column": the
+            // one qualifier a column takes is an alias, and what the writer needs to be told
+            // is which alias to give the table. See [`Refused::ThreePartName`].
+            if self.peek() == Some(&Tok::Dot) {
+                return Err(self.refuse_at(Refused::ThreePartName, at));
+            }
             return Ok(Name { qualifier: Some(first), column });
         }
         Ok(Name::bare(first))
@@ -342,6 +349,26 @@ impl Parser<'_> {
             }
             _ => Err(self.syntax(want)),
         }
+    }
+
+    /// `[<database> '.'] <table>`, the way every statement names a table.
+    ///
+    /// Two parts and never three. A column keeps its one-level qualifier, which always means an
+    /// alias - see [`crate::ast::Name`] - because the select list is parsed before `FROM` and a
+    /// three-part name would make `a.b` ambiguous between "alias `a`, column `b`" and
+    /// "database `a`, table `b`". `sales.orders.amount` is refused with the alias to write
+    /// instead, rather than resolved by guessing.
+    pub(super) fn table_ref(&mut self, want: &'static str) -> Result<(Option<String>, String)> {
+        let at = self.at();
+        let first = self.bare_ident(want)?;
+        if !self.eat(&Tok::Dot) {
+            return Ok((None, first));
+        }
+        let table = self.bare_ident("a table name after the database")?;
+        if self.peek() == Some(&Tok::Dot) {
+            return Err(self.refuse_at(Refused::ThreePartName, at));
+        }
+        Ok((Some(first), table))
     }
 
     pub(super) fn bare_ident(&mut self, want: &'static str) -> Result<String> {

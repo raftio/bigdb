@@ -70,14 +70,26 @@ impl<P: PagerMut + Sync> Cluster<P> {
     /// change naming what did land - the same report a field created on its own gets.
     fn sql_ddl(&self, ddl: &big_api::SqlDdl) -> Result<(ResultSet, Format)> {
         let (column, changed) = match ddl {
-            big_api::SqlDdl::CreateTable { table, engine, columns, if_not_exists } => {
-                ("table", self.sql_create_table(table, engine.as_deref(), columns, *if_not_exists)?)
+            big_api::SqlDdl::CreateDatabase { name, if_not_exists } => {
+                ("database", self.sql_create_database(name, *if_not_exists)?)
             }
-            big_api::SqlDdl::AlterTable { table, changes } => {
-                ("fields", self.sql_alter_table(table, changes)?)
+            big_api::SqlDdl::DropDatabase { name, if_exists, cascade } => {
+                ("dropped", self.sql_drop_database(name, *if_exists, *cascade)?)
             }
-            big_api::SqlDdl::DropTable { table, if_exists } => {
-                ("dropped", self.sql_drop_table(table, *if_exists)?)
+            big_api::SqlDdl::CreateTable { database, table, engine, columns, if_not_exists } => (
+                "table",
+                self.sql_create_table(
+                    &qualified(database, table),
+                    engine.as_deref(),
+                    columns,
+                    *if_not_exists,
+                )?,
+            ),
+            big_api::SqlDdl::AlterTable { database, table, changes } => {
+                ("fields", self.sql_alter_table(&qualified(database, table), changes)?)
+            }
+            big_api::SqlDdl::DropTable { database, table, if_exists } => {
+                ("dropped", self.sql_drop_table(&qualified(database, table), *if_exists)?)
             }
         };
         Ok((big_api::one_cell(column, big_api::Datum::Int(changed.into())), Format::default()))
@@ -132,6 +144,38 @@ impl<P: PagerMut + Sync> Cluster<P> {
             return Err(local(big_db::DbError::UnknownTable(table.to_string())));
         }
         self.drop_table(table).map(u64::from)
+    }
+
+    /// `CREATE DATABASE`, answering with how many it created - one, or nothing when it was
+    /// already there.
+    ///
+    /// Without `IF NOT EXISTS` a database that already exists is an error rather than a quiet
+    /// zero, which is the rule `CREATE TABLE` follows one level down.
+    fn sql_create_database(&self, name: &str, if_not_exists: bool) -> Result<u64> {
+        if self.api.databases_named(name) {
+            if if_not_exists {
+                return Ok(0);
+            }
+            return Err(local(big_db::DbError::NameTaken(name.to_string())));
+        }
+        self.create_database(name).map(u64::from)
+    }
+
+    /// `DROP DATABASE`, answering with how many it dropped.
+    ///
+    /// `IF EXISTS` is answered here, before the drop is attempted, because a database that is
+    /// not there is a request already satisfied rather than one to report on. Everything else -
+    /// the default database, and the emptiness a bare `DROP` refuses on - belongs to
+    /// [`Cluster::drop_database_if_empty`], which is where the `/database/{d}` route asks the
+    /// same questions.
+    fn sql_drop_database(&self, name: &str, if_exists: bool, cascade: bool) -> Result<u64> {
+        if if_exists && !self.api.databases_named(name) {
+            return Ok(0);
+        }
+        match self.drop_database_if_empty(name, cascade)? {
+            true => Ok(1),
+            false => Err(local(big_db::DbError::UnknownDatabase(name.to_string()))),
+        }
     }
 
     /// `ALTER TABLE`, answering with how many fields it changed.
@@ -229,7 +273,7 @@ impl<P: PagerMut + Sync> Cluster<P> {
         // listing goes nowhere at all. Deciding it here rather than inside `plan_sql` is what
         // keeps a `CREATE TABLE` from being applied on whichever node the client happened to
         // reach - which is the failure a schema leader exists to prevent.
-        let statement = match self.api.translate(text)? {
+        let statement = match self.api.translate_in(text, opts.database())? {
             big_api::Sql::Ddl(ddl) => return self.sql_ddl(&ddl),
             big_api::Sql::Insert(insert) => return self.sql_insert(&insert),
             big_api::Sql::Show(show) => return self.sql_show(&show),
@@ -275,11 +319,15 @@ impl<P: PagerMut + Sync> Cluster<P> {
     /// the order the rows were written, so `VALUES (…), (…)` reads back in the order it was
     /// typed.
     fn sql_insert(&self, insert: &big_api::SqlInsert) -> Result<(ResultSet, Format)> {
+        // The qualified name, which is what every route below takes and what an error should
+        // say back: `orders` is not the table that was not found, `sales.orders` is.
+        let name = qualified(&insert.database, &insert.table);
+        let target = big_db::TableRef::parse(&name);
         let schema = self.schema();
         let table = schema
             .iter()
-            .find(|t| t.name == insert.table)
-            .ok_or_else(|| local(big_db::DbError::UnknownTable(insert.table.clone())))?;
+            .find(|t| t.name == target.table && t.database == target.database)
+            .ok_or_else(|| local(big_db::DbError::UnknownTable(name.clone())))?;
 
         // Resolved once per column rather than once per value: a statement writing ten thousand
         // rows names the same handful of fields over and over. **The schema's copy of the name,
@@ -291,10 +339,7 @@ impl<P: PagerMut + Sync> Cluster<P> {
                 continue;
             }
             let info = table.fields.iter().find(|f| &f.name == column).ok_or_else(|| {
-                local(big_db::DbError::UnknownField {
-                    table: insert.table.clone(),
-                    field: column.clone(),
-                })
+                local(big_db::DbError::UnknownField { table: name.clone(), field: column.clone() })
             })?;
             fields.push(info);
         }
@@ -303,7 +348,7 @@ impl<P: PagerMut + Sync> Cluster<P> {
         // row would make a thousand-row insert a thousand round trips to one node.
         let allocated = match insert.id_at {
             Some(_) => 0,
-            None => self.allocate(&insert.table, insert.rows.len() as u64)?,
+            None => self.allocate(&name, insert.rows.len() as u64)?,
         };
 
         let mut facts = Vec::with_capacity(insert.fact_count());
@@ -326,10 +371,10 @@ impl<P: PagerMut + Sync> Cluster<P> {
         // The same two-armed choice the import route makes: facts borrowed all the way in when
         // this node writes alone, owned when a batch has to be shipped.
         let outcome = if self.writes_alone() {
-            self.import_borrowed(&insert.table, &facts)?
+            self.import_borrowed(&name, &facts)?
         } else {
             let owned: Vec<_> = facts.iter().map(OwnedFact::from_fact).collect();
-            self.import(&insert.table, &owned)?
+            self.import(&name, &owned)?
         };
         let _ = outcome;
         Ok((
@@ -342,9 +387,16 @@ impl<P: PagerMut + Sync> Cluster<P> {
     fn sql_show(&self, show: &big_api::SqlShow) -> Result<(ResultSet, Format)> {
         let schema = self.schema();
         let set = match &show.what {
-            big_api::SqlShown::Columns { table } => big_api::introspect::describe(&schema, table),
-            big_api::SqlShown::Tables => Ok(big_api::introspect::show_tables(&schema)),
-            big_api::SqlShown::Create { table } => big_api::introspect::show_create(&schema, table),
+            big_api::SqlShown::Columns { database, table } => {
+                big_api::introspect::describe(&schema, &qualified(database, table))
+            }
+            big_api::SqlShown::Tables { database } => {
+                Ok(big_api::introspect::show_tables(&schema, database.as_deref()))
+            }
+            big_api::SqlShown::Databases => Ok(big_api::introspect::show_databases(&schema)),
+            big_api::SqlShown::Create { database, table } => {
+                big_api::introspect::show_create(&schema, &qualified(database, table))
+            }
         };
         Ok((set.map_err(ClusterError::Local)?, show.format))
     }
@@ -443,5 +495,15 @@ fn asked_of_owners(plan: &Plan) -> Plan {
         // a *ranking* - a group that leads nowhere can still lead everywhere once the shards
         // are added up, so no owner may drop one.
         other => other.clone(),
+    }
+}
+
+/// `database.table`, or the bare table when the statement did not name a database.
+///
+/// The one string form a table travels as - see `big_db::TableRef::parse`, which reads it back.
+fn qualified(database: &Option<String>, table: &str) -> String {
+    match database {
+        Some(d) => format!("{d}.{table}"),
+        None => table.to_string(),
     }
 }

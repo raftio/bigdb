@@ -24,6 +24,7 @@ use big_keys::KeyStore;
 use big_pager::{kind, CATALOG_ENTRY_BYTES};
 use std::collections::BTreeMap;
 
+pub type DatabaseId = u32;
 pub type TableId = u32;
 pub type FieldId = u32;
 pub type ViewId = u32;
@@ -35,6 +36,7 @@ pub const KIND_FIELD: u8 = kind::FIELD;
 pub const KIND_VIEW: u8 = kind::VIEW;
 pub const KIND_FRAGMENT: u8 = kind::FRAGMENT;
 pub const KIND_SEQ: u8 = kind::SEQ;
+pub const KIND_DATABASE: u8 = kind::DATABASE;
 
 const NAME_AT: usize = 24;
 
@@ -44,6 +46,29 @@ const NAME_AT: usize = 24;
 /// same budget as `big_keys::MAX_KEY_LEN`. Truncating merges two different names into one and,
 /// when the cut lands inside a character, destroys the entry outright on the next reload.
 pub const MAX_NAME_LEN: usize = CATALOG_ENTRY_BYTES - NAME_AT;
+
+/// The database a table is in when nobody said which, and the one every table written before
+/// databases existed is in.
+///
+/// **Zero on purpose.** A table catalog entry written by an older build has zeroes in the word
+/// that now names its database, so the number that word decodes to has to be the database those
+/// tables have always been in. That makes the format additive in both directions with no
+/// migration - the same argument [`TableEngine`]'s zero byte carries, one field over.
+///
+/// Never handed out by [`Catalog::intern_database`], which allocates from
+/// [`FIRST_NAMED_DATABASE`], and never dropped: a table has to be in some database, and this is
+/// the one that is always there to be in.
+pub const DEFAULT_DATABASE: DatabaseId = 0;
+
+/// What [`DEFAULT_DATABASE`] is called in SQL and in a listing.
+///
+/// `default` rather than `main` or `public` because it is ClickHouse's, and the clients that
+/// introspect this surface - a BI tool populating a table tree - are the ones that already know
+/// that name.
+pub const DEFAULT_DATABASE_NAME: &str = "default";
+
+/// First id [`Catalog::intern_database`] may allocate.
+const FIRST_NAMED_DATABASE: DatabaseId = DEFAULT_DATABASE + 1;
 
 /// The default view every field has; time quantum views are extra ones alongside it.
 ///
@@ -88,12 +113,92 @@ pub use big_engine::TableEngine;
 /// because the catalog is what stores it. The byte on disk is the discriminant.
 pub use big_engine::FieldKind;
 
+/// A table, under the database its name is unique within.
+///
+/// # Why this is a type and not a second parameter
+///
+/// Every method that reaches a table by name needs the database too, and there are about forty
+/// of them across this crate and `big-api`. Adding a parameter to each would touch every call
+/// site in the workspace to say `default` - noise that hides the handful of call sites where
+/// the database is a real decision.
+///
+/// So a bare `&str` converts into one, meaning [`DEFAULT_DATABASE_NAME`], and the signatures
+/// take `impl Into<TableRef<'_>>`. `db.count("tx")` still reads the way it did, and
+/// `db.count(TableRef::new("sales", "orders"))` is the case that had something to say.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct TableRef<'a> {
+    pub database: &'a str,
+    pub table: &'a str,
+}
+
+impl<'a> TableRef<'a> {
+    pub fn new(database: &'a str, table: &'a str) -> Self {
+        Self { database, table }
+    }
+
+    /// A table in [`DEFAULT_DATABASE`], which is what an unqualified name means.
+    pub fn bare(table: &'a str) -> Self {
+        Self { database: DEFAULT_DATABASE_NAME, table }
+    }
+
+    /// Reads `database.table`, or a bare name as one in the default database.
+    ///
+    /// **The one decoder, and the reason there is only one representation.** A table travels as
+    /// a single `String` in three places that predate databases - a [`crate::FragmentAddr`], a
+    /// `big_plan::Plan`, and a DDL message between nodes - and giving each of them its own
+    /// second field would be three chances for a qualified name to mean one thing in the repair
+    /// path and another in the planner. So the qualified name *is* the string form, [`Display`]
+    /// writes it, and this reads it back.
+    ///
+    /// Unambiguous because [`check_name`] refuses a `.` in a name, so the first one can only be
+    /// the separator.
+    ///
+    /// [`Display`]: core::fmt::Display
+    pub fn parse(name: &'a str) -> Self {
+        match name.split_once('.') {
+            Some((database, table)) => Self { database, table },
+            None => Self::bare(name),
+        }
+    }
+}
+
+impl<'a> From<&'a str> for TableRef<'a> {
+    fn from(name: &'a str) -> Self {
+        Self::parse(name)
+    }
+}
+
+impl<'a> From<&'a String> for TableRef<'a> {
+    fn from(name: &'a String) -> Self {
+        Self::parse(name)
+    }
+}
+
+impl core::fmt::Display for TableRef<'_> {
+    /// Qualified only when it says something: a table in the default database prints as the
+    /// name somebody typed, which is what an error message about it should say back.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        if self.database == DEFAULT_DATABASE_NAME {
+            write!(f, "{}", self.table)
+        } else {
+            write!(f, "{}.{}", self.database, self.table)
+        }
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct TableDef {
     pub id: TableId,
     pub name: String,
     /// What this table writes for every fact. Fixed at creation; see [`TableEngine`].
     pub engine: TableEngine,
+    /// The namespace [`TableDef::name`] is unique within.
+    ///
+    /// **Not part of this table's identity below the catalog.** A [`TableId`] is unique across
+    /// every database, so nothing keyed on one - no [`FragmentKey`], no row key, no root
+    /// record - mentions a database at all. Which is why a namespace above tables cost the
+    /// storage layer nothing.
+    pub database: DatabaseId,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -147,8 +252,16 @@ impl FragmentMeta {
 
 #[derive(Clone, Default, Debug)]
 pub struct Catalog {
+    /// Named databases only. [`DEFAULT_DATABASE`] is not in here: it exists whether or not
+    /// anything was ever written, so storing it would mean every reload having to decide
+    /// whether to put it back.
+    databases: BTreeMap<DatabaseId, String>,
+    database_ids: BTreeMap<String, DatabaseId>,
     tables: BTreeMap<TableId, TableDef>,
-    table_ids: BTreeMap<String, TableId>,
+    /// Nested for the reason `field_ids` is, below: a lookup takes `&str` through
+    /// `String: Borrow<str>` and allocates nothing, where a flat `(DatabaseId, String)` key
+    /// would allocate a `String` on every probe just to find a table.
+    table_ids: BTreeMap<DatabaseId, BTreeMap<String, TableId>>,
     fields: BTreeMap<(TableId, FieldId), FieldDef>,
     /// Nested rather than keyed on `(TableId, String)`, and that shape is load-bearing.
     ///
@@ -173,6 +286,7 @@ pub struct Catalog {
 
 #[derive(Clone, Debug)]
 struct Sequences {
+    database: DatabaseId,
     table: TableId,
     view: ViewId,
     /// Per table, because field ids are scoped to their table.
@@ -181,7 +295,12 @@ struct Sequences {
 
 impl Default for Sequences {
     fn default() -> Self {
-        Self { table: 0, view: FIRST_NAMED_VIEW, field: BTreeMap::new() }
+        Self {
+            database: FIRST_NAMED_DATABASE,
+            table: 0,
+            view: FIRST_NAMED_VIEW,
+            field: BTreeMap::new(),
+        }
     }
 }
 
@@ -190,6 +309,7 @@ mod seq_of {
     pub const TABLE: u8 = 0;
     pub const VIEW: u8 = 1;
     pub const FIELD: u8 = 2;
+    pub const DATABASE: u8 = 3;
 }
 
 /// Panics rather than truncating if a name got this far over-long: every public entry point
@@ -205,6 +325,13 @@ fn put_name(b: &mut [u8], name: &str) {
 fn check_name(name: &str) -> Result<()> {
     if name.len() > MAX_NAME_LEN {
         return Err(DbError::NameTooLong { name: name.to_string(), max: MAX_NAME_LEN });
+    }
+    // A `.` is the separator in a qualified name, and [`TableRef::parse`] splits on the first
+    // one. A table actually called `a.b` would be indistinguishable from table `b` in database
+    // `a` everywhere a table travels as one string - so the name is refused, which is the only
+    // answer that keeps the two apart.
+    if name.contains('.') {
+        return Err(DbError::NameSeparator(name.to_string()));
     }
     Ok(())
 }
@@ -248,8 +375,64 @@ impl Catalog {
         Self::default()
     }
 
-    pub fn table(&self, name: &str) -> Option<&TableDef> {
-        self.table_ids.get(name).and_then(|id| self.tables.get(id))
+    /// The id of a named database, or [`DEFAULT_DATABASE`] for the name it always answers to.
+    pub fn database(&self, name: &str) -> Option<DatabaseId> {
+        if name == DEFAULT_DATABASE_NAME {
+            return Some(DEFAULT_DATABASE);
+        }
+        self.database_ids.get(name).copied()
+    }
+
+    pub fn database_name(&self, id: DatabaseId) -> Option<&str> {
+        if id == DEFAULT_DATABASE {
+            return Some(DEFAULT_DATABASE_NAME);
+        }
+        self.databases.get(&id).map(|s| s.as_str())
+    }
+
+    /// Every database, [`DEFAULT_DATABASE`] first. It is prepended rather than stored, for the
+    /// reason [`Catalog::databases`]' field documents.
+    pub fn databases(&self) -> impl Iterator<Item = (DatabaseId, &str)> {
+        core::iter::once((DEFAULT_DATABASE, DEFAULT_DATABASE_NAME))
+            .chain(self.databases.iter().map(|(id, name)| (*id, name.as_str())))
+    }
+
+    pub fn table(&self, database: DatabaseId, name: &str) -> Option<&TableDef> {
+        self.table_ids
+            .get(&database)
+            .and_then(|by_name| by_name.get(name))
+            .and_then(|id| self.tables.get(id))
+    }
+
+    /// The database of a reference, or [`DbError::UnknownDatabase`].
+    ///
+    /// The one place a database name becomes an id, so that "no such database" is said once and
+    /// in the same words wherever a qualified name is resolved.
+    pub fn database_of(&self, r: TableRef<'_>) -> Result<DatabaseId> {
+        self.database(r.database).ok_or_else(|| DbError::UnknownDatabase(r.database.to_string()))
+    }
+
+    /// A table by qualified reference. `Ok(None)` is "no such table"; the error is "no such
+    /// database", which is a different fix.
+    pub fn table_ref(&self, r: TableRef<'_>) -> Result<Option<&TableDef>> {
+        Ok(self.table(self.database_of(r)?, r.table))
+    }
+
+    /// The same, with "no such table" promoted to an error - which is what almost every caller
+    /// wants, since a table that is not there is not a question they can answer.
+    pub fn require(&self, r: TableRef<'_>) -> Result<&TableDef> {
+        self.table_ref(r)?.ok_or_else(|| DbError::UnknownTable(r.to_string()))
+    }
+
+    /// A table by its qualified string name, with an unknown database answering `None` rather
+    /// than an error.
+    ///
+    /// For the callers whose whole question is "is this a table" - a planner asking whether a
+    /// name resolves, a field class lookup - where an absent database and an absent table lead
+    /// to the same next step. Callers who report the difference want [`Catalog::table_ref`].
+    pub fn lookup(&self, name: &str) -> Option<&TableDef> {
+        let r = TableRef::parse(name);
+        self.table(self.database(r.database)?, r.table)
     }
 
     pub fn table_by_id(&self, id: TableId) -> Option<&TableDef> {
@@ -260,6 +443,11 @@ impl Catalog {
     /// which is what a tool inspecting a file has to do.
     pub fn tables(&self) -> impl Iterator<Item = &TableDef> {
         self.tables.values()
+    }
+
+    /// Every table in one database, in id order.
+    pub fn tables_in(&self, database: DatabaseId) -> impl Iterator<Item = &TableDef> {
+        self.tables.values().filter(move |t| t.database == database)
     }
 
     pub fn field(&self, table: TableId, name: &str) -> Option<&FieldDef> {
@@ -302,9 +490,52 @@ impl Catalog {
         self.views.get(&id).map(|s| s.as_str())
     }
 
+    /// Interns a database, returning the existing id if it is already there.
+    ///
+    /// Idempotent rather than an error on a repeat, which is the rule `IF NOT EXISTS` wants and
+    /// which costs nothing here: a database has no engine and no columns, so there is no
+    /// second declaration for a repeat to contradict.
+    pub fn intern_database(&mut self, name: &str) -> Result<DatabaseId> {
+        check_name(name)?;
+        if let Some(id) = self.database(name) {
+            return Ok(id);
+        }
+        let id = self.seq.database;
+        self.seq.database += 1;
+        self.databases.insert(id, name.to_string());
+        self.database_ids.insert(name.to_string(), id);
+        Ok(id)
+    }
+
+    /// Removes a database that holds no tables, with the fragments of none.
+    ///
+    /// **Emptiness is the caller's to arrange.** A cascading drop is a loop over
+    /// [`Catalog::drop_table`], and each of those returns the fragment keys whose pages the
+    /// caller has to free - so a drop that quietly swallowed its tables here would strand every
+    /// one of those pages. [`DEFAULT_DATABASE`] is never dropped: a table has to be in some
+    /// database, and it is the one that is always there.
+    pub fn drop_database(&mut self, name: &str) -> Option<DatabaseId> {
+        if name == DEFAULT_DATABASE_NAME {
+            return None;
+        }
+        let id = *self.database_ids.get(name)?;
+        if self.tables_in(id).next().is_some() {
+            return None;
+        }
+        self.database_ids.remove(name);
+        self.databases.remove(&id);
+        self.table_ids.remove(&id);
+        Some(id)
+    }
+
+    /// How many tables a database holds, which is what a `RESTRICT` refusal has to say.
+    pub fn table_count(&self, database: DatabaseId) -> usize {
+        self.tables_in(database).count()
+    }
+
     /// Interns a table under the default engine. See [`Catalog::intern_table_with`].
-    pub fn intern_table(&mut self, name: &str) -> Result<TableId> {
-        self.intern_table_with(name, TableEngine::default())
+    pub fn intern_table(&mut self, database: DatabaseId, name: &str) -> Result<TableId> {
+        self.intern_table_with(database, name, TableEngine::default())
     }
 
     /// Idempotent for an identical declaration, an error for a contradicting one.
@@ -313,9 +544,14 @@ impl Catalog {
     /// id for a table declared with a different engine hands the caller a table they did not ask
     /// for - a bitmap-only one where they wrote `columnar` - and the mismatch would only surface
     /// later, as queries that are slower than they asked for or refusals they did not expect.
-    pub fn intern_table_with(&mut self, name: &str, engine: TableEngine) -> Result<TableId> {
+    pub fn intern_table_with(
+        &mut self,
+        database: DatabaseId,
+        name: &str,
+        engine: TableEngine,
+    ) -> Result<TableId> {
         check_name(name)?;
-        if let Some(id) = self.table_ids.get(name) {
+        if let Some(id) = self.table_ids.get(&database).and_then(|by_name| by_name.get(name)) {
             let existing = self.tables[id].engine;
             return if existing == engine {
                 Ok(*id)
@@ -329,8 +565,8 @@ impl Catalog {
         }
         let id = self.seq.table;
         self.seq.table += 1;
-        self.tables.insert(id, TableDef { id, name: name.to_string(), engine });
-        self.table_ids.insert(name.to_string(), id);
+        self.tables.insert(id, TableDef { id, name: name.to_string(), engine, database });
+        self.table_ids.entry(database).or_default().insert(name.to_string(), id);
         Ok(id)
     }
 
@@ -393,13 +629,16 @@ impl Catalog {
     /// `Ok(false)` means there was no such table. Renaming onto a name someone else holds is
     /// an error, not a silent overwrite: the map would point at the new holder and the old one
     /// would keep its data with no way to reach it.
-    pub fn rename_table(&mut self, old: &str, new: &str) -> Result<bool> {
+    /// Within one database: a rename that also moved a table would be two changes wearing one
+    /// name, and nothing above this asks for it.
+    pub fn rename_table(&mut self, database: DatabaseId, old: &str, new: &str) -> Result<bool> {
         check_name(new)?;
-        if old != new && self.table_ids.contains_key(new) {
+        let by_name = self.table_ids.entry(database).or_default();
+        if old != new && by_name.contains_key(new) {
             return Err(DbError::NameTaken(new.to_string()));
         }
-        let Some(id) = self.table_ids.remove(old) else { return Ok(false) };
-        self.table_ids.insert(new.to_string(), id);
+        let Some(id) = by_name.remove(old) else { return Ok(false) };
+        by_name.insert(new.to_string(), id);
         if let Some(t) = self.tables.get_mut(&id) {
             t.name = new.to_string();
         }
@@ -414,8 +653,8 @@ impl Catalog {
     /// is the state this whole operation exists to avoid.
     ///
     /// `None` means there was no such table.
-    pub fn drop_table(&mut self, name: &str) -> Option<Vec<FragmentKey>> {
-        let id = self.table_ids.remove(name)?;
+    pub fn drop_table(&mut self, database: DatabaseId, name: &str) -> Option<Vec<FragmentKey>> {
+        let id = self.table_ids.get_mut(&database)?.remove(name)?;
         self.tables.remove(&id);
 
         let fields: Vec<FieldId> =
@@ -532,6 +771,13 @@ impl Catalog {
 
     pub fn encode(&self) -> Vec<Vec<u8>> {
         let mut out = Vec::new();
+        for (id, name) in &self.databases {
+            let mut b = vec![0u8; CATALOG_ENTRY_BYTES];
+            b[0] = KIND_DATABASE;
+            b[4..8].copy_from_slice(&id.to_le_bytes());
+            put_name(&mut b, name);
+            out.push(b);
+        }
         for t in self.tables.values() {
             let mut b = vec![0u8; CATALOG_ENTRY_BYTES];
             b[0] = KIND_TABLE;
@@ -540,6 +786,10 @@ impl Catalog {
             // `CATALOG_ENTRY_BYTES` wide and nothing about the chain's stride moves.
             b[1] = t.engine.code();
             b[4..8].copy_from_slice(&t.id.to_le_bytes());
+            // Bytes 8..12 are where a field record keeps its table, and were unused here. Same
+            // argument as the engine byte, and the same payoff: an entry written before
+            // databases existed has zeroes here, and zero is `DEFAULT_DATABASE`.
+            b[8..12].copy_from_slice(&t.database.to_le_bytes());
             put_name(&mut b, &t.name);
             out.push(b);
         }
@@ -590,7 +840,11 @@ impl Catalog {
     /// The counters as flat records. One per table for fields, plus one each for tables and
     /// views, so the whole thing costs a handful of entries rather than one per object.
     fn seq_records(&self) -> Vec<(u8, u32, u32)> {
-        let mut out = vec![(seq_of::TABLE, 0, self.seq.table), (seq_of::VIEW, 0, self.seq.view)];
+        let mut out = vec![
+            (seq_of::TABLE, 0, self.seq.table),
+            (seq_of::VIEW, 0, self.seq.view),
+            (seq_of::DATABASE, 0, self.seq.database),
+        ];
         out.extend(self.seq.field.iter().map(|(t, n)| (seq_of::FIELD, *t, *n)));
         out
     }
@@ -627,8 +881,22 @@ impl Catalog {
                             engine: e[1],
                         });
                     };
-                    c.table_ids.insert(name.clone(), id);
-                    c.tables.insert(id, TableDef { id, name, engine });
+                    // Zero for every entry written before databases existed, which is
+                    // `DEFAULT_DATABASE` - the database those tables have always been in.
+                    let database = rd32(8);
+                    c.table_ids.entry(database).or_default().insert(name.clone(), id);
+                    c.tables.insert(id, TableDef { id, name, engine, database });
+                }
+                KIND_DATABASE => {
+                    let (id, Some(name)) = (rd32(4), get_name(e)) else { continue };
+                    // `DEFAULT_DATABASE` is never written, so an entry claiming it is a file
+                    // this build did not produce. Skipped rather than inserted: keeping it
+                    // would shadow the built-in name with a second entry for the same id.
+                    if id == DEFAULT_DATABASE {
+                        continue;
+                    }
+                    c.database_ids.insert(name.clone(), id);
+                    c.databases.insert(id, name);
                 }
                 KIND_VIEW => {
                     let (id, Some(name)) = (rd32(4), get_name(e)) else { continue };
@@ -682,6 +950,7 @@ impl Catalog {
                             let slot = c.seq.field.entry(scope).or_insert(0);
                             *slot = (*slot).max(value);
                         }
+                        seq_of::DATABASE => c.seq.database = c.seq.database.max(value),
                         _ => {}
                     }
                 }
@@ -695,6 +964,10 @@ impl Catalog {
         // can never hand out an id that is already in use.
         c.seq.table = c.seq.table.max(c.tables.keys().next_back().map_or(0, |m| m + 1));
         c.seq.view = c.seq.view.max(c.views.keys().next_back().map_or(FIRST_NAMED_VIEW, |m| m + 1));
+        c.seq.database = c
+            .seq
+            .database
+            .max(c.databases.keys().next_back().map_or(FIRST_NAMED_DATABASE, |m| m + 1));
         for (table, field) in c.fields.keys() {
             let slot = c.seq.field.entry(*table).or_insert(0);
             *slot = (*slot).max(field + 1);

@@ -194,6 +194,17 @@ fn every_schema_change_survives() {
         },
         wire::Ddl::DropTable { table: "tx".to_string() },
         wire::Ddl::DropField { table: "tx".to_string(), field: "amount".to_string() },
+        wire::Ddl::CreateDatabase { name: "sales".to_string() },
+        wire::Ddl::DropDatabase { name: "sales".to_string() },
+        // A table in a database travels as one qualified string rather than as a second field,
+        // which is the whole of what `WIRE_VERSION` 3 changed. The round trip is the assertion
+        // that the string survives the `.` it now carries.
+        wire::Ddl::CreateTable {
+            table: "sales.orders".to_string(),
+            engine: big_api::TableEngine::Bitmap,
+        },
+        wire::Ddl::DropTable { table: "sales.orders".to_string() },
+        wire::Ddl::DropField { table: "sales.orders".to_string(), field: "amount".to_string() },
     ];
     for case in cases {
         assert_eq!(wire::Ddl::decode(&case.encode()).unwrap(), case);

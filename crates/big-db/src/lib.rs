@@ -37,7 +37,8 @@ pub mod ingest;
 pub mod matches;
 
 pub use catalog::{
-    Catalog, FieldDef, FieldKind, FragmentMeta, TableDef, TableEngine, EXISTS_FIELD, STANDARD_VIEW,
+    Catalog, DatabaseId, FieldDef, FieldKind, FragmentMeta, TableDef, TableEngine, TableRef,
+    DEFAULT_DATABASE, DEFAULT_DATABASE_NAME, EXISTS_FIELD, STANDARD_VIEW,
 };
 pub use db::{At, Cell, Db, DbRead, DbWrite, KeyStats, QueryLimits};
 pub use ingest::Ingest;

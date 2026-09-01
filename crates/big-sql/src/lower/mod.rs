@@ -238,7 +238,7 @@ fn lower_one(select: &Select) -> Result<Statement> {
         return join::joined(select, &stars, &columns, &aggregates);
     }
 
-    let table = &select.from.table;
+    let table = &select.from.qualified();
     match select.group_by.as_slice() {
         [] => ungrouped::ungrouped(select, table, &rows, &stars, &columns, &aggregates),
         [one] => grouped::grouped(select, table, &rows, one, &stars, &columns, &aggregates),

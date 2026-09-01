@@ -187,11 +187,11 @@ pub struct CatalogSchema<'a>(pub &'a Catalog);
 
 impl Schema for CatalogSchema<'_> {
     fn has_table(&self, table: &str) -> bool {
-        self.0.table(table).is_some()
+        self.0.lookup(table).is_some()
     }
 
     fn stores_values(&self, table: &str) -> bool {
-        self.0.table(table).is_some_and(|t| t.engine.has_columns())
+        self.0.lookup(table).is_some_and(|t| t.engine.has_columns())
     }
 
     /// Storage kinds collapse to the three classes a planner can tell apart. A decimal is an
@@ -199,7 +199,7 @@ impl Schema for CatalogSchema<'_> {
     /// only one value at a time - a distinction the storage layer enforces on write, not one
     /// the query language needs a rule for.
     fn field_class(&self, table: &str, field: &str) -> Option<FieldClass> {
-        let t = self.0.table(table)?.id;
+        let t = self.0.lookup(table)?.id;
         let f = self.0.field(t, field)?;
         Some(match f.kind {
             FieldKind::Int => FieldClass::Integer { scale: 0 },
@@ -354,10 +354,10 @@ impl ColumnPlan {
         let signed = is_signed(db, table, field);
         let catalog = db.catalog();
         let keyed = catalog
-            .table(table)
+            .lookup(table)
             .and_then(|t| catalog.field(t.id, field))
             .is_some_and(|f| f.kind.is_keyed());
-        let has_columns = catalog.table(table).is_some_and(|t| t.engine.has_columns());
+        let has_columns = catalog.lookup(table).is_some_and(|t| t.engine.has_columns());
         if has_columns {
             Self::Segment { keyed, signed }
         } else {
@@ -445,7 +445,7 @@ fn decode_int<P: Pager + Sync>(
     }
     let declared = db
         .catalog()
-        .table(table)
+        .lookup(table)
         .and_then(|t| db.catalog().field(t.id, field))
         .map_or(64, |f| if f.bit_depth == 0 { 64 } else { f.bit_depth });
     big_db::signed::decode(stored, declared) as i128
@@ -550,7 +550,7 @@ pub fn sort_by_key(groups: &mut [Group]) {
 /// field" error rather than with something about signs.
 fn is_signed<P: Pager + Sync>(db: &DbRead<'_, P>, table: &str, field: &str) -> bool {
     db.catalog()
-        .table(table)
+        .lookup(table)
         .and_then(|t| db.catalog().field(t.id, field))
         .is_some_and(|f| f.kind.is_signed())
 }

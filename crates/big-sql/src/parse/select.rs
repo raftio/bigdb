@@ -174,7 +174,7 @@ impl Parser<'_> {
 
     /// One table in `FROM`, with the alias the rest of the statement calls it by.
     pub(super) fn source(&mut self, want: &'static str) -> Result<Source> {
-        let table = self.bare_ident(want)?;
+        let (database, table) = self.table_ref(want)?;
         // `AS` is optional in SQL and `FROM tx a` is the common spelling. A word here is an
         // alias unless it is a keyword that continues the statement - a table called `where`
         // has to be quoted, which is true of every dialect.
@@ -185,7 +185,7 @@ impl Parser<'_> {
         } else {
             None
         };
-        Ok(Source { table, alias })
+        Ok(Source { database, table, alias })
     }
 
     /// Whether the current word begins a clause rather than being an alias.

@@ -36,11 +36,23 @@ pub mod kind {
     /// falls back to deriving the next id from the largest one it can see, which is exactly
     /// what every reader did before dropping existed.
     pub const SEQ: u8 = 6;
+    /// The namespace a table's name is unique within. Purely additive in both directions: a
+    /// reader that predates this kind skips the entry, and every table record written before
+    /// it carries a zero in the word that now names its database - which is
+    /// `big_db::catalog::DEFAULT_DATABASE`, the database such a table has always been in.
+    pub const DATABASE: u8 = 7;
 }
 
 /// Every kind, so adding one without checking it against the others is not possible.
-pub const ALL_KINDS: [u8; 6] =
-    [kind::TABLE, kind::FIELD, kind::VIEW, kind::ROW_KEY, kind::FRAGMENT, kind::SEQ];
+pub const ALL_KINDS: [u8; 7] = [
+    kind::TABLE,
+    kind::FIELD,
+    kind::VIEW,
+    kind::ROW_KEY,
+    kind::FRAGMENT,
+    kind::SEQ,
+    kind::DATABASE,
+];
 
 // Distinctness, checked at compile time. Two crates allocate out of this space and cannot see
 // each other's constants; without this a duplicate would surface as records vanishing on

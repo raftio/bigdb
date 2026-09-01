@@ -260,7 +260,10 @@ fn a_token_that_does_not_reach_far_enough_is_a_403() {
 #[test]
 fn a_sql_statement_raises_the_role_the_route_asks_for() {
     let (_dir, path) = token_file("ro read\nrw write\nsecret admin\n");
-    let addr = spawn(9, ServerConfig { auth: Auth::from_file(&path).unwrap(), ..config() });
+    // Eleven, which is how many requests this test makes: the server serves exactly that many
+    // and then stops, so a request added below without this moving answers `connection
+    // refused` rather than anything about roles.
+    let addr = spawn(11, ServerConfig { auth: Auth::from_file(&path).unwrap(), ..config() });
 
     // A schema change needs `admin`, the same power `POST /table/{t}` demands.
     let r = send_with(addr, "POST", "/sql", "CREATE TABLE tx (n INT)", Some("rw"));
@@ -283,9 +286,18 @@ fn a_sql_statement_raises_the_role_the_route_asks_for() {
     assert_eq!(send_with(addr, "POST", "/sql", "SELECT count(*) FROM tx", Some("ro")).status, 200);
     assert_eq!(send_with(addr, "POST", "/sql", "DESCRIBE tx", Some("ro")).status, 200);
     assert_eq!(send_with(addr, "POST", "/sql", "SHOW TABLES", Some("ro")).status, 200);
+    // A database is a schema change like any other, so it demands `admin` the way
+    // `CREATE TABLE` does - the powers have to move together or the weaker one is a way round
+    // the stronger.
+    let r = send_with(addr, "POST", "/sql", "DROP DATABASE d", Some("ro"));
+    assert_eq!(r.status, 403, "{}", r.body);
+    assert!(r.body.contains("needs `admin`"), "{}", r.body);
+    let r = send_with(addr, "POST", "/sql", "CREATE DATABASE d", Some("ro"));
+    assert_eq!(r.status, 403, "{}", r.body);
+
     // A statement that does not translate is refused for what is wrong with it, and the refusal
     // does not depend on the credential - a 400 rather than a 403.
-    let r = send_with(addr, "POST", "/sql", "DROP DATABASE d", Some("ro"));
+    let r = send_with(addr, "POST", "/sql", "CREATE VIEW v AS SELECT count(*) FROM tx", Some("ro"));
     assert_eq!(r.status, 400, "{}", r.body);
 }
 

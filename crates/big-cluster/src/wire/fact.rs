@@ -173,12 +173,43 @@ pub struct Assignment {
 /// the only ones with a protocol.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Ddl {
-    CreateTable { table: String, engine: TableEngine },
-    CreateField { table: String, field: String, kind: FieldKind, bit_depth: u32 },
-    CreateDecimal { table: String, field: String, bit_depth: u32, scale: i8 },
-    CreateTimeQuantum { table: String, field: String, granularity: Vec<Granularity> },
-    DropTable { table: String },
-    DropField { table: String, field: String },
+    CreateTable {
+        table: String,
+        engine: TableEngine,
+    },
+    CreateField {
+        table: String,
+        field: String,
+        kind: FieldKind,
+        bit_depth: u32,
+    },
+    CreateDecimal {
+        table: String,
+        field: String,
+        bit_depth: u32,
+        scale: i8,
+    },
+    CreateTimeQuantum {
+        table: String,
+        field: String,
+        granularity: Vec<Granularity>,
+    },
+    DropTable {
+        table: String,
+    },
+    DropField {
+        table: String,
+        field: String,
+    },
+    CreateDatabase {
+        name: String,
+    },
+    /// Always the cascading form on the wire. Whether `CASCADE` was written is decided at the
+    /// leader, which is where the table count that `RESTRICT` refuses on is authoritative; what
+    /// travels to the other nodes is a change already ruled legal.
+    DropDatabase {
+        name: String,
+    },
 }
 
 impl Ddl {
@@ -221,6 +252,14 @@ impl Ddl {
                 put_u8(&mut out, 5);
                 put_str(&mut out, table);
                 put_str(&mut out, field);
+            }
+            Self::CreateDatabase { name } => {
+                put_u8(&mut out, 6);
+                put_str(&mut out, name);
+            }
+            Self::DropDatabase { name } => {
+                put_u8(&mut out, 7);
+                put_str(&mut out, name);
             }
         }
         out
@@ -270,6 +309,8 @@ impl Ddl {
             },
             4 => Self::DropTable { table: r.str()? },
             5 => Self::DropField { table: r.str()?, field: r.str()? },
+            6 => Self::CreateDatabase { name: r.str()? },
+            7 => Self::DropDatabase { name: r.str()? },
             tag => return Err(WireError::BadTag { what: "schema change", tag }),
         };
         finished(&r)?;

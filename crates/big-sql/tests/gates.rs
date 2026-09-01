@@ -141,14 +141,27 @@ fn every_refusal_is_reached_by_a_statement_in_the_corpus() {
 fn every_declared_table_survives_being_written_back_out() {
     let mut checked = 0;
     for (path, line, sql) in statements() {
-        let Ok(Sql::Ddl(Ddl::CreateTable { table, engine, columns, .. })) =
+        let Ok(Sql::Ddl(Ddl::CreateTable { database, table, engine, columns, .. })) =
             big_sql::translate(&sql)
         else {
             continue;
         };
-        let written = big_sql::render::create_table(&table, engine.as_deref(), &columns);
+        // Qualified when the statement was, because that is what `SHOW CREATE TABLE` answers
+        // with - and a gate that rendered the bare name would be checking a statement the
+        // server never produces.
+        let name = match &database {
+            Some(d) => format!("{d}.{table}"),
+            None => table.clone(),
+        };
+        let written = big_sql::render::create_table(&name, engine.as_deref(), &columns);
         let back = match big_sql::translate(&written) {
-            Ok(Sql::Ddl(Ddl::CreateTable { columns, .. })) => columns,
+            // The database has to survive the round trip too: a `sales.orders` that read back
+            // as `orders` would recreate the table in whichever database asked.
+            Ok(Sql::Ddl(Ddl::CreateTable { database: read_back, columns, .. }))
+                if read_back == database =>
+            {
+                columns
+            }
             other => panic!(
                 "{}:{line} was written back as something else:\n{written}\n{other:?}",
                 path.display()

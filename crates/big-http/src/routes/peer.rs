@@ -34,6 +34,7 @@ pub(super) fn peer_query<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request) ->
         Err(e) => return unreadable(&e),
     };
     let opts = QueryOptions {
+        database: None,
         limits: None,
         // What is left of the coordinator's budget, not a fresh one. Memory ceilings are not
         // carried: they are this node's own property, and a node's ceiling is about the memory

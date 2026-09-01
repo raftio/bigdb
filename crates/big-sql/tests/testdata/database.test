@@ -1,0 +1,195 @@
+# The namespace above a table.
+#
+# A database here is BigQuery's dataset with ClickHouse's spelling: a **namespace**, and the
+# natural place to hang retention and access on later - not a storage boundary. Nothing below
+# the catalog knows there is one. A `TableId` is unique across every database, so no fragment,
+# no row key and no root record mentions a database, and `CREATE DATABASE` writes exactly one
+# catalog record.
+#
+# That is also why a cross-database join is not refused: a join here pairs records through the
+# *string* a keyed column was interned from, and a string is the same string whichever namespace
+# the table holding it lives in.
+#
+# `DATABASE` is what ClickHouse, Doris and StarRocks call it and what every JDBC driver
+# introspects with; `SCHEMA` is the standard's word and `DATASET` is BigQuery's. One meaning, so
+# all three parse to one statement.
+
+## Creating and dropping.
+
+ddl
+CREATE DATABASE sales
+----
+CreateDatabase sales
+
+ddl
+CREATE SCHEMA sales
+----
+CreateDatabase sales
+
+ddl
+CREATE DATASET sales
+----
+CreateDatabase sales
+
+ddl
+CREATE DATABASE IF NOT EXISTS sales
+----
+CreateDatabase sales if_not_exists
+
+ddl
+DROP DATABASE sales
+----
+DropDatabase sales
+
+ddl
+DROP SCHEMA IF EXISTS sales
+----
+DropDatabase sales if_exists
+
+# `RESTRICT` is the default, so writing it changes nothing. Accepted because it is what somebody
+# writes to be explicit about the behaviour they are already getting.
+ddl
+DROP DATABASE sales RESTRICT
+----
+DropDatabase sales
+
+# `CASCADE` is the only way to drop a database that still holds tables. `DROP DATABASE` is one
+# word away from being the most expensive typo on this surface, so the word is required.
+ddl
+DROP DATABASE sales CASCADE
+----
+DropDatabase sales cascade
+
+ddl
+DROP DATABASE IF EXISTS sales CASCADE
+----
+DropDatabase sales if_exists cascade
+
+## A qualified name in every statement that names a table.
+##
+## An unqualified name is left unqualified here, rather than filled in with `default`: which
+## database it means is the *request's*, not the text's, and `big_sql::qualify` applies it one
+## layer up where that is in scope. A statement that named no database and one that named
+## `default` are different statements, and only the first follows `?database=`.
+
+ddl
+CREATE TABLE sales.t (amount UINT(32), country TEXT)
+----
+CreateTable sales.t
+├── amount int depth=32
+└── country set depth=32
+
+ddl
+CREATE TABLE IF NOT EXISTS sales.t
+----
+CreateTable sales.t if_not_exists
+
+ddl
+ALTER TABLE sales.t ADD COLUMN active BOOL
+----
+AlterTable sales.t
+└── add active bool depth=32
+
+ddl
+DROP TABLE sales.t
+----
+DropTable sales.t
+
+ddl
+DROP TABLE IF EXISTS sales.t
+----
+DropTable sales.t if_exists
+
+## The catalog, asked about.
+
+show
+SHOW DATABASES
+----
+Databases
+
+show
+SHOW SCHEMAS
+----
+Databases
+
+show
+SHOW DATASETS
+----
+Databases
+
+show
+SHOW TABLES
+----
+Tables
+
+show
+SHOW TABLES FROM sales
+----
+Tables sales
+
+# `IN` is the same question in the dialects that spell it that way.
+show
+SHOW TABLES IN sales
+----
+Tables sales
+
+show
+DESCRIBE sales.t
+----
+Columns sales.t
+
+show
+SHOW COLUMNS FROM sales.t
+----
+Columns sales.t
+
+show
+SHOW CREATE TABLE sales.t
+----
+Create sales.t
+
+## Queries. The database rides along in the name the plan carries, so a qualified statement
+## plans exactly as an unqualified one does - there is no second code path.
+
+plan
+SELECT count(*) FROM sales.t
+----
+Count sales.t
+└── all
+
+plan
+SELECT count(*) FROM sales.t WHERE country = 'GB'
+----
+Count sales.t
+└── country = 'GB'
+
+plan
+SELECT count(*) FROM sales.t AS o WHERE o.amount > 5
+----
+Count sales.t
+└── amount > 5
+
+shape
+SELECT category, count(*) FROM sales.t GROUP BY category
+----
+Groups keys=[#0]
+├── category = key
+└── count = group #0 else 0
+
+## A cross-database join, which costs exactly what a same-database join costs.
+
+plan
+SELECT count(*) FROM sales.t a JOIN ops.u b ON a.category = b.category
+----
+Distinct sales.t.category
+└── all
+Distinct ops.u.category
+└── all
+
+## An `INSERT` into a qualified table.
+
+insert
+INSERT INTO sales.t (amount, country) VALUES (10, 'GB')
+----
+Insert sales.t (amount, country) id=allocated
+└── 10, 'GB'

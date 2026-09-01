@@ -103,13 +103,55 @@ pub enum Sql {
     Ddl(Ddl),
 }
 
+/// The database an unqualified name means when the request did not say.
+///
+/// Kept here rather than imported from `big-db` because this crate links no storage: the two
+/// are checked against each other by a test in `big-api`, which sees both.
+pub const DEFAULT_DATABASE: &str = "default";
+
 /// Parses one statement and translates it, which is the whole of this crate's job.
 ///
 /// Only a query is lowered. The other three are already what they mean: a schema change names
 /// its columns, an insert carries its literals, and a question about the catalog is a question
 /// - none of them has a plan to be turned into, which is why none of them is a `Statement`.
 pub fn translate(text: &str) -> Result<Sql> {
-    Ok(match parse(text)? {
+    translate_in(text, DEFAULT_DATABASE)
+}
+
+/// The same, against the database an unqualified name in this request means.
+///
+/// **The default is applied here, once, before anything is lowered.** A table name reaches the
+/// planner, the shape and the executor as one string, and filling the database in at each of
+/// those would be three chances for them to disagree about which table a statement was about.
+/// So it happens on the parse tree, and everything downstream sees names that are already
+/// whatever they are going to be.
+///
+/// A name the statement qualified itself is untouched: `sales.orders` in a request against
+/// `ops` means `sales`. And a request against the default database changes nothing at all, so
+/// the common case still carries the bare name somebody wrote.
+pub fn translate_in(text: &str, database: &str) -> Result<Sql> {
+    let mut parsed = parse(text)?;
+    // A request against the default database is left exactly as written. Not an optimisation:
+    // an unqualified name already resolves in the default database, so filling it in would
+    // change every name in the common case to say what it already meant.
+    if database != DEFAULT_DATABASE {
+        match &mut parsed {
+            Parsed::Query(q) => {
+                for select in &mut q.branches {
+                    select.from.database.get_or_insert_with(|| database.to_string());
+                    for join in &mut select.joins {
+                        join.source.database.get_or_insert_with(|| database.to_string());
+                    }
+                }
+            }
+            Parsed::Insert(i) => {
+                i.database.get_or_insert_with(|| database.to_string());
+            }
+            Parsed::Show(s) => s.what.fill_database(database),
+            Parsed::Ddl(d) => d.fill_database(database),
+        }
+    }
+    Ok(match parsed {
         Parsed::Query(q) => Sql::Query(lower(&q)?),
         Parsed::Insert(i) => Sql::Insert(i),
         Parsed::Show(s) => Sql::Show(s),

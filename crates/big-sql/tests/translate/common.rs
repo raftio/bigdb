@@ -170,7 +170,7 @@ pub fn show(sql: &str) -> big_sql::Show {
 /// A tuple rather than the struct: a column list test is a table of what each type name means,
 /// and a table reads better than twenty struct literals.
 pub fn columns(sql: &str) -> Vec<(String, &'static str, u32, Option<i8>)> {
-    let big_sql::Ddl::CreateTable { columns, .. } = ddl(sql) else {
+    let big_sql::Ddl::CreateTable { database: None, columns, .. } = ddl(sql) else {
         panic!("`{sql}` is not a CREATE TABLE")
     };
     columns.into_iter().map(|c| (c.name, c.kind.as_str(), c.bit_depth, c.scale)).collect()

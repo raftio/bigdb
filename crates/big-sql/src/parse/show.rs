@@ -28,7 +28,8 @@ impl Parser<'_> {
         let what = if self.eat_word("DESCRIBE") || self.eat_word("DESC") {
             // `DESCRIBE TABLE t` is ClickHouse's spelling and `DESCRIBE t` is everyone else's.
             self.eat_word("TABLE");
-            Shown::Columns { table: self.bare_ident("a table name")? }
+            let (database, table) = self.table_ref("a table name")?;
+            Shown::Columns { database, table }
         } else {
             self.expect_word("SHOW", "SHOW")?;
             self.show_what()?
@@ -44,24 +45,30 @@ impl Parser<'_> {
     /// What follows `SHOW`.
     fn show_what(&mut self) -> Result<Shown> {
         if self.eat_word("TABLES") {
-            return Ok(Shown::Tables);
+            // `SHOW TABLES FROM sales`, and `IN` for the dialects that spell it that way.
+            let database = if self.eat_word("FROM") || self.eat_word("IN") {
+                Some(self.bare_ident("a database name")?)
+            } else {
+                None
+            };
+            return Ok(Shown::Tables { database });
+        }
+        if self.eat_word("DATABASES") || self.eat_word("SCHEMAS") || self.eat_word("DATASETS") {
+            return Ok(Shown::Databases);
         }
         if self.eat_word("COLUMNS") || self.eat_word("FIELDS") {
             self.expect_word("FROM", "FROM and a table name")?;
-            return Ok(Shown::Columns { table: self.bare_ident("a table name")? });
+            let (database, table) = self.table_ref("a table name")?;
+            return Ok(Shown::Columns { database, table });
         }
         if self.eat_word("CREATE") {
             self.eat_word("TABLE");
-            return Ok(Shown::Create { table: self.bare_ident("a table name")? });
-        }
-        // `SHOW DATABASES` and `SHOW SCHEMAS` ask about a level that does not exist here, which
-        // is a different answer from "not supported".
-        if self.word_is("DATABASES") || self.word_is("SCHEMAS") {
-            return Err(self.refuse(Refused::Database));
+            let (database, table) = self.table_ref("a table name")?;
+            return Ok(Shown::Create { database, table });
         }
         // `SHOW INDEX`, `SHOW GRANTS`, `SHOW PROCESSLIST`: each is a surface of its own, and
         // none of them is one this statement can grow by accident.
-        Err(self.syntax("TABLES, COLUMNS FROM a table, or CREATE TABLE"))
+        Err(self.syntax("TABLES, DATABASES, COLUMNS FROM a table, or CREATE TABLE"))
     }
 
     /// The trailing `FORMAT <name>`, or the default.

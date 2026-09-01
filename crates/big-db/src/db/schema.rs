@@ -26,7 +26,7 @@ impl<P: PagerMut> Db<P> {
     ///
     /// Takes the default engine. See [`Db::create_table_with`] to choose one, and
     /// [`TableEngine`] for what the choice costs.
-    pub fn create_table(&self, name: &str) -> Result<TableId> {
+    pub fn create_table<'a>(&self, name: impl Into<TableRef<'a>>) -> Result<TableId> {
         self.create_table_with(name, TableEngine::default())
     }
 
@@ -35,11 +35,61 @@ impl<P: PagerMut> Db<P> {
     /// Fixed at creation and never changed afterwards: switching would mean rewriting every
     /// fragment and every segment the table owns, which is a migration and not a setting. A
     /// second call naming a different engine is refused rather than ignored.
-    pub fn create_table_with(&self, name: &str, engine: TableEngine) -> Result<TableId> {
+    pub fn create_table_with<'a>(
+        &self,
+        name: impl Into<TableRef<'a>>,
+        engine: TableEngine,
+    ) -> Result<TableId> {
+        let name = name.into();
         let mut w = self.write();
-        let id = w.catalog.intern_table_with(name, engine)?;
+        // The database has to exist first. Creating one implicitly would turn a typo in a
+        // qualified name into a new namespace holding one table, which is the failure a
+        // two-part name makes easy and which `CREATE DATABASE` exists to keep deliberate.
+        let database = w.catalog.database_of(name)?;
+        let id = w.catalog.intern_table_with(database, name.table, engine)?;
         w.commit()?;
         Ok(id)
+    }
+
+    /// Creates a database, or returns the id of the one already there.
+    pub fn create_database(&self, name: &str) -> Result<DatabaseId> {
+        let mut w = self.write();
+        let id = w.catalog.intern_database(name)?;
+        w.commit()?;
+        Ok(id)
+    }
+
+    /// Removes a database and, with `cascade`, every table in it.
+    ///
+    /// `Ok(false)` means there was no such database. Without `cascade` a database that still
+    /// holds tables is [`DbError::DatabaseNotEmpty`] rather than a silent mass drop - the same
+    /// default Postgres and BigQuery take, and for the same reason: `DROP DATABASE` is one word
+    /// away from being the most expensive typo on this surface.
+    ///
+    /// One transaction, so there is no window where the tables are gone and the database is
+    /// still there to be found.
+    pub fn drop_database(&self, name: &str, cascade: bool) -> Result<bool> {
+        if name == DEFAULT_DATABASE_NAME {
+            return Err(DbError::DropDefaultDatabase);
+        }
+        let mut w = self.write();
+        let Some(id) = w.catalog.database(name) else { return Ok(false) };
+
+        let held = w.catalog.table_count(id);
+        if held > 0 && !cascade {
+            return Err(DbError::DatabaseNotEmpty { database: name.to_string(), tables: held });
+        }
+        // Collected first: dropping mutates the map these names come from.
+        let tables: Vec<String> = w.catalog.tables_in(id).map(|t| t.name.clone()).collect();
+        for table in &tables {
+            // Each drop hands back the fragment keys whose pages have to be freed. Swallowing
+            // them here would strand every page the table owned.
+            let Some(keys) = w.catalog.drop_table(id, table) else { continue };
+            w.discard(&keys)?;
+        }
+        let dropped = w.catalog.drop_database(name).is_some();
+        w.commit()?;
+        Ok(dropped)
     }
 
     /// A decimal field: stored as an integer, read back as a value with `scale` digits after
@@ -47,13 +97,14 @@ impl<P: PagerMut> Db<P> {
     ///
     /// Nothing in storage knows about the point. The scale lives in the catalog so the query
     /// layer can turn `price > 5.25` into the integer comparison that means the same thing.
-    pub fn create_decimal(
+    pub fn create_decimal<'a>(
         &self,
-        table: &str,
+        table: impl Into<TableRef<'a>>,
         name: &str,
         bit_depth: u32,
         scale: i8,
     ) -> Result<FieldId> {
+        let table = table.into();
         self.declare(table, name, FieldKind::Decimal, bit_depth, scale, Vec::new())
     }
 
@@ -65,45 +116,50 @@ impl<P: PagerMut> Db<P> {
     /// Worth knowing before choosing a depth: a signed field always uses every plane it
     /// declared, because the top one is the sign bit and every non-negative value sets it. An
     /// unsigned field of the same declared depth only pays for the planes its data reaches.
-    pub fn create_signed(&self, table: &str, name: &str, bit_depth: u32) -> Result<FieldId> {
+    pub fn create_signed<'a>(
+        &self,
+        table: impl Into<TableRef<'a>>,
+        name: &str,
+        bit_depth: u32,
+    ) -> Result<FieldId> {
+        let table = table.into();
         self.declare(table, name, FieldKind::SignedInt, bit_depth, 0, Vec::new())
     }
 
     /// A time quantum field: a keyed field that also writes into one view per granularity.
-    pub fn create_time_quantum(
+    pub fn create_time_quantum<'a>(
         &self,
-        table: &str,
+        table: impl Into<TableRef<'a>>,
         name: &str,
         granularity: Vec<Granularity>,
     ) -> Result<FieldId> {
+        let table = table.into();
         self.declare(table, name, FieldKind::TimeQuantum, 0, 0, granularity)
     }
 
-    pub fn create_field(
+    pub fn create_field<'a>(
         &self,
-        table: &str,
+        table: impl Into<TableRef<'a>>,
         name: &str,
         kind: FieldKind,
         bit_depth: u32,
     ) -> Result<FieldId> {
+        let table = table.into();
         self.declare(table, name, kind, bit_depth, 0, Vec::new())
     }
 
-    fn declare(
+    fn declare<'a>(
         &self,
-        table: &str,
+        table: impl Into<TableRef<'a>>,
         name: &str,
         kind: FieldKind,
         bit_depth: u32,
         scale: i8,
         granularity: Vec<Granularity>,
     ) -> Result<FieldId> {
+        let table = table.into();
         let mut w = self.write();
-        let table_id = w
-            .catalog
-            .table(table)
-            .map(|t| t.id)
-            .ok_or_else(|| DbError::UnknownTable(table.to_string()))?;
+        let table_id = w.catalog.require(table)?.id;
         let id = w.catalog.add_field(FieldDef {
             id: 0,
             table: table_id,
@@ -121,9 +177,11 @@ impl<P: PagerMut> Db<P> {
     ///
     /// `Ok(false)` means there was no such table. Schema and data go in one transaction, so
     /// there is no window where the table is gone but its fragments are still reachable.
-    pub fn drop_table(&self, name: &str) -> Result<bool> {
+    pub fn drop_table<'a>(&self, name: impl Into<TableRef<'a>>) -> Result<bool> {
+        let name = name.into();
         let mut w = self.write();
-        let Some(keys) = w.catalog.drop_table(name) else { return Ok(false) };
+        let database = w.catalog.database_of(name)?;
+        let Some(keys) = w.catalog.drop_table(database, name.table) else { return Ok(false) };
         w.discard(&keys)?;
         w.commit()?;
         Ok(true)
@@ -146,14 +204,16 @@ impl<P: PagerMut> Db<P> {
     /// That is the honest shape of this operation and worth stating: it drops the *index by
     /// day*, not the records. A query with a `BETWEEN` stops finding them; a `count(*)` does
     /// not change. Deleting records is [`crate::db::DbWrite::delete_records`].
-    pub fn drop_days_before(&self, table: &str, field: &str, unix_seconds: i64) -> Result<usize> {
+    pub fn drop_days_before<'a>(
+        &self,
+        table: impl Into<TableRef<'a>>,
+        field: &str,
+        unix_seconds: i64,
+    ) -> Result<usize> {
+        let table = table.into();
         let cutoff = big_engine::bitmap::field::day_view(unix_seconds);
         let mut w = self.write();
-        let table_id = w
-            .catalog
-            .table(table)
-            .map(|t| t.id)
-            .ok_or_else(|| DbError::UnknownTable(table.to_string()))?;
+        let table_id = w.catalog.require(table)?.id;
         let def = w.catalog.field(table_id, field).ok_or_else(|| DbError::UnknownField {
             table: table.to_string(),
             field: field.to_string(),
@@ -177,13 +237,10 @@ impl<P: PagerMut> Db<P> {
         Ok(dropped)
     }
 
-    pub fn drop_field(&self, table: &str, field: &str) -> Result<bool> {
+    pub fn drop_field<'a>(&self, table: impl Into<TableRef<'a>>, field: &str) -> Result<bool> {
+        let table = table.into();
         let mut w = self.write();
-        let table_id = w
-            .catalog
-            .table(table)
-            .map(|t| t.id)
-            .ok_or_else(|| DbError::UnknownTable(table.to_string()))?;
+        let table_id = w.catalog.require(table)?.id;
         let Some(keys) = w.catalog.drop_field(table_id, field) else { return Ok(false) };
         w.discard(&keys)?;
         w.commit()?;

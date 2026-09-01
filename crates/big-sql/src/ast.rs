@@ -55,6 +55,13 @@ impl core::fmt::Display for Name {
 /// One table in `FROM`, under the name the rest of the statement calls it by.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Source {
+    /// `sales` in `FROM sales.orders`. `None` means the request's default database.
+    ///
+    /// Two tables in one statement may name different databases: a join here pairs records
+    /// through the *string* a keyed column was interned from, and a string is the same string
+    /// whichever namespace the table holding it lives in. So a cross-database join costs
+    /// exactly what a same-database one costs, and there is nothing to forbid.
+    pub database: Option<String>,
     /// The table.
     pub table: String,
     /// `AS x`, when one was written.
@@ -67,6 +74,19 @@ impl Source {
     /// `FROM tx a JOIN tx b` from being ambiguous.
     pub fn label(&self) -> &str {
         self.alias.as_deref().unwrap_or(&self.table)
+    }
+
+    /// The name the plan carries: `database.table`, or the bare table when the statement did
+    /// not qualify it.
+    ///
+    /// A bare name is left bare rather than filled in with `default`, because which database it
+    /// means is not this crate's to know - it is the request's, and
+    /// [`crate::qualify`] applies it one layer up where that is in scope.
+    pub fn qualified(&self) -> String {
+        match &self.database {
+            Some(d) => format!("{d}.{}", self.table),
+            None => self.table.clone(),
+        }
     }
 }
 

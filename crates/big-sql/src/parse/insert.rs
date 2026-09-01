@@ -29,7 +29,7 @@ impl Parser<'_> {
     /// bracket of the list that should have held one, and a `SELECT` at the `SELECT`.
     pub(super) fn insert(&mut self) -> Result<Insert> {
         self.eat_word("INTO");
-        let table = self.bare_ident("a table name")?;
+        let (database, table) = self.table_ref("a table name")?;
 
         // `INSERT INTO t SELECT ...` is a whole statement's worth of meaning, and answering it
         // with "expected (" would be answering a question nobody asked.
@@ -78,7 +78,7 @@ impl Parser<'_> {
         if self.peek().is_some() {
             return Err(self.syntax("the end of the statement"));
         }
-        Ok(Insert { table, columns, id_at, rows })
+        Ok(Insert { database, table, columns, id_at, rows })
     }
 
     /// One `( <literal>, ... )`, as wide as the column list.

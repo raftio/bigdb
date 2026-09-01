@@ -531,7 +531,10 @@ impl KeysBody {
 pub fn put_schema(out: &mut Vec<u8>, tables: &[big_api::TableInfo]) {
     put_count(out, tables.len());
     for table in tables {
-        put_str(out, &table.name);
+        // Qualified, so a repair recreates the table in the database the sender had it in.
+        // Bare for the default database, which is every table a `2` node ever had - so a
+        // schema from one still reads as tables in `default`, which is where they are.
+        put_str(out, &big_db::TableRef::new(&table.database, &table.name).to_string());
         put_u8(out, table.engine.code());
         put_count(out, table.fields.len());
         for field in &table.fields {
@@ -575,7 +578,13 @@ pub fn get_schema(bytes: &[u8]) -> Result<Vec<big_api::TableInfo>> {
             }
             fields.push(big_api::FieldInfo { name: field, kind, bit_depth, scale, granularity });
         }
-        tables.push(big_api::TableInfo { name, engine, fields });
+        let r = big_db::TableRef::parse(&name);
+        tables.push(big_api::TableInfo {
+            database: r.database.to_string(),
+            name: r.table.to_string(),
+            engine,
+            fields,
+        });
     }
     finished(&r)?;
     Ok(tables)

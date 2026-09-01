@@ -42,6 +42,8 @@ use big_plan::Literal;
 /// One `INSERT INTO t (...) VALUES (...)`.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Insert {
+    /// `sales` in `INSERT INTO sales.orders`. `None` means the request's default database.
+    pub database: Option<String>,
     pub table: String,
     /// The columns named, in the order written, including `id`.
     pub columns: Vec<String>,

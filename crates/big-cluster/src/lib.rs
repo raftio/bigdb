@@ -97,7 +97,14 @@ use std::time::{Duration, Instant};
 /// `2` since a table carries its storage engine: `Ddl::CreateTable` gained a byte and the
 /// schema exchange gained one per table. Both are places where a `1` node reading a `2` body
 /// would take the engine byte for the next field's length - exactly the quiet mistake above.
-pub const WIRE_VERSION: u32 = 2;
+///
+/// `3` since a table is in a database. **No message changed shape** - a table still travels as
+/// one string - but that string is now `database.table` whenever the database is not the
+/// default one, and a `2` node reading a `3` body would create a table whose name is literally
+/// `sales.orders` in its own single namespace. That is the same class of failure as a
+/// misaligned byte and worse to find: both nodes would report success, and the tables would be
+/// in different places. The schema exchange carries the database for the same reason.
+pub const WIRE_VERSION: u32 = 3;
 
 /// The header carrying [`WIRE_VERSION`].
 pub const WIRE_HEADER: &str = "x-big-wire";

@@ -55,14 +55,24 @@ struct Stub;
 impl Schema for Stub {
     // `u` and `v` are the further tables a join resolves against: two for the ordinary join,
     // three for the star.
+    //
+    // Each of them also exists in `sales` and in `ops`, which is what lets a corpus case be
+    // about a qualified name at all - and what makes the cross-database join in
+    // `database.test` a case rather than an assertion about an error message.
     fn has_table(&self, table: &str) -> bool {
-        matches!(table, "t" | "u" | "v")
+        let (database, table) = match table.split_once('.') {
+            Some((d, t)) => (d, t),
+            None => ("default", table),
+        };
+        matches!(database, "default" | "sales" | "ops") && matches!(table, "t" | "u" | "v")
     }
 
     fn field_class(&self, table: &str, field: &str) -> Option<FieldClass> {
         if !self.has_table(table) {
             return None;
         }
+        // Every copy of a table has the same columns, whichever database it is in: what a
+        // database changes is which table a name reaches, not what the table holds.
         Some(match field {
             "amount" => FieldClass::Integer { scale: 0 },
             "price" => FieldClass::Integer { scale: 2 },
@@ -78,7 +88,7 @@ impl Schema for Stub {
     /// `t` keeps its values and `u` does not, so that the refusal a projection meets over an
     /// index-only table is reachable from this corpus without a second schema.
     fn stores_values(&self, table: &str) -> bool {
-        table == "t"
+        table.rsplit('.').next() == Some("t")
     }
 }
 
@@ -113,9 +123,9 @@ fn dispatch(case: &Case) -> String {
             other => not(&other, "a question about the catalog"),
         }),
         "render" => with(sql, |s| match s {
-            Sql::Ddl(big_sql::Ddl::CreateTable { table, engine, columns, .. }) => {
-                big_sql::render::create_table(&table, engine.as_deref(), &columns)
-            }
+            Sql::Ddl(big_sql::Ddl::CreateTable {
+                database: None, table, engine, columns, ..
+            }) => big_sql::render::create_table(&table, engine.as_deref(), &columns),
             other => not(&other, "a CREATE TABLE"),
         }),
         other => format!("unknown directive `{other}`"),

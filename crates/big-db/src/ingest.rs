@@ -32,6 +32,7 @@
 //! one writer, and holding that slot for the length of an ingest would stall every other
 //! writer for the same reason it would help this one.
 
+use crate::catalog::TableRef;
 use crate::db::Db;
 use crate::error::{DbError, Result};
 use big_engine::{shard_of, RecordId, RowId, ShardId};
@@ -397,7 +398,7 @@ impl<'db, P: PagerMut> Ingest<'db, P> {
         }
         {
             let catalog = self.db.catalog();
-            let t = catalog.table(table).ok_or_else(|| DbError::UnknownTable(table.to_string()))?;
+            let t = catalog.require(TableRef::bare(table))?;
             catalog.field(t.id, field).ok_or_else(|| DbError::UnknownField {
                 table: table.to_string(),
                 field: field.to_string(),

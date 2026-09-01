@@ -20,7 +20,13 @@ use big_db::Granularity;
 /// One table as it looks on the way out: owned values, no lock held.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct TableInfo {
-    /// The table's name.
+    /// The database the table is in, which is what its name is unique within.
+    ///
+    /// Reported for the same reason `engine` is: it is not derivable from anything else a
+    /// client can see, and it is what one node needs in order to recreate another's table in
+    /// the place the first one had it.
+    pub database: String,
+    /// The table's name, unique within [`TableInfo::database`].
     pub name: String,
     /// What the table writes for every fact, and therefore which questions it answers cheaply.
     ///
@@ -61,6 +67,10 @@ pub(crate) fn snapshot(catalog: &Catalog) -> Vec<TableInfo> {
     // without the catalog having to expose its map.
     while let Some(table) = catalog.table_by_id(id) {
         out.push(TableInfo {
+            database: catalog
+                .database_name(table.database)
+                .unwrap_or(big_db::DEFAULT_DATABASE_NAME)
+                .to_string(),
             name: table.name.clone(),
             engine: table.engine,
             fields: catalog

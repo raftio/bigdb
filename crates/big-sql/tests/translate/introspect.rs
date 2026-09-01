@@ -21,7 +21,7 @@ use big_sql::{Column, ColumnKind, Format, Shown};
 /// nothing to gain from knowing which one was typed.
 #[test]
 fn describing_a_table_has_four_spellings_and_one_meaning() {
-    let columns = Shown::Columns { table: "events".to_string() };
+    let columns = Shown::Columns { database: None, table: "events".to_string() };
     for sql in [
         "DESCRIBE events",
         "DESC events",
@@ -31,8 +31,8 @@ fn describing_a_table_has_four_spellings_and_one_meaning() {
     ] {
         assert_eq!(show(sql).what, columns, "{sql}");
     }
-    assert_eq!(show("SHOW TABLES").what, Shown::Tables);
-    let create = Shown::Create { table: "events".to_string() };
+    assert_eq!(show("SHOW TABLES").what, Shown::Tables { database: None });
+    let create = Shown::Create { database: None, table: "events".to_string() };
     assert_eq!(show("SHOW CREATE TABLE events").what, create);
     assert_eq!(show("SHOW CREATE events").what, create);
 }
@@ -50,9 +50,6 @@ fn a_listing_is_written_in_whichever_format_was_asked_for() {
 /// What `SHOW` will not answer.
 #[test]
 fn the_catalog_questions_that_have_no_answer_here() {
-    // A level of naming that does not exist, rather than one that is not implemented.
-    assert_eq!(code("SHOW DATABASES"), "sql_no_database");
-    assert_eq!(code("SHOW SCHEMAS"), "sql_no_database");
     // Each of these is a surface of its own, and none is one this statement grows by accident.
     for sql in ["SHOW INDEX FROM t", "SHOW GRANTS", "SHOW PROCESSLIST", "DESCRIBE", "SHOW"] {
         assert_eq!(code(sql), "parse_error", "{sql}");
@@ -84,7 +81,8 @@ fn a_rendered_schema_reads_back_as_the_schema_it_came_from() {
     for engine in ["columnar", "bitmap+columnar"] {
         let written =
             big_sql::render::create_table("t", Some(engine), &columns_of("CREATE TABLE t (a SET)"));
-        let big_sql::Ddl::CreateTable { engine: read_back, .. } = ddl(&written) else {
+        let big_sql::Ddl::CreateTable { database: None, engine: read_back, .. } = ddl(&written)
+        else {
             panic!("a CREATE is a CreateTable")
         };
         assert_eq!(read_back.as_deref(), Some(engine), "{written}");
@@ -111,7 +109,7 @@ fn a_decimal_that_came_from_the_field_route_renders_wide_enough() {
 
 /// The columns of a `CREATE TABLE`, as the structs the renderer takes.
 fn columns_of(sql: &str) -> Vec<Column> {
-    let big_sql::Ddl::CreateTable { columns, .. } = ddl(sql) else {
+    let big_sql::Ddl::CreateTable { database: None, columns, .. } = ddl(sql) else {
         panic!("`{sql}` is not a CREATE TABLE")
     };
     columns

@@ -33,18 +33,16 @@ impl Parser<'_> {
     /// table stored every fact it already holds under.
     pub(super) fn alter_table(&mut self) -> Result<crate::ddl::Ddl> {
         if !self.word_is("TABLE") {
-            if self.word_is("DATABASE") || self.word_is("SCHEMA") {
-                return Err(self.refuse(Refused::Database));
-            }
             if self.word_is("VIEW") || self.word_is("MATERIALIZED") {
                 return Err(self.refuse(Refused::View));
             }
-            // `ALTER USER`, `ALTER INDEX`: a schema this surface does not have, which is what
-            // the `Write` refusal already says.
+            // `ALTER DATABASE`, `ALTER USER`, `ALTER INDEX`: a change this surface does not
+            // have, which is what the `Write` refusal already says. A database here carries a
+            // name and nothing else, so there is nothing about one to alter.
             return Err(self.refuse(Refused::Write));
         }
         self.i += 1;
-        let table = self.bare_ident("a table name")?;
+        let (database, table) = self.table_ref("a table name")?;
 
         let mut changes = Vec::new();
         loop {
@@ -57,7 +55,7 @@ impl Parser<'_> {
         if self.peek().is_some() {
             return Err(self.syntax("the end of the statement"));
         }
-        Ok(crate::ddl::Ddl::AlterTable { table, changes })
+        Ok(crate::ddl::Ddl::AlterTable { database, table, changes })
     }
 
     /// One clause of an `ALTER TABLE`.
@@ -120,10 +118,22 @@ impl Parser<'_> {
     /// leader and then to every node, and there is no journal that would let half of a list be
     /// undone - so a list would promise an atomicity nothing below here has.
     pub(super) fn drop_table(&mut self) -> Result<crate::ddl::Ddl> {
-        if !self.word_is("TABLE") {
-            if self.word_is("DATABASE") || self.word_is("SCHEMA") {
-                return Err(self.refuse(Refused::Database));
+        if self.word_is("DATABASE") || self.word_is("SCHEMA") || self.word_is("DATASET") {
+            self.i += 1;
+            let if_exists = self.if_exists(false)?;
+            let name = self.bare_ident("a database name")?;
+            // `RESTRICT` is the default, so saying it changes nothing - it is accepted because
+            // it is what somebody writes to be explicit about the behaviour they are getting.
+            let cascade = self.eat_word("CASCADE");
+            if !cascade {
+                self.eat_word("RESTRICT");
             }
+            if self.peek().is_some() {
+                return Err(self.syntax("the end of the statement"));
+            }
+            return Ok(crate::ddl::Ddl::DropDatabase { name, if_exists, cascade });
+        }
+        if !self.word_is("TABLE") {
             if self.word_is("VIEW") || self.word_is("MATERIALIZED") {
                 return Err(self.refuse(Refused::View));
             }
@@ -131,11 +141,11 @@ impl Parser<'_> {
         }
         self.i += 1;
         let if_exists = self.if_exists(false)?;
-        let table = self.bare_ident("a table name")?;
+        let (database, table) = self.table_ref("a table name")?;
 
         if self.peek().is_some() {
             return Err(self.syntax("the end of the statement"));
         }
-        Ok(crate::ddl::Ddl::DropTable { table, if_exists })
+        Ok(crate::ddl::Ddl::DropTable { database, table, if_exists })
     }
 }
