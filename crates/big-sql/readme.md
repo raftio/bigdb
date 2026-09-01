@@ -246,6 +246,25 @@ run against a table somebody has since altered.
 so the two cannot drift. All three read the catalog every node already holds: no plan, no
 fan-out, and a `read` token is enough.
 
-Each of the four kinds of statement is a variant of [`Sql`], and that is also how the edge
-decides what a statement costs: a schema change needs `admin`, an `INSERT` needs `write`, and a
-`SELECT` or a `DESCRIBE` reads. A fifth kind cannot be added without that decision being made.
+Each kind of statement is a variant of [`Sql`], and that is also how the edge decides what a
+statement costs: a schema change needs `admin`, an `INSERT` needs `write`, and a `SELECT` or a
+`DESCRIBE` reads. A further kind cannot be added without that decision being made.
+
+## What a statement would do
+
+`EXPLAIN [PLAN | SHAPE] <statement>` answers with what the statement means and runs none of it —
+one row per line, under a column called `explain`. A query is planned but never executed, so
+`EXPLAIN SELECT nope FROM t` still reports the unknown field; a schema change, a write and a
+listing are already wholly in the parse tree, so explaining one reads no catalog at all and
+cannot be used to ask whether a table exists.
+
+`PLAN` and `SHAPE` name the two halves a query has — the plans its calls resolve to, and the
+columns and clauses its answer takes. Naming a half of a statement that has one description is
+refused (`sql_explain_half`), and so is `EXPLAIN EXPLAIN`, which is not a statement in any
+dialect and so is a syntax error rather than a refusal.
+
+**`EXPLAIN` is one wrapper around every kind rather than a flag on each**, which is why it
+inherits the whole refusal list: `EXPLAIN DELETE FROM t` is `sql_read_only` and
+`EXPLAIN SELECT * FROM t, u` is `sql_no_joins`, with no arm anywhere deciding that twice. It is
+also not a reserved word — only the leading token position is special, so a table or a column may
+still be called `explain`.

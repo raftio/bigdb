@@ -67,40 +67,48 @@ pub(super) fn sql<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request) -> Respon
         Ok(t) => t.trim(),
         Err(e) => return e.into_response(),
     };
-    // **The route's role is a floor, and the statement raises it.** The check in `dispatch` runs
-    // before any body is decoded, which is what keeps it cheap and is why it cannot know what
-    // statement arrived. Without this a read-only token could create tables and write facts -
-    // the same powers `POST /table/{t}` and `POST /table/{t}/import` demand their own roles for.
-    //
-    // Classified by the parser rather than by sniffing the first word, so there is one
-    // definition of what each kind of statement is and the check cannot disagree with the
-    // executor. `Sql` is matched exhaustively here on purpose: a fifth kind of statement cannot
-    // be added without this deciding what it costs.
-    let raised = match ctx.cluster.classify(text) {
-        Ok(big_api::Sql::Ddl(_)) => Some(Role::Admin),
-        Ok(big_api::Sql::Insert(_)) => Some(Role::Write),
-        // A `SELECT` and a `DESCRIBE` both read, which the route's floor already covers. A
-        // statement that does not translate is refused below, by the path that has an error to
-        // report - nothing here needs to decide that twice.
-        Ok(big_api::Sql::Query(_)) | Ok(big_api::Sql::Show(_)) | Err(_) => None,
-    };
-    if let Some(role) = raised {
-        if let Some(refusal) = super::require(ctx.auth, req, role) {
-            return refusal;
-        }
-    }
-
     // `?database=sales` says which database an unqualified name in the statement means. A
     // property of the request rather than of the text, because this route answers one statement
     // and remembers nothing - there is no session for a `USE` to leave one in. `bigc` holds a
     // typed `USE` on the caller's behalf and sends it here.
+    //
+    // Built before the statement is classified because classifying needs it: a name resolves
+    // against this database or against no database at all, and the two do not always agree.
     let opts = QueryOptions {
         limits: None,
         timeout: ctx.query_timeout,
         cancel: ctx.cancel.clone(),
         database: req.param("database").map(|d| d.into_owned()),
     };
-    match ctx.cluster.sql(text, &opts) {
+
+    // **Translated once, for both decisions.** What the statement is decides what it costs and
+    // what it does, and those have to be the same statement: classifying the text here and then
+    // handing the *text* on to be translated again is two answers with nothing holding them
+    // together. So the value authorised below is the value run below it.
+    //
+    // A statement that does not translate is reported here rather than deferred. It never runs -
+    // there is nothing left to run it - so the report is the whole answer, and it is the same
+    // 400 the second translation used to produce.
+    let sql = match ctx.cluster.classify(text, &opts) {
+        Ok(sql) => sql,
+        Err(e) => return from_cluster(&e),
+    };
+
+    // **The route's role is a floor, and the statement raises it.** The check in `dispatch` runs
+    // before any body is decoded, which is what keeps it cheap and is why it cannot know what
+    // statement arrived. Without this a read-only token could create tables and write facts -
+    // the same powers `POST /table/{t}` and `POST /table/{t}/import` demand their own roles for.
+    //
+    // Which statements cost what is `big_api::Sql::authority`'s to say, not this route's: the
+    // rule belongs next to the variants it is about, where a kind of statement added later
+    // cannot be added without answering for it. Re-checking `read` against a route whose floor
+    // is already `read` costs one constant-time comparison and removes the branch that used to
+    // decide when the check was worth making.
+    if let Some(refusal) = super::require(ctx.auth, req, sql.authority().into()) {
+        return refusal;
+    }
+
+    match ctx.cluster.run(sql, &opts) {
         // The statement's `FORMAT` decides both the bytes and the type they are declared as: a
         // client that asked for TSV and was told `application/json` was answered twice, once
         // wrongly.

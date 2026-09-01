@@ -134,6 +134,8 @@ pub enum Refused {
     Union,
     /// A quantile level that is not a fraction this surface resolves.
     Quantile,
+    /// `EXPLAIN PLAN` or `EXPLAIN SHAPE` over a statement that is not a query.
+    ExplainHalf,
 }
 
 impl Refused {
@@ -147,7 +149,7 @@ impl Refused {
     /// Kept honest by [`Refused::rank`] below, whose exhaustive match will not compile until a
     /// new variant is named - and by a test asserting that every rank appears here exactly once,
     /// which is what catches naming one and forgetting to add it.
-    pub const ALL: [Self; 43] = [
+    pub const ALL: [Self; 44] = [
         Self::Joins,
         Self::OuterJoin,
         Self::JoinOn,
@@ -191,6 +193,7 @@ impl Refused {
         Self::ViewBody,
         Self::ViewColumn,
         Self::ViewDepth,
+        Self::ExplainHalf,
     ];
 
     /// Where this refusal sits in [`Refused::ALL`], and the reason that list can be trusted.
@@ -245,6 +248,7 @@ impl Refused {
             Self::ViewBody => 40,
             Self::ViewColumn => 41,
             Self::ViewDepth => 42,
+            Self::ExplainHalf => 43,
         }
     }
 
@@ -285,6 +289,7 @@ impl Refused {
             Self::Format => "sql_unknown_format",
             Self::Union => "sql_union",
             Self::Quantile => "sql_quantile_level",
+            Self::ExplainHalf => "sql_explain_half",
             Self::Subquery
             | Self::Having
             | Self::Window
@@ -543,6 +548,12 @@ impl Refused {
             Self::Predicate => {
                 "a condition compares a column with a value using `=`, `!=`, `<`, `<=`, `>`, \
                  `>=`, `IN` or `BETWEEN`; there is no pattern matching and no arithmetic"
+            }
+            Self::ExplainHalf => {
+                "`PLAN` and `SHAPE` name the two halves of a query's explanation - the plans its \
+                 calls resolve to, and the columns and clauses its answer takes. A schema \
+                 change, a write and a question about the catalog have one description and no \
+                 halves, so `EXPLAIN` on its own is the whole of what there is to ask for"
             }
             Self::Quantile => {
                 "a quantile takes a level between 0 and 1 with at most three digits after the \

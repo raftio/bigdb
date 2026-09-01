@@ -111,5 +111,33 @@ fuzz_target!(|data: &[u8]| {
             }
             assert!(!big_sql::explain::ddl(&d).is_empty());
         }
+        // An `EXPLAIN` is the statement under it, so the properties worth fuzzing are the ones
+        // already checked above - reached by feeding the inner statement back through this
+        // target rather than by a second copy of every assertion.
+        //
+        // **The two rules the wrapper itself has to keep**, neither of which the type enforces:
+        // the parser refuses a second `EXPLAIN`, so the inner statement is never one; and the
+        // printer promises no blank line, because the corpora end an expected block at one and a
+        // blank line would silently truncate a case to half an answer.
+        big_sql::Sql::Explain { mode, inner } => {
+            assert!(
+                !matches!(*inner, big_sql::Sql::Explain { .. }),
+                "`{text}` nested an EXPLAIN the parser is supposed to refuse"
+            );
+            let described = match &*inner {
+                big_sql::Sql::Ddl(d) => big_sql::explain::Explained::Ddl(d),
+                big_sql::Sql::Insert(i) => big_sql::explain::Explained::Insert(i),
+                big_sql::Sql::Show(s) => big_sql::explain::Explained::Show(s),
+                // A query's half needs a schema to resolve, and this target links none. Its
+                // plans and shape are fuzzed through the `Sql::Query` arm above instead.
+                big_sql::Sql::Query(_) | big_sql::Sql::Explain { .. } => return,
+            };
+            let printed = big_sql::explain::explained(mode, &described);
+            assert!(!printed.is_empty(), "`{text}` explained to nothing");
+            assert!(
+                !printed.lines().any(|l| l.trim().is_empty()),
+                "`{text}` explained with a blank line, which truncates a corpus case"
+            );
+        }
     }
 });

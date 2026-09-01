@@ -35,6 +35,7 @@
 //! | `ddl` | the schema change |
 //! | `insert` | the write |
 //! | `show` | the question about the catalog |
+//! | `explain` | what `EXPLAIN` answers with, line for line |
 //! | `render` | a `CREATE TABLE` written back out of the columns it declared |
 //!
 //! `BIG_REWRITE=1 cargo test -p big-sql --test testdata` regenerates every expected block.
@@ -136,6 +137,15 @@ fn dispatch(case: &Case) -> String {
             Sql::Show(s) => explain::show(&s),
             other => not(&other, "a question about the catalog"),
         }),
+        // Exactly what a client gets back from `EXPLAIN`, line for line.
+        //
+        // The rows it becomes are `big-api`'s, but every character of the text is this crate's -
+        // which is why the format is pinned here, at parser-test speed against `Stub`, rather
+        // than only where a database is running.
+        "explain" => with(sql, |s| match s {
+            Sql::Explain { mode, inner } => explained(mode, *inner),
+            other => not(&other, "an explanation"),
+        }),
         "render" => with(sql, |s| match s {
             Sql::Ddl(big_sql::Ddl::CreateTable {
                 database: None, table, engine, columns, ..
@@ -172,8 +182,43 @@ fn not(sql: &Sql, wanted: &str) -> String {
         Sql::Insert(_) => "a write",
         Sql::Show(_) => "a question about the catalog",
         Sql::Ddl(_) => "a schema change",
+        Sql::Explain { .. } => "an explanation",
     };
     format!("not {wanted}: {what}")
+}
+
+/// An explanation, resolved against [`Stub`] exactly as a node would resolve it against a real
+/// schema - which is what makes the answer below the one a client would have read.
+fn explained(mode: big_sql::ExplainMode, inner: Sql) -> String {
+    use big_sql::explain::{Explained, Probed};
+    match inner {
+        Sql::Query(statement) => {
+            let plans: Vec<_> = statement
+                .calls
+                .iter()
+                .filter_map(|ask| big_plan::plan(&ask.table, &ask.call, &Stub).ok())
+                .collect();
+            let probes: Vec<_> = statement
+                .probes
+                .iter()
+                .filter_map(|p| {
+                    big_plan::plan(&p.table, &p.rows, &Stub)
+                        .ok()
+                        .map(|rows| Probed { probe: p, rows })
+                })
+                .collect();
+            let answer = resolved_answer(statement.clone());
+            big_sql::explain::explained(
+                mode,
+                &Explained::Query { plans: &plans, probes: &probes, answer: &answer },
+            )
+        }
+        Sql::Ddl(d) => big_sql::explain::explained(mode, &Explained::Ddl(&d)),
+        Sql::Insert(i) => big_sql::explain::explained(mode, &Explained::Insert(&i)),
+        Sql::Show(s) => big_sql::explain::explained(mode, &Explained::Show(&s)),
+        // The parser refuses a second `EXPLAIN`, so no statement in the corpus reaches this.
+        Sql::Explain { .. } => "explain of an explain".to_string(),
+    }
 }
 
 /// One tree per call, then one per search, in the order a caller would run them.

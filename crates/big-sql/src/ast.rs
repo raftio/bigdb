@@ -126,6 +126,27 @@ pub struct Query {
     pub branches: Vec<Select>,
 }
 
+/// Which half of an explanation `EXPLAIN` was asked for.
+///
+/// There are two printers because a statement means two things that move independently - the
+/// plans its calls resolve to, and the shape its answer takes - and [`mod@crate::explain`] says
+/// at length why keeping them apart is worth more than one combined dump. The default prints
+/// both; the two halves are named for a reader who wants one of them to stop churning.
+///
+/// **Only a query has a shape.** A schema change, a write and a question about the catalog each
+/// have exactly one printer, so naming a half of one is refused rather than ignored - see
+/// [`crate::Refused::ExplainHalf`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum ExplainMode {
+    /// `EXPLAIN <statement>`: everything there is to say about it.
+    #[default]
+    All,
+    /// `EXPLAIN PLAN <select>`: the plan tree per call, and nothing about the answer.
+    Plan,
+    /// `EXPLAIN SHAPE <select>`: the answer's columns and clauses, and no plans.
+    Shape,
+}
+
 /// One accepted `SELECT`.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Select {

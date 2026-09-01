@@ -52,14 +52,28 @@ use crate::error::{ApiError, Result};
 /// A statement naming no view is left byte-for-byte alone, which is the common case and costs
 /// one catalog probe per source.
 pub fn expand(parsed: &mut Parsed, catalog: &Catalog) -> Result<()> {
-    // Only a query reads through a view. An `INSERT` into one is not expanded and is refused
-    // where the table is resolved - writing through a view means deciding what the columns it
-    // does not expose should hold, and there is no answer to that this engine could invent.
-    let Parsed::Query(query) = parsed else { return Ok(()) };
-    for select in &mut query.branches {
-        expand_select(select, catalog)?;
+    // Matched exhaustively rather than skipped with a `let ... else`, because what was safe to
+    // fall through has stopped being one kind of statement. A kind added later fails to compile
+    // here rather than losing its views quietly - and the failure that would cause is not a
+    // missing answer but a wrong one: a statement whose view was never substituted names a
+    // table that is not there, and reports that instead of what is actually wrong.
+    match parsed {
+        // Only a query reads through a view. An `INSERT` into one is not expanded and is refused
+        // where the table is resolved - writing through a view means deciding what the columns it
+        // does not expose should hold, and there is no answer to that this engine could invent.
+        Parsed::Query(query) => {
+            for select in &mut query.branches {
+                expand_select(select, catalog)?;
+            }
+            Ok(())
+        }
+        // An `EXPLAIN` reads through whatever the statement under it reads through: describing
+        // `SELECT ... FROM v` means describing the statement `v` stands for. The parser refuses
+        // a second `EXPLAIN`, so this recurses exactly once.
+        Parsed::Explain { inner, .. } => expand(inner, catalog),
+        // A schema change and a listing name no source to read through.
+        Parsed::Insert(_) | Parsed::Show(_) | Parsed::Ddl(_) => Ok(()),
     }
-    Ok(())
 }
 
 /// One branch of a statement: its `FROM`, then each `JOIN`.

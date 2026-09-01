@@ -30,6 +30,7 @@
 #![deny(missing_docs)]
 
 pub mod error;
+pub mod explain;
 pub mod fact;
 pub mod introspect;
 pub mod result;
@@ -67,8 +68,9 @@ pub use big_sql::{
     Threshold, Units,
 };
 pub use big_sql::{
-    Alter as SqlAlter, Column as SqlColumn, ColumnKind as SqlColumnKind, Ddl as SqlDdl,
-    Insert as SqlInsert, Show as SqlShow, Shown as SqlShown, Sql, RECORD_COLUMN,
+    Alter as SqlAlter, Authority, Column as SqlColumn, ColumnKind as SqlColumnKind, Ddl as SqlDdl,
+    ExplainMode, Insert as SqlInsert, Show as SqlShow, Shown as SqlShown, Sql, SqlError,
+    RECORD_COLUMN,
 };
 
 use big_db::{At, Db};
@@ -722,12 +724,16 @@ impl<P: PagerMut + Sync> Api<P> {
             // change goes to the leader, an insert goes to the shard owners, and a listing is
             // already in this node's catalog. Reachable only through the un-clustered path; a
             // coordinator classifies first - see `Api::translate`.
-            big_sql::Sql::Ddl(_) | big_sql::Sql::Insert(_) | big_sql::Sql::Show(_) => {
-                Err(ApiError::Sql(big_sql::SqlError::Refused {
-                    what: big_sql::Refused::Write,
-                    at: 0,
-                }))
-            }
+            // ...and an `EXPLAIN`, which is a statement *about* a statement: there is no value
+            // for this to answer with, because the whole of what it asks for is that nothing
+            // runs. The surface that answers one is `Cluster::sql`, which builds rows.
+            big_sql::Sql::Ddl(_)
+            | big_sql::Sql::Insert(_)
+            | big_sql::Sql::Show(_)
+            | big_sql::Sql::Explain { .. } => Err(ApiError::Sql(big_sql::SqlError::Refused {
+                what: big_sql::Refused::Write,
+                at: 0,
+            })),
         }
     }
 

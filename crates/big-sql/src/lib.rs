@@ -64,7 +64,7 @@ pub mod render;
 pub mod shape;
 pub mod show;
 
-pub use ast::{Query, Select};
+pub use ast::{ExplainMode, Query, Select};
 pub use ddl::{Alter, Column, ColumnKind, Ddl, MAX_VIEW_DEPTH};
 pub use error::{Refused, Result, SqlError};
 pub use insert::{Insert, MAX_INSERT_ROWS, RECORD_COLUMN};
@@ -78,7 +78,7 @@ pub use show::{Show, Shown};
 
 /// One statement, translated.
 ///
-/// Four variants because they are four different things downstream, and the differences are not
+/// Five variants because they are five different things downstream, and the differences are not
 /// cosmetic:
 ///
 /// | | what it is | what it costs the caller |
@@ -87,13 +87,17 @@ pub use show::{Show, Shown};
 /// | `Insert` | literals for the layer that holds a schema to turn into facts | a write |
 /// | `Show` | a question the catalog already holds the answer to | a read |
 /// | `Ddl` | a change decided at one node and applied everywhere | an admin |
+/// | `Explain` | a description of one of the four above, run nowhere | whatever it wraps |
 ///
-/// That last column is why this is an enum rather than a `Statement` with more fields: the edge
-/// matches on it to decide which role a statement needs, and a fifth kind of statement cannot
-/// be added without every such match failing to compile.
+/// That last column is why this is an enum rather than a `Statement` with more fields, and it is
+/// [`Sql::authority`] rather than prose: a caller asks the statement what it costs instead of
+/// writing a sixth match over these variants, and a further kind of statement cannot be added
+/// without that one match failing to compile.
 // The variants are far apart in size, and boxing the large one would be the wrong trade: a
 // `Sql` exists once per statement and is destructured immediately, so the allocation would be
-// pure cost against 320 bytes of stack that the caller was going to hold anyway.
+// pure cost against 320 bytes of stack that the caller was going to hold anyway. `Explain` is
+// boxed for the one reason that is not a trade - a variant holding its own enum has no size
+// without it - and pays for that allocation only when somebody writes `EXPLAIN`.
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Sql {
@@ -101,6 +105,69 @@ pub enum Sql {
     Insert(Insert),
     Show(Show),
     Ddl(Ddl),
+    /// `EXPLAIN <statement>`: what the statement would do, having done none of it.
+    ///
+    /// **A wrapper rather than a fifth kind of work.** The four above say what a statement
+    /// does; this one does none of it - no plan is run, no fact is written, no schema is
+    /// changed. What it *costs the caller* is a separate question, and the answer is not "a
+    /// read": see [`Sql::authority`], which looks inside.
+    Explain {
+        /// Which half was asked for.
+        mode: ExplainMode,
+        /// The statement being described, which is never itself an `EXPLAIN`.
+        inner: Box<Sql>,
+    },
+}
+
+/// What a statement demands of whoever sent it.
+///
+/// **The last column of [`Sql`]'s table, as code rather than as prose.** That column was a
+/// promise two other crates were each keeping by hand - the HTTP edge turned a statement into
+/// the role a token needs, the un-clustered door turned one into a refusal - and two
+/// hand-written copies of one rule are one rule plus the day they disagree. It lives here, in
+/// the file where a variant can be added, so adding one fails to compile in exactly one place.
+///
+/// Deliberately *not* `big-http`'s `Role`. This says what a statement is; a role says what a
+/// credential holds. They happen to map one to one, and that mapping is the edge's to write -
+/// there is no reason for a dialect crate to learn how a token file is spelled.
+///
+/// Ordered, weakest first: an authority contains the ones below it, which is what lets an edge
+/// compare one against the floor its route already checked.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum Authority {
+    /// Reads what is already there: a `SELECT`, a `DESCRIBE`, a `SHOW`.
+    Read,
+    /// Writes facts, and changes no schema.
+    Write,
+    /// Changes the schema.
+    Admin,
+}
+
+impl Sql {
+    /// What this statement demands of whoever sent it.
+    ///
+    /// **`EXPLAIN` inherits rather than reading as a read.** It runs nothing, so on the letter
+    /// of it an `EXPLAIN CREATE TABLE` is harmless - today it renders a parse tree the caller
+    /// already holds and reads no catalog at all. The rule is here anyway, because the
+    /// alternative decides an authority from a *wrapper keyword* rather than from what the
+    /// statement is about, and that is the shape that goes wrong the first time an explained
+    /// statement has to read something to say anything useful. An authority says which class of
+    /// statement a credential may name, not only which it may run - and this way round it fails
+    /// closed. It is also what ClickHouse does, whose `EXPLAIN` checks the access the explained
+    /// query would have needed rather than a permission of its own.
+    ///
+    /// The recursion terminates because the parser refuses `EXPLAIN EXPLAIN`, and would still
+    /// terminate on a nesting some other build wrote: each step unwraps one `Box`.
+    #[must_use]
+    pub fn authority(&self) -> Authority {
+        match self {
+            Self::Ddl(_) => Authority::Admin,
+            Self::Insert(_) => Authority::Write,
+            Self::Explain { inner, .. } => inner.authority(),
+            // A `SELECT` and a `DESCRIBE` both read, which is the floor every surface starts at.
+            Self::Query(_) | Self::Show(_) => Authority::Read,
+        }
+    }
 }
 
 /// The database an unqualified name means when the request did not say.
@@ -166,6 +233,9 @@ pub fn qualify(parsed: &mut Parsed, database: &str) {
         }
         Parsed::Show(s) => s.what.fill_database(database),
         Parsed::Ddl(d) => d.fill_database(database),
+        // The names an `EXPLAIN` describes are the inner statement's, and they mean what they
+        // would have meant had it been run - so this is the same walk, one level down.
+        Parsed::Explain { inner, .. } => qualify(inner, database),
     }
 }
 
@@ -179,5 +249,9 @@ pub fn finish(parsed: Parsed) -> Result<Sql> {
         Parsed::Insert(i) => Sql::Insert(i),
         Parsed::Show(s) => Sql::Show(s),
         Parsed::Ddl(d) => Sql::Ddl(d),
+        // Lowered exactly as it would have been unwrapped, so what is described is what would
+        // have run - including the refusals. `EXPLAIN` of a statement this engine will not
+        // answer fails with that statement's own refusal, which is the useful answer.
+        Parsed::Explain { mode, inner } => Sql::Explain { mode, inner: Box::new(finish(*inner)?) },
     })
 }
