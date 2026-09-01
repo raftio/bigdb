@@ -171,10 +171,12 @@ SELECT amount, price FROM t LIMIT 10
 Project t.(amount, price) limit=10
 └── all
 
-same Row(visit="home", from=100, to=200)
+# `SELECT *` is a projection of every column, so its PQL twin is the `Project` with no `field=`
+# - the spelling that asks the schema for the list, exactly as the star does.
+same Project(Row(visit="home", from=100, to=200))
 SELECT * FROM t WHERE visit = 'home' AND visit BETWEEN 100 AND 200
 ----
-Rows t
+Project t.(amount, price, balance, category, country, device, visit, active)
 └── visit = 'home' in [100, 200]
 
 # The same question asked of the other table, which is what makes the table a parameter rather

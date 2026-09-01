@@ -617,10 +617,15 @@ pub enum Shape {
     },
     /// Record ids, one per row.
     ///
-    /// The one shape that is not what SQL would give elsewhere, and it is deliberate: this
-    /// engine stores facts as bits at `(row, record)` and has no row of values to hand back, so
-    /// `SELECT *` answers with the identity of each match and nothing else. Better a column
-    /// visibly called `id` than a table of values reconstructed at a point read apiece.
+    /// The one shape that is not what SQL would give elsewhere, and what `SELECT *` falls back
+    /// to where there is nothing a projection could read - a table with no fields, or one whose
+    /// engine keeps no values and declares only keyed columns. This engine stores facts as bits
+    /// at `(row, record)`, so a record with no readable column still has an identity, and a
+    /// column visibly called by the record's own name is worth more than an empty header.
+    ///
+    /// It is also the only way a record id reaches a SQL answer at all: `_record_id` names a
+    /// record on the way in, for an `INSERT`, and is not a column a select list can ask for.
+    /// `GET /table/{t}/records` is the route that lists them.
     Records {
         /// The column name.
         column: String,
@@ -756,9 +761,7 @@ impl Shape {
             Self::Union { branches } => branches.first().map(Shape::columns).unwrap_or_default(),
             Self::Pairs { cells, .. } => cells.iter().map(|c| c.column.as_str()).collect(),
             Self::Records { column, .. } => vec![column.as_str()],
-            Self::Table { columns } => {
-                columns.named().iter().map(|c| c.column.as_str()).collect()
-            }
+            Self::Table { columns } => columns.named().iter().map(|c| c.column.as_str()).collect(),
             Self::Row { cells } | Self::Groups { cells, .. } | Self::Join { cells, .. } => {
                 cells.iter().map(|c| c.column.as_str()).collect()
             }
@@ -878,7 +881,10 @@ impl Shape {
                                         table: table.clone(),
                                         field: field.clone(),
                                     };
-                                    Ok(Selected { column: field, units: resolve_units(schema, units)? })
+                                    Ok(Selected {
+                                        column: field,
+                                        units: resolve_units(schema, units)?,
+                                    })
                                 })
                                 .collect::<Result<Vec<_>, PlanError>>()?,
                         ),

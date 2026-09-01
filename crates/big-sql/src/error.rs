@@ -460,8 +460,9 @@ impl Refused {
                 "a view here is a filter and a projection over one table: \
                  `SELECT <columns> FROM <table> [WHERE ...]`. It is inlined into the statement \
                  that reads it, and there is no subquery below to nest one in - so a body that \
-                 groups, aggregates, joins, orders or limits has no statement to become. Note \
-                 that `*` means the record id rather than every column, so a view names the \
+                 groups, aggregates, joins, orders or limits has no statement to become. `*` is \
+                 refused too: a view is re-planned at every read, so a body written with one \
+                 would start exposing whatever column the table gains next. A view names the \
                  columns it exposes"
             }
             Self::ViewColumn => {

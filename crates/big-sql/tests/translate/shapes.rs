@@ -60,10 +60,12 @@ fn the_aggregates_and_their_shapes() {
         translate("SELECT count(DISTINCT category) FROM t").unwrap().answer.shape,
         Shape::Row { cells: vec![Cell::plain("count".to_string(), Of::Groups { plan: 0 })] }
     );
+    // `SELECT *` is unexpanded here: translation sees no schema, and only a schema knows what
+    // the star came to. The limit rides along for the fall back to a record listing, which is
+    // what a table with nothing readable resolves to.
     assert_eq!(
         translate("SELECT * FROM t WHERE active = true LIMIT 10").unwrap().answer.shape,
-        // The record's own name, underscored so that `id` stays free for a field.
-        Shape::Records { column: big_sql::RECORD_COLUMN.to_string(), limit: Some(10) }
+        Shape::Table { columns: Columns::All { table: "t".to_string(), limit: Some(10) } }
     );
     assert_eq!(
         translate("SELECT category, count(*) FROM t GROUP BY category").unwrap().answer.shape,

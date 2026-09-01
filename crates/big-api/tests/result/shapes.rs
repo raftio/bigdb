@@ -15,7 +15,7 @@
 //! Each shape reads the answers it names, and nothing else.
 
 use crate::common::*;
-use big_api::{result_set, Absent, Cut, Datum, Of, Projected, Projection, Shape, Value};
+use big_api::{result_set, Absent, Columns, Cut, Datum, Of, Projected, Projection, Shape, Value};
 
 #[test]
 fn a_single_row_reads_one_cell_per_plan() {
@@ -113,7 +113,9 @@ fn records_answer_with_one_id_per_row() {
 
 #[test]
 fn a_projection_renders_the_values_the_plan_already_cut() {
-    let shape = Shape::Table { columns: vec![plain_column("amount"), plain_column("score")] };
+    let shape = Shape::Table {
+        columns: Columns::Named(vec![plain_column("amount"), plain_column("score")]),
+    };
     let values = vec![Value::Table(vec![
         Projected { record: 1, values: vec![Projection::Int(100), Projection::Absent] },
         Projected { record: 2, values: vec![Projection::Int(250), Projection::Int(7)] },
@@ -132,7 +134,9 @@ fn a_projection_renders_the_values_the_plan_already_cut() {
 /// the units the field stores, which is what keeps it exact.
 #[test]
 fn a_decimal_column_is_rendered_with_the_point_its_field_keeps() {
-    let shape = Shape::Table { columns: vec![scaled_column("price", 2), plain_column("qty")] };
+    let shape = Shape::Table {
+        columns: Columns::Named(vec![scaled_column("price", 2), plain_column("qty")]),
+    };
     let values = vec![Value::Table(vec![
         Projected { record: 1, values: vec![Projection::Int(1250), Projection::Int(3)] },
         // Fewer digits than the scale, which is where a naive placing of the point drops the

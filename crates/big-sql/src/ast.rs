@@ -210,7 +210,8 @@ impl Item {
 /// What one select-list entry asks for.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Proj {
-    /// `*`, which here means the record id and nothing else — see [`crate::Shape::Records`].
+    /// `*`: every column the table declares — see [`crate::Columns::All`], which is where the
+    /// list is filled in, because nothing at this level knows the table.
     Star,
     /// A bare column: the grouped column, or one of a projection's.
     Column(Name),

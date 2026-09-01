@@ -154,9 +154,10 @@ impl Parser<'_> {
             || select.items.iter().any(|item| {
                 // A per-entry `FILTER` narrows one aggregate, and there are no aggregates here.
                 item.filter.is_some()
-                    // `*` is the record id rather than every column, so a body written with one
-                    // would expose a single column and not the one anybody meant. A view names
-                    // what it exposes.
+                    // `*` is every column the table has *at the time it is read*, and a view is
+                    // stored as text and re-planned at every read - so a body written with one
+                    // would silently start exposing a column added to the table years later. A
+                    // view names what it exposes.
                     || !matches!(&item.proj, Proj::Column(name) if name.qualifier.is_none())
             });
         if bad {

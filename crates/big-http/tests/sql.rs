@@ -56,9 +56,9 @@ fn every_answer_shape_comes_back_as_columns_and_rows() {
     let (_, body) = send(addr, "POST", "/sql", "SELECT count(DISTINCT country) FROM tx");
     assert_eq!(body, r#"{"columns":["count"],"rows":[[2]]}"#);
 
-    // `SELECT *` is record ids, under a column that says so.
+    // `SELECT *` is every column the table declares, in declaration order.
     let (_, body) = send(addr, "POST", "/sql", "SELECT * FROM tx WHERE country = 'GB'");
-    assert_eq!(body, r#"{"columns":["_record_id"],"rows":[[1],[3]]}"#);
+    assert_eq!(body, r#"{"columns":["amount","country"],"rows":[[100,"GB"],[500,"GB"]]}"#);
 }
 
 /// A ranking is cut by the plan, and `LIMIT` on an unranked grouping cuts the shape.
@@ -73,8 +73,9 @@ fn limit_applies_where_the_statement_put_it() {
     );
     assert_eq!(body, r#"{"columns":["country","n"],"rows":[["GB",2]]}"#);
 
+    // A `LIMIT` on `SELECT *` is the plan's cut, because the columns are read per record.
     let (_, body) = send(addr, "POST", "/sql", "SELECT * FROM tx LIMIT 2");
-    assert_eq!(body, r#"{"columns":["_record_id"],"rows":[[1],[2]]}"#);
+    assert_eq!(body, r#"{"columns":["amount","country"],"rows":[[100,"GB"],[900,"US"]]}"#);
 }
 
 /// Nothing matched is `null`, not zero: a minimum over an empty set is absent, and a result set
@@ -1059,9 +1060,11 @@ fn rows_written_by_a_statement_are_read_back_by_one() {
     assert_eq!(body, r#"{"columns":["count"],"rows":[[1]]}"#);
     let (_, body) = send(addr, "POST", "/sql", "SELECT sum(amount) FROM tx");
     assert_eq!(body, r#"{"columns":["sum"],"rows":[[1000]]}"#);
-    // The ids the statement named are the records that exist, because the id *is* the record.
+    // The records the statement named are the ones that exist, and `SELECT *` reads their
+    // columns back. The ids themselves are the record listing's answer - see
+    // `a_record_id_is_allocated_when_the_statement_does_not_name_one`.
     let (_, body) = send(addr, "POST", "/sql", "SELECT * FROM tx");
-    assert_eq!(body, r#"{"columns":["_record_id"],"rows":[[1],[2]]}"#);
+    assert_eq!(body, r#"{"columns":["amount","country"],"rows":[[100,"GB"],[900,"US"]]}"#);
     // Writing the same id again writes about the same record, exactly as two import lines do.
     assert_eq!(
         send(addr, "POST", "/sql", "INSERT INTO tx (_record_id, amount) VALUES (1, 700)").0,
@@ -1299,21 +1302,21 @@ fn a_record_id_is_allocated_when_the_statement_does_not_name_one() {
         send(addr, "POST", "/sql", "INSERT INTO t (n, country) VALUES (10, 'GB'), (20, 'US')");
     assert_eq!(status, 200, "{body}");
     assert_eq!(body, r#"{"columns":["inserted"],"rows":[[2]]}"#);
-    let (_, body) = send(addr, "POST", "/sql", "SELECT * FROM t");
-    assert_eq!(body, r#"{"columns":["_record_id"],"rows":[[0],[1]]}"#);
+    let (_, body) = send(addr, "GET", "/table/t/records", "");
+    assert_eq!(body, r#"{"records":[0,1],"next":null}"#);
 
     // The next statement carries on above them rather than starting again.
     assert_eq!(send(addr, "POST", "/sql", "INSERT INTO t (n) VALUES (30)").0, 200);
-    let (_, body) = send(addr, "POST", "/sql", "SELECT * FROM t");
-    assert_eq!(body, r#"{"columns":["_record_id"],"rows":[[0],[1],[2]]}"#);
+    let (_, body) = send(addr, "GET", "/table/t/records", "");
+    assert_eq!(body, r#"{"records":[0,1,2],"next":null}"#);
 
     // **Above an id written by hand, too.** Allocation is one past the highest that exists, not
     // a counter of its own - so a statement that names an id cannot be overwritten by one that
     // does not, whichever order they arrive in.
     assert_eq!(send(addr, "POST", "/sql", "INSERT INTO t (_record_id, n) VALUES (100, 40)").0, 200);
     assert_eq!(send(addr, "POST", "/sql", "INSERT INTO t (n) VALUES (50)").0, 200);
-    let (_, body) = send(addr, "POST", "/sql", "SELECT * FROM t");
-    assert_eq!(body, r#"{"columns":["_record_id"],"rows":[[0],[1],[2],[100],[101]]}"#);
+    let (_, body) = send(addr, "GET", "/table/t/records", "");
+    assert_eq!(body, r#"{"records":[0,1,2,100,101],"next":null}"#);
 
     // Each row is its own record: the values went where the ids say they did.
     let (_, body) = send(addr, "POST", "/sql", "SELECT count(*) FROM t WHERE country = 'GB'");

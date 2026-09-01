@@ -49,12 +49,19 @@ SELECT count(*)           FROM t
 `SELECT DISTINCT c` is not a special case: standard SQL defines it as `SELECT c GROUP BY c`, the
 parser normalises it into exactly that, and the plan is the one a `GROUP BY` already produced.
 
-`SELECT *` answers with record ids under a column called `_record_id`, and nothing else — this engine
-stores facts as bits at `(row, record)` and has no row of values to hand back. Naming the columns
-instead is a projection, which reconstructs a value per record per column at a point read
+Naming columns is a projection, which reconstructs a value per record per column at a point read
 apiece; the cut is therefore part of the plan rather than a view of its answer, and it bounds
 the reads rather than trimming them afterwards. A `LIMIT` is optional, and leaving it out asks
 for every matching record at that price.
+
+`SELECT *` is a projection of every column the table declares, in declaration order. The list is
+not in the statement — nothing there knows the table — so both halves of the answer are filled in
+against the schema out of one expansion, `expanded_columns`: the plan reads the columns and the
+header names them, and a plan reading three under a header of four would be an answer that is
+wrong rather than absent. A column the star cannot reach is not named by it: on a table that
+keeps no values a keyed or boolean column has no read back from a record at all, and where
+nothing at all can be read `*` falls back to record ids under `_record_id`. That fall back is the
+only way to see a record id from SQL; `GET /table/{t}/records` is the route that lists them.
 
 A window is a key and its bounds against the same time quantum column, fused out of the
 conjunction into one `Row`. A field with no views by time has no window to answer, and the

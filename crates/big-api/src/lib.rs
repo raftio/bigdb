@@ -62,9 +62,9 @@ pub use big_plan::{Plan, Rows};
 // The SQL surface's two public shapes. `Shape` appears in the return type of `Api::sql`, so a
 // caller that renders an answer has to be able to name it.
 pub use big_sql::{
-    Absent, Answer, Ask, Cell, Cut, Format, GroupOrder, Having, JoinSide, Keying, Of, OrderBy,
-    Pairing, Probe as SqlProbe, Refused, Selected, Shape, Statement as SqlStatement, Threshold,
-    Units,
+    Absent, Answer, Ask, Cell, Columns, Cut, Format, GroupOrder, Having, JoinSide, Keying, Of,
+    OrderBy, Pairing, Probe as SqlProbe, Refused, Selected, Shape, Statement as SqlStatement,
+    Threshold, Units,
 };
 pub use big_sql::{
     Alter as SqlAlter, Column as SqlColumn, ColumnKind as SqlColumnKind, Ddl as SqlDdl,

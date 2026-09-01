@@ -16,6 +16,19 @@ predecessor.
 
 ### SQL
 
+- **`SELECT *` is every column the table declares**, in declaration order, rather than the record
+  id it used to answer with. The list is not in the statement - nothing there knows the table -
+  so the plan that reads the columns and the header that names them are filled in against the
+  schema out of one expansion, and cannot disagree. A column the star cannot reach is not named
+  by it: on a table that keeps no values a keyed or boolean column has no read back from a record
+  at all, and where nothing at all can be read `*` still answers with record ids under
+  `_record_id`. Naming such a column by hand stays refused, with the sentence it always gave.
+- **A projection no longer needs a `LIMIT`.** `SELECT amount FROM t` reads every matching record
+  rather than being refused, and the 10,000-row cap on an explicit `LIMIT` is gone with it - once
+  a full scan is something you can ask for, a cap on the smaller ask protects nothing. The cost
+  is unchanged and is the reason the cut still lives in the plan rather than in the shape: a
+  projection is a point read per record per column, so a cut applied to the answer would be one
+  applied after paying for it. `sql_projection_unsupported` no longer exists.
 - **`avg` over a join is answered.** One cell rather than two and a division: each half is
   scaled by the same per-key product, and that product is inside both sums rather than outside
   the fraction - so `Σ sum_s·Π / Σ count_s·Π` is the average of the join and the mean of the
@@ -34,8 +47,10 @@ predecessor.
   that has its own ids passes them straight through. Allocation is the schema leader's, where
   key interning already happens, because "one past the highest" has one right answer per cluster
   and two coordinators computing it independently would write two records into one. A leader
-  that cannot be reached stops the statement rather than guessing. `SELECT *` answers under the
-  same name, and a *field* called `_record_id` is refused (`sql_id_column`).
+  that cannot be reached stops the statement rather than guessing. A *field* called `_record_id`
+  is refused (`sql_id_column`). It is a name for writing about a record, not a column a select
+  list can ask for: `GET /table/{t}/records` lists ids, and `SELECT *` answers under this name
+  only on a table where nothing at all can be read back.
 - **`DROP TABLE [IF EXISTS]`** and **`CREATE TABLE IF NOT EXISTS`**. `IF NOT EXISTS` leaves a
   table that is already there exactly as it is, fields included, which is what makes a setup
   script re-runnable against a table somebody has since altered.
@@ -58,8 +73,8 @@ predecessor.
 
   A body is a filter and a projection over one table, because a view here is *inlined* and
   there is no subquery to nest one in; anything else is `sql_view_body`, said at `CREATE` rather
-  than at the first read. `*` is not allowed in one, since here it means the record id rather
-  than every column. Views nest, appear in `SHOW TABLES` under a `type` column, answer
+  than at the first read. `*` is not allowed in one: a view is re-planned at every
+  read, so a body written with one would start exposing whatever column the table gains next. Views nest, appear in `SHOW TABLES` under a `type` column, answer
   `DESCRIBE` with the columns they expose, and are listed with their statements by `SHOW VIEWS`.
   `CREATE OR REPLACE VIEW` changes what one means; `SHOW CREATE VIEW` reads back as the
   statement that made it.
@@ -127,7 +142,7 @@ predecessor.
   `count`, `sum`, `min`, `max`, `avg`, `count(DISTINCT x)`, `median`/`quantile`, `topK`,
   `SELECT DISTINCT`, `GROUP BY` one or two columns, `HAVING`, `ORDER BY`, `LIMIT`, `OFFSET`,
   `WITH TIES`, `FILTER (WHERE ...)`, `UNION ALL`, `PREWHERE`, `WITH <constant> AS`, `FORMAT`,
-  an inner join, a time window, and a projection of stored values under a required cut. A
+  an inner join, a time window, and a projection of stored values. A
   translation into PQL rather than a second engine: both surfaces resolve through one planner,
   so a schema mistake answers with the same code either way.
 - ClickHouse's spellings where they mean something here: `countIf`/`sumIf`/`minIf`/`maxIf`/
@@ -152,8 +167,9 @@ predecessor.
   two ordinary plans and a shape, and the arithmetic happens after both sides have merged.
 - Time windows: `visit = 'home' AND visit BETWEEN <seconds> AND <seconds>`, answered from the
   views by day a time quantum field writes.
-- Selecting stored values, previously refused. `SELECT amount, price FROM t WHERE ... LIMIT 100`
-  reads bit-sliced columns back under a required `LIMIT` of 1 to 10000.
+- Selecting stored values, previously refused. `SELECT amount, price FROM t WHERE ...` reads
+  bit-sliced columns back, cut by a `LIMIT` when one is written and scanning every match when
+  none is.
 - `HAVING`, `OFFSET`, `WITH TIES` and every ordering `TopN` cannot carry are applied by the
   coordinator after the merge, in the order SQL specifies. A `HAVING` threshold on a decimal
   column is converted to stored units by the planner's own conversion.
