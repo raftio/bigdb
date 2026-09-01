@@ -85,7 +85,9 @@ of the product.
 
 ### Checklist
 
-1. `CHANGELOG.md` — move `[Unreleased]` to the new version with a date.
+1. Write the release notes. There is no `CHANGELOG.md` yet: nothing has been released, so
+   every entry one could hold would describe the first release rather than a change to it.
+   Whoever cuts that release writes it then, out of the git log.
 2. `workspace.package.version` in the root `Cargo.toml`, and the `version` on every path
    dependency that names it.
 3. CI green, including `fmt`, `clippy`, `docs`, `msrv` and the crash tests.
