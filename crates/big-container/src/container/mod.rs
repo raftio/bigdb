@@ -200,10 +200,21 @@ impl Container {
     }
 
     /// Values may arrive in any order; duplicates collapse.
+    ///
+    /// **The ordered case is checked for, because it is the common one and it is free.** A
+    /// bitmap write hands this the offsets of one container in the order the records arrived,
+    /// and a load hands records over ascending - so the list is already strictly increasing and
+    /// both the sort and the `dedup` are two passes that change nothing. One comparison per
+    /// element establishes that; a container holds up to sixty-five thousand of them and a
+    /// commit builds hundreds of containers.
     pub fn from_values(values: impl IntoIterator<Item = u16>) -> Self {
         let mut v: Vec<u16> = values.into_iter().collect();
-        v.sort_unstable();
-        v.dedup();
+        // Strictly increasing, so ordered *and* free of duplicates - which is what lets both
+        // passes below be skipped rather than only the sort.
+        if !v.windows(2).all(|w| w[0] < w[1]) {
+            v.sort_unstable();
+            v.dedup();
+        }
         Self::Array(v)
     }
 

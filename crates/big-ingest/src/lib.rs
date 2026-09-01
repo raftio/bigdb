@@ -134,86 +134,150 @@ pub fn run(args: &[String], io: &mut Io<'_>, env: &dyn Fn(&str) -> Option<String
     let mut chunks = 0u64;
     let mut reported: Vec<String> = Vec::new();
 
-    loop {
-        let chunk = match chunker.next_chunk() {
-            Ok(Some(c)) => c,
-            Ok(None) => break,
-            Err(e) => {
-                bar.clear(io.err);
-                let _ = writeln!(io.err, "bigi: {e}");
-                return exit::USAGE;
+    // **A window of requests, retired in the order they were sent.**
+    //
+    // The server parses a body before it can commit it, and those are different resources: with
+    // one request in flight the parse of the next cannot begin until the commit of the last has
+    // finished, and one of the two machines is idle throughout. A second request in flight lets
+    // them overlap. It does *not* make the writes concurrent - the engine has a single writer,
+    // and that is a design decision rather than a lock waiting to be removed.
+    //
+    // **FIFO retirement is what keeps `--resume` honest.** Acks can arrive in any order, but a
+    // checkpoint is a single offset meaning "everything before this is written" - so it may only
+    // advance across a *contiguous* run of successes. Joining in send order gives that for free:
+    // the checkpoint is written after each chunk retires, and a failure stops the walk there,
+    // leaving the offset at the last chunk for which every earlier one also succeeded.
+    //
+    // Chunks still in flight when that happens may well land on the server. That is safe for the
+    // reason the whole file rests on: a fact is a bit set at a record id the caller wrote, so a
+    // resend writes what the first send wrote. The resumed run sends them again and is right.
+    let depth = options.in_flight;
+    let mut code = exit::OK;
+
+    std::thread::scope(|scope| {
+        let mut window: std::collections::VecDeque<Flight<'_>> = std::collections::VecDeque::new();
+        let mut drained = false;
+
+        loop {
+            while !drained && window.len() < depth {
+                match chunker.next_chunk() {
+                    Ok(Some(chunk)) => {
+                        // Where this chunk begins, which is what an operator needs when the
+                        // server refuses it.
+                        let began = chunk.end - chunk.body.len() as u64;
+                        chunks += 1;
+
+                        if options.dry_run {
+                            offset = chunk.end;
+                            lines_done += chunk.lines as u64;
+                            bar.tick(io.err, offset, lines_done);
+                            continue;
+                        }
+
+                        let client = &client;
+                        let target = target.as_str();
+                        let retries = options.retries;
+                        let body = chunk.body;
+                        window.push_back(Flight {
+                            began,
+                            end: chunk.end,
+                            lines: chunk.lines,
+                            handle: scope.spawn(move || post_chunk(client, target, &body, retries)),
+                        });
+                    }
+                    Ok(None) => drained = true,
+                    Err(e) => {
+                        bar.clear(io.err);
+                        let _ = writeln!(io.err, "bigi: {e}");
+                        code = exit::USAGE;
+                        // Not an immediate return: what is already in flight has been sent, and
+                        // retiring it is what lets the checkpoint record how far the load got.
+                        drained = true;
+                    }
+                }
             }
-        };
-        // Where this chunk begins, which is what an operator needs when the server refuses it.
-        let began = chunk.end - chunk.body.len() as u64;
-        chunks += 1;
 
-        if options.dry_run {
-            offset = chunk.end;
-            lines_done += chunk.lines as u64;
-            bar.tick(io.err, offset, lines_done);
-            continue;
-        }
+            let Some(flight) = window.pop_front() else { break };
+            let sent = flight.handle.join().expect("a request thread must not panic");
 
-        let response =
-            match post_chunk(&client, &target, &chunk.body, options.retries, &mut bar, io.err) {
+            // Said here rather than in the thread, so notes from several requests do not
+            // interleave halfway through each other's lines.
+            for note in &sent.notes {
+                bar.clear(io.err);
+                let _ = writeln!(io.err, "bigi: {note}");
+            }
+
+            let response = match sent.result {
                 Ok(r) => r,
-                Err(code) => {
-                    let _ = writeln!(io.err, "bigi: stopped at byte {began} of {name}");
-                    return code;
+                Err(c) => {
+                    let _ = writeln!(io.err, "bigi: stopped at byte {} of {name}", flight.began);
+                    code = c;
+                    break;
                 }
             };
 
-        if !response.ok() {
-            // Never retried. A chunk the server understood and rejected is rejected identically
-            // the second time, and the operator is owed the sentence rather than the delay.
-            bar.clear(io.err);
-            let failure = Failure::read(&response.body);
-            let _ = writeln!(io.err, "bigi: {} [{}]", failure.message, failure.code);
-            let _ = writeln!(
-                io.err,
-                "bigi: stopped at byte {began} of {name}; {} {} before it",
-                progress::thousands(wrote_total),
-                options.verb.noun()
-            );
-            return exit::REFUSED;
-        }
-
-        let (count, missed) = outcome(&response.body, options.verb);
-        wrote_total += count;
-        lines_done += chunk.lines as u64;
-        offset = chunk.end;
-
-        // A copy that did not take the write is a divergence, not a retry: sending the chunk
-        // again reaches the same copies. `POST /repair` is what closes it, so the note says so -
-        // once per distinct copy, because a load of ten thousand chunks would otherwise print
-        // the same sentence ten thousand times.
-        for note in missed {
-            if !reported.contains(&note) {
+            if !response.ok() {
+                // Never retried. A chunk the server understood and rejected is rejected
+                // identically the second time, and the operator is owed the sentence rather
+                // than the delay.
                 bar.clear(io.err);
+                let failure = Failure::read(&response.body);
+                let _ = writeln!(io.err, "bigi: {} [{}]", failure.message, failure.code);
                 let _ = writeln!(
                     io.err,
-                    "bigi: a copy did not take this write: {note} (run `bigc repair`)"
+                    "bigi: stopped at byte {} of {name}; {} {} before it",
+                    flight.began,
+                    progress::thousands(wrote_total),
+                    options.verb.noun()
                 );
-                reported.push(note);
+                code = exit::REFUSED;
+                break;
             }
-        }
 
-        if let Some(path) = &checkpoint_path {
-            let record = Checkpoint {
-                target: target.clone(),
-                input: name.clone(),
-                size: total.unwrap_or_default(),
-                offset,
-                lines: lines_done,
-                wrote: wrote_total,
-            };
-            if let Err(code) = write_checkpoint(&record, path, &mut bar, io.err) {
-                return code;
+            let (count, missed) = outcome(&response.body, options.verb);
+            wrote_total += count;
+            lines_done += flight.lines as u64;
+            offset = flight.end;
+
+            // A copy that did not take the write is a divergence, not a retry: sending the
+            // chunk again reaches the same copies. `POST /repair` is what closes it, so the
+            // note says so - once per distinct copy, because a load of ten thousand chunks
+            // would otherwise print the same sentence ten thousand times.
+            for note in missed {
+                if !reported.contains(&note) {
+                    bar.clear(io.err);
+                    let _ = writeln!(
+                        io.err,
+                        "bigi: a copy did not take this write: {note} (run `bigc repair`)"
+                    );
+                    reported.push(note);
+                }
             }
-        }
 
-        bar.tick(io.err, offset, lines_done);
+            if let Some(path) = &checkpoint_path {
+                let record = Checkpoint {
+                    target: target.clone(),
+                    input: name.clone(),
+                    size: total.unwrap_or_default(),
+                    offset,
+                    lines: lines_done,
+                    wrote: wrote_total,
+                };
+                if let Err(c) = write_checkpoint(&record, path, &mut bar, io.err) {
+                    code = c;
+                    break;
+                }
+            }
+
+            bar.tick(io.err, offset, lines_done);
+        }
+        // Whatever is left in the window is joined by the scope on the way out. Its results are
+        // deliberately dropped: they are chunks after the one that failed, and a checkpoint that
+        // counted them would skip the failure on resume.
+    });
+
+    if code != exit::OK {
+        return code;
     }
 
     bar.finish(io.err, offset, lines_done);
@@ -337,34 +401,42 @@ fn resume_from(
 /// writes what sending it once wrote. A connection that died - possibly *after* the server
 /// committed - is therefore free to re-send. A `Protocol` error is not retried, because what
 /// came back was not an answer this client can read and it will not be one next time either.
-fn post_chunk(
-    client: &Client,
-    target: &str,
-    body: &str,
-    retries: u32,
-    bar: &mut Progress,
-    err: &mut dyn Write,
-) -> Result<big_cli::http::Response, i32> {
+/// One request the window is waiting on.
+struct Flight<'s> {
+    began: u64,
+    end: u64,
+    lines: usize,
+    handle: std::thread::ScopedJoinHandle<'s, Sent>,
+}
+
+/// A request's outcome, and whatever it wanted to say on the way.
+///
+/// Collected rather than printed, because a request now runs on its own thread and two of them
+/// writing retry notes at once would interleave mid-line.
+struct Sent {
+    result: Result<big_cli::http::Response, i32>,
+    notes: Vec<String>,
+}
+
+fn post_chunk(client: &Client, target: &str, body: &str, retries: u32) -> Sent {
     let mut attempt = 0u32;
     let mut wait = FIRST_BACKOFF;
+    let mut notes = Vec::new();
     loop {
         match client.send("POST", target, body) {
-            Ok(r) => return Ok(r),
+            Ok(r) => return Sent { result: Ok(r), notes },
             Err(HttpError::Unreachable(why)) if attempt < retries => {
                 attempt += 1;
-                bar.clear(err);
-                let _ = writeln!(
-                    err,
-                    "bigi: {why}; retrying in {} ({attempt} of {retries})",
+                notes.push(format!(
+                    "{why}; retrying in {} ({attempt} of {retries})",
                     progress::short(wait)
-                );
+                ));
                 std::thread::sleep(wait);
                 wait = (wait * 2).min(MAX_BACKOFF);
             }
             Err(e) => {
-                bar.clear(err);
-                let _ = writeln!(err, "bigi: {e}");
-                return Err(exit::UNREACHABLE);
+                notes.push(e.to_string());
+                return Sent { result: Err(exit::UNREACHABLE), notes };
             }
         }
     }

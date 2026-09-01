@@ -83,8 +83,9 @@
 //! has one - which is a token in more places than the data it guards. Neither route reveals
 //! anything: liveness is a constant, and readiness is whether the engine answers at all.
 //!
-//! **Why `/metrics` needs only `read`.** Page counts and reader counts are far less than the
-//! data itself, and a scraper is not an administrator. Give a scraper its own read token; if a
+//! **Why `/metrics` needs only `read`.** Page counts, reader counts and I/O rates are far less
+//! than the data itself - the storage counters say how many pages moved, never which - and a
+//! scraper is not an administrator. Give a scraper its own read token; if a
 //! deployment needs a credential that can scrape and nothing else, a fourth role is the change
 //! to make, not an exception here.
 //!
@@ -122,8 +123,8 @@ use query::*;
 use crate::auth::{Auth, Outcome, Role};
 use crate::metrics::ServerMetrics;
 use crate::{json, Request, Response};
-use big_api::{Api, QueryOptions};
-use big_cluster::wire::{self, FactValue, OwnedFact};
+use big_api::{Api, Fact, FieldInfo, QueryOptions};
+use big_cluster::wire::{self, OwnedFact};
 use big_cluster::{Cluster, ClusterError};
 use big_db::catalog::FieldKind;
 use big_pager::PagerMut;
@@ -327,8 +328,12 @@ fn resolve<'a>(method: &str, segments: &[&'a str]) -> Option<Target<'a>> {
 /// connection, and this is what turns that into the owner stopping work rather than finishing
 /// an answer nobody is left to read.
 pub fn may_run_long(req: &Request) -> bool {
+    // Borrowed back out of the decoded segments. `resolve` matches on `&str` patterns and has
+    // no business knowing whether the text behind them was escaped on the wire.
+    let segments = req.segments();
+    let borrowed: Vec<&str> = segments.iter().map(std::convert::AsRef::as_ref).collect();
     matches!(
-        resolve(req.method.as_str(), req.segments().as_slice()),
+        resolve(req.method.as_str(), &borrowed),
         Some(Target::Query(_) | Target::Sql | Target::PeerQuery)
     )
 }
@@ -336,7 +341,8 @@ pub fn may_run_long(req: &Request) -> bool {
 /// Routes one request and runs it, or answers `404`, `401` or `403` without running anything.
 pub fn dispatch<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request) -> Response {
     let segments = req.segments();
-    let Some(target) = resolve(req.method.as_str(), &segments) else {
+    let borrowed: Vec<&str> = segments.iter().map(std::convert::AsRef::as_ref).collect();
+    let Some(target) = resolve(req.method.as_str(), &borrowed) else {
         return Response::failure(404, "no_such_route", "no such route");
     };
 

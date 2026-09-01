@@ -42,6 +42,19 @@ impl RowSet {
         }
     }
 
+    /// Whether this row holds `record`, which belongs to `shard`.
+    ///
+    /// A binary search over the slots and a lookup inside one container. Written for the write
+    /// path rather than the read path: a flush asks it once per record it is about to write, to
+    /// find out whether that record has an old value that needs clearing.
+    pub fn contains(&self, shard: ShardId, record: RecordId) -> bool {
+        let local = local_of(record);
+        let slot = local / CONTAINER_WIDTH;
+        let offset = (local % CONTAINER_WIDTH) as u16;
+        debug_assert_eq!(shard_of(record), shard, "a record from another shard");
+        self.get(slot).is_some_and(|c| c.contains(offset))
+    }
+
     pub fn get(&self, slot: u64) -> Option<&Container> {
         self.slots.binary_search_by_key(&slot, |(k, _)| *k).ok().map(|i| &self.slots[i].1)
     }

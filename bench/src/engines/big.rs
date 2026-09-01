@@ -45,19 +45,18 @@ impl Flavour for Default_ {
     const NAME: &'static str = "big";
 }
 
-/// The engine `ColumnarMerge` schedules differently, so the two sit next to each other.
+/// Half of the default engine: the columns without the index.
 ///
-/// **Without this column the comparison is wrong**, and wrong in a way that flatters nothing: the
-/// default engine answers a group-by from its index and a columnar one has to scan for it, so
-/// putting `columnar+merge` beside `big` would charge the scheduling for the whole
-/// index-versus-scan difference.
+/// **A column of its own because the default engine is a composition**, and a table that shows
+/// only the composite cannot say what either half is worth. This one answers a group-by by
+/// scanning, which is what makes the `bitmap` column beside it mean something.
 pub struct Columnar;
 impl Flavour for Columnar {
     const ENGINE: TableEngine = TableEngine::Columnar;
     const NAME: &'static str = "big/columnar";
 }
 
-/// The same, for the bitmap merge tree.
+/// The other half: the index without the columns.
 pub struct Bitmap;
 impl Flavour for Bitmap {
     const ENGINE: TableEngine = TableEngine::Bitmap;
@@ -108,8 +107,14 @@ impl<F: Flavour> Engine for BigEngine<F> {
 
     fn ingest(&mut self, batch: &[Record]) {
         let mut w = self.db.write();
+        // The field resolved once for the batch, not once per record. `set_int` by name walks
+        // the catalog and clones a `FieldDef` - which owns a `String` and a `Vec` - so calling
+        // it per record charged this benchmark two allocations per record to re-learn a field
+        // that cannot change inside one transaction. Every rival here is handed its prepared
+        // statement or its appender once per batch; this is the same courtesy.
+        let at = w.at(TABLE, FIELD).unwrap();
         for (id, value) in batch {
-            w.set_int(TABLE, FIELD, *id, *value).unwrap();
+            w.set_int_at(&at, *id, *value).unwrap();
         }
         w.commit().unwrap();
     }

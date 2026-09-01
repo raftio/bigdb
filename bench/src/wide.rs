@@ -110,57 +110,136 @@ fn mix(state: &mut u64) -> u64 {
     z ^ (z >> 31)
 }
 
-/// The category of every record, in record order: each category repeated its quota times, then
-/// shuffled.
+/// The seed every shuffle in this file starts from. Fixed, so two machines agree.
+const SEED: u64 = 0x5EED_1234_5678_9ABC;
+
+/// A pseudorandom bijection on `[0, n)`, computed rather than stored.
 ///
-/// **The shuffle is what makes the comparison honest.** Handing out categories in blocks would
-/// give every group one contiguous run of record ids, which is simultaneously the best case for
-/// a bitmap - one run per container - and the best case for a clustered column store, so
-/// neither engine would be measured on anything but the harness's own convenience. An earlier
-/// version tried to scatter with a stride coprime to `n`; it is a permutation, but consecutive
-/// records land near a handful of anchor points rather than anywhere, and the first hundred
-/// records covered five categories instead of most of a hundred. A full shuffle has no such
-/// structure to accidentally rely on.
-fn shuffled_categories(n: u64) -> Vec<u32> {
-    let quotas = category_quotas(n);
-    let mut out = Vec::with_capacity(n as usize);
-    for (category, quota) in quotas.iter().enumerate() {
-        out.extend(std::iter::repeat_n(category as u32, *quota as usize));
+/// **Why this replaced a Fisher-Yates shuffle.** The categories have to be scattered across the
+/// record ids - handing them out in blocks would give every group one contiguous run, which is
+/// simultaneously the best case for a bitmap (one run per container) and the best case for a
+/// clustered column store, so neither engine would be measured on anything but the harness's own
+/// convenience. A shuffle does that correctly and costs a `Vec<u32>` the length of the corpus:
+/// four gigabytes at a billion records, on top of the thirty-two the records themselves want.
+/// The corpus stopped fitting in memory long before the engine ran out of anything.
+///
+/// A Feistel network gives the same scatter with no array at all. Four rounds over
+/// `2 * half_bits` bits is a bijection on that power of two by construction - a Feistel round is
+/// invertible whatever its round function does - and *cycle walking* narrows it to `[0, n)`:
+/// re-apply it until the result lands in range. The domain is under four times `n`, so the walk
+/// terminates in a handful of steps on average and is bounded rather than expected-bounded in
+/// the sense that matters: it cannot loop for ever, because the permutation has no fixed cycle
+/// outside `[0, n)` to get stuck in.
+///
+/// **An earlier attempt is worth recording so it is not tried again.** Scattering with a stride
+/// coprime to `n` is also a permutation and is also O(1) memory, and it is not random enough:
+/// consecutive records land near a handful of anchor points rather than anywhere, and the first
+/// hundred records covered five categories instead of most of a hundred. `categories_are_
+/// scattered_rather_than_blocked` is the test that caught it and still guards this.
+#[derive(Clone, Copy)]
+pub struct Permutation {
+    n: u64,
+    half_bits: u32,
+    mask: u64,
+    seed: u64,
+}
+
+impl Permutation {
+    pub fn new(n: u64, seed: u64) -> Self {
+        let bits = if n <= 1 { 1 } else { 64 - (n - 1).leading_zeros() };
+        let half_bits = bits.div_ceil(2).max(1);
+        Self { n, half_bits, mask: (1u64 << half_bits) - 1, seed }
     }
 
-    // Fisher-Yates, back to front, from a fixed seed. Deterministic across machines because
-    // nothing here is wider than 64 bits or dependent on a library's idea of a shuffle.
-    let mut state = 0x5EED_1234_5678_9ABC;
-    for i in (1..out.len()).rev() {
-        let j = (mix(&mut state) % (i as u64 + 1)) as usize;
-        out.swap(i, j);
+    fn round(&self, round: u32, x: u64) -> u64 {
+        let mut state =
+            self.seed ^ (u64::from(round) << 40) ^ x.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        mix(&mut state) & self.mask
     }
-    out
+
+    /// Where `i` lands. A bijection on `[0, n)`; nonsense outside it.
+    pub fn at(&self, i: u64) -> u64 {
+        let mut x = i;
+        loop {
+            let (mut l, mut r) = (x >> self.half_bits, x & self.mask);
+            for round in 0..4 {
+                let next = l ^ self.round(round, r);
+                l = r;
+                r = next;
+            }
+            x = (l << self.half_bits) | r;
+            if x < self.n {
+                return x;
+            }
+        }
+    }
+}
+
+/// Where each category's run starts, if the quotas were laid end to end. `CATEGORIES + 1` long.
+///
+/// Two kilobytes whatever the corpus size, which is the whole trick: a record's category is
+/// which bucket its permuted index falls into, so the assignment that used to be an array the
+/// length of the corpus is a binary search over this instead.
+fn category_bounds(n: u64) -> Vec<u64> {
+    let quotas = category_quotas(n);
+    let mut bounds = Vec::with_capacity(quotas.len() + 1);
+    let mut acc = 0;
+    bounds.push(0);
+    for q in &quotas {
+        acc += q;
+        bounds.push(acc);
+    }
+    bounds
+}
+
+/// The category of the record at `i`, given the bounds and the permutation.
+///
+/// Exactly quota-many records get each category, because `at` is a bijection and the buckets
+/// partition `[0, n)`. That is the same guarantee the shuffle gave, arrived at without the
+/// array - and `the_workload_honours_its_quotas` checks it rather than trusting this paragraph.
+fn category_at(bounds: &[u64], perm: &Permutation, i: u64) -> u32 {
+    let p = perm.at(i);
+    // `partition_point` returns how many bounds are <= p; the bucket is one before that.
+    (bounds.partition_point(|b| *b <= p) - 1) as u32
+}
+
+/// Deterministic wide workload, one record at a time and nothing held.
+///
+/// The streaming form exists because the corpus outgrew the machine before the engine did: at a
+/// billion records the `Vec` this used to return is thirty-two gigabytes, so the load could not
+/// be *generated* on a box that could comfortably have stored the result. Everything a record
+/// is made of is a function of its index, so nothing needs to be kept.
+///
+/// [`wide_workload`] is this collected, and is still the right call for the analytical
+/// comparison, which checks every answer against a materialised ground truth.
+pub fn wide_stream(n: u64, layout: Layout) -> impl Iterator<Item = WideRecord> {
+    let bounds = category_bounds(n);
+    let perm = Permutation::new(n, SEED);
+    (0..n).map(move |i| record_at(&bounds, &perm, layout, i))
 }
 
 /// Deterministic wide workload. Same reasoning as [`crate::workload`]: a real RNG would make
 /// runs incomparable across machines and buy nothing.
 pub fn wide_workload(n: u64, layout: Layout) -> Vec<WideRecord> {
-    let categories = shuffled_categories(n);
+    wide_stream(n, layout).collect()
+}
 
-    (0..n)
-        .map(|i| {
-            let id = match layout {
-                Layout::Dense => i,
-                Layout::Sparse { shards } => (i % shards) * SHARD_WIDTH + i / shards,
-            };
-            // Knuth's multiplicative hash, unchanged from the storage workload so the
-            // `count_ge` column means the same thing in both comparisons.
-            let amount = i.wrapping_mul(2_654_435_761) % VALUE_CEILING;
-            let category = categories[i as usize];
-            // Different constants per column, so no two columns are functions of each other and
-            // an intersection actually narrows.
-            let country =
-                ((i.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32) % u64::from(COUNTRIES)) as u32;
-            let active = (i.wrapping_mul(0xD6E8_FEB8_6659_FD93) >> 33) & 1 == 0;
-            WideRecord { id, amount, category, country, active }
-        })
-        .collect()
+/// One record, from its index and nothing else. Every column here is unchanged from the
+/// version that read categories out of a shuffled array, except the category itself.
+fn record_at(bounds: &[u64], perm: &Permutation, layout: Layout, i: u64) -> WideRecord {
+    let id = match layout {
+        Layout::Dense => i,
+        Layout::Sparse { shards } => (i % shards) * SHARD_WIDTH + i / shards,
+    };
+    // Knuth's multiplicative hash, unchanged from the storage workload so the `count_ge` column
+    // means the same thing in both comparisons.
+    let amount = i.wrapping_mul(2_654_435_761) % VALUE_CEILING;
+    let category = category_at(bounds, perm, i);
+    // Different constants per column, so no two columns are functions of each other and an
+    // intersection actually narrows.
+    let country = ((i.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32) % u64::from(COUNTRIES)) as u32;
+    let active = (i.wrapping_mul(0xD6E8_FEB8_6659_FD93) >> 33) & 1 == 0;
+    WideRecord { id, amount, category, country, active }
 }
 
 /// `Count(Row(amount >= k))`.
@@ -237,6 +316,34 @@ mod tests {
     #[should_panic(expected = "strictly distinct frequencies")]
     fn quotas_refuse_a_corpus_too_small_to_separate() {
         category_quotas(32_895);
+    }
+
+    #[test]
+    fn the_permutation_is_a_bijection() {
+        // Every index lands in range and no two land on the same value. A Feistel network is
+        // invertible by construction; cycle walking is where an off-by-one would hide, and a
+        // permutation that is not one would silently skew every category count below.
+        for n in [1u64, 2, 3, 1_000, 32_896, 100_000] {
+            let perm = Permutation::new(n, SEED);
+            let mut seen = vec![false; n as usize];
+            for i in 0..n {
+                let p = perm.at(i);
+                assert!(p < n, "n={n}: {i} left the range at {p}");
+                assert!(!seen[p as usize], "n={n}: {p} was hit twice");
+                seen[p as usize] = true;
+            }
+        }
+    }
+
+    #[test]
+    fn the_stream_and_the_vec_are_the_same_workload() {
+        // The `Vec` form is the stream collected, and the analytical comparison still uses it -
+        // so if these ever diverge, one report is measuring a corpus the other never saw.
+        for layout in [Layout::Dense, Layout::Sparse { shards: 64 }] {
+            let collected = wide_workload(N, layout);
+            let streamed: Vec<_> = wide_stream(N, layout).collect();
+            assert_eq!(collected, streamed);
+        }
     }
 
     #[test]

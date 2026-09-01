@@ -44,7 +44,7 @@ use big_engine::bitmap::field::{BoolField, Bsi};
 use big_engine::bitmap::FragmentKey;
 use big_engine::{shard_of, RecordId, RowId};
 use big_pager::PagerMut;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 /// A value waiting to be placed, in the form the fragment will take it.
 enum Value {
@@ -52,9 +52,14 @@ enum Value {
     /// resolved, so nothing below here has to know the kind.
     Stored(u64),
     Row(RowId),
-    /// A key that has not been interned yet. Interning mutates the catalog, so it cannot happen
-    /// while facts are merely being collected.
-    Key(String),
+    /// A key that has not been interned yet, held as an index into [`BulkLoad::keys`].
+    ///
+    /// Interning mutates the catalog, so it cannot happen while facts are merely being
+    /// collected - but *storing* the key need not wait, and storing it inline as a `String` was
+    /// one heap allocation per fact on a path that holds the entire load in memory at once.
+    /// A set field draws from a small alphabet by definition, so the same few hundred strings
+    /// were being allocated millions of times over.
+    Key(u32),
 }
 
 /// One fact, resolved as far as it can be without touching the catalog.
@@ -62,6 +67,17 @@ struct Fact {
     field: crate::catalog::FieldId,
     record: RecordId,
     value: Value,
+}
+
+/// What a setter needs from a field definition, in a form that fits in a register pair.
+///
+/// [`Catalog::field`] hands back a `&FieldDef`, which owns a name and a granularity list, so
+/// caching one meant cloning it - two allocations - on every one of the millions of setter
+/// calls a bulk load is made of, to learn three numbers that cannot change while it runs.
+#[derive(Clone, Copy)]
+struct FieldRef {
+    id: crate::catalog::FieldId,
+    bit_depth: u32,
 }
 
 /// How many pages one commit may carry before the next fragment starts a new one.
@@ -84,8 +100,11 @@ pub struct BulkLoad<'db, P: PagerMut> {
     table_name: String,
     /// Interned once per name pair, because a load names a handful of fields and holds millions
     /// of facts.
-    fields: BTreeMap<String, FieldDef>,
+    fields: BTreeMap<String, FieldRef>,
     facts: Vec<Fact>,
+    /// Every distinct key the load names, held once each. See [`Value::Key`].
+    keys: Vec<String>,
+    key_index: HashMap<String, u32>,
     records: BTreeSet<RecordId>,
     /// Whether `finish` was called. The destructor's job is catching a loader that was *dropped*
     /// holding facts, which is a caller who forgot; a `finish` that failed is a caller who was
@@ -145,6 +164,8 @@ impl<'db, P: PagerMut> BulkLoad<'db, P> {
             table_name: table.to_string(),
             fields: BTreeMap::new(),
             facts: Vec::new(),
+            keys: Vec::new(),
+            key_index: HashMap::new(),
             records: BTreeSet::new(),
             finished: false,
         })
@@ -189,7 +210,8 @@ impl<'db, P: PagerMut> BulkLoad<'db, P> {
     /// correctly, and the refusal here says so.
     pub fn set_key(&mut self, field: &str, record: RecordId, value: &str) -> Result<()> {
         let def = self.field(field, |k| k == FieldKind::Set, "set")?;
-        self.push(def.id, record, Value::Key(value.to_string()))
+        let value = self.intern_text(value);
+        self.push(def.id, record, Value::Key(value))
     }
 
     /// Records held but not yet written.
@@ -202,20 +224,32 @@ impl<'db, P: PagerMut> BulkLoad<'db, P> {
         name: &str,
         ok: impl Fn(FieldKind) -> bool,
         expected: &'static str,
-    ) -> Result<FieldDef> {
+    ) -> Result<FieldRef> {
         if let Some(def) = self.fields.get(name) {
-            return Ok(def.clone());
+            return Ok(*def);
         }
         let catalog = self.db.catalog();
-        let def = catalog.field(self.table, name).cloned().ok_or_else(|| {
+        let def: &FieldDef = catalog.field(self.table, name).ok_or_else(|| {
             DbError::UnknownField { table: self.table_name.clone(), field: name.to_string() }
         })?;
         if !ok(def.kind) {
             return Err(DbError::WrongFieldKind { field: name.to_string(), expected });
         }
+        let r = FieldRef { id: def.id, bit_depth: def.bit_depth };
         drop(catalog);
-        self.fields.insert(name.to_string(), def.clone());
-        Ok(def)
+        self.fields.insert(name.to_string(), r);
+        Ok(r)
+    }
+
+    /// Holds one copy of a key and hands back the index the facts refer to it by.
+    fn intern_text(&mut self, key: &str) -> u32 {
+        if let Some(i) = self.key_index.get(key) {
+            return *i;
+        }
+        let i = self.keys.len() as u32;
+        self.keys.push(key.to_string());
+        self.key_index.insert(key.to_string(), i);
+        i
     }
 
     fn push(
@@ -256,21 +290,36 @@ impl<'db, P: PagerMut> BulkLoad<'db, P> {
     }
 
     /// Turns every key into a row id, in one commit.
+    ///
+    /// **Once per distinct `(field, key)`, not once per fact.** Interning a key already known is
+    /// a lookup that returns the id it returned last time, so calling it per fact asked the
+    /// catalog the same question millions of times and wrote down millions of identical answers.
+    /// A load names a handful of fields and, being keyed, a bounded alphabet of values; the pair
+    /// set is that product and nothing larger.
     fn intern_keys(&mut self) -> Result<()> {
-        let mut w = self.db.write();
-        let mut resolved: Vec<(usize, RowId)> = Vec::new();
-        for (i, f) in self.facts.iter().enumerate() {
-            if let Value::Key(name) = &f.value {
-                let row = w.catalog_mut().keys.intern(self.table, f.field, name)?;
-                resolved.push((i, row));
+        let mut wanted: BTreeSet<(crate::catalog::FieldId, u32)> = BTreeSet::new();
+        for f in &self.facts {
+            if let Value::Key(i) = &f.value {
+                wanted.insert((f.field, *i));
             }
         }
-        if resolved.is_empty() {
+        if wanted.is_empty() {
             return Ok(());
         }
+
+        let db = self.db;
+        let mut w = db.write();
+        let mut rows: BTreeMap<(crate::catalog::FieldId, u32), RowId> = BTreeMap::new();
+        for (field, i) in wanted {
+            let row = w.catalog_mut().keys.intern(self.table, field, &self.keys[i as usize])?;
+            rows.insert((field, i), row);
+        }
         w.commit()?;
-        for (i, row) in resolved {
-            self.facts[i].value = Value::Row(row);
+
+        for f in &mut self.facts {
+            if let Value::Key(i) = &f.value {
+                f.value = Value::Row(rows[&(f.field, *i)]);
+            }
         }
         Ok(())
     }

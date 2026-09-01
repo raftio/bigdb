@@ -33,6 +33,33 @@ impl<P: PagerMut + Sync> Cluster<P> {
     /// Two owners never contend. A record id belongs to exactly one of them and a fragment
     /// holds facts about its own records only, so the single-writer constraint is per node and
     /// the cluster's write throughput is the sum.
+    /// Whether this node writes a batch by itself, with no peer to route to.
+    ///
+    /// Public so a caller holding facts that borrow their request body can ask *before* copying
+    /// them into [`OwnedFact`]s. On the single-node path that copy is pure waste - the very next
+    /// line borrows them straight back - and on the import route it was two `String`
+    /// allocations per fact, on the one route whose whole purpose is volume.
+    pub fn writes_alone(&self) -> bool {
+        self.config.owns_everything()
+    }
+
+    /// [`Cluster::import`] for a caller whose facts are already borrowed.
+    ///
+    /// Only valid when [`Cluster::writes_alone`] is true, because a batch that has to be routed
+    /// needs owned data to group by range and ship. Refused rather than silently mis-routed.
+    pub fn import_borrowed(
+        &self,
+        table: &str,
+        facts: &[big_api::Fact<'_>],
+    ) -> Result<WriteOutcome> {
+        debug_assert!(self.writes_alone(), "import_borrowed on a node with peers");
+        if !self.writes_alone() {
+            return self.import(table, &facts.iter().map(OwnedFact::from_fact).collect::<Vec<_>>());
+        }
+        self.api.import(table, facts)?;
+        Ok(WriteOutcome { count: facts.len() as u64, missed: Vec::new() })
+    }
+
     pub fn import(&self, table: &str, facts: &[OwnedFact]) -> Result<WriteOutcome> {
         // One node owning everything is also the leader, so interning and writing are the same
         // transaction they have always been. Splitting them would pay for an agreement with

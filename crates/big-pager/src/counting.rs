@@ -131,6 +131,13 @@ impl<P: Pager> Pager for CountingPager<P> {
     fn verify_bitmap(&self, pgno: Pgno, page: &Page, expected: u32) -> bool {
         self.inner.verify_bitmap(pgno, page, expected)
     }
+
+    /// The inner backend's, unchanged. This decorator counts calls and the backend counts
+    /// I/O; a test that wraps a real pager should still see what the disk did, and the two
+    /// disagreeing - reads counted here but not there - is itself the interesting signal.
+    fn io_stats(&self) -> Option<crate::io::IoStats> {
+        self.inner.io_stats()
+    }
 }
 
 impl<P: PagerMut> PagerMut for CountingPager<P> {

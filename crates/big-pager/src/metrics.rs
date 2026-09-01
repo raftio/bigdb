@@ -14,6 +14,7 @@
 
 //! Without these, the failure mode of copy-on-write only shows up when the disk fills.
 
+use crate::io::IoStats;
 use big_page::TxnId;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -37,6 +38,16 @@ pub struct Metrics {
     pub durability: crate::Durability,
     /// Where the last commit's pages went, by class.
     pub last_commit: CommitBreakdown,
+    /// What the storage backend has done to the disk since open, when it counts it.
+    ///
+    /// Everything else here is a *gauge over the file* - how many pages there are, how many
+    /// are pinned, which reader is holding them. None of it says how hard the disk is being
+    /// worked to keep that shape, and the two come apart in exactly the case that matters: a
+    /// database whose page count is flat while its write rate is enormous is one rewriting the
+    /// same pages over and over, and the gauges alone show nothing at all.
+    ///
+    /// `None` when the backend keeps no count. See [`crate::Pager::io_stats`].
+    pub io: Option<IoStats>,
 }
 
 /// Pages written by one commit, split by what they were.

@@ -27,7 +27,7 @@
 //! alert asks ("is it serving", "are clients wrong", "are we broken") and cannot grow a label
 //! per status that some future route invents.
 
-use big_pager::Metrics as PagerMetrics;
+use big_pager::{IoStats, Metrics as PagerMetrics};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -263,6 +263,90 @@ fn render_pager(out: &mut String, m: &PagerMetrics) {
             "The transaction id the oldest live reader is pinned to. Absent when no reader is open.",
             id);
     }
+
+    // Omitted entirely when the backend keeps no count, for the same reason as the line above:
+    // a backend that does not measure and a backend that did no I/O are different facts, and a
+    // block of zeroes says the second when it means the first.
+    if let Some(io) = &m.io {
+        render_io(out, io);
+    }
+}
+
+/// What the storage backend did to the disk. Counters, not gauges: every one of these is read
+/// as a rate, and the panel an operator wants is pages-per-second next to flushes-per-second.
+///
+/// **Everything here carries a `backend` label**, and it costs no cardinality: one process
+/// opens one backend, so the label is fixed for its lifetime. It is here because these numbers
+/// only mean something once you know what produced them - `reads` on a mapped backend counts
+/// what the engine asked for and says nothing about what reached the disk, and a second backend
+/// would answer the same series a different way.
+fn render_io(out: &mut String, io: &IoStats) {
+    let b = io.backend;
+    io_counter(
+        out,
+        "big_storage_reads_total",
+        b,
+        "Pages the storage backend handed to the engine since it was opened. Pages asked for, \
+         not disk reads: on a mapped backend the read that reaches the disk is a page fault \
+         this process is never told about. Against the write rate it is the read/write mix.",
+        io.reads,
+    );
+    io_counter(
+        out,
+        "big_storage_writes_total",
+        b,
+        "Pages written. Divided by the rate of big_txn_id this is write amplification: pages \
+         per commit, which under copy-on-write is the number that decides how fast the file \
+         grows.",
+        io.writes,
+    );
+    io_counter(out, "big_storage_write_bytes_total", b, "Bytes written.", io.write_bytes);
+    io_counter(
+        out,
+        "big_storage_grows_total",
+        b,
+        "Calls that extended the file. Rising while big_free_pages_reusable is non-zero means \
+         pages are being pinned faster than they can be reused.",
+        io.grows,
+    );
+    io_counter(
+        out,
+        "big_storage_truncates_total",
+        b,
+        "Calls that shortened the file.",
+        io.truncates,
+    );
+    io_counter(
+        out,
+        "big_storage_syncs_total",
+        b,
+        "Flushes the engine asked for: two per commit unless durability is off, and none at \
+         all when it is. Its ratio to big_txn_id is what the durability setting is actually \
+         doing, as opposed to what it is set to. Barrier counts the same two as full - it is a \
+         weaker kind of flush, not fewer of them, and the difference between them is a duration \
+         rather than a count.",
+        io.syncs,
+    );
+
+    // Seconds and a float, which is what the exposition format wants for a time counter, and
+    // the pair `_seconds_total / _total` is a mean flush that any dashboard can divide out.
+    out.push_str(
+        "# HELP big_storage_sync_seconds_total Wall-clock spent inside those flushes. Over \
+         big_storage_syncs_total it is the mean flush, and a commit that got slow almost always \
+         got slow here.\n# TYPE big_storage_sync_seconds_total counter\n",
+    );
+    out.push_str(&format!(
+        "big_storage_sync_seconds_total{{backend=\"{b}\"}} {}\n",
+        io.sync_nanos as f64 / 1e9
+    ));
+}
+
+/// A counter carrying the one label this section uses.
+fn io_counter(out: &mut String, name: &str, backend: &str, help: &str, value: u64) {
+    let help: String = help.chars().map(|c| if c == '\n' { ' ' } else { c }).collect();
+    out.push_str(&format!(
+        "# HELP {name} {help}\n# TYPE {name} counter\n{name}{{backend=\"{backend}\"}} {value}\n"
+    ));
 }
 
 /// The row-key dictionary, which is the one thing here that grows with cardinality.
@@ -379,9 +463,40 @@ mod tests {
     }
 
     #[test]
+    fn a_backend_that_counts_nothing_publishes_no_io_series() {
+        let text = ServerMetrics::new().render(&pager_metrics());
+        // Not "zero reads" - no reads series at all. Zeroes would read as an idle database.
+        assert!(!text.contains("big_storage_"), "io series published for a backend with no counts");
+    }
+
+    #[test]
+    fn io_series_are_labelled_by_backend() {
+        let io = IoStats {
+            backend: "mmap",
+            reads: 9,
+            writes: 3,
+            write_bytes: 3 * 8192,
+            grows: 1,
+            truncates: 0,
+            syncs: 2,
+            sync_nanos: 1_500_000_000,
+        };
+        let text = ServerMetrics::new().render(&PagerMetrics { io: Some(io), ..pager_metrics() });
+
+        assert!(text.contains("big_storage_reads_total{backend=\"mmap\"} 9"));
+        assert!(text.contains("big_storage_writes_total{backend=\"mmap\"} 3"));
+        assert!(text.contains("big_storage_write_bytes_total{backend=\"mmap\"} 24576"));
+        assert!(text.contains("big_storage_grows_total{backend=\"mmap\"} 1"));
+        assert!(text.contains("big_storage_syncs_total{backend=\"mmap\"} 2"));
+        // Nanoseconds in, seconds out: the exposition format has no other unit for time.
+        assert!(text.contains("big_storage_sync_seconds_total{backend=\"mmap\"} 1.5"));
+    }
+
+    #[test]
     fn every_sample_declares_a_type() {
         let m = ServerMetrics::new();
-        let text = m.render(&pager_metrics());
+        let io = IoStats { backend: "mmap", ..Default::default() };
+        let text = m.render(&PagerMetrics { io: Some(io), ..pager_metrics() });
         for line in text.lines() {
             if let Some(rest) = line.strip_prefix("# HELP ") {
                 let name = rest.split(' ').next().unwrap();

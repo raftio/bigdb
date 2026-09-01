@@ -668,6 +668,12 @@ catalog as a new record kind, which is additive and needs no format version bump
 | `big_page_count` | Pages in the file |
 | `big_live_readers` | Open read transactions |
 | `big_txn_id` | Committed transaction id; its *rate* is the write rate |
+| `big_storage_reads_total{backend=…}` | Pages the backend handed to the engine |
+| `big_storage_writes_total{backend=…}` | Pages written; over the `big_txn_id` rate it is write amplification |
+| `big_storage_write_bytes_total{backend=…}` | The same in bytes, for a byte-rate panel |
+| `big_storage_grows_total{backend=…}` | Calls that extended the file |
+| `big_storage_syncs_total{backend=…}` | Flushes issued; two per commit unless durability is off |
+| `big_storage_sync_seconds_total{backend=…}` | Time inside those flushes; over the count it is the mean flush |
 | `big_http_connections_rejected_total` | Connections shed because the pool was full |
 | `big_http_responses_total{class=…}` | Responses by `2xx`/`4xx`/`5xx` |
 | `big_http_request_duration_seconds` | Latency histogram |
@@ -675,6 +681,22 @@ catalog as a new record kind, which is additive and needs no format version bump
 
 `big_oldest_reader_txn_id` is **absent** when no reader is open. It is not reported as zero,
 because zero is a real transaction id.
+
+The `big_storage_*` counters are **absent entirely** on a backend that keeps no count, for the
+same reason: a block of zeroes reads as an idle database rather than as an unmeasured one. They
+are what the *storage layer* did, as opposed to the gauges above, which are the shape the file
+ended up in - and the two come apart in the case that matters most. A database whose
+`big_page_count` is flat while `big_storage_writes_total` climbs is one rewriting the same pages
+over and over; nothing in the gauges shows that at all.
+
+`big_storage_reads_total` counts pages the engine **asked for**, not disk reads. On the mapped
+backend a read is a pointer into the mapping, and whether it reaches the platter is a page fault
+the kernel handles without telling the process - so there is no `read_bytes` series, and the
+number to watch is this one against the write rate. For actual disk reads, the kernel's own
+counters (`/proc/<pid>/io`, `major faults`) are the source; this process cannot see them.
+
+`backend` is one fixed label - a process opens one backend for its lifetime - so it costs no
+cardinality and tells a dashboard which implementation the numbers came from.
 
 ### What to alert on
 
@@ -696,6 +718,17 @@ rate(big_txn_id[15m]) == 0
 
 # Durability was relaxed and not put back. Nothing else makes this visible.
 big_durability{level="full"} == 0
+
+# Commits are flushing but the disk is not keeping up. The mean flush, in seconds.
+rate(big_storage_sync_seconds_total[5m]) / rate(big_storage_syncs_total[5m]) > 0.1
+
+# Pages written per commit. Copy-on-write pays a floor of a few; a jump means a commit is
+# rewriting far more of the tree than it touched, and the file will grow to match.
+rate(big_storage_writes_total[15m]) / rate(big_txn_id[15m]) > 100
+
+# Configured for full durability but not flushing. The two disagreeing is a bug, not a setting.
+big_durability{level="none"} == 0 and rate(big_storage_syncs_total[15m]) == 0
+  and rate(big_txn_id[15m]) > 0
 ```
 
 Do **not** alert on `4xx`. It is clients being wrong, which is normal traffic.

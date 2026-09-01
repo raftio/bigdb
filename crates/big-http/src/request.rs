@@ -18,6 +18,7 @@
 //! the strength of a header a client wrote.
 
 use crate::{Response, MAX_BODY, MAX_INTERNAL_BODY};
+use std::borrow::Cow;
 use std::io::Read;
 
 /// Longest request line or header line accepted. A client that sends more is not talking to
@@ -163,13 +164,25 @@ impl Request {
             .map_err(|_| RequestError::Malformed("body is not valid UTF-8"))
     }
 
-    /// The value of one query-string parameter, if present.
-    pub fn param(&self, name: &str) -> Option<&str> {
+    /// The value of one query-string parameter, percent-decoded, if present.
+    ///
+    /// **Decoded, because it used not to be and that was a bug with teeth.** `bigc` escapes
+    /// every value it sends - correctly, since a query string is not allowed to carry arbitrary
+    /// bytes - so `--engine bitmap+columnar` arrived here as `bitmap%2Bcolumnar` and was handed
+    /// straight to a parser that had never heard of it. The refusal named the three engines it
+    /// accepts and one of them was what the caller had typed. The whole of `create table
+    /// --engine bitmap+columnar`, the default engine, was unreachable over HTTP.
+    ///
+    /// `+` is deliberately *not* read as a space. That convention belongs to HTML form bodies
+    /// rather than to URIs, and honouring it here would break the other half of the same case:
+    /// a `curl` that sends `?engine=bitmap+columnar` unescaped, which is the spelling a person
+    /// reaches for first.
+    pub fn param(&self, name: &str) -> Option<Cow<'_, str>> {
         self.query
             .split('&')
             .filter_map(|pair| pair.split_once('='))
             .find(|(k, _)| *k == name)
-            .map(|(_, v)| v)
+            .map(|(_, v)| percent_decode(v))
     }
 
     /// One header by name, case-insensitively. First occurrence wins: a request that sends
@@ -197,9 +210,52 @@ impl Request {
         scheme.eq_ignore_ascii_case("bearer").then(|| token.trim())
     }
 
-    /// Path split on `/`, empty segments dropped.
-    pub fn segments(&self) -> Vec<&str> {
-        self.path.split('/').filter(|s| !s.is_empty()).collect()
+    /// Path split on `/`, empty segments dropped, each one percent-decoded.
+    ///
+    /// Split first and decoded after, which is the order that makes `%2F` mean a slash *inside*
+    /// a name rather than a new segment - so a table whose name contains one is routed to as
+    /// one table rather than as a path that does not exist.
+    pub fn segments(&self) -> Vec<Cow<'_, str>> {
+        self.path.split('/').filter(|s| !s.is_empty()).map(percent_decode).collect()
+    }
+}
+
+/// `%XX` back into bytes, borrowing when there is nothing to do.
+///
+/// Lenient about what it does not understand: a stray `%` that is not followed by two hex
+/// digits is left as itself rather than refused. A query string is not a place to be strict on
+/// a caller's behalf - the value goes on to a parser that will say what it thinks of it, and
+/// that parser gives a better sentence than "malformed escape" ever would.
+///
+/// Bytes that do not form UTF-8 fall back to the undecoded text for the same reason: the route
+/// that receives it decides, not this.
+fn percent_decode(s: &str) -> Cow<'_, str> {
+    if !s.contains('%') {
+        return Cow::Borrowed(s);
+    }
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hex = |b: u8| match b {
+                b'0'..=b'9' => Some(b - b'0'),
+                b'a'..=b'f' => Some(b - b'a' + 10),
+                b'A'..=b'F' => Some(b - b'A' + 10),
+                _ => None,
+            };
+            if let (Some(hi), Some(lo)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                out.push(hi * 16 + lo);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    match String::from_utf8(out) {
+        Ok(decoded) => Cow::Owned(decoded),
+        Err(_) => Cow::Borrowed(s),
     }
 }
 
@@ -227,4 +283,73 @@ fn read_line(reader: &mut impl Read) -> Result<String, RequestError> {
         line.push(byte[0]);
     }
     Err(RequestError::Malformed("header line too long"))
+}
+
+#[cfg(test)]
+mod decode_tests {
+    use super::*;
+
+    fn req(query: &str) -> Request {
+        Request {
+            method: "POST".to_string(),
+            path: "/table/t".to_string(),
+            query: query.to_string(),
+            body: Vec::new(),
+            headers: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn an_escaped_value_arrives_as_what_was_typed() {
+        // The case that was broken: `bigc create table t --engine bitmap+columnar` escapes the
+        // plus, and the engine parser had never heard of `bitmap%2Bcolumnar`.
+        assert_eq!(
+            req("engine=bitmap%2Bcolumnar").param("engine").as_deref(),
+            Some("bitmap+columnar")
+        );
+    }
+
+    #[test]
+    fn a_bare_plus_is_a_plus_and_not_a_space() {
+        // The other half of the same case: a `curl` that did not escape anything. Reading `+`
+        // as a space is a form-encoding rule, and this is not a form.
+        assert_eq!(
+            req("engine=bitmap+columnar").param("engine").as_deref(),
+            Some("bitmap+columnar")
+        );
+    }
+
+    #[test]
+    fn a_value_with_nothing_to_decode_is_not_copied() {
+        assert!(matches!(req("kind=int").param("kind"), Some(Cow::Borrowed("int"))));
+    }
+
+    #[test]
+    fn a_broken_escape_is_left_alone_rather_than_refused() {
+        // The route's own parser gives a better sentence than "malformed escape" would.
+        assert_eq!(req("a=100%").param("a").as_deref(), Some("100%"));
+        assert_eq!(req("a=%zz").param("a").as_deref(), Some("%zz"));
+    }
+
+    #[test]
+    fn utf8_survives_the_round_trip() {
+        assert_eq!(req("name=b%C3%A1o%20c%C3%A1o").param("name").as_deref(), Some("báo cáo"));
+    }
+
+    #[test]
+    fn an_encoded_slash_stays_inside_one_segment() {
+        // Split first, decode after: a table named `a/b` is one segment, not two.
+        let r = Request {
+            method: "POST".to_string(),
+            path: "/table/a%2Fb/import".to_string(),
+            query: String::new(),
+            body: Vec::new(),
+            headers: Vec::new(),
+        };
+        let segments = r.segments();
+        assert_eq!(
+            segments.iter().map(std::convert::AsRef::as_ref).collect::<Vec<&str>>(),
+            vec!["table", "a/b", "import"]
+        );
+    }
 }

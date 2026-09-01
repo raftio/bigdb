@@ -39,7 +39,7 @@ pub mod matches;
 pub use catalog::{
     Catalog, FieldDef, FieldKind, FragmentMeta, TableDef, TableEngine, EXISTS_FIELD, STANDARD_VIEW,
 };
-pub use db::{Cell, Db, DbRead, DbWrite, KeyStats, QueryLimits};
+pub use db::{At, Cell, Db, DbRead, DbWrite, KeyStats, QueryLimits};
 pub use ingest::Ingest;
 pub mod bulk;
 pub use big_engine::bitmap::{Container, ContainerKey};

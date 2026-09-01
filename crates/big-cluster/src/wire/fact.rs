@@ -49,6 +49,34 @@ pub enum FactValue {
 }
 
 impl OwnedFact {
+    /// The owned form, for a caller holding facts that borrow something about to go away.
+    ///
+    /// The inverse of [`OwnedFact::as_fact`], and the slow direction on purpose: a batch is
+    /// parsed into borrowed facts because that costs nothing, and only a batch that has to be
+    /// *shipped to a peer* pays to own them.
+    pub fn from_fact(fact: &big_api::Fact<'_>) -> Self {
+        let (field, record, value) = match fact {
+            big_api::Fact::Int { field, record, value } => {
+                (*field, *record, FactValue::Int(*value))
+            }
+            big_api::Fact::Signed { field, record, value } => {
+                (*field, *record, FactValue::Signed(*value))
+            }
+            big_api::Fact::Bool { field, record, value } => {
+                (*field, *record, FactValue::Bool(*value))
+            }
+            big_api::Fact::Key { field, record, value } => {
+                (*field, *record, FactValue::Key((*value).to_string()))
+            }
+            big_api::Fact::Time { field, record, value, unix_seconds } => (
+                *field,
+                *record,
+                FactValue::Time { value: (*value).to_string(), unix_seconds: *unix_seconds },
+            ),
+        };
+        Self { field: field.to_string(), record, value }
+    }
+
     /// The borrowed form the engine takes, valid as long as this one is.
     pub fn as_fact(&self) -> big_api::Fact<'_> {
         match &self.value {

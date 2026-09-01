@@ -40,6 +40,41 @@ pub const DEFAULT_CHUNK_LINES: usize = 1_000_000;
 /// How many times a *transport* failure is tried again. Never a refusal - see `run`.
 pub const DEFAULT_RETRIES: u32 = 3;
 
+/// Requests in flight by default: one, which is a strictly sequential load.
+///
+/// **Two, because one leaves both ends idle and the second is worth 1.6x.**
+///
+/// With a single request outstanding the load is strictly alternating: the client waits while
+/// the server parses and commits, then the server waits while the client reads and sends. A
+/// second request lets the server parse one body while it commits the one before, which is the
+/// only overlap available - the engine has one writer, so this does not make writes concurrent.
+///
+/// Two million records over HTTP, bitmap engine, `durability full`, two passes:
+///
+/// | in flight | | | records/s |
+/// |---|---|---|---|
+/// | 1 | 9.4s | 10.3s | ~203,000 |
+/// | **2** | 6.3s | **5.8s** | **~331,000** |
+/// | 3 | 5.8s | 5.8s | ~345,000 |
+/// | 4 | 6.6s | 5.7s | ~327,000 |
+/// | 6 | 6.4s | 5.7s | ~331,000 |
+///
+/// A third is inside the noise and a fourth is nothing at all, which is what the single writer
+/// predicts: past the one body being parsed ahead, another request can only queue. So the
+/// default is the first step and not the largest number that still helps.
+///
+/// **What it costs is how much a resume repeats.** A checkpoint is one offset meaning
+/// "everything before this is written", so it may only advance across a contiguous run of
+/// acknowledged chunks. With one request outstanding a killed run has sent exactly what it
+/// acknowledged plus one; with two it has sent one more, and the resumed run sends it again.
+/// Nothing is lost - a fact is a bit set at a record id the caller chose, so a resend writes
+/// what the first send wrote - and the repeat is bounded by one `--chunk-bytes`. That is a
+/// smaller thing to explain to an operator than why a load takes half again as long as it need.
+pub const DEFAULT_IN_FLIGHT: usize = 2;
+
+/// Past this, an in-flight window is holding more memory than any overlap it can buy.
+pub const MAX_IN_FLIGHT: usize = 8;
+
 pub const USAGE: &str = "\
 usage: bigi [options] import|delete <table> <file>|-
 
@@ -56,6 +91,13 @@ Options:
   --chunk-lines <n>           lines per request; default 1000000
   --resume <file>             write the acknowledged offset here, and start from it
   --retries <n>               retry a dropped connection this many times; default 3
+  --in-flight <n>             requests waiting on the server at once; default 2, ceiling 8
+                              the second lets the server parse one body while it commits the
+                              one before, which is worth about 1.6x. It does not make writes
+                              concurrent - the engine has one writer - so a third buys little
+                              and a fourth nothing, and each one in flight holds another
+                              --chunk-bytes of memory on both sides. Drop to 1 to keep a
+                              resumed load from repeating more than the chunk it died on
   --progress | --no-progress  default: progress when stderr is a terminal
   --dry-run                   chunk the file and report, without sending anything
   --addr <host:port>          default 127.0.0.1:7654, or $BIG_ADDR
@@ -124,6 +166,13 @@ pub struct Options {
     pub chunk_lines: usize,
     pub resume: Option<String>,
     pub retries: u32,
+    /// Requests allowed to be waiting on the server at once.
+    ///
+    /// One is the loop this binary used to be: send, wait, send. The server parses a body
+    /// before it can commit it, and those are different resources - so a second request in
+    /// flight lets the parse of one overlap the commit of the last. It cannot make the
+    /// *writes* concurrent, because the engine has one writer by design.
+    pub in_flight: usize,
     /// `None` means "decide from whether stderr is a terminal".
     pub progress: Option<bool>,
     pub dry_run: bool,
@@ -138,6 +187,7 @@ pub fn parse(args: &[String], env: &dyn Fn(&str) -> Option<String>) -> Result<Op
     let mut chunk_lines = DEFAULT_CHUNK_LINES;
     let mut resume = None;
     let mut retries = DEFAULT_RETRIES;
+    let mut in_flight = DEFAULT_IN_FLIGHT;
     let mut progress = None;
     let mut dry_run = false;
     let mut positional: Vec<String> = Vec::new();
@@ -186,6 +236,14 @@ pub fn parse(args: &[String], env: &dyn Fn(&str) -> Option<String>) -> Result<Op
             "--retries" => {
                 retries = u32::try_from(number(&value()?, arg)?)
                     .map_err(|_| "--retries is larger than any load needs".to_string())?;
+                i += 2;
+            }
+            "--in-flight" => {
+                in_flight = usize::try_from(number(&value()?, arg)?)
+                    .map_err(|_| "--in-flight is larger than any load needs".to_string())?;
+                if in_flight == 0 || in_flight > MAX_IN_FLIGHT {
+                    return Err(format!("--in-flight must be between 1 and {MAX_IN_FLIGHT}"));
+                }
                 i += 2;
             }
             "--progress" => {
@@ -249,6 +307,7 @@ pub fn parse(args: &[String], env: &dyn Fn(&str) -> Option<String>) -> Result<Op
         chunk_lines,
         resume,
         retries,
+        in_flight,
         progress,
         dry_run,
     })

@@ -117,8 +117,24 @@ fn bytes_per_record(records: &[(u64, u64)], batch: usize) -> u64 {
 /// Sparse did not move at all. Its fragments hold too few records for a container to be dense,
 /// so there is nothing to delta and nothing to merge; the cost there is the per-fragment path,
 /// which is a different problem and still open.
+///
+/// **Moved again, deliberately, on 2026-09-01**, from `26,299 / 2,272 / 110` sparse. That open
+/// problem, closed: a bit-sliced value used to write a *clear* for every zero plane, and
+/// `Bsi::group_all` skips the ones for records the fragment has never held - they were
+/// erasing bits that were never set. `BulkLoad` had always dropped them wholesale on the same
+/// reasoning; this is the per-record version of it, so a stream gets it too.
+///
+/// **Dense did not move, and that is the shape of the win rather than a disappointment.** A
+/// dense batch puts its records in one container, which the *set* bits rewrite regardless, so
+/// dropping the clears removes no work. A sparse batch puts each record in a container of its
+/// own, so the clears were naming containers nothing else touched - and `write_bits` reads and
+/// rewrites every container either half names. 2.4x at batch 100, 2.1x at batch 1,000, and
+/// nothing at 10,000, where one commit into an empty file has nothing to clear anyway.
+///
+/// To read the six current figures without running the whole report:
+/// `cargo test --test amplification -- --ignored --nocapture measured_amplification`.
 const DENSE: [(usize, u64); 3] = [(100, 1_712), (1_000, 177), (10_000, 20)];
-const SPARSE_64: [(usize, u64); 3] = [(100, 26_299), (1_000, 2_272), (10_000, 110)];
+const SPARSE_64: [(usize, u64); 3] = [(100, 10_960), (1_000, 1_098), (10_000, 110)];
 
 fn check(layout: Layout, expected: &[(usize, u64)]) {
     let records = workload(N, layout);
@@ -203,7 +219,7 @@ mod flush_fraction {
 
     const CAPACITY: usize = 1_000;
 
-    fn bytes_per_record(records: &[(u64, u64)], fraction: f64) -> u64 {
+    pub(super) fn bytes_per_record(records: &[(u64, u64)], fraction: f64) -> u64 {
         let d = Db::open(CountingPager::new(MemPager::new())).unwrap();
         d.create_table_with("t", TableEngine::Bitmap).unwrap();
         d.create_field("t", "v", FieldKind::Int, BIT_DEPTH).unwrap();
@@ -223,8 +239,16 @@ mod flush_fraction {
     ///
     /// To change these: re-measure, confirm the figure moved for a reason you can name, and
     /// update this table and the knob's doc comment together.
+    /// **Moved deliberately on 2026-09-01**, from `2,272/1,574 · 10,302/7,295 · 45,130/29,767`.
+    /// `Bsi::group_all` does not write a clear for every zero plane of a record the fragment has
+    /// never held. 2.1x at 64 shards, 2.4x at 256, 2.7x at 1,024 - the wider the fan-out the
+    /// more of it, because the clears were naming containers no set bit touched and a fragment
+    /// holding few records has more such containers per record.
+    ///
+    /// The knob's own ratio barely moved: 1.4x before, 1.3x after. It buys the same thing it
+    /// always did, on a smaller number.
     const GRID: [(u64, u64, u64); 3] =
-        [(64, 2_272, 1_574), (256, 10_302, 7_295), (1_024, 45_130, 29_767)];
+        [(64, 1_098, 822), (256, 4_301, 3_191), (1_024, 16_726, 11_249)];
 
     #[test]
     fn staggering_reduces_bytes_by_the_measured_amount() {
@@ -354,7 +378,7 @@ mod cost_model {
     /// fragment exists and every write is the read-modify-write this module is about. A total
     /// would average that against the first commit, which builds its trees bottom-up and is the
     /// one case the engine already does well.
-    fn last_commit(fields: usize, batch: usize) -> (CommitBreakdown, usize) {
+    pub(super) fn last_commit(fields: usize, batch: usize) -> (CommitBreakdown, usize) {
         let d = Db::open(CountingPager::new(MemPager::new())).unwrap();
         d.create_table_with("t", TableEngine::Bitmap).unwrap();
         let names: Vec<String> = (0..fields).map(|i| format!("f{i}")).collect();
@@ -382,7 +406,19 @@ mod cost_model {
     /// commit which of the three properties below it changes. A number here moving without one
     /// of those tests failing means this table is being updated to match the code rather than
     /// the code being measured against it.
-    const PAGES_BY_FIELD: [(usize, u64); 4] = [(1, 320), (2, 576), (4, 1_088), (8, 2_112)];
+    /// **Moved deliberately on 2026-09-01**, from `320 / 576 / 1,088 / 2,112`. The shape is what
+    /// matters, not the four numbers: it was `256 x fields + 64` and it is now `64 x fields +
+    /// 64`. **The per-field cost of a commit fell fourfold**; the fixed part did not move,
+    /// which is the property `the_fixed_chains_are_not_where_the_bytes_go` asserts separately.
+    ///
+    /// The cause is one change: a bit-sliced value no longer writes a clear for every zero
+    /// plane of a record the fragment has never held. Those clears named containers that no set
+    /// bit named, and `write_bits` reads and rewrites every container either half names - so
+    /// each field was paying for its own zeros, once per commit, for ever.
+    ///
+    /// It gets better with more fields, which is the direction that matters: 2.5x at one field
+    /// and 3.7x at eight.
+    const PAGES_BY_FIELD: [(usize, u64); 4] = [(1, 128), (2, 192), (4, 320), (8, 576)];
 
     /// **The finding.** Ten times the records in one commit, to the page identical.
     ///
@@ -466,4 +502,39 @@ mod cost_model {
             );
         }
     }
+}
+
+/// Scratch: prints the six figures the gated tables hold, for updating them after a deliberate
+/// change. Ignored, so it never runs in CI - `cargo test --test amplification -- --ignored
+/// --nocapture measured_amplification` is how it is read.
+#[test]
+#[ignore]
+fn measured_amplification() {
+    for (layout, name) in [(Layout::Dense, "DENSE"), (Layout::Sparse { shards: 64 }, "SPARSE_64")] {
+        let records = workload(N, layout);
+        let figures: Vec<String> = [100usize, 1_000, 10_000]
+            .iter()
+            .map(|&batch| format!("({batch}, {})", bytes_per_record(&records, batch)))
+            .collect();
+        println!("const {name}: [(usize, u64); 3] = [{}];", figures.join(", "));
+    }
+
+    let grid: Vec<String> = [64u64, 256, 1_024]
+        .iter()
+        .map(|&shards| {
+            let records = workload(N, Layout::Sparse { shards });
+            format!(
+                "({shards}, {}, {})",
+                flush_fraction::bytes_per_record(&records, 1.0),
+                flush_fraction::bytes_per_record(&records, 0.25)
+            )
+        })
+        .collect();
+    println!("const GRID: [(u64, u64, u64); 3] = [{}];", grid.join(", "));
+
+    let pages: Vec<String> = [1usize, 2, 4, 8]
+        .iter()
+        .map(|&fields| format!("({fields}, {})", cost_model::last_commit(fields, 1_000).0.data))
+        .collect();
+    println!("const PAGES_BY_FIELD: [(usize, u64); 4] = [{}];", pages.join(", "));
 }

@@ -33,6 +33,7 @@ pub mod counting;
 pub mod durability;
 pub mod error;
 pub mod freelist;
+pub mod io;
 pub mod mem;
 pub mod metrics;
 pub mod pager;
@@ -48,6 +49,7 @@ pub use counting::{CountingPager, PagerCounts};
 pub use durability::Durability;
 pub use error::{Result, StoreError};
 pub use freelist::{FreeRun, Freelist, FREE_ENTRY_BYTES};
+pub use io::{IoCounters, IoStats};
 pub use mem::MemPager;
 pub use metrics::Metrics;
 pub use pager::{Pager, PagerMut};
@@ -363,6 +365,7 @@ impl<P: Pager> Store<P> {
             txn_id: st.meta.txn_id,
             durability: self.durability(),
             last_commit: *self.last_commit.lock().unwrap(),
+            io: self.pager.io_stats(),
         }
     }
 }

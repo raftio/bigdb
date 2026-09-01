@@ -78,6 +78,11 @@ pub struct MmapPager {
     /// Page numbers whose dense-bitmap checksum has already been verified, and the checksum
     /// they verified against. See [`Pager::verify_bitmap`] for why remembering is sound.
     verified: Vec<RwLock<std::collections::HashMap<Pgno, u32>>>,
+    /// Counts what this backend does to the file. `read` below copies nothing, so what it
+    /// records is how often the engine asked for a page rather than how many reached the disk -
+    /// that last one is a page fault, and this process is not told about it. `write` is a real
+    /// `pwrite`, so its bytes are real.
+    io: crate::io::IoCounters,
 }
 
 impl MmapPager {
@@ -116,6 +121,7 @@ impl MmapPager {
             mapsize_pages,
             file_pages: AtomicU64::new(file_pages),
             verified: (0..VERIFY_SHARDS).map(|_| RwLock::new(Default::default())).collect(),
+            io: crate::io::IoCounters::new("mmap"),
         })
     }
 
@@ -134,6 +140,8 @@ impl Pager for MmapPager {
         }
         let off = pgno as usize * PAGE_SIZE;
 
+        self.io.read(pgno);
+
         // SAFETY: off + PAGE_SIZE <= EOF, checked just above, so the region is backed by the
         // file. The mmap base is system-page aligned (>= 4096) and off is a multiple of 8192,
         // so the pointer is 8-aligned as `#[repr(align(8))] Page` requires. The mapping is
@@ -147,6 +155,10 @@ impl Pager for MmapPager {
 
     fn capacity(&self) -> Option<u64> {
         Some(self.mapsize_pages)
+    }
+
+    fn io_stats(&self) -> Option<crate::io::IoStats> {
+        Some(self.io.snapshot())
     }
 
     /// Verifies once per page number and remembers it. Sound because copy-on-write never
@@ -186,6 +198,7 @@ impl PagerMut for MmapPager {
         // outlived the bytes it was about.
         self.forget_verified(pgno);
         self.file.write_all_at(page.as_bytes(), pgno as u64 * PAGE_SIZE as u64)?;
+        self.io.write();
         Ok(())
     }
 
@@ -201,6 +214,7 @@ impl PagerMut for MmapPager {
         }
         self.file.set_len(page_count * PAGE_SIZE as u64)?;
         self.file_pages.store(page_count, Ordering::Release);
+        self.io.grow();
         Ok(())
     }
 
@@ -215,18 +229,19 @@ impl PagerMut for MmapPager {
             for shard in &self.verified {
                 shard.write().unwrap().retain(|&p, _| (p as u64) < page_count);
             }
+            self.io.truncate();
         }
         Ok(())
     }
 
     fn sync(&self) -> Result<()> {
-        full_sync(&self.file)
+        self.io.sync(|| full_sync(&self.file))
     }
 
     /// `fdatasync`, which on Linux is exactly what `sync` does and on macOS is the half of it
     /// that does not wait for the drive.
     fn sync_data(&self) -> Result<()> {
-        self.file.sync_data()?;
+        self.io.sync(|| self.file.sync_data())?;
         Ok(())
     }
 }

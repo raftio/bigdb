@@ -16,6 +16,25 @@ and until this table existed the only analytical question in the benchmark was `
 
 They share a workload generator and a rule, and nothing else. Each has its own binary.
 
+**A third, which is not a comparison.** `profile_load` asks where the time in a load goes, and
+it is the one to run before optimising anything: a load's wall clock is the caller's fact
+building, the buffering, the commit and the fsyncs added together, and those four respond to
+entirely different fixes. It moves one of them per line, so the gaps between the lines are the
+answer rather than the rows.
+
+Everything here is driven by one script, so a run on a fresh box is one line:
+
+```sh
+./scripts/bench env                  # the machine, and whether the disk has room
+./scripts/bench load 10000000        # where the time in a load goes
+./scripts/bench ab   10000000        # the same, working tree against HEAD
+./scripts/bench storage
+BENCH_PEERS=olap-peers ./scripts/bench olap 1000000
+```
+
+Each command writes its report to `bench/results/` with the machine recorded above it, because
+a benchmark number without the machine under it is not a result.
+
 **Both are single-node, and neither is a measurement of distribution.** Every engine here — `big`
 included — is asked from one process against one file. There is no shard fan-out, no replication,
 no merge and no network in any number this crate produces, and `bigd --cluster` is never started.

@@ -64,6 +64,9 @@ pub(super) fn backup<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request) -> Res
             "name is required, and is the file to create inside the backup directory",
         );
     };
+    // Borrowed back out of the `Cow` the decoder hands over, so the rest of this function is
+    // unchanged: everything below wants a `&str` and a path component.
+    let name = name.as_ref();
     if let Err(why) = check_name(name) {
         return Response::failure(400, "bad_parameter", &why);
     }

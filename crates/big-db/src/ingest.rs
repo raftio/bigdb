@@ -34,16 +34,28 @@
 
 use crate::db::Db;
 use crate::error::{DbError, Result};
-use big_engine::{shard_of, RecordId, ShardId};
+use big_engine::{shard_of, RecordId, RowId, ShardId};
 use big_pager::PagerMut;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// A buffered write, in the form it will be replayed in.
+///
+/// **Text is held by index, not by value.** A key or a time value is a short string drawn from
+/// a small alphabet - a hundred categories, a few thousand days - repeated across every record
+/// that mentions it. Storing the `String` inline cost one heap allocation *per fact*, which on
+/// a load whose whole point is volume is the single largest per-fact cost in this file, and it
+/// bought nothing: the same twenty bytes were allocated, copied and freed millions of times to
+/// hold a value already in hand. [`Pool`] holds each distinct string once and the op holds a
+/// four-byte index into it.
+///
+/// It also halves the buffer. `Value` was 40 bytes because of the `String`; it is 16 now, so
+/// `Op` fell from 56 to 32 - which is not only memory but the replay pass, which walks every
+/// op in order and is bound by how much of it fits in cache.
 enum Value {
     Int(u64),
     Bool(bool),
-    Key(String),
-    Time { value: String, unix_seconds: i64 },
+    Key(u32),
+    Time { value: u32, unix_seconds: i64 },
 }
 
 struct Op {
@@ -51,6 +63,39 @@ struct Op {
     target: u32,
     record: RecordId,
     value: Value,
+}
+
+/// Distinct strings buffered by this ingest, each held once.
+///
+/// Bounded by the buffer rather than by the run: [`Pool::clear`] runs whenever the op buffer is
+/// drained in full, so a stream of a billion distinct time values holds at most one buffer-full
+/// of them at a time. A partial flush leaves it alone, because the ops it retained still index
+/// into it.
+#[derive(Default)]
+struct Pool {
+    texts: Vec<String>,
+    index: HashMap<String, u32>,
+}
+
+impl Pool {
+    fn intern(&mut self, text: &str) -> u32 {
+        if let Some(i) = self.index.get(text) {
+            return *i;
+        }
+        let i = self.texts.len() as u32;
+        self.texts.push(text.to_string());
+        self.index.insert(text.to_string(), i);
+        i
+    }
+
+    fn get(&self, i: u32) -> &str {
+        &self.texts[i as usize]
+    }
+
+    fn clear(&mut self) {
+        self.texts.clear();
+        self.index.clear();
+    }
 }
 
 /// Buffers writes and commits them in batches sized for the engine rather than for the caller.
@@ -73,6 +118,8 @@ pub struct Ingest<'db, P: PagerMut> {
     /// a linear scan to intern is cheaper than the allocations it avoids.
     targets: Vec<(String, String)>,
     ops: Vec<Op>,
+    /// Every key and time value the buffered ops name, held once each. See [`Value`].
+    pool: Pool,
     capacity: usize,
     /// Fraction of the buffered shards a flush commits, fullest first. `1.0` commits all of
     /// them, which is what this type did before the knob existed. See
@@ -92,6 +139,7 @@ impl<'db, P: PagerMut> Ingest<'db, P> {
             db,
             targets: Vec::new(),
             ops: Vec::new(),
+            pool: Pool::default(),
             // A zero would mean "flush before anything is buffered", which is not a policy.
             capacity: capacity.max(1),
             flush_fraction: 1.0,
@@ -186,7 +234,8 @@ impl<'db, P: PagerMut> Ingest<'db, P> {
         value: &str,
     ) -> Result<()> {
         let target = self.target(table, field)?;
-        self.push(target, record, Value::Key(value.to_string()))
+        let value = self.pool.intern(value);
+        self.push(target, record, Value::Key(value))
     }
 
     pub fn set_time(
@@ -198,8 +247,8 @@ impl<'db, P: PagerMut> Ingest<'db, P> {
         unix_seconds: i64,
     ) -> Result<()> {
         let target = self.target(table, field)?;
-        let v = Value::Time { value: value.to_string(), unix_seconds };
-        self.push(target, record, v)
+        let value = self.pool.intern(value);
+        self.push(target, record, Value::Time { value, unix_seconds })
     }
 
     /// Commits whatever is buffered. A no-op when there is nothing to write, so it is safe to
@@ -259,6 +308,15 @@ impl<'db, P: PagerMut> Ingest<'db, P> {
         // batch naming a field that does not exist is refused before any of it is applied.
         let at: Vec<crate::db::At> =
             self.targets.iter().map(|(table, field)| w.at(table, field)).collect::<Result<_>>()?;
+
+        // Row ids for the keys this flush names, resolved on first use and reused after.
+        //
+        // Interning is idempotent, so replaying a key per fact asked the catalog for an answer
+        // it had already given - once per fact, for the whole buffer. Keyed fields draw from a
+        // small alphabet by definition, so what this holds is that alphabet: one entry per
+        // `(field, distinct key)`, filled lazily so a flush that names three keys allocates
+        // three slots rather than one per buffered value.
+        let mut rows: Vec<Vec<Option<RowId>>> = vec![Vec::new(); at.len()];
         let mut written = 0u64;
         for op in &self.ops {
             if let Some(shards) = &selected {
@@ -271,10 +329,23 @@ impl<'db, P: PagerMut> Ingest<'db, P> {
                 Value::Int(v) => w.set_int_at(at, op.record, *v)?,
                 Value::Bool(v) => w.set_bool_at(at, op.record, *v)?,
                 Value::Key(v) => {
-                    w.set_key_at(at, op.record, v)?;
+                    let slot = &mut rows[op.target as usize];
+                    let i = *v as usize;
+                    if slot.len() <= i {
+                        slot.resize(i + 1, None);
+                    }
+                    let row = match slot[i] {
+                        Some(row) => row,
+                        None => {
+                            let row = w.intern_key_at(at, self.pool.get(*v))?;
+                            slot[i] = Some(row);
+                            row
+                        }
+                    };
+                    w.set_row_at(at, op.record, row)?;
                 }
                 Value::Time { value, unix_seconds } => {
-                    w.set_time_at(at, op.record, value, *unix_seconds)?;
+                    w.set_time_at(at, op.record, self.pool.get(*value), *unix_seconds)?;
                 }
             }
             written += 1;
@@ -284,7 +355,12 @@ impl<'db, P: PagerMut> Ingest<'db, P> {
         self.records += written;
         self.commits += 1;
         match &selected {
-            None => self.ops.clear(),
+            // Nothing indexes into the pool once the buffer is empty, so it goes with it. That
+            // is what keeps it bounded by the buffer rather than by the length of the run.
+            None => {
+                self.ops.clear();
+                self.pool.clear();
+            }
             // Retained in arrival order. Ops on one record are always in one shard - a record
             // belongs to exactly one - so per-record last-write-wins is preserved even though
             // ops on *different* shards no longer interleave the way they arrived.

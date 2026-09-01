@@ -170,7 +170,7 @@ impl FragmentWrite {
         // Every read here happens before any write, so all of them see the same pre-batch
         // tree. `group` yields each container key once, so no key is merged twice.
         let mut merged = Vec::new();
-        for (ckey, c) in group(bits) {
+        for (ckey, c) in containers_of(group_offsets(bits)) {
             let m = match self.existing(txn, ckey)? {
                 Some(old) => apply(SetOp::Or, old.as_ref(), c.as_ref()).into_owned(),
                 None => c,
@@ -193,8 +193,23 @@ impl FragmentWrite {
         set: impl IntoIterator<Item = (RowId, RecordId)>,
         clear: impl IntoIterator<Item = (RowId, RecordId)>,
     ) -> Result<()> {
-        let set = group(set);
-        let clear = group(clear);
+        self.write_grouped(txn, group_offsets(set), group_offsets(clear))
+    }
+
+    /// The same write, for a caller that has already grouped its bits by container.
+    ///
+    /// **Split out because the pairs are the expensive part and some callers never need them.**
+    /// A bit-sliced value knows the container and the offset of every bit it implies without
+    /// building `(row, record)` first - see [`crate::bitmap::field::Bsi::group_all`] - and this
+    /// is the door that lets it hand the answer straight over.
+    pub fn write_grouped<P: PagerMut>(
+        &mut self,
+        txn: &mut WriteTxn<'_, P>,
+        set: Grouped,
+        clear: Grouped,
+    ) -> Result<()> {
+        let set = containers_of(set);
+        let clear = containers_of(clear);
         let keys: BTreeSet<ContainerKey> = set.keys().chain(clear.keys()).copied().collect();
 
         let mut out = Vec::with_capacity(keys.len());
@@ -216,7 +231,7 @@ impl FragmentWrite {
         txn: &mut WriteTxn<'_, P>,
         bits: impl IntoIterator<Item = (RowId, RecordId)>,
     ) -> Result<()> {
-        self.clear_grouped(txn, group(bits))
+        self.clear_grouped(txn, containers_of(group_offsets(bits)))
     }
 
     /// Removes `records` from every row this fragment holds.
@@ -339,15 +354,33 @@ impl FragmentWrite {
 /// A sort was measured here first and is 4% *slower*: a commit holds tens of millions of pairs
 /// but only a few hundred distinct container keys, so the map is three levels deep and lives in
 /// cache, and `n log n` over the pairs buys nothing a probe was paying.
-fn group(bits: impl IntoIterator<Item = (RowId, RecordId)>) -> BTreeMap<ContainerKey, Container> {
+pub fn group_offsets(bits: impl IntoIterator<Item = (RowId, RecordId)>) -> Grouped {
     // `collect` on a `Vec`'s own iterator is a move, so the batch path allocates nothing here;
     // the one-bit helpers pay for a Vec of one, which is not a path anything hot goes down.
     let bits: Vec<(RowId, RecordId)> = bits.into_iter().collect();
-    let offsets = match fan_out(bits.len()) {
+    match fan_out(bits.len()) {
         1 => offsets_of(&bits),
         threads => offsets_of_parallel(&bits, threads),
-    };
-    offsets.into_iter().map(|(k, v)| (k, Container::from_values(v))).collect()
+    }
+}
+
+/// Offsets grouped by the container they belong to, in the order they arrived.
+///
+/// The intermediate form of every bitmap write. It is two bytes per bit where the `(row,
+/// record)` pair it replaces is sixteen, which is the whole reason it is named and passed
+/// around rather than being a local inside the grouping.
+pub type Grouped = BTreeMap<ContainerKey, Vec<u16>>;
+
+/// Folds one grouped batch into another, keeping each container's arrival order.
+pub fn merge_grouped(into: &mut Grouped, from: Grouped) {
+    for (ckey, mut offsets) in from {
+        into.entry(ckey).or_default().append(&mut offsets);
+    }
+}
+
+/// Builds the containers a grouped batch describes.
+pub fn containers_of(g: Grouped) -> BTreeMap<ContainerKey, Container> {
+    g.into_iter().map(|(k, v)| (k, Container::from_values(v))).collect()
 }
 
 /// One chunk's worth: container key to the offsets landing in it, in arrival order.
@@ -357,7 +390,7 @@ fn group(bits: impl IntoIterator<Item = (RowId, RecordId)>) -> BTreeMap<Containe
 /// Consecutive bits usually belong to the same container, so this holds the run it is building
 /// and hands it over only when the key actually changes. What makes "usually" true is the order
 /// the batch arrives in; see [`crate::bitmap::field::Bsi::bits_for_all`], which exists to produce it.
-fn offsets_of(bits: &[(RowId, RecordId)]) -> BTreeMap<ContainerKey, Vec<u16>> {
+fn offsets_of(bits: &[(RowId, RecordId)]) -> Grouped {
     let mut by_ckey: BTreeMap<ContainerKey, Vec<u16>> = BTreeMap::new();
     let mut open: Option<ContainerKey> = None;
     let mut run: Vec<u16> = Vec::new();
@@ -384,7 +417,7 @@ fn offsets_of(bits: &[(RowId, RecordId)]) -> BTreeMap<ContainerKey, Vec<u16>> {
 /// carries a few thousand bits finishes this loop in less than that — the fan-out has to be
 /// invisible to the small writes, which are most of them, or it is a regression dressed as an
 /// optimisation.
-fn fan_out(bits: usize) -> usize {
+pub(crate) fn fan_out(bits: usize) -> usize {
     const MIN_PER_THREAD: usize = 250_000;
     if bits < 2 * MIN_PER_THREAD {
         return 1;
@@ -394,25 +427,20 @@ fn fan_out(bits: usize) -> usize {
 }
 
 /// The same map, built by several threads and stitched back together in chunk order.
-fn offsets_of_parallel(
-    bits: &[(RowId, RecordId)],
-    threads: usize,
-) -> BTreeMap<ContainerKey, Vec<u16>> {
+fn offsets_of_parallel(bits: &[(RowId, RecordId)], threads: usize) -> Grouped {
     let chunk = bits.len().div_ceil(threads);
     // Scoped threads so the batch is borrowed rather than shared through an `Arc`, and nothing
     // outlives this call. No transaction is touched in here: this is arithmetic over a slice,
     // which is exactly why it is the half of a commit that can be split at all.
-    let parts: Vec<BTreeMap<ContainerKey, Vec<u16>>> = std::thread::scope(|scope| {
+    let parts: Vec<Grouped> = std::thread::scope(|scope| {
         let handles: Vec<_> =
             bits.chunks(chunk).map(|part| scope.spawn(move || offsets_of(part))).collect();
         handles.into_iter().map(|h| h.join().expect("grouping a batch panicked")).collect()
     });
 
-    let mut out: BTreeMap<ContainerKey, Vec<u16>> = BTreeMap::new();
+    let mut out = Grouped::new();
     for part in parts {
-        for (ckey, mut offs) in part {
-            out.entry(ckey).or_default().append(&mut offs);
-        }
+        merge_grouped(&mut out, part);
     }
     out
 }

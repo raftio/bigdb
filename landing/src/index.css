@@ -1,0 +1,179 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ============================================================================
+   bigdb — design tokens
+   Near-monochrome neutrals, ONE accent (signal cyan). Semantic hues are
+   reserved for state only: healthy / degraded / refused / failed.
+   A refusal is informational, not destructive — it owns violet, never red.
+   Both themes are authored; neither is derived from the other.
+   ========================================================================= */
+
+@layer base {
+  /* ── light: warm paper, cool ink ──────────────────────────────────────── */
+  :root {
+    --bg:            60 14% 96%;
+    --surface:        0  0% 100%;
+    --surface-raised:60 23% 97%;
+    --surface-sunken:60 11% 93%;
+    --overlay:        0  0% 100%;
+
+    --fg:           228 11%  9%;
+    --fg-muted:     220  5% 35%;
+    --fg-faint:     220  4% 52%;
+    --fg-inverted:   60 14% 97%;
+
+    --border:        60  9% 87%;
+    --border-strong: 60  7% 76%;
+    --grid:          60  9% 91%;
+
+    /* The accent is a set bit. Nothing decorative is allowed to spend it. */
+    --accent:       219 45% 41%;
+    --accent-fg:      0  0% 100%;
+    --accent-soft:  219 45% 94%;
+    --accent-line:  219 45% 62%;
+    /* The other half of the pair: a bit that is not set. */
+    --unset:         60 10% 88%;
+
+    --healthy:      158 62% 27%;
+    --healthy-soft: 158 40% 93%;
+    --degraded:      32 80% 36%;
+    --degraded-soft: 34 82% 93%;
+    --refused:      292 52% 44%;   /* informational — the planner said no */
+    --refused-soft: 292 60% 95%;
+    --failed:         4 66% 45%;
+    --failed-soft:    6 74% 95%;
+    --unknown:      220  4% 52%;
+    --unknown-soft:  60  9% 92%;
+
+    --viz-p50:      219 45% 41%;
+    --viz-p95:      219 38% 55%;
+    --viz-p99:      248 38% 62%;
+    --viz-fill:     219 45% 41%;
+
+    /* Tight radii — the landing draws boxes, not pills. */
+    --radius-sm: 2px;
+    --radius:    3px;
+    --radius-lg: 5px;
+
+    --elev-1: 0 1px 2px 0 hsl(60 10% 20% / 0.05);
+    --elev-2: 0 2px 6px -1px hsl(60 10% 20% / 0.09), 0 1px 2px hsl(60 10% 20% / 0.04);
+    --elev-3: 0 12px 32px -8px hsl(60 10% 15% / 0.16), 0 2px 6px hsl(60 10% 15% / 0.05);
+
+    --ring: 219 45% 45%;
+
+    /* Loaded from Google Fonts in index.html — no bundler font pipeline here. */
+    --font-sans: "Archivo", system-ui, -apple-system, "Segoe UI", sans-serif;
+    --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo,
+      Consolas, "Liberation Mono", monospace;
+  }
+
+  /* ── dark: near-black, neutral, periwinkle bit ────────────────────────── */
+  .dark {
+    --bg:            220 11%  5%;
+    --surface:       228 12%  8%;
+    --surface-raised:230 11% 11%;
+    --surface-sunken:225 12%  6.5%;
+    --overlay:       230 11% 10%;
+
+    --fg:            225  9% 91%;
+    --fg-muted:      220  6% 64%;
+    --fg-faint:      219  6% 44%;
+    --fg-inverted:   220 30%  8%;
+
+    --border:        223  9% 15%;
+    --border-strong: 222  9% 22%;
+    --grid:          223  9% 12%;
+
+    --accent:        218 100% 81%;
+    --accent-fg:     219  60%  8%;
+    --accent-soft:   218  45% 16%;
+    --accent-line:   218  70% 52%;
+    --unset:         225  11% 15%;
+
+    --healthy:       152 52% 55%;
+    --healthy-soft:  154 34% 12%;
+    --degraded:       36 84% 62%;
+    --degraded-soft:  34 50% 12%;
+    --refused:       292 78% 76%;
+    --refused-soft:  292 40% 15%;
+    --failed:          4 76% 66%;
+    --failed-soft:     4 46% 14%;
+    --unknown:       220  6% 56%;
+    --unknown-soft:  223  9% 14%;
+
+    --viz-p50:       218 100% 81%;
+    --viz-p95:       218  60% 62%;
+    --viz-p99:       250  55% 72%;
+    --viz-fill:      218 100% 81%;
+
+    /* Elevation in dark is a lighter surface and a hairline, not a shadow. */
+    --elev-1: 0 0 0 1px hsl(223 9% 15%);
+    --elev-2: 0 0 0 1px hsl(222 9% 18%), 0 4px 14px -6px hsl(0 0% 0% / 0.75);
+    --elev-3: 0 0 0 1px hsl(222 9% 22%), 0 18px 44px -12px hsl(0 0% 0% / 0.85);
+
+    --ring: 218 100% 81%;
+  }
+
+  * { border-color: hsl(var(--border)); }
+
+  html { color-scheme: light; }
+  html.dark { color-scheme: dark; }
+
+  body {
+    background-color: hsl(var(--bg));
+    color: hsl(var(--fg));
+    font-family: var(--font-sans);
+    font-feature-settings: "cv05" 1, "ss01" 1;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  /* Every number, id, token, query and error code is mono and tabular. */
+  code, kbd, pre, samp, .font-mono, [data-mono] {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    font-feature-settings: "tnum" 1, "zero" 1, "calt" 0;
+  }
+
+  /* Focus is always visible and always the accent. */
+  :focus-visible {
+    outline: 2px solid hsl(var(--ring));
+    outline-offset: 1px;
+    border-radius: var(--radius-sm);
+  }
+
+  ::selection { background: hsl(var(--accent) / 0.28); }
+
+  /* Quiet, thin scrollbars — chrome stays out of the way of numbers. */
+  * { scrollbar-width: thin; scrollbar-color: hsl(var(--border-strong)) transparent; }
+  *::-webkit-scrollbar { width: 10px; height: 10px; }
+  *::-webkit-scrollbar-track { background: transparent; }
+  *::-webkit-scrollbar-thumb {
+    background: hsl(var(--border-strong));
+    border: 3px solid transparent;
+    background-clip: content-box;
+    border-radius: 9999px;
+  }
+}
+
+@layer utilities {
+  .tabular { font-variant-numeric: tabular-nums; }
+  .surface-grid {
+    background-image:
+      linear-gradient(hsl(var(--grid)) 1px, transparent 1px),
+      linear-gradient(90deg, hsl(var(--grid)) 1px, transparent 1px);
+    background-size: 32px 32px;
+  }
+}
+
+/* Motion: fast and functional, ≤150ms — and none at all when asked. */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+}

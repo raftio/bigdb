@@ -28,7 +28,7 @@ pub(super) fn create_table<P: PagerMut + Sync>(
     // answers the widest range of questions well; a caller who wants the narrow one says so.
     let engine = match req.param("engine") {
         None => big_api::TableEngine::default(),
-        Some(s) => match big_api::TableEngine::parse(s) {
+        Some(s) => match big_api::TableEngine::parse(&s) {
             Some(e) => e,
             None => {
                 return Response::failure(
@@ -51,14 +51,14 @@ pub(super) fn create_field<P: PagerMut + Sync>(
     table: &str,
     field: &str,
 ) -> Response {
-    let Some(kind) = req.param("kind").and_then(parse_kind) else {
+    let Some(kind) = req.param("kind").as_deref().and_then(parse_kind) else {
         return Response::failure(
             400,
             "bad_parameter",
             "kind must be int, decimal, set, mutex, bool or timequantum",
         );
     };
-    let bit_depth = match req.param("bit_depth").map(str::parse::<u32>) {
+    let bit_depth = match req.param("bit_depth").map(|v| v.parse::<u32>()) {
         Some(Ok(n)) => n,
         Some(Err(_)) => {
             return Response::failure(400, "bad_parameter", "bit_depth must be a number")
@@ -67,7 +67,7 @@ pub(super) fn create_field<P: PagerMut + Sync>(
     };
 
     let result = match kind {
-        FieldKind::Decimal => match req.param("scale").map(str::parse::<i8>) {
+        FieldKind::Decimal => match req.param("scale").map(|v| v.parse::<i8>()) {
             Some(Ok(scale)) => ctx.cluster.create_decimal(table, field, bit_depth, scale),
             Some(Err(_)) => {
                 return Response::failure(400, "bad_parameter", "scale must be a small number")

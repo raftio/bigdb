@@ -159,6 +159,49 @@ fn metrics_render_in_the_prometheus_text_format() {
     assert!(r.body.contains("big_page_count "), "{}", r.body);
     // The request that came before this one was counted.
     assert!(r.body.contains(r#"big_http_responses_total{class="2xx"} 1"#), "{}", r.body);
+
+    // This server is in memory, and `MemPager` counts no I/O because it does none. Absent
+    // rather than zero: a block of zeroes would read as a database nobody is writing to.
+    assert!(!r.body.contains("big_storage_"), "io series on a backend with no disk: {}", r.body);
+}
+
+/// A file-backed server exports what its backend did to the disk.
+///
+/// The counterpart to the assertion above, and the reason it is a separate test: the two say
+/// that the series appear exactly when there is a backend behind them, which is a different
+/// claim from either one alone. This is also the only place the whole chain runs end to end -
+/// the pager counting, `Store::metrics` forwarding, and the renderer labelling - over a real
+/// socket rather than through a struct literal.
+#[test]
+#[cfg(unix)]
+fn metrics_report_what_the_storage_backend_did() {
+    let dir = tempfile::tempdir().unwrap();
+    let api = Api::open(dir.path().join("t.big")).unwrap();
+    api.create_table("tx").unwrap();
+    // A commit, so there is something to have written and flushed.
+    api.create_field("tx", "amount", big_db::catalog::FieldKind::Int, 32).unwrap();
+
+    let server = Server::bind_with(api, "127.0.0.1:0", config()).unwrap();
+    let addr = server.local_addr().unwrap();
+    std::thread::spawn(move || {
+        let _ = server.serve_n(1);
+    });
+    let r = send(addr, "GET", "/metrics", "");
+
+    assert_eq!(r.status, 200);
+    assert!(r.body.contains("# TYPE big_storage_writes_total counter"), "{}", r.body);
+    // The label is what makes the numbers attributable to an implementation.
+    assert!(r.body.contains(r#"big_storage_writes_total{backend="mmap"}"#), "{}", r.body);
+    // Creating a table and a field committed, and a commit flushes. Both had to be non-zero
+    // for the counters to be wired to anything at all.
+    assert!(
+        !r.body.contains(r#"big_storage_syncs_total{backend="mmap"} 0"#),
+        "the backend reported no flushes after a commit: {}",
+        r.body
+    );
+    // No byte counter for reads on this backend, on purpose: the read that reaches the disk is
+    // a page fault this process is never told about.
+    assert!(!r.body.contains("big_storage_read_bytes_total"), "{}", r.body);
 }
 
 // ---------------------------------------------------------------------------

@@ -63,7 +63,7 @@ pub use big_sql::{
 };
 pub use big_sql::{Ddl as SqlDdl, Sql};
 
-use big_db::Db;
+use big_db::{At, Db};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -455,21 +455,7 @@ impl<P: PagerMut + Sync> Api<P> {
     /// two fsyncs and a full metadata rewrite - once per fact.
     pub fn import(&self, table: &str, facts: &[Fact<'_>]) -> Result<()> {
         let mut w = self.db.write();
-        for fact in facts {
-            match fact {
-                Fact::Int { field, record, value } => w.set_int(table, field, *record, *value)?,
-                Fact::Signed { field, record, value } => {
-                    w.set_signed(table, field, *record, *value)?
-                }
-                Fact::Bool { field, record, value } => w.set_bool(table, field, *record, *value)?,
-                Fact::Key { field, record, value } => {
-                    w.set_key(table, field, *record, value)?;
-                }
-                Fact::Time { field, record, value, unix_seconds } => {
-                    w.set_time(table, field, *record, value, *unix_seconds)?;
-                }
-            }
-        }
+        apply(&mut w, table, facts)?;
         w.commit()?;
         Ok(())
     }
@@ -511,21 +497,7 @@ impl<P: PagerMut + Sync> Api<P> {
         for k in keys {
             w.assign_key(table, k.field, k.key, k.row)?;
         }
-        for fact in facts {
-            match fact {
-                Fact::Int { field, record, value } => w.set_int(table, field, *record, *value)?,
-                Fact::Signed { field, record, value } => {
-                    w.set_signed(table, field, *record, *value)?
-                }
-                Fact::Bool { field, record, value } => w.set_bool(table, field, *record, *value)?,
-                Fact::Key { field, record, value } => {
-                    w.set_key(table, field, *record, value)?;
-                }
-                Fact::Time { field, record, value, unix_seconds } => {
-                    w.set_time(table, field, *record, value, *unix_seconds)?;
-                }
-            }
-        }
+        apply(&mut w, table, facts)?;
         w.commit()?;
         Ok(())
     }
@@ -885,5 +857,118 @@ impl<P: PagerMut + Sync> Api<P> {
     #[cfg(feature = "unstable")]
     pub fn db(&self) -> &Db<P> {
         &self.db
+    }
+}
+
+/// Applies a batch of facts to an open transaction, resolving each field it names **once**.
+///
+/// A `Fact` carries its field as a name, and the setters that take a name resolve it - two
+/// catalog lookups and a clone of a `FieldDef`, which owns a `String` and a `Vec` - on every
+/// call. A batch is the unit of this API precisely because it is large, so that was two
+/// allocations per fact to re-learn something fixed for the length of the transaction. A batch
+/// names a handful of fields, so the cache below is a handful of entries scanned linearly:
+/// comparing a few short names beats hashing them, and beats resolving them by a wide margin.
+/// One field of the batch, resolved once, with what it has been told so far.
+struct Resolved<'f> {
+    /// The name as the *first* fact of this field spelled it, kept so the next fact can be
+    /// matched against it. See [`same_slice`].
+    name: &'f str,
+    at: At,
+    /// Row ids for the keys this batch has named at this field, resolved on first use.
+    ///
+    /// Interning is idempotent: a key already known is a scope lookup and a string comparison
+    /// that return the id they returned last time, and a load names the same few hundred keys
+    /// over and over.
+    ///
+    /// **Per field, not one map keyed by `(field, key)`.** The flat version was measured
+    /// hashing the field's index with SipHash at **1.25% of the daemon** - more than it spent
+    /// hashing the key string beside it, to distinguish four fields. Nesting the map is the
+    /// same lookup with that half of the key already answered by which map is being asked.
+    ///
+    /// **A map, and it has to be a map.** This was a `Vec` scanned linearly, on the reasoning
+    /// that a keyed field draws from a small alphabet. It does - and "small" was 256 categories,
+    /// so every fact compared its key against up to 256 strings. A profile put
+    /// `__memcmp_avx2_movbe` at **38% of the daemon** and the stacks led here.
+    rows: std::collections::HashMap<&'f str, RowId>,
+}
+
+/// Whether two `&str` are literally the same slice: one address, one length.
+///
+/// **A pointer comparison standing in for a string comparison, and it is allowed to say no when
+/// the answer is yes.** Every caller below falls back to a real comparison when this misses, so
+/// the only thing it can cost is the two instructions it took to ask.
+///
+/// It hits because of where the names come from. `/import` resolves each line's field against
+/// the schema and hands the fact the schema's *own* copy of the name, so every fact naming
+/// `amount` carries the identical slice - and matching a fact to its resolved field becomes an
+/// address compare instead of `__memcmp_avx2_movbe`, which a call graph put at 2% of the daemon
+/// doing nothing else.
+fn same_slice(a: &str, b: &str) -> bool {
+    a.as_ptr() == b.as_ptr() && a.len() == b.len()
+}
+
+fn apply<'f, P: big_pager::PagerMut>(
+    w: &mut big_db::DbWrite<'_, P>,
+    table: &str,
+    facts: &[Fact<'f>],
+) -> Result<()> {
+    let mut at: Vec<Resolved<'f>> = Vec::new();
+    for fact in facts {
+        let name = fact.field();
+        let i = match at.iter().position(|r| same_slice(r.name, name)) {
+            Some(i) => i,
+            // Either a caller that spells the name afresh per fact, or a field not seen yet.
+            // Both are answered by comparing the strings; only the second resolves anything.
+            None => match at.iter().position(|r| r.name == name) {
+                Some(i) => i,
+                None => {
+                    let resolved = Resolved {
+                        name,
+                        at: w.at(table, name)?,
+                        rows: std::collections::HashMap::new(),
+                    };
+                    at.push(resolved);
+                    at.len() - 1
+                }
+            },
+        };
+        match fact {
+            Fact::Int { record, value, .. } => w.set_int_at(&at[i].at, *record, *value)?,
+            Fact::Signed { record, value, .. } => w.set_signed_at(&at[i].at, *record, *value)?,
+            Fact::Bool { record, value, .. } => w.set_bool_at(&at[i].at, *record, *value)?,
+            Fact::Key { record, value, .. } => {
+                // `copied()` ends the borrow of the cache before the miss goes on to write to
+                // it, which is what lets the lookup and the insert share one `at[i]`.
+                let row = match at[i].rows.get(*value).copied() {
+                    Some(row) => row,
+                    None => {
+                        let row = w.intern_key_at(&at[i].at, value)?;
+                        at[i].rows.insert(value, row);
+                        row
+                    }
+                };
+                w.set_row_at(&at[i].at, *record, row)?;
+            }
+            Fact::Time { record, value, unix_seconds, .. } => {
+                w.set_time_at(&at[i].at, *record, value, *unix_seconds)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+impl<'a> Fact<'a> {
+    /// The field this fact is about, whatever kind it is.
+    ///
+    /// Tied to the batch rather than to the borrow of this one fact, which is what lets a caller
+    /// hold the name while it goes on reading the batch - `apply` keeps one per distinct field.
+    pub fn field(&self) -> &'a str {
+        match self {
+            Fact::Int { field, .. }
+            | Fact::Signed { field, .. }
+            | Fact::Bool { field, .. }
+            | Fact::Key { field, .. }
+            | Fact::Time { field, .. } => field,
+        }
     }
 }

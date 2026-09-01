@@ -40,6 +40,24 @@ struct Placed {
     cell: Option<ColEdit>,
 }
 
+impl Placed {
+    /// Empties the record without giving up its buffers.
+    ///
+    /// **The point is the `Vec`s.** A `Placed` was built per fact, and a keyed or boolean fact
+    /// pushes into `bits` - so routing a four-field record allocated and freed three times,
+    /// per record, for buffers that never hold more than two entries. `clear` keeps the
+    /// capacity, so the first record of a transaction pays for them and the rest do not.
+    fn reset(&mut self) {
+        self.observe_bitmap = None;
+        self.observe_columns = None;
+        self.planes = None;
+        self.bits.clear();
+        self.bits_in.clear();
+        self.mutex = None;
+        self.cell = None;
+    }
+}
+
 impl Sink for Placed {
     fn observe(&mut self, half: Half, value: u64) {
         match half {
@@ -100,6 +118,28 @@ struct Pending {
     /// rightmost leaf for almost nothing *and* the case a fold can detect in one pass and do
     /// nothing about.
     cells: Vec<(RecordId, ColEdit)>,
+    /// The zone map this fragment's facts imply, as the lowest and highest value seen.
+    ///
+    /// **Folded here rather than applied to the catalog per fact.** `Catalog::fragment_mut` is a
+    /// map keyed exactly as this one is, so observing a value where it was observed meant a
+    /// second descent of a second `BTreeMap` for every fact - the same key, the same depth, the
+    /// same comparisons. `observe` is a min and a max, which fold: seeing every value once at
+    /// the flush leaves the identical `(min, max, bit_depth)`, because a value's bit width is
+    /// monotonic in the value and the widest is therefore the largest.
+    observe: Option<(u64, u64)>,
+    /// The same for the column half, which lives at this fragment's address one view over.
+    observe_cols: Option<(u64, u64)>,
+}
+
+/// Widens a folded zone map to include one more value.
+fn note_zone(slot: &mut Option<(u64, u64)>, value: u64) {
+    match slot {
+        Some((lo, hi)) => {
+            *lo = (*lo).min(value);
+            *hi = (*hi).max(value);
+        }
+        None => *slot = Some((value, value)),
+    }
 }
 
 /// Collapses a buffer of writes to one entry per key, keeping the last — which is exactly what
@@ -112,9 +152,9 @@ struct Pending {
 /// bounds check. The order still has to be paid for, but once for the batch rather than once
 /// per write — and the flush was going to walk the whole buffer anyway.
 ///
-/// The sort is stable, so entries for one key keep their arrival order; reversing before the
-/// dedup is what makes the survivor the *last* arrival rather than the first. An already-ordered
-/// buffer skips the sort and keeps that property for free, having never been reordered.
+/// The sort is stable, so entries for one key keep their arrival order, and [`dedup_last`] keeps
+/// the last of each run rather than the first. An already-ordered buffer skips the sort and keeps
+/// that property for free, having never been reordered.
 fn last_per_key<K: Ord + Copy, V>(mut buf: Vec<(K, V)>) -> Vec<(K, V)> {
     // One pass first, because the common case needs no work at all: a load hands records over
     // ascending and writes each field of one record once, so the buffer arrives strictly
@@ -127,10 +167,7 @@ fn last_per_key<K: Ord + Copy, V>(mut buf: Vec<(K, V)>) -> Vec<(K, V)> {
     if !sorted {
         buf.sort_by_key(|entry| entry.0);
     }
-    buf.reverse();
-    buf.dedup_by(|a, b| a.0 == b.0);
-    buf.reverse();
-    buf
+    dedup_last(buf)
 }
 
 /// Whether a buffer is already ascending by key, and whether any key repeats.
@@ -148,6 +185,257 @@ fn shape_of<K: Ord, V>(buf: &[(K, V)]) -> (bool, bool) {
         }
     }
     (true, repeats)
+}
+
+/// Prepares every buffered fragment, on several threads when there is enough work to pay for
+/// them.
+///
+/// **The threshold is not decoration.** Spawning a thread costs tens of microseconds and a
+/// commit of three small fragments is over in less than that, so an unconditional fan-out makes
+/// the small case slower - and the small case is every commit an interactive writer makes. Below
+/// the threshold this is the loop it replaced, exactly.
+fn prepare_all(
+    catalog: &Catalog,
+    pending: BTreeMap<FragmentKey, Pending>,
+    held: &BTreeMap<FragmentKey, RowSet>,
+) -> Result<Vec<Prepared>> {
+    let work: Vec<(FragmentKey, Pending)> = pending.into_iter().collect();
+    let total: usize = work.iter().map(|(_, p)| p.values.len() + p.bits.len()).sum();
+
+    let threads =
+        core::cmp::min(work.len(), std::thread::available_parallelism().map_or(1, |n| n.get()));
+    if threads < 2 || total < PARALLEL_FLUSH_MIN {
+        // Nothing else is running, so the one fragment being prepared may have the whole box.
+        let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+        return work
+            .into_iter()
+            .map(|(key, p)| prepare_fragment(catalog, key, p, held.get(&key), cores))
+            .collect();
+    }
+
+    // Chunked rather than work-stolen. One fragment is usually most of a commit and the rest are
+    // small, so a queue would spend its time on the handful that finish instantly; chunking by
+    // count keeps the common shape - a few big fragments - spread across the threads.
+    // Split into owned groups before spawning. A `chunks()` slice would hand each thread a
+    // borrow and force a `clone` of the buffers - which are the millions of entries this whole
+    // function exists to process, so cloning them would cost more than the threads save.
+    let chunk = work.len().div_ceil(threads);
+    let mut groups: Vec<Vec<(FragmentKey, Pending)>> = Vec::with_capacity(threads);
+    let mut work = work;
+    while !work.is_empty() {
+        let take = core::cmp::min(chunk, work.len());
+        groups.push(work.drain(..take).collect());
+    }
+    let count: usize = groups.iter().map(Vec::len).sum();
+
+    let mut out: Vec<Result<Vec<Prepared>>> = Vec::with_capacity(groups.len());
+    std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(groups.len());
+        for group in groups {
+            handles.push(scope.spawn(move || -> Result<Vec<Prepared>> {
+                // One core each: the fan-out has already been spent, out here.
+                group
+                    .into_iter()
+                    .map(|(key, p)| prepare_fragment(catalog, key, p, held.get(&key), 1))
+                    .collect()
+            }));
+        }
+        for h in handles {
+            // A panic in a prepare is a bug in this file, not a condition to report: there is no
+            // I/O in there to fail. Propagating it keeps the transaction from committing half a
+            // batch, which is what swallowing it would do.
+            out.push(h.join().expect("preparing a fragment must not panic"));
+        }
+    });
+
+    let mut prepared = Vec::with_capacity(count);
+    for group in out {
+        prepared.extend(group?);
+    }
+    Ok(prepared)
+}
+
+/// Buffered entries below which a commit prepares on one thread. Measured on the import path,
+/// where a chunk carries millions and an interactive write carries one.
+const PARALLEL_FLUSH_MIN: usize = 50_000;
+
+/// One fragment's flush, computed but not yet written.
+///
+/// The split exists so the expensive half can run on another core. Everything in here is
+/// arithmetic over the buffer this fragment collected - collapsing duplicates, expanding values
+/// into bit planes - and touches neither the pager nor the transaction. What remains for the
+/// serial half is allocating pages and walking a tree, which one writer has to do alone.
+struct Prepared {
+    key: FragmentKey,
+    /// Already grouped by container, because grouping is the expensive half and it is pure.
+    /// See [`big_engine::bitmap::write::Grouped`].
+    set: Grouped,
+    clear: Grouped,
+    cells: Vec<(RecordId, ColEdit)>,
+    /// Whether the bitmap half has nothing in it. Not `set.is_empty() && clear.is_empty()`,
+    /// which would also be true of a fragment whose values collapsed to nothing - and that
+    /// distinction is what keeps an empty tree out of the catalog.
+    nothing_to_write: bool,
+}
+
+/// The pure half of a flush. See [`Prepared`].
+fn prepare_fragment(
+    catalog: &Catalog,
+    key: FragmentKey,
+    p: Pending,
+    held: Option<&RowSet>,
+    threads: usize,
+) -> Result<Prepared> {
+    let values = last_per_key(p.values);
+    let bits = last_per_bit(p.bits);
+
+    // Reserved rather than grown from empty, because the size is known here and the batch is
+    // large: a twenty-bit field over a million records pushes twenty-one million pairs, and
+    // a `Vec` doubling its way there memmoves roughly its own final length in the process.
+    //
+    // Half the total in each, not the whole of it in both. `bits_for` sends every plane to
+    // exactly one of the two, so together they receive `depth + 1` per record and neither
+    // alone can be predicted - but a value sets about half its bits, so half is the estimate
+    // that costs one doubling in the worst case instead of twenty-five, without reserving
+    // twice the memory the pair will ever hold.
+    let depth = catalog.fragment(&key).map_or(1, |m| m.bit_depth.max(1)) as usize;
+
+    let (mut set, mut clear) = if values.is_empty() {
+        (Grouped::new(), Grouped::new())
+    } else {
+        // The depth the catalog ended the transaction on, not the depth each individual write
+        // saw. A record written before the depth grew still gets every plane accounted for, so
+        // overwriting a large value with a small one cannot leave a stale high bit behind.
+        //
+        // One membership test per record, not one per plane: the answer is the same for every
+        // plane of a record, so asking twenty times would be asking the same question twenty
+        // times.
+        let already: Option<Vec<bool>> = held.map(|rows| {
+            values.iter().map(|(record, _)| rows.contains(key.shard, *record)).collect()
+        });
+        Bsi::new(depth as u32).group_all(&values, already.as_deref(), threads)?
+    };
+
+    // The loose bits keep the general grouping. A keyed field's rows are drawn from an alphabet
+    // as wide as the shard has distinct values, which is the case a table indexed by row cannot
+    // serve - and there is one of them per record rather than twenty-one, so it is not the case
+    // worth serving.
+    if !bits.is_empty() {
+        merge_grouped(&mut set, group_offsets(bits.iter().filter(|(_, on)| *on).map(|(b, _)| *b)));
+        merge_grouped(
+            &mut clear,
+            group_offsets(bits.iter().filter(|(_, on)| !*on).map(|(b, _)| *b)),
+        );
+    }
+
+    let nothing_to_write = set.is_empty() && clear.is_empty();
+    Ok(Prepared { key, set, clear, cells: fold_edits(p.cells), nothing_to_write })
+}
+
+/// [`last_per_key`] for bits, which are keyed by `(row, record)` and are the one buffer whose
+/// fast path never fires.
+///
+/// **Why this needed its own function.** `last_per_key` skips its sort when the buffer already
+/// ascends, and for values it usually does: records arrive in order. Bits do not. A keyed field
+/// writes `(row, record)` where the row is whichever key that record happened to name, so the
+/// row column jumps about and the buffer is unsorted by construction - the sort was 5.6% of an
+/// import, every time, with no case in which it was skipped.
+///
+/// The rows come from a small alphabet, though: a keyed field's rows are dense from zero, a
+/// bool has two, the exists row is one. So this buckets by row - counting sort, one pass to
+/// count and one to scatter - and sorts nothing at all in the ordinary case. Within a bucket
+/// the records arrive ascending already, which is checked rather than assumed; a bucket that
+/// is out of order is sorted on its own, and it is small.
+fn last_per_bit(buf: Vec<((RowId, RecordId), bool)>) -> Vec<((RowId, RecordId), bool)> {
+    let (sorted, repeats) = shape_of(&buf);
+    if sorted && !repeats {
+        return buf;
+    }
+    if !sorted {
+        // The bucket table is indexed by row, so a sparse or enormous row space would allocate
+        // more than the buffer itself. Comparison sort is the honest fallback there.
+        //
+        // Compared as a `u64` before any conversion. `max as usize + 1` wraps to zero for a row
+        // id near `u64::MAX`, and a wrapped zero passes both bounds below and then indexes off
+        // the end of a one-element table - which is a memory bug reachable from a row id, not a
+        // theoretical one. `a_row_space_too_wide_to_bucket_falls_back` is that case.
+        let max_row = buf.iter().map(|e| e.0 .0).max().unwrap_or(0);
+        let bucketable = max_row < MAX_BUCKETED_ROWS as u64 && (max_row as usize) < buf.len();
+        if bucketable {
+            return dedup_last(bucket_by_row(buf, max_row as usize + 1));
+        }
+        let mut buf = buf;
+        buf.sort_by_key(|entry| entry.0);
+        return dedup_last(buf);
+    }
+    dedup_last(buf)
+}
+
+/// Above this many distinct rows, the counting sort's table costs more than the sort it saves.
+const MAX_BUCKETED_ROWS: usize = 1 << 16;
+
+/// Stable counting sort by row, then by record within each row.
+fn bucket_by_row(
+    buf: Vec<((RowId, RecordId), bool)>,
+    rows: usize,
+) -> Vec<((RowId, RecordId), bool)> {
+    debug_assert!(!buf.is_empty(), "an empty buffer is sorted and never reaches here");
+    let mut starts = vec![0usize; rows + 1];
+    for entry in &buf {
+        starts[entry.0 .0 as usize + 1] += 1;
+    }
+    for i in 0..rows {
+        starts[i + 1] += starts[i];
+    }
+
+    let mut out = vec![buf[0]; buf.len()];
+    let mut cursor = starts.clone();
+    for entry in buf {
+        let row = entry.0 .0 as usize;
+        out[cursor[row]] = entry;
+        cursor[row] += 1;
+    }
+
+    // Scattering in arrival order leaves each bucket in arrival order, which for a load is
+    // already ascending by record. Checked per bucket rather than assumed, because "already
+    // ascending" is a property of the caller and this function's answer has to be right for
+    // every caller.
+    for row in 0..rows {
+        let bucket = &mut out[starts[row]..starts[row + 1]];
+        if bucket.windows(2).any(|w| w[0].0 .1 > w[1].0 .1) {
+            bucket.sort_by_key(|entry| entry.0 .1);
+        }
+    }
+    out
+}
+
+/// Keeps the last arrival of each key in a buffer already ordered by key.
+///
+/// **Reverse, dedup, reverse - and the obvious improvement measured slower.** `dedup_by` keeps
+/// the *first* of each run, so this reverses to bring the last arrival to the front and reverses
+/// back. That moves every element twice, which looks like exactly the thing to remove: the same
+/// answer comes out of a single forward pass if the predicate swaps, so that the later entry
+/// lands in the earlier slot and the later slot is the one dropped.
+///
+/// Interleaved on one machine, 5,000,000 records, two pairs:
+///
+/// | | pair 1 | pair 2 |
+/// |---|---|---|
+/// | one pass, swapping in the predicate | 37.6s | 27.2s |
+/// | reverse, dedup, reverse | **36.0s** | **25.9s** |
+///
+/// `reverse` is a tight loop over a contiguous buffer and the compiler vectorises it. A
+/// `dedup_by` whose predicate branches and calls `swap` is a comparison and a branch per
+/// element, and it does not. Two vectorised passes beat one scalar pass.
+///
+/// The box drifted 38% between the pairs, which is why they are *pairs* run minutes apart
+/// rather than two timings taken an hour apart, and why the direction is what they are offered
+/// for rather than the margin.
+fn dedup_last<K: PartialEq, V>(mut buf: Vec<(K, V)>) -> Vec<(K, V)> {
+    buf.reverse();
+    buf.dedup_by(|a, b| a.0 == b.0);
+    buf.reverse();
+    buf
 }
 
 /// Collapses a buffer of column edits to one per record, ascending.
@@ -202,6 +490,14 @@ pub struct DbWrite<'db, P: PagerMut> {
     /// Column segments this transaction has touched, keyed exactly as fragments are and
     /// differing only in the view. See [`COLUMN_VIEW`].
     cols: BTreeMap<FragmentKey, ColumnWrite>,
+    /// The scratch an engine records one fact into, reused across facts. See [`Placed::reset`].
+    placed: Placed,
+    /// The last record marked as existing, so a record with four fields buffers the bit once.
+    ///
+    /// **Invalidated wherever `pending` shrinks**, which is `flush_fragment`, `flush_all` and
+    /// `discard`. A memo that outlived the buffer it describes would skip a bit that is no
+    /// longer there, and the record would read back as never written.
+    exists_memo: Option<(TableId, RecordId)>,
     db: &'db Db<P>,
 }
 
@@ -214,6 +510,8 @@ impl<P: PagerMut> Db<P> {
             frags: BTreeMap::new(),
             pending: BTreeMap::new(),
             cols: BTreeMap::new(),
+            placed: Placed::default(),
+            exists_memo: None,
             db: self,
         }
     }
@@ -249,56 +547,34 @@ impl<'db, P: PagerMut> DbWrite<'db, P> {
     }
 
     /// Applies everything buffered for one fragment in a single pass over its tree.
+    /// Applies everything buffered for one fragment in a single pass over its tree.
     fn flush_fragment(&mut self, key: FragmentKey) -> Result<()> {
         let Some(p) = self.pending.remove(&key) else { return Ok(()) };
-        let values = last_per_key(p.values);
-        let bits = last_per_key(p.bits);
+        // Before preparing: the depth `prepare_fragment` expands at is the one this leaves.
+        self.apply_zone(key, &p);
+        self.exists_memo = None;
+        // The single-fragment path, taken by `fragment()` when a caller wants a handle that
+        // reflects what is buffered. It keeps every clear: this is one fragment being settled
+        // mid-transaction rather than a load, so the read that would let it drop them is not
+        // worth the walk.
+        let prepared = prepare_fragment(&self.catalog, key, p, None, 1)?;
+        self.apply_prepared(prepared)
+    }
 
-        // Reserved rather than grown from empty, because the size is known here and the batch is
-        // large: a twenty-bit field over a million records pushes twenty-one million pairs, and
-        // a `Vec` doubling its way there memmoves roughly its own final length in the process.
-        //
-        // Half the total in each, not the whole of it in both. `bits_for` sends every plane to
-        // exactly one of the two, so together they receive `depth + 1` per record and neither
-        // alone can be predicted — but a value sets about half its bits, so half is the estimate
-        // that costs one doubling in the worst case instead of twenty-five, without reserving
-        // twice the memory the pair will ever hold.
-        let depth = self.catalog.fragment(&key).map_or(1, |m| m.bit_depth.max(1)) as usize;
-        let planes = if values.is_empty() { 0 } else { values.len() * (depth + 1) };
-        let each = (planes + bits.len()).div_ceil(2);
-        let mut set = Vec::with_capacity(each);
-        let mut clear = Vec::with_capacity(each);
-
-        if !values.is_empty() {
-            // The depth the catalog ended the transaction on, not the depth each individual
-            // write saw. A record written before the depth grew still gets every plane
-            // accounted for, so overwriting a large value with a small one cannot leave a
-            // stale high bit behind.
-            // Plane-major, which is what keeps the grouping downstream on one container at a
-            // time. See `Bsi::bits_for_all`.
-            Bsi::new(depth as u32).bits_for_all(&values, &mut set, &mut clear)?;
+    /// The half of a flush that has to be serial: it allocates pages and writes trees.
+    fn apply_prepared(&mut self, pr: Prepared) -> Result<()> {
+        if !pr.cells.is_empty() {
+            self.flush_cells(pr.key, pr.cells)?;
         }
-        for ((row, record), on) in &bits {
-            if *on {
-                set.push((*row, *record));
-            } else {
-                clear.push((*row, *record));
-            }
-        }
-
-        if !p.cells.is_empty() {
-            self.flush_cells(key, fold_edits(p.cells))?;
-        }
-
         // A segment-only key has no bitmap half to write. Returning before `fragment_raw`
         // matters: registering it would put a standard-view fragment in the catalog that holds
         // nothing, and every scan would then visit a tree that does not exist.
-        if set.is_empty() && clear.is_empty() && values.is_empty() {
+        if pr.nothing_to_write {
             return Ok(());
         }
-        let mut f = self.fragment_raw(key);
-        f.write_bits(&mut self.txn, set, clear)?;
-        self.save_fragment(key, f);
+        let mut f = self.fragment_raw(pr.key);
+        f.write_grouped(&mut self.txn, pr.set, pr.clear)?;
+        self.save_fragment(pr.key, f);
         Ok(())
     }
 
@@ -352,10 +628,58 @@ impl<'db, P: PagerMut> DbWrite<'db, P> {
         Ok(())
     }
 
+    /// Applies every buffered fragment, preparing them on as many cores as are worth using.
+    ///
+    /// **The split is what makes this safe.** [`prepare_fragment`] reads the catalog and its own
+    /// fragment's buffer and touches nothing else - no pager, no transaction, no shared mutable
+    /// state - so fragments can be prepared in any order and on any thread. Applying them is
+    /// serial and stays serial: one writer allocates the pages, and that is the engine's design
+    /// rather than a lock this could remove.
+    ///
+    /// Order is preserved across the parallel section. Fragments are independent, so the answer
+    /// does not depend on it - but the *file* does, through the order pages are allocated in,
+    /// and a benchmark that produces a different layout on every run is one nobody can compare.
     fn flush_all(&mut self) -> Result<()> {
-        let keys: Vec<FragmentKey> = self.pending.keys().copied().collect();
-        for key in keys {
-            self.flush_fragment(key)?;
+        let pending = core::mem::take(&mut self.pending);
+        self.exists_memo = None;
+        if pending.is_empty() {
+            return Ok(());
+        }
+
+        // **The zone maps first, and all of them.** `prepare_fragment` reads the bit depth a
+        // fragment ended the transaction on, so a value observed after the fragment beside it
+        // was prepared would be expanded at yesterday's depth. Settling every one of them here
+        // is one pass over a map of a few hundred entries.
+        for (key, p) in &pending {
+            self.apply_zone(*key, p);
+        }
+
+        // **Read before preparing, because preparing cannot read.**
+        //
+        // A bit-sliced value writes a *clear* for every zero plane, and a clear is only needed
+        // where something might already be there. This asks each fragment which records it
+        // already holds - one row read, `EXISTS_ROW`, walked once - so the preparation can drop
+        // the clears for records that are new. On an append-only load that is every clear.
+        //
+        // Serial and here rather than inside `prepare_fragment`, which runs on other threads and
+        // is pure by design: reading the row needs the transaction, and handing a transaction to
+        // several threads is the thing the single writer exists to prevent.
+        let mut held: BTreeMap<FragmentKey, RowSet> = BTreeMap::new();
+        for (key, p) in &pending {
+            // Only a bit-sliced fragment produces clears, and only one with a root has anything
+            // to clear. Calling `fragment_raw` on the others would register empty fragments in
+            // the catalog, which is the mistake `apply_prepared` returns early to avoid.
+            if p.values.is_empty() {
+                continue;
+            }
+            let f = self.fragment_raw(*key);
+            if let Some(r) = f.reader(&self.txn) {
+                held.insert(*key, r.row(EXISTS_ROW)?);
+            }
+        }
+
+        for prepared in prepare_all(&self.catalog, pending, &held)? {
+            self.apply_prepared(prepared)?;
         }
         Ok(())
     }
@@ -397,21 +721,6 @@ impl<'db, P: PagerMut> DbWrite<'db, P> {
     /// calls for one record are two values it now holds, not the second replacing the first.
     fn buffer_cell(&mut self, key: FragmentKey, record: RecordId, edit: ColEdit) {
         self.pending.entry(key).or_default().cells.push((record, edit));
-    }
-
-    /// Resolves a write to the field it names and the fragment it lands in.
-    ///
-    /// Every setter started with these three lines and then diverged, which is how `set_bool`
-    /// and `set_key` ended up without the kind check `set_int` had.
-    fn target(
-        &self,
-        table: &str,
-        field: &str,
-        record: RecordId,
-    ) -> Result<(TableId, FieldDef, FragmentKey)> {
-        let (t, def) = resolve(&self.catalog, table, field)?;
-        let key = self.key(t, def.id, shard_of(record));
-        Ok((t, def, key))
     }
 
     /// Resolves a field once, for a caller about to write many facts at it.
@@ -461,30 +770,59 @@ impl<'db, P: PagerMut> DbWrite<'db, P> {
         record: RecordId,
         fact: big_engine::base::engine::Fact<'_>,
     ) -> Result<()> {
-        let mut placed = Placed::default();
-        self.engine(t).spec().place(&mut placed, fact);
+        // **Written into where it lives, not moved out and back.** The first version of this
+        // took the scratch with `mem::take` and put it back at the end, which is two copies of
+        // the whole struct per fact - two `Vec` headers, four `Option<u64>` and an
+        // `Option<ColEdit>` that owns a `Vec` of its own. A call graph put those copies at 6% of
+        // the daemon, more than the three allocations the scratch exists to avoid. The engine
+        // descriptor is `&'static`, so resolving it first ends the borrow of `self` before the
+        // scratch is borrowed, and the two field borrows below are disjoint.
+        let spec = self.engine(t).spec();
+        self.placed.reset();
+        spec.place(&mut self.placed, fact);
 
         let shard = shard_of(record);
         let key = self.key(t, def.id, shard);
-        if let Some(v) = placed.observe_bitmap {
-            self.catalog.fragment_mut(key).observe(v);
+        // **One descent, for everything this fact leaves at its fragment.** The zone map, the
+        // value and the bits all address the same fragment, and each used to find it on its own
+        // - two walks of `pending` and one of the catalog, per fact, for a key already in hand.
+        let placed = &self.placed;
+        if placed.observe_bitmap.is_some()
+            || placed.observe_columns.is_some()
+            || placed.planes.is_some()
+            || !placed.bits.is_empty()
+        {
+            // Two fields of `self`, borrowed at once. Disjoint field borrows are what make this
+            // spelling possible at all, and they are why the scratch has to stay a field rather
+            // than be handed to a method.
+            let p = self.pending.entry(key).or_default();
+            if let Some(v) = placed.observe_bitmap {
+                note_zone(&mut p.observe, v);
+            }
+            if let Some(v) = placed.observe_columns {
+                note_zone(&mut p.observe_cols, v);
+            }
+            if let Some(v) = placed.planes {
+                p.values.push((record, v));
+            }
+            for (row, on) in &placed.bits {
+                p.bits.push(((*row, record), *on));
+            }
         }
-        if let Some(v) = placed.observe_columns {
-            self.catalog.fragment_mut(self.column_key(t, def.id, shard)).observe(v);
+        let mutex = placed.mutex;
+        // Moved out only when there is something to move. A time quantum field is the only one
+        // that fills `bits_in`, and `buffer_bit` needs `&mut self`, so the empty case - which is
+        // every other field kind - must not pay for the `take` that case would need.
+        if !self.placed.bits_in.is_empty() {
+            for (view, row, on) in core::mem::take(&mut self.placed.bits_in) {
+                self.buffer_bit(FragmentKey { view, ..key }, row, record, on);
+            }
         }
-        if let Some(v) = placed.planes {
-            self.pending.entry(key).or_default().values.push((record, v));
-        }
-        for (row, on) in placed.bits {
-            self.buffer_bit(key, row, record, on);
-        }
-        for (view, row, on) in placed.bits_in {
-            self.buffer_bit(FragmentKey { view, ..key }, row, record, on);
-        }
-        if let Some(row) = placed.mutex {
+        let cell = self.placed.cell.take();
+        if let Some(row) = mutex {
             self.apply_mutex(key, record, row)?;
         }
-        if let Some(edit) = placed.cell {
+        if let Some(edit) = cell {
             self.buffer_cell(self.column_key(t, def.id, shard), record, edit);
         }
         Ok(())
@@ -508,8 +846,38 @@ impl<'db, P: PagerMut> DbWrite<'db, P> {
     }
 
     fn mark_exists_at(&mut self, table: TableId, record: RecordId) {
+        // **The repeat is skipped on the record, not on the fragment key.** The memo this
+        // replaced compared a `FragmentKey` - four fields, and it lost to the push it was
+        // avoiding. A table id and a record id are two integers, and they answer the same
+        // question: every setter of one record marks the same existence bit, so only the first
+        // has anything to say.
+        //
+        // A miss is harmless rather than wrong. Records arriving interleaved defeat the memo and
+        // buffer the bit again, which is what `last_per_bit` collapses; the saving is a property
+        // of the ordinary case, the correctness is not.
+        if self.exists_memo == Some((table, record)) {
+            return;
+        }
+        self.exists_memo = Some((table, record));
         let key = self.key(table, EXISTS_FIELD, shard_of(record));
         self.buffer_bit(key, EXISTS_ROW, record, true);
+    }
+
+    /// Applies one fragment's folded zone map to the catalog. See [`Pending::observe`].
+    ///
+    /// Both ends, because `FragmentMeta::observe` folds a single value: the pair is the whole
+    /// of what the batch saw, and the bit depth follows from the larger of them.
+    fn apply_zone(&mut self, key: FragmentKey, p: &Pending) {
+        if let Some((lo, hi)) = p.observe {
+            let m = self.catalog.fragment_mut(key);
+            m.observe(lo);
+            m.observe(hi);
+        }
+        if let Some((lo, hi)) = p.observe_cols {
+            let m = self.catalog.fragment_mut(FragmentKey { view: COLUMN_VIEW, ..key });
+            m.observe(lo);
+            m.observe(hi);
+        }
     }
 
     pub fn set_int(
@@ -563,8 +931,14 @@ impl<'db, P: PagerMut> DbWrite<'db, P> {
         record: RecordId,
         value: i64,
     ) -> Result<()> {
-        let (t, def, _) = self.target(table, field, record)?;
-        expect_kind(&def, field, FieldKind::is_signed, "signed int")?;
+        let at = self.at(table, field)?;
+        self.set_signed_at(&at, record, value)
+    }
+
+    /// The same, at a field resolved once. See [`At`].
+    pub fn set_signed_at(&mut self, at: &At, record: RecordId, value: i64) -> Result<()> {
+        let (t, def) = (at.table, &at.def);
+        expect_kind(def, &def.name, FieldKind::is_signed, "signed int")?;
 
         let declared = if def.bit_depth == 0 { 64 } else { def.bit_depth };
         let stored =
@@ -577,7 +951,7 @@ impl<'db, P: PagerMut> DbWrite<'db, P> {
         // Everything below sees the *stored* value, which is what makes the zone map work
         // unchanged: the encoding is monotonic, so a window in stored space is the same window in
         // value space.
-        self.route(t, &def, record, Fact::Value { value: stored, kind: def.kind })?;
+        self.route(t, def, record, Fact::Value { value: stored, kind: def.kind })?;
         self.mark_exists_at(t, record);
         Ok(())
     }
@@ -614,6 +988,36 @@ impl<'db, P: PagerMut> DbWrite<'db, P> {
     ) -> Result<RowId> {
         let at = self.at(table, field)?;
         self.set_key_at(&at, record, value)
+    }
+
+    /// Interns a key at a field resolved once, and writes nothing.
+    ///
+    /// For a caller replaying many facts that name the same handful of keys: interning is
+    /// idempotent, so `set_key_at` per fact asks the catalog to look up a string it has already
+    /// been given - two map lookups and a string hash - to be told the row it was told last
+    /// time. Resolving each distinct key once and writing through [`set_row_at`] moves that off
+    /// the per-fact path entirely.
+    ///
+    /// [`set_row_at`]: DbWrite::set_row_at
+    pub fn intern_key_at(&mut self, at: &At, value: &str) -> Result<RowId> {
+        expect_kind(&at.def, &at.def.name, FieldKind::is_keyed, "set, mutex or time quantum")?;
+        Ok(self.catalog.keys.intern(at.table, at.def.id, value)?)
+    }
+
+    /// Sets the bit for a row this transaction has already interned. See [`intern_key_at`].
+    ///
+    /// Identical to [`set_key_at`] in every respect but the lookup - same kind check, same
+    /// routing, same exists bit - so a mutex still reads its shadow and a caller cannot use this
+    /// to bypass a rule the keyed path enforces.
+    ///
+    /// [`intern_key_at`]: DbWrite::intern_key_at
+    /// [`set_key_at`]: DbWrite::set_key_at
+    pub fn set_row_at(&mut self, at: &At, record: RecordId, row: RowId) -> Result<()> {
+        let (t, def) = (at.table, &at.def);
+        expect_kind(def, &def.name, FieldKind::is_keyed, "set, mutex or time quantum")?;
+        self.route(t, def, record, Fact::Row { row, kind: def.kind, views: &[] })?;
+        self.mark_exists_at(t, record);
+        Ok(())
     }
 
     /// The same, at a field resolved once. See [`At`].
@@ -804,6 +1208,7 @@ impl<'db, P: PagerMut> DbWrite<'db, P> {
             // Anything buffered or cached for this fragment is about to become a root record
             // pointing at freed pages, so it goes first.
             self.pending.remove(key);
+            self.exists_memo = None;
             self.frags.remove(key);
             self.cols.remove(key);
             if let Some(root) = self.txn.root(key) {
@@ -965,5 +1370,81 @@ impl<'db, P: PagerMut> DbWrite<'db, P> {
         let id = self.txn.commit()?;
         *self.db.catalog.write().unwrap() = self.catalog;
         Ok(id)
+    }
+}
+
+#[cfg(test)]
+mod bit_order_tests {
+    use super::*;
+
+    /// What `last_per_bit` has to agree with, written out rather than borrowed.
+    ///
+    /// Deliberately the slow, obvious implementation: sort, reverse, keep the first of each run,
+    /// reverse back. Calling `last_per_key` instead would share `dedup_last` with the code under
+    /// test, and a reference that shares the suspect's machinery proves nothing about it.
+    fn reference(mut buf: Vec<((RowId, RecordId), bool)>) -> Vec<((RowId, RecordId), bool)> {
+        buf.sort_by_key(|entry| entry.0);
+        buf.reverse();
+        buf.dedup_by(|a, b| a.0 == b.0);
+        buf.reverse();
+        buf
+    }
+
+    fn mixer(state: &mut u64) -> u64 {
+        *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = *state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    #[test]
+    fn rows_that_jump_about_are_still_ordered() {
+        // The shape a keyed field actually produces: records ascending, rows arbitrary.
+        let buf: Vec<((RowId, RecordId), bool)> =
+            (0..1000u64).map(|i| ((i % 7, i), true)).collect();
+        assert_eq!(last_per_bit(buf.clone()), reference(buf));
+    }
+
+    #[test]
+    fn the_last_arrival_wins() {
+        // Three writes to one bit, the last of them clearing it. Getting this backwards would
+        // set a bit the caller asked to clear, and nothing downstream would notice.
+        let buf = vec![((3u64, 9u64), true), ((3, 9), false), ((3, 9), true), ((3, 9), false)];
+        assert_eq!(last_per_bit(buf), vec![((3, 9), false)]);
+    }
+
+    #[test]
+    fn a_bucket_out_of_order_is_sorted_rather_than_trusted() {
+        // Records descending inside one row - which a bulk caller can produce even though a
+        // load does not. Scattering alone would leave this bucket unsorted.
+        let buf: Vec<((RowId, RecordId), bool)> =
+            (0..64u64).rev().map(|i| ((1u64, i), true)).collect();
+        assert_eq!(last_per_bit(buf.clone()), reference(buf));
+    }
+
+    #[test]
+    fn it_agrees_with_the_reference_on_random_input() {
+        let mut state = 0x1234_5678_9ABC_DEF0u64;
+        for case in 0..200 {
+            let n = (mixer(&mut state) % 400) as usize;
+            // Rows deliberately narrow so keys repeat and the dedup is exercised.
+            let buf: Vec<((RowId, RecordId), bool)> = (0..n)
+                .map(|_| {
+                    let row = mixer(&mut state) % 9;
+                    let rec = mixer(&mut state) % 40;
+                    ((row, rec), mixer(&mut state) & 1 == 0)
+                })
+                .collect();
+            assert_eq!(last_per_bit(buf.clone()), reference(buf), "case {case}");
+        }
+    }
+
+    #[test]
+    fn a_row_space_too_wide_to_bucket_falls_back() {
+        // One entry, one enormous row id: the bucket table would be gigabytes, so the
+        // comparison sort has to take over. A panic or an allocation failure here is the bug.
+        let buf = vec![((u64::MAX, 1u64), true), ((0, 2), true)];
+        assert_eq!(last_per_bit(buf.clone()), reference(buf));
     }
 }

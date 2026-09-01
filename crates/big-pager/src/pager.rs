@@ -15,6 +15,7 @@
 //! The storage boundary. Everything above knows only these two traits, not mmap or files.
 
 use crate::error::Result;
+use crate::io::IoStats;
 use big_page::{Page, Pgno};
 use core::ops::Deref;
 
@@ -51,6 +52,21 @@ pub trait Pager {
     /// The default recomputes every time. Always correct, never wrong, just slow.
     fn verify_bitmap(&self, _pgno: Pgno, page: &Page, expected: u32) -> bool {
         big_page::bitmap_page_checksum(page) == expected
+    }
+
+    /// What this backend has done to the disk since it was opened, if it counts.
+    ///
+    /// **The backend counts, not the layer above.** A call into `read` is not an I/O, and how
+    /// much of one it is differs per backend by more than a constant: a mapped read copies
+    /// nothing and may not touch the disk at all, a file read is a syscall and 8 KiB, a
+    /// key-value read is a lookup in somebody else's b-tree. Only the implementation can say,
+    /// so only the implementation is asked.
+    ///
+    /// `None` means this backend does not keep the count - which is the honest answer for a
+    /// pager with no disk under it - and a caller reporting metrics should omit the series
+    /// rather than publish zeroes that look like an idle database.
+    fn io_stats(&self) -> Option<IoStats> {
+        None
     }
 }
 

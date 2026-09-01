@@ -40,6 +40,7 @@ use crate::matches::Matches;
 use big_engine::bitmap::field::{
     bsi::EXISTS_ROW, BoolField, Bsi, Granularity, MutexField, RangeOp,
 };
+use big_engine::bitmap::write::{group_offsets, merge_grouped, Grouped};
 use big_engine::bitmap::{
     Container, ContainerKey, FragmentKey, FragmentRead, FragmentWrite, RowSet,
 };

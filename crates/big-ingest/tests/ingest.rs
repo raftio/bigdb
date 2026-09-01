@@ -306,6 +306,13 @@ fn a_checkpoint_from_another_load_is_refused_rather_than_applied() {
 /// connection nobody is reading, so the client's own deadline ends it - which is exactly the
 /// case Decision 4 covers: `bigd` may or may not have committed that chunk, and re-sending it
 /// is correct either way.
+///
+/// **`--in-flight 1`, stated rather than inherited.** Every count below - three answered, an
+/// offset of exactly thirty lines, nine requests left, seventy lines re-read - is arithmetic
+/// that only holds while one request is outstanding at a time. Under a wider window the client
+/// needs a request the server was never told to answer, and the test hangs instead of failing;
+/// that is what happened when `DEFAULT_IN_FLIGHT` moved to two. The windowed case is
+/// `a_windowed_load_resumes_without_losing_a_record`, which deliberately predicts nothing.
 #[test]
 fn an_interrupted_load_resumes_where_it_stopped() {
     let server =
@@ -320,6 +327,8 @@ fn an_interrupted_load_resumes_where_it_stopped() {
         path.as_str(),
         "--chunk-lines",
         "10",
+        "--in-flight",
+        "1",
         "--resume",
         check.to_str().unwrap(),
         "--retries",
@@ -359,4 +368,66 @@ fn an_interrupted_load_resumes_where_it_stopped() {
     // A finished load leaves no checkpoint: one that stayed would make the same command run
     // again do nothing, which looks exactly like a load that worked.
     assert!(big_ingest::Checkpoint::read(&check).unwrap().is_none());
+}
+
+/// A window in flight loses nothing when the load is interrupted and resumed.
+///
+/// **The test the window exists to earn.** With `--in-flight` above one the acknowledgements
+/// stop being the only thing outstanding: a killed run has chunks the server may or may not
+/// have written, and the checkpoint may only advance across a *contiguous* run of successes. A
+/// checkpoint that jumped to the furthest acknowledgement instead would skip whatever gap sat
+/// behind it, and the load would come back short with nothing anywhere saying so.
+///
+/// So this asserts the only thing that settles it: after the interruption and the resume, every
+/// record is there.
+#[test]
+fn a_windowed_load_resumes_without_losing_a_record() {
+    let server =
+        Arc::new(Server::bind_with(database(), "127.0.0.1:0", ServerConfig::default()).unwrap());
+    let addr = server.local_addr().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = write(dir.path(), "facts", &facts(1..=100));
+    let check = dir.path().join("windowed.ck");
+    let args = [
+        "import",
+        "tx",
+        path.as_str(),
+        "--chunk-lines",
+        "10",
+        "--in-flight",
+        "3",
+        "--resume",
+        check.to_str().unwrap(),
+        "--retries",
+        "0",
+        "--timeout",
+        "1",
+    ];
+
+    // Cut short mid-window: three answered, and whatever else the window had sent is left
+    // unanswered until the client's own timeout gives up on it.
+    let first = Arc::clone(&server);
+    std::thread::spawn(move || {
+        let _ = first.serve_n(3);
+    });
+    let r = run(addr, &args);
+    assert_eq!(r.code, exit::UNREACHABLE, "{}\n{}", r.out, r.err);
+
+    // The checkpoint is a contiguous prefix, so it can only be a whole number of chunks and
+    // never past what was acknowledged.
+    let found = big_ingest::Checkpoint::read(&check).unwrap().expect("a checkpoint was written");
+    assert!(found.offset <= (30 * LINE) as u64, "checkpoint ran ahead: {}", found.offset);
+    assert_eq!(found.offset as usize % LINE, 0, "checkpoint fell inside a line");
+
+    // Generous, and not joined: what the window left in the backlog is not a number this test
+    // should have to predict, and predicting it wrong would hang rather than fail.
+    let second = Arc::clone(&server);
+    std::thread::spawn(move || {
+        let _ = second.serve_n(64);
+    });
+    let r = run(addr, &args);
+    assert_eq!(r.code, exit::OK, "{}\n{}", r.out, r.err);
+
+    // The whole point: nothing was skipped over.
+    assert_eq!(counted(addr), 100, "a record went missing across the resume");
 }
