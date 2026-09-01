@@ -154,7 +154,9 @@ impl<P: PagerMut + Sync> Cluster<P> {
         // The schema first, or nothing else can land: a fragment belongs to a field, and a
         // node that was away while the field was created has never heard of it.
         let mut moved = self.match_schema(source, target)?;
-        for table in self.pull_schema(source)? {
+        // The views came across with `match_schema` and hold no bits, so only the tables have
+        // anything left to move.
+        for table in self.pull_schema(source)?.0 {
             // The keys first. A fragment is rows of bits, and a row is a number until
             // something says which string it stands for.
             let keys = self.pull_keys(source, &table.name)?;
@@ -204,8 +206,8 @@ impl<P: PagerMut + Sync> Cluster<P> {
     /// created with a different kind while this copy was away - ends up as the source has it
     /// rather than as a conflict.
     pub(super) fn match_schema(&self, source: usize, target: usize) -> Result<usize> {
-        let mine = self.pull_schema(source)?;
-        let theirs = self.pull_schema(target)?;
+        let (mine, my_views) = self.pull_schema(source)?;
+        let (theirs, their_views) = self.pull_schema(target)?;
         let mut changes = 0;
 
         for table in &mine {
@@ -259,12 +261,36 @@ impl<P: PagerMut + Sync> Cluster<P> {
                 }
             }
         }
+
+        // Views last, and after the tables in both directions, because a view is created over a
+        // table that has to be there first - `Api::create_view` refuses one that names nothing.
+        for view in &my_views {
+            let name = view.qualified();
+            // Text compared rather than just the name: a view redefined while this copy was
+            // away holds a different statement under the same name, and a repair that only
+            // matched names would leave the two nodes answering differently.
+            if their_views.iter().any(|v| v.qualified() == name && v.text == view.text) {
+                continue;
+            }
+            self.tell(target, &Ddl::CreateView { view: name, text: view.text.clone() })?;
+            changes += 1;
+        }
+        for view in &their_views {
+            let name = view.qualified();
+            if !my_views.iter().any(|v| v.qualified() == name) {
+                self.tell(target, &Ddl::DropView { view: name })?;
+                changes += 1;
+            }
+        }
         Ok(changes)
     }
 
-    pub(super) fn pull_schema(&self, node: usize) -> Result<Vec<big_api::TableInfo>> {
+    pub(super) fn pull_schema(
+        &self,
+        node: usize,
+    ) -> Result<(Vec<big_api::TableInfo>, Vec<big_api::ViewInfo>)> {
         if node == self.config.this_index() {
-            return Ok(self.api.schema());
+            return Ok((self.api.schema(), self.api.views()));
         }
         let bytes = self.ask(node, path::SCHEMA, &[], None)?;
         self.read(node, || wire::get_schema(&bytes))

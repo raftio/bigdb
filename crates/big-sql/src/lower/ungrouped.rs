@@ -16,10 +16,10 @@
 
 use super::measure::units_of;
 use super::pql::{as_call, call_of, field_arg, named};
-use super::{answer, rows_of, Ask, Calls, Probe, Statement, MAX_PROJECTION};
+use super::{answer, rows_of, Ask, Calls, Probe, Statement};
 use crate::ast::{Item, Name, Proj, Select};
 use crate::error::{Refused, Result, SqlError};
-use crate::shape::{Cell, Of, Selected, Shape, Units};
+use crate::shape::{Cell, Columns, Of, Selected, Shape, Units};
 use big_plan::ast::{Expr, Literal};
 
 /// `SELECT *`, or aggregates over the whole filtered set.
@@ -45,39 +45,45 @@ pub(super) fn ungrouped(
             return Err(SqlError::Refused { what: Refused::Shape, at: first.at });
         }
         if let Some(order) = &select.order_by {
-            // Sorting a projection means reading every matching record's value before the cut
-            // rather than after it, which is the cost the mandatory limit exists to bound.
+            // Sorting a projection means materialising every matching record's value and then
+            // ordering it, which is a sort this surface has no operator behind - the values are
+            // reconstructed a record at a time, in record order, and nothing holds them.
             return Err(SqlError::Refused { what: Refused::Order, at: order.at });
         }
         if select.offset.is_some() {
             return Err(SqlError::Refused { what: Refused::Offset, at: first.at });
         }
-        // **The limit is required, and it is required here rather than defaulted.** A
-        // projection costs a point read per record per column; without a cut that is the whole
-        // table, and a default would be this surface choosing how much of it to pay for.
-        let Some(limit) = select.limit.filter(|n| *n as usize <= MAX_PROJECTION && *n > 0) else {
-            return Err(SqlError::Refused { what: Refused::Projection, at: first.at });
-        };
+        // **The limit is optional, and its absence is a full scan.** A projection costs a point
+        // read per record per column, so a statement without a `LIMIT` reads every matching
+        // record at that price - which is what `SELECT <column> FROM t` asks for everywhere
+        // else, and what somebody who writes it here means. The cut is still part of the plan
+        // rather than a view of the answer, because it bounds the reads rather than trimming
+        // them afterwards.
+        let limit = select.limit;
 
         let mut args = vec![rows.clone()];
         args.extend(columns.iter().map(|(_, name)| field_arg(name)));
-        args.push(named("n", Expr::Literal(Literal::Int(limit))));
+        if let Some(limit) = limit {
+            args.push(named("n", Expr::Literal(Literal::Int(limit))));
+        }
         return Ok(Statement {
             calls: vec![Ask { table: table.to_string(), call: call_of("Project", args) }],
             probes: Vec::new(),
             answer: answer(
                 select,
                 Shape::Table {
-                    columns: columns
-                        .iter()
-                        .map(|(item, name)| Selected {
-                            column: item.column(),
-                            units: Units::Written {
-                                table: table.to_string(),
-                                field: name.column.clone(),
-                            },
-                        })
-                        .collect(),
+                    columns: Columns::Named(
+                        columns
+                            .iter()
+                            .map(|(item, name)| Selected {
+                                column: item.column(),
+                                units: Units::Written {
+                                    table: table.to_string(),
+                                    field: name.column.clone(),
+                                },
+                            })
+                            .collect(),
+                    ),
                 },
             ),
         });
@@ -93,16 +99,30 @@ pub(super) fn ungrouped(
             return Err(SqlError::Refused { what: Refused::Offset, at: item.at });
         }
         if let Some(order) = &select.order_by {
-            // Records come back in id order and there is nothing to sort them by: the values
-            // that would order them are exactly the ones this surface does not materialise.
+            // The values that would order the rows are read back a record at a time, in record
+            // order, and nothing holds them - the same sort a named projection is refused.
             return Err(SqlError::Refused { what: Refused::Order, at: order.at });
         }
+        // `SELECT *` is every column the table declares, and the list is not written here
+        // because nothing here knows the table. Both halves of the answer say so and both are
+        // filled in against a schema: a `Project` with no `field=` for the plan, and
+        // `Columns::All` for the header. A table with nothing a projection could read falls
+        // back to record ids on both sides, which is what `*` answered before it expanded.
+        let mut args = vec![rows.clone()];
+        if let Some(limit) = select.limit {
+            args.push(named("n", Expr::Literal(Literal::Int(limit))));
+        }
         return Ok(Statement {
-            calls: vec![Ask { table: table.to_string(), call: as_call(rows.clone()) }],
+            calls: vec![Ask { table: table.to_string(), call: call_of("Project", args) }],
             probes: Vec::new(),
             answer: answer(
                 select,
-                Shape::Records { column: item.column(), limit: select.limit.map(|n| n as usize) },
+                Shape::Table {
+                    columns: Columns::All {
+                        table: table.to_string(),
+                        limit: select.limit.map(|n| n as usize),
+                    },
+                },
             ),
         });
     }

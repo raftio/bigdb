@@ -1,0 +1,205 @@
+# A `SELECT` kept under a name.
+#
+# A view here is **inlined** into the statement that reads it: the base table replaces the
+# view's name, the two `WHERE`s are ANDed, and the reader's columns are renamed through the
+# view's select list. There is no subquery below this crate to nest one in, so that substitution
+# is the whole of what a view can be - which is why a body is a filter and a projection over one
+# table and nothing else.
+#
+# This crate holds no catalog, so nothing here is expanded. What these cases pin is the two
+# statements and the body rule; the substitution itself is `big-api`'s, in `tests/views.rs`.
+#
+# The body is stored as **text**, sliced from the statement as it was written, and re-parsed at
+# every read. That is what `SHOW CREATE VIEW` answers with, and it is why the printer below
+# shows the exact string that goes to disk.
+
+## Creating and dropping.
+
+ddl
+CREATE VIEW big AS SELECT amount, country FROM tx WHERE amount >= 500
+----
+CreateView big
+└── SELECT amount, country FROM tx WHERE amount >= 500
+
+ddl
+DROP VIEW big
+----
+DropView big
+
+# `IF NOT EXISTS` leaves what is there; `OR REPLACE` overwrites it. Opposite answers to one
+# situation, so writing both is a syntax error rather than a precedence rule to remember.
+
+ddl
+CREATE VIEW IF NOT EXISTS big AS SELECT amount FROM tx
+----
+CreateView big if_not_exists
+└── SELECT amount FROM tx
+
+ddl
+CREATE OR REPLACE VIEW big AS SELECT amount FROM tx
+----
+CreateView big or_replace
+└── SELECT amount FROM tx
+
+error
+CREATE OR REPLACE VIEW IF NOT EXISTS big AS SELECT amount FROM tx
+----
+parse_error
+
+ddl
+DROP VIEW IF EXISTS big
+----
+DropView big if_exists
+
+## A view is in a database, the way a table is.
+
+ddl
+CREATE VIEW sales.big AS SELECT amount FROM sales.orders
+----
+CreateView sales.big
+└── SELECT amount FROM sales.orders
+
+ddl
+DROP VIEW sales.big
+----
+DropView sales.big
+
+# A body may name a table in another database. Nothing forbids it for the same reason nothing
+# forbids a cross-database join: a database is a namespace, not a storage boundary.
+
+ddl
+CREATE VIEW sales.mirror AS SELECT amount FROM ops.events
+----
+CreateView sales.mirror
+└── SELECT amount FROM ops.events
+
+## Renaming, which is the other half of what a view is for.
+
+ddl
+CREATE VIEW big AS SELECT amount AS amt, country AS cc FROM tx WHERE amount >= 500
+----
+CreateView big
+└── SELECT amount AS amt, country AS cc FROM tx WHERE amount >= 500
+
+## What a body may not be.
+##
+## Every one of these is refused for one reason: a view is inlined, and a clause that cannot
+## survive being substituted into the outer statement is a clause whose answer would have to
+## exist before that statement ran. That is a materialised view, and a different feature.
+
+# An aggregate. Nothing to inline it into: `count(*) FROM v` would be a count of a count.
+error
+CREATE VIEW v AS SELECT count(*) FROM t
+----
+sql_view_body
+
+error
+CREATE VIEW v AS SELECT sum(amount) FROM t
+----
+sql_view_body
+
+# `*` here means the **record id**, not every column - so a body written with one would expose a
+# single column and not the one anybody meant. A view names what it exposes.
+error
+CREATE VIEW v AS SELECT * FROM t
+----
+sql_view_body
+
+# Grouping. The rows a group produces are not records for an outer `WHERE` to narrow.
+error
+CREATE VIEW v AS SELECT country FROM t GROUP BY country
+----
+sql_view_body
+
+# A join in the body. The outer statement may have a star of its own, and two stars are not one
+# star - so the substitution has nowhere to put this one.
+error
+CREATE VIEW v AS SELECT a.amount FROM t a JOIN u b ON a.k = b.k
+----
+sql_view_body
+
+# Ordering and paging. Both are about which rows come back, and a view produces no rows until
+# something reads it - so an outer `LIMIT` and this one would be two answers to one question.
+error
+CREATE VIEW v AS SELECT amount FROM t ORDER BY amount
+----
+sql_view_body
+
+error
+CREATE VIEW v AS SELECT amount FROM t LIMIT 10
+----
+sql_view_body
+
+error
+CREATE VIEW v AS SELECT amount FROM t OFFSET 5
+----
+sql_view_body
+
+# `FORMAT` is about the bytes an answer is written as, and a view is never written out.
+error
+CREATE VIEW v AS SELECT amount FROM t FORMAT TSV
+----
+sql_view_body
+
+# A per-entry `FILTER` narrows one aggregate, and a body has no aggregates to narrow - so it is
+# refused before the body rule is reached, by the clause that says a `FILTER` needs one.
+error
+CREATE VIEW v AS SELECT amount FILTER (WHERE amount > 5) FROM t
+----
+sql_unsupported
+
+# A view is one `SELECT`. A `UNION` is two, and there is nothing to substitute two of.
+error
+CREATE VIEW v AS SELECT a FROM t UNION ALL SELECT a FROM u
+----
+sql_view_body
+
+# A body has to be a `SELECT` at all.
+error
+CREATE VIEW v AS INSERT INTO t (a) VALUES (1)
+----
+parse_error
+
+error
+CREATE VIEW v
+----
+parse_error
+
+## Listings.
+
+show
+SHOW VIEWS
+----
+Views
+
+show
+SHOW VIEWS FROM sales
+----
+Views sales
+
+# `SHOW CREATE x` looks the name up as either a table or a view, which is what somebody
+# exploring means by it. Naming the kind is how they say that the other one would be wrong.
+
+show
+SHOW CREATE VIEW big
+----
+Create big view
+
+show
+SHOW CREATE big
+----
+Create big
+
+# A view answers `DESCRIBE` too, with the columns it exposes rather than the base table's - a
+# `DESCRIBE` that listed the columns a view exists to hide would undo the view. Which of the two
+# a name is is the catalog's to know, so this parses to the same question either way.
+
+show
+DESCRIBE big
+----
+Columns big
+
+show
+SHOW VIEWS FORMAT TSV
+----
+Views format=tsv

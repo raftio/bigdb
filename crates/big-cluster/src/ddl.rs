@@ -43,6 +43,14 @@ impl<P: PagerMut + Sync> Cluster<P> {
         self.api.schema()
     }
 
+    /// Every view this node holds, with the statement each carries.
+    ///
+    /// This node's own, like [`Cluster::schema`]: a schema change reaches every node before it
+    /// is answered, so a listing has no one to ask.
+    pub fn views(&self) -> Vec<big_api::ViewInfo> {
+        self.api.views()
+    }
+
     /// Creates a table under the default engine.
     pub fn create_table(&self, table: &str) -> Result<u64> {
         self.create_table_with(table, big_api::TableEngine::default())
@@ -119,13 +127,51 @@ impl<P: PagerMut + Sync> Cluster<P> {
                 big_db::DbError::DropDefaultDatabase,
             )));
         }
-        let held = self.schema().iter().filter(|t| t.database == name).count();
+        // Views count too, the same way they do in `Catalog::drop_database`: a `RESTRICT` that
+        // was about tables only would drop a database still holding statements somebody wrote.
+        let held = self.schema().iter().filter(|t| t.database == name).count()
+            + self.api.views().iter().filter(|v| v.database == name).count();
         if held > 0 && !cascade {
             return Err(ClusterError::Local(big_api::ApiError::Db(
                 big_db::DbError::DatabaseNotEmpty { database: name.to_string(), tables: held },
             )));
         }
         self.ddl(&Ddl::DropDatabase { name: name.to_string() }).map(|n| n == 1)
+    }
+
+    /// Stores a `SELECT` under a name everywhere.
+    ///
+    /// **`IF NOT EXISTS` and `OR REPLACE` are both decided here and only here**, for the reason
+    /// [`Cluster::drop_database_if_empty`] states: the definition that is already there is the
+    /// leader's to see, and a peer re-deciding against its own copy could refuse a change the
+    /// leader has already made. What travels is [`Ddl::CreateView`], which always replaces.
+    ///
+    /// `Ok(false)` means the name already held this statement and nothing was created.
+    pub fn create_view(
+        &self,
+        view: &str,
+        text: &str,
+        or_replace: bool,
+        if_not_exists: bool,
+    ) -> Result<bool> {
+        let existing = self.api.views().into_iter().find(|v| v.qualified() == view);
+        if let Some(existing) = existing {
+            if if_not_exists || existing.text == text {
+                return Ok(false);
+            }
+            if !or_replace {
+                return Err(ClusterError::Local(big_api::ApiError::Db(
+                    big_db::DbError::ViewRedefined(view.to_string()),
+                )));
+            }
+        }
+        self.ddl(&Ddl::CreateView { view: view.to_string(), text: text.to_string() })
+            .map(|n| n == 1)
+    }
+
+    /// Forgets a view everywhere. `Ok(false)` means there was no such view.
+    pub fn drop_view(&self, view: &str) -> Result<bool> {
+        self.ddl(&Ddl::DropView { view: view.to_string() }).map(|n| n == 1)
     }
 
     /// `Ok(false)` means there was no such table - at the leader, which is the node whose
@@ -245,5 +291,10 @@ pub fn apply_ddl<P: PagerMut + Sync>(api: &Api<P>, op: &Ddl) -> big_api::Result<
         // what reaches a peer is a change already ruled legal. A peer re-deciding it against
         // its own table count would be a second opinion, and the two could differ.
         Ddl::DropDatabase { name } => api.drop_database(name, true)? as u64,
+        // Always the replacing form, for the reason above: whether `OR REPLACE` was written was
+        // judged at the leader against the definition that was there, and a peer re-deciding it
+        // could refuse a change the leader already made.
+        Ddl::CreateView { view, text } => api.create_view(view, text, true)? as u64,
+        Ddl::DropView { view } => api.drop_view(view)? as u64,
     })
 }

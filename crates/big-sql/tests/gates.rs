@@ -93,8 +93,15 @@ fn every_refusal_is_reached_by_a_statement_in_the_corpus() {
     /// because it was the refusal a window earned before the planner had a field class that
     /// could tell a set from a time quantum, and the window it refused is now answered. This
     /// gate found that, and the variant is gone.
-    const EXCUSED: [(&str, &str); 1] =
-        [("sql_insert_too_large", "needs 10,001 tuples; covered in tests/translate/writes.rs")];
+    const EXCUSED: [(&str, &str); 3] = [
+        ("sql_insert_too_large", "needs 10,001 tuples; covered in tests/translate/writes.rs"),
+        // The two refusals a view is expanded into. `translate` holds no catalog - which is
+        // what makes every test in this crate a parser test - so no statement here can reach a
+        // refusal that needs a stored `SELECT` to decide. They are raised in `big-api::views`
+        // and covered where the catalog is.
+        ("sql_view_column", "needs a stored view; covered in big-api/tests/views.rs"),
+        ("sql_view_depth", "needs a stored view; covered in big-api/tests/views.rs"),
+    ];
 
     let reached: BTreeSet<&str> = statements()
         .iter()

@@ -88,7 +88,10 @@ fn head(plan: &Plan) -> String {
             folded(aggregate)
         ),
         Plan::Project { table, fields, limit, .. } => {
-            format!("Project {table}.({}) limit={limit}", fields.join(", "))
+            // No `limit=` at all where there is none, rather than `limit=none`: the line is
+            // read as the shape of the work, and a full scan is the absence of a cut.
+            let cut = limit.map_or(String::new(), |n| format!(" limit={n}"));
+            format!("Project {table}.({}){cut}", fields.join(", "))
         }
     }
 }

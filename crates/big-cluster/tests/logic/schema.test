@@ -47,8 +47,8 @@ price    decimal  34         2      NULL
 query
 SHOW TABLES
 ----
-name  engine           fields
-tx    bitmap+columnar  4
+name  type        engine           fields
+tx    BASE TABLE  bitmap+columnar  4
 
 query
 SHOW CREATE TABLE tx

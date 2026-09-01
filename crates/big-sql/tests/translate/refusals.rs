@@ -89,14 +89,12 @@ fn every_refusal_names_itself() {
     assert_eq!(code("SELECT DISTINCT category FROM t GROUP BY category"), "sql_unsupported");
     assert_eq!(code("SELECT count(*) FROM t WHERE amount IS NULL"), "sql_no_nulls");
     assert_eq!(code("SELECT count(*) FROM t WHERE amount = NULL"), "sql_no_nulls");
-    // A projection without the cut that bounds what it costs, and one with a cut past the cap.
-    assert_eq!(code("SELECT amount FROM t"), "sql_projection_unsupported");
-    assert_eq!(code("SELECT country FROM t WHERE amount > 5"), "sql_projection_unsupported");
-    assert_eq!(code("SELECT amount FROM t LIMIT 0"), "sql_projection_unsupported");
-    assert_eq!(
-        code(&format!("SELECT amount FROM t LIMIT {}", big_sql::MAX_PROJECTION + 1)),
-        "sql_projection_unsupported"
-    );
+    // A projection is not refused for its limit any more - with one, without one, or with one
+    // past what used to be the cap, it lowers.
+    assert!(translate("SELECT amount FROM t").is_ok());
+    assert!(translate("SELECT country FROM t WHERE amount > 5").is_ok());
+    assert!(translate("SELECT amount FROM t LIMIT 0").is_ok());
+    assert!(translate("SELECT amount FROM t LIMIT 100000").is_ok());
     // An `INSERT` is answered now - see `writes` - so what is refused is one that does not
     // name the record it writes about.
     // A column list is still required - without one the values would be positional against a
@@ -122,9 +120,16 @@ fn every_refusal_names_itself() {
     // one statement is one request, so the database arrives with the request rather than being
     // something `USE` can leave behind for the next one.
     assert_eq!(code("USE d"), "sql_use_unsupported");
-    assert_eq!(code("DROP VIEW v"), "sql_no_views");
-    assert_eq!(code("CREATE VIEW v AS SELECT count(*) FROM t"), "sql_no_views");
-    assert_eq!(code("CREATE MATERIALIZED VIEW v AS SELECT count(*) FROM t"), "sql_no_views");
+    // A plain view is answered now - see `view.test`. What is refused is the materialised half,
+    // which is a table plus a write path rather than a name for a statement.
+    assert_eq!(
+        code("CREATE MATERIALIZED VIEW v AS SELECT count(*) FROM t"),
+        "sql_no_materialized_views"
+    );
+    assert_eq!(code("DROP MATERIALIZED VIEW v"), "sql_no_materialized_views");
+    // `ALTER VIEW` gets the ordinary write refusal instead: `CREATE OR REPLACE VIEW` already
+    // says the whole statement, so there is no change to a view left to name.
+    assert_eq!(code("ALTER VIEW v AS SELECT a FROM t"), "sql_read_only");
     // The three shapes of computation this dialect has no evaluator for, each named by what it
     // asked for rather than by the evaluator that is missing.
     assert_eq!(code("SELECT CASE WHEN amount > 5 THEN 1 ELSE 0 END FROM t"), "sql_unsupported");
@@ -188,13 +193,12 @@ fn a_refusal_says_what_it_is_and_what_exists_instead() {
     assert!(what.why().contains("CROSS JOIN"), "{}", what.why());
     assert!(what.why().contains("NATURAL JOIN"), "{}", what.why());
 
-    // A projection is answered now, so what this refusal names is the missing cut rather than
-    // the clause: the sentence has to say both what it costs and what to write instead.
-    let e = translate("SELECT amount FROM t").unwrap_err();
-    assert_eq!(e.code(), "sql_projection_unsupported");
-    assert!(e.to_string().contains("point read"), "{e}");
-    assert!(e.to_string().contains("LIMIT"), "{e}");
-    // And the same statement with one is not a refusal at all.
+    // A projection with no `LIMIT` is a full scan rather than a refusal, so the clause that is
+    // still refused over one is `ORDER BY` - which would need every value materialised and
+    // sorted, and nothing here holds them.
+    let e = translate("SELECT amount FROM t ORDER BY amount").unwrap_err();
+    assert_eq!(e.code(), "sql_unsupported_order");
+    assert!(translate("SELECT amount FROM t").is_ok());
     assert!(translate("SELECT amount FROM t LIMIT 100").is_ok());
 }
 

@@ -59,8 +59,6 @@ pub enum Refused {
     MultiDistinct,
     /// `IS NULL` or `IS NOT NULL`.
     Null,
-    /// Selecting stored values without the cut that bounds what it costs.
-    Projection,
     /// `UPDATE`, `TRUNCATE`, `MERGE`, or a schema change this engine has no operation behind.
     Write,
     /// An `INSERT` with no column list, which would be positional against a field order the
@@ -83,8 +81,23 @@ pub enum Refused {
     SessionUse,
     /// `sales.orders.amount`: a column qualified by more than an alias.
     ThreePartName,
-    /// A view, materialised or not: nothing here stores a statement.
-    View,
+    /// A **materialised** view. A plain one exists - see [`crate::Ddl::CreateView`].
+    ///
+    /// The difference is not a keyword: a plain view is a name for a statement, re-planned at
+    /// every read and costing nothing until somebody reads it. A materialised one is a table
+    /// plus a promise to keep it current, which is a write path.
+    MaterializedView,
+    /// A view body that is not a filter and a projection over one table.
+    ///
+    /// Raised at parse time, so it needs no schema and is reachable by the corpus.
+    ViewBody,
+    /// A statement naming a column its view does not expose.
+    ///
+    /// Raised where a view is expanded, in `big-api`, because deciding it needs the stored
+    /// statement. Not reachable by [`crate::translate`], which has no catalog.
+    ViewColumn,
+    /// Views nested past [`crate::MAX_VIEW_DEPTH`]. Also raised in `big-api`.
+    ViewDepth,
     /// `CASE WHEN`, `if`, `multiIf`, `coalesce` — choosing between two values per record.
     Case,
     /// `CAST`, `toInt64`, `toString`: a conversion between representations that do not convert.
@@ -134,7 +147,7 @@ impl Refused {
     /// Kept honest by [`Refused::rank`] below, whose exhaustive match will not compile until a
     /// new variant is named - and by a test asserting that every rank appears here exactly once,
     /// which is what catches naming one and forgetting to add it.
-    pub const ALL: [Self; 41] = [
+    pub const ALL: [Self; 43] = [
         Self::Joins,
         Self::OuterJoin,
         Self::JoinOn,
@@ -149,7 +162,6 @@ impl Refused {
         Self::Expression,
         Self::MultiDistinct,
         Self::Null,
-        Self::Projection,
         Self::Write,
         Self::InsertColumns,
         Self::InsertId,
@@ -158,7 +170,7 @@ impl Refused {
         Self::InsertSize,
         Self::DeleteRows,
         Self::SessionUse,
-        Self::View,
+        Self::MaterializedView,
         Self::Case,
         Self::Cast,
         Self::Aggregate,
@@ -176,6 +188,9 @@ impl Refused {
         Self::Union,
         Self::Quantile,
         Self::ThreePartName,
+        Self::ViewBody,
+        Self::ViewColumn,
+        Self::ViewDepth,
     ];
 
     /// Where this refusal sits in [`Refused::ALL`], and the reason that list can be trusted.
@@ -201,33 +216,35 @@ impl Refused {
             Self::Expression => 11,
             Self::MultiDistinct => 12,
             Self::Null => 13,
-            Self::Projection => 14,
-            Self::Write => 15,
-            Self::InsertColumns => 16,
-            Self::InsertId => 17,
-            Self::IdColumn => 18,
-            Self::InsertSelect => 19,
-            Self::InsertSize => 20,
-            Self::DeleteRows => 21,
-            Self::SessionUse => 22,
-            Self::View => 23,
-            Self::Case => 24,
-            Self::Cast => 25,
-            Self::Aggregate => 26,
-            Self::AlterKind => 27,
-            Self::Rename => 28,
-            Self::AlterEngine => 29,
-            Self::ColumnType => 30,
-            Self::Constraint => 31,
-            Self::DecimalScale => 32,
-            Self::BitDepth => 33,
-            Self::Shape => 34,
-            Self::Predicate => 35,
-            Self::TooManyCalls => 36,
-            Self::Format => 37,
-            Self::Union => 38,
-            Self::Quantile => 39,
-            Self::ThreePartName => 40,
+            Self::Write => 14,
+            Self::InsertColumns => 15,
+            Self::InsertId => 16,
+            Self::IdColumn => 17,
+            Self::InsertSelect => 18,
+            Self::InsertSize => 19,
+            Self::DeleteRows => 20,
+            Self::SessionUse => 21,
+            Self::MaterializedView => 22,
+            Self::Case => 23,
+            Self::Cast => 24,
+            Self::Aggregate => 25,
+            Self::AlterKind => 26,
+            Self::Rename => 27,
+            Self::AlterEngine => 28,
+            Self::ColumnType => 29,
+            Self::Constraint => 30,
+            Self::DecimalScale => 31,
+            Self::BitDepth => 32,
+            Self::Shape => 33,
+            Self::Predicate => 34,
+            Self::TooManyCalls => 35,
+            Self::Format => 36,
+            Self::Union => 37,
+            Self::Quantile => 38,
+            Self::ThreePartName => 39,
+            Self::ViewBody => 40,
+            Self::ViewColumn => 41,
+            Self::ViewDepth => 42,
         }
     }
 
@@ -245,7 +262,6 @@ impl Refused {
             Self::JoinFilter => "sql_join_filter",
             Self::Order => "sql_unsupported_order",
             Self::Null => "sql_no_nulls",
-            Self::Projection => "sql_projection_unsupported",
             // A `DELETE` shares `sql_read_only` with the other writes this surface does not
             // take: what the client does about it is the same in both cases, which is the rule
             // this list follows.
@@ -254,7 +270,10 @@ impl Refused {
             Self::IdColumn => "sql_id_column",
             Self::InsertSize => "sql_insert_too_large",
             Self::SessionUse => "sql_use_unsupported",
-            Self::View => "sql_no_views",
+            Self::MaterializedView => "sql_no_materialized_views",
+            Self::ViewBody => "sql_view_body",
+            Self::ViewColumn => "sql_view_column",
+            Self::ViewDepth => "sql_view_depth",
             Self::AlterKind => "sql_no_alter_column",
             Self::Rename => "sql_no_rename",
             Self::AlterEngine => "sql_no_alter_engine",
@@ -364,21 +383,17 @@ impl Refused {
                 "there are no nulls here: a record either carries a value or the bit is not set, \
                  and neither is a null that comparisons propagate"
             }
-            Self::Projection => {
-                "selecting stored values needs a `LIMIT` of between 1 and 10000, because \
-                 reconstructing one costs a point read per record per column and the number of \
-                 records is the whole of what it costs. A keyed column cannot be selected at \
-                 all - it has no read back from a record to its string - so count it, \
-                 aggregate it, or group by it"
-            }
             Self::Write => {
                 "the writes on this surface are `INSERT INTO t (...) VALUES (...)`, \
-                 `CREATE TABLE`, `ALTER TABLE ... ADD`/`DROP COLUMN` and `DROP TABLE`. \
+                 `CREATE TABLE`, `ALTER TABLE ... ADD`/`DROP COLUMN`, `DROP TABLE`, \
+                 `CREATE DATABASE`/`DROP DATABASE` and `CREATE VIEW`/`DROP VIEW`. \
                  `UPDATE` has no row to change in place - a fact is a bit at `(row, record)`, \
-                 so changing one means writing the new fact and clearing the old - and \
-                 `TRUNCATE`, `MERGE`, `REPLACE` and `CREATE INDEX` are each a statement with no \
-                 operation behind it here: a bitmap is already the index. Write facts in volume \
-                 with `POST /table/{t}/import` and use the `/table` routes for the rest"
+                 so changing one means writing the new fact and clearing the old; `ALTER VIEW` \
+                 is `CREATE OR REPLACE VIEW`, which says the whole statement rather than a \
+                 change to one; and `TRUNCATE`, `MERGE`, `REPLACE` and `CREATE INDEX` are each \
+                 a statement with no operation behind it here: a bitmap is already the index. \
+                 Write facts in volume with `POST /table/{t}/import` and use the `/table` \
+                 routes for the rest"
             }
             Self::InsertColumns => {
                 "an `INSERT` names the columns it writes, as `INSERT INTO t (country, amount) \
@@ -435,11 +450,28 @@ impl Refused {
                  column then reaches it through an alias: \
                  `FROM sales.orders o WHERE o.amount > 5`"
             }
-            Self::View => {
-                "a view is a statement kept under a name and re-planned at every read, and \
-                 nothing here stores a statement: the catalog holds tables, fields and keys. \
-                 Write the `SELECT` where it is used, or create a table and write the answer \
-                 into it - which is the materialised half, said out loud"
+            Self::MaterializedView => {
+                "a materialised view is a table plus a promise to keep it current, and nothing \
+                 here keeps that promise. A plain `CREATE VIEW` does exist - it is a name for a \
+                 statement, re-planned at every read - and the materialised half is written out \
+                 loud: create a table and write the answer into it"
+            }
+            Self::ViewBody => {
+                "a view here is a filter and a projection over one table: \
+                 `SELECT <columns> FROM <table> [WHERE ...]`. It is inlined into the statement \
+                 that reads it, and there is no subquery below to nest one in - so a body that \
+                 groups, aggregates, joins, orders or limits has no statement to become. Note \
+                 that `*` means the record id rather than every column, so a view names the \
+                 columns it exposes"
+            }
+            Self::ViewColumn => {
+                "the view does not expose that column, which is most of what a view is for. \
+                 `SHOW CREATE VIEW` says what it does expose; reading the column means going to \
+                 the table underneath, or a view that names it"
+            }
+            Self::ViewDepth => {
+                "views nested too deep. A view over a view is expanded by substitution, so the \
+                 depth is a bound on the statement this becomes rather than a taste in schemas"
             }
             Self::Case => {
                 "there is nothing here that chooses between two values per record, because \

@@ -91,7 +91,7 @@ fn an_aggregate_over_nothing_answers_null() {
 /// there is `422` because the body is well formed and describes something absent.
 #[test]
 fn a_refusal_and_a_schema_mistake_get_different_statuses() {
-    let addr = stocked(6);
+    let addr = stocked(5);
 
     // A join on a keyed column is answered, so the refusal here is the pairing that has no
     // key, which is what a comma between tables is.
@@ -99,10 +99,6 @@ fn a_refusal_and_a_schema_mistake_get_different_statuses() {
     assert_eq!(status, 400);
     assert!(body.contains(r#""code":"sql_no_joins""#), "{body}");
     assert!(body.contains("comma between tables"), "{body}");
-
-    let (status, body) = send(addr, "POST", "/sql", "SELECT amount FROM tx");
-    assert_eq!(status, 400);
-    assert!(body.contains(r#""code":"sql_projection_unsupported""#), "{body}");
 
     let (status, body) = send(addr, "POST", "/sql", "DELETE FROM tx");
     assert_eq!(status, 400);
@@ -585,12 +581,12 @@ fn a_filtered_group_that_matched_nothing_is_zero_for_a_count_and_absent_for_a_su
 /// became part of the statement.
 ///
 /// A projection reconstructs a value per record per column out of the bit planes it is stored
-/// in, so the number of records **is** what it costs. That is why the `LIMIT` is required and
-/// why it lives in the plan rather than in the shape: a cut applied to the answer would be a
-/// cut applied after paying for it.
+/// in, so the number of records **is** what it costs. That is why the `LIMIT` lives in the plan
+/// rather than in the shape: a cut applied to the answer would be a cut applied after paying
+/// for it. Leaving the `LIMIT` out is a full scan, which is the caller having asked for one.
 #[test]
-fn stored_values_can_be_selected_under_a_limit() {
-    let addr = stocked(6);
+fn stored_values_can_be_selected_with_or_without_a_limit() {
+    let addr = stocked(7);
 
     // Records 1, 2, 3 hold 100, 900, 500, and come back in record order.
     let (status, body) = send(addr, "POST", "/sql", "SELECT amount FROM tx LIMIT 10");
@@ -614,11 +610,15 @@ fn stored_values_can_be_selected_under_a_limit() {
     assert_eq!(status, 200, "{body}");
     assert_eq!(body, r#"{"columns":["country"],"rows":[["GB"],["US"],["GB"]]}"#);
 
-    // Without a limit there is no bound on what it costs, so the statement is refused.
+    // No limit is every match, at the same price per record - the same three rows the explicit
+    // `LIMIT 10` above asked for, because there are only three.
     let (status, body) = send(addr, "POST", "/sql", "SELECT amount FROM tx");
-    assert_eq!(status, 400, "{body}");
-    assert!(body.contains(r#""code":"sql_projection_unsupported""#), "{body}");
-    assert!(body.contains("LIMIT"), "{body}");
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body, r#"{"columns":["amount"],"rows":[[100],[900],[500]]}"#);
+
+    // And the `WHERE` still decides which records are paid for.
+    let (_, body) = send(addr, "POST", "/sql", "SELECT amount FROM tx WHERE country = 'GB'");
+    assert_eq!(body, r#"{"columns":["amount"],"rows":[[100],[500]]}"#);
 
     // And a value beside a number about the whole set is two answers of different heights.
     let (status, _) = send(addr, "POST", "/sql", "SELECT amount, count(*) FROM tx LIMIT 10");
@@ -1242,12 +1242,12 @@ fn the_catalog_answers_in_sql_what_the_schema_route_answers_in_json() {
     let (_, body) = send(addr, "POST", "/sql", "SHOW TABLES");
     assert_eq!(
         body,
-        r#"{"columns":["name","engine","fields"],"rows":[["t","bitmap+columnar",3]]}"#
+        r#"{"columns":["name","type","engine","fields"],"rows":[["t","BASE TABLE","bitmap+columnar",3]]}"#
     );
 
     // `FORMAT` is the same clause a `SELECT` takes, and means the same thing.
     let (_, body) = send(addr, "POST", "/sql", "SHOW TABLES FORMAT TSV");
-    assert_eq!(body, "t\tbitmap+columnar\t3\n");
+    assert_eq!(body, "t\tBASE TABLE\tbitmap+columnar\t3\n");
 
     let (status, body) = send(addr, "POST", "/sql", "DESCRIBE nope");
     assert_eq!(status, 404, "{body}");

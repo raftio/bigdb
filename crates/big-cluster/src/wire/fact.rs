@@ -210,6 +210,19 @@ pub enum Ddl {
     DropDatabase {
         name: String,
     },
+    /// A `SELECT` kept under a name. Always the replacing form on the wire: whether `OR REPLACE`
+    /// was written is decided at the leader, where the existing definition is authoritative, and
+    /// what travels to the other nodes is a change already ruled legal - the same argument
+    /// [`Ddl::DropDatabase`] carries one variant up.
+    CreateView {
+        /// Qualified `database.view`, the single-string form every name here travels as.
+        view: String,
+        /// The statement, as it was written.
+        text: String,
+    },
+    DropView {
+        view: String,
+    },
 }
 
 impl Ddl {
@@ -261,6 +274,15 @@ impl Ddl {
                 put_u8(&mut out, 7);
                 put_str(&mut out, name);
             }
+            Self::CreateView { view, text } => {
+                put_u8(&mut out, 8);
+                put_str(&mut out, view);
+                put_str(&mut out, text);
+            }
+            Self::DropView { view } => {
+                put_u8(&mut out, 9);
+                put_str(&mut out, view);
+            }
         }
         out
     }
@@ -311,6 +333,8 @@ impl Ddl {
             5 => Self::DropField { table: r.str()?, field: r.str()? },
             6 => Self::CreateDatabase { name: r.str()? },
             7 => Self::DropDatabase { name: r.str()? },
+            8 => Self::CreateView { view: r.str()?, text: r.str()? },
+            9 => Self::DropView { view: r.str()? },
             tag => return Err(WireError::BadTag { what: "schema change", tag }),
         };
         finished(&r)?;

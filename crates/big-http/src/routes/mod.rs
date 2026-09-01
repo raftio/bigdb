@@ -430,7 +430,7 @@ pub fn dispatch<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request) -> Response
         Target::PeerRepaired => peer_repaired(ctx, req),
         Target::PeerSchema => {
             let mut out = Vec::new();
-            wire::put_schema(&mut out, &ctx.cluster.schema());
+            wire::put_schema(&mut out, &ctx.cluster.schema(), &ctx.cluster.views());
             Response::binary(out)
         }
         Target::Repair => repair(ctx),

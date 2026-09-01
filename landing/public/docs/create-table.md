@@ -30,8 +30,10 @@ decision to make before the name.
 
 - **Writes** — Column segments, plus the existence row.
 - **Answers well** — Aggregates and projections that read a column end to end.
-- **Costs** — No index to intersect, so a filter scans. Time windows and named views are refused by
-  name: they live in an index this table does not keep.
+- **Costs** — No index to intersect, so a filter scans. Time windows and the per-granularity
+  bitmap views behind them are refused by name: they live in an index this table does not keep.
+  (Those are *bitmap* views — a partition of a field's bits by time. A SQL `CREATE VIEW` is an
+  unrelated thing and works under every engine.)
 
 The existence row is kept under every engine, columnar included: it is one bit per record, and it is
 what `NOT`, `count(*)` and the record cursor stand on.

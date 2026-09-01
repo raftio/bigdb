@@ -143,14 +143,18 @@ pub enum Plan {
         /// How many values of the left column to group by. Never absent.
         left_max: usize,
     },
-    /// The stored values of some columns, for the first `limit` matching records.
+    /// The stored values of some columns, for the first `limit` matching records - or for every
+    /// one of them where there is no limit.
     ///
-    /// **The one plan that reads values back rather than counting bits**, and the reason it
-    /// carries a mandatory limit. A record's value in a bit-sliced field is not stored anywhere
-    /// as a number: reconstructing it means reading one bit per plane, so a projection costs a
-    /// point read per record per column. That is affordable for a page and ruinous for a table,
-    /// and the difference between the two is exactly the number in `limit` - which is therefore
-    /// part of the plan rather than a view of its answer.
+    /// **The one plan that reads values back rather than counting bits**, and the reason its
+    /// limit is part of the plan rather than a view of the answer. A record's value in a
+    /// bit-sliced field is not stored anywhere as a number: reconstructing it means reading one
+    /// bit per plane, so a projection costs a point read per record per column. A cut applied
+    /// after the reads would save nothing, so the number travels with the plan and bounds the
+    /// loop that does them.
+    ///
+    /// Absent is a full scan, and it is the caller's to ask for: a statement with no `LIMIT`
+    /// reads every matching record, at that cost, however many there are.
     ///
     /// Only bit-sliced columns. A keyed column has no read back from a record to its string at
     /// all, and the planner refuses one by name.
@@ -159,8 +163,8 @@ pub enum Plan {
         rows: Rows,
         /// The columns, in the order the answer's cells go in.
         fields: Vec<String>,
-        /// How many records to read. Never absent.
-        limit: usize,
+        /// How many records to read, or [`None`] to read every match.
+        limit: Option<usize>,
     },
 }
 
@@ -427,11 +431,11 @@ impl<S: Schema> Ctx<'_, S> {
         Ok(Plan::GroupByPair { table, rows, left, right, aggregate: Box::new(aggregate), left_max })
     }
 
-    /// `Project(<bitmap>, field=<name>, field=<name>, ..., n=<count>)`.
+    /// `Project(<bitmap>, field=<name>, field=<name>, ..., [n=<count>])`.
     ///
     /// The one call whose field argument may repeat, because a projection is a list of columns
-    /// and their order is the order the answer's cells go in. `n` is required: see
-    /// [`Plan::Project`] for why the cut is part of the plan rather than a view of its answer.
+    /// and their order is the order the answer's cells go in. `n` is optional, and leaving it
+    /// out asks for every matching record: see [`Plan::Project`] for what that costs.
     fn project(&self, call: &Call) -> Result<Plan> {
         let mut rows = None;
         let mut fields: Vec<String> = Vec::new();
@@ -449,25 +453,34 @@ impl<S: Schema> Ctx<'_, S> {
                 _ => {
                     return Err(PlanError::BadArgument {
                         call: "Project",
-                        want: "a bitmap, one or more field=<name>, and n=<count>",
+                        want: "a bitmap, one or more field=<name>, and an optional n=<count>",
                     })
                 }
             }
         }
 
-        let (Some(rows), Some(limit)) = (rows, n) else {
+        let Some(rows) = rows else {
             return Err(PlanError::Arity {
                 call: "Project",
-                want: "a bitmap, one or more field=<name>, and n=<count>",
+                want: "a bitmap, one or more field=<name>, and an optional n=<count>",
                 got: call.args.len(),
             });
         };
+        let limit = n;
+
+        // No `field=` at all is `SELECT *`: every column the table declares, in declaration
+        // order. Expanded here rather than by the caller because only a schema knows the list -
+        // and through [`crate::expanded_columns`] rather than by hand, because the shape that
+        // names these columns expands the same `*` and the two have to come out the same.
         if fields.is_empty() {
-            return Err(PlanError::Arity {
-                call: "Project",
-                want: "at least one field=<name>",
-                got: call.args.len(),
-            });
+            let fields = crate::expanded_columns(self.schema, self.table);
+            // Nothing a projection could read - a table with no fields, or one whose engine
+            // keeps no values. `SELECT *` falls back to record ids, which is the answer it gave
+            // before it expanded to anything.
+            if fields.is_empty() {
+                return Ok(Plan::Rows { table: self.table.to_string(), rows });
+            }
+            return Ok(Plan::Project { table: self.table.to_string(), rows, fields, limit });
         }
 
         let stores_values = self.schema.stores_values(self.table);

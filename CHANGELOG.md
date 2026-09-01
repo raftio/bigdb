@@ -46,8 +46,23 @@ predecessor.
 - **Named refusals for the SQL this engine cannot answer**, in place of a syntax error or a
   blanket "this surface writes no rows": `CASE WHEN` and `if` (`sql_unsupported`), `CAST` and
   `toString`, `argMin`/`stddev`/`corr`, `INSERT … SELECT`, `DELETE FROM` (`sql_read_only`),
-  `CREATE`/`DROP`/`ALTER DATABASE` and `USE` (`sql_no_database`), and views
-  (`sql_no_views`). Each says what the engine's shape makes impossible and what exists instead.
+  `USE` (`sql_use_unsupported`), `ALTER DATABASE` and materialised views
+  (`sql_no_materialized_views`). Each says what the engine's shape makes impossible and what
+  exists instead.
+- **`CREATE VIEW` and `DROP VIEW`.** A view is a `SELECT` kept under a name and re-planned at
+  every read: `CREATE VIEW big AS SELECT amount, country AS cc FROM tx WHERE amount >= 500`, and
+  then `SELECT count(*) FROM big WHERE cc = 'GB'` asks exactly what the substitution written by
+  hand would have asked. It costs nothing until somebody reads it, and it is the only way this
+  surface has to hand somebody a narrowed, renamed slice of a table without copying it — a
+  column the view does not name is refused (`sql_view_column`) rather than reachable through it.
+
+  A body is a filter and a projection over one table, because a view here is *inlined* and
+  there is no subquery to nest one in; anything else is `sql_view_body`, said at `CREATE` rather
+  than at the first read. `*` is not allowed in one, since here it means the record id rather
+  than every column. Views nest, appear in `SHOW TABLES` under a `type` column, answer
+  `DESCRIBE` with the columns they expose, and are listed with their statements by `SHOW VIEWS`.
+  `CREATE OR REPLACE VIEW` changes what one means; `SHOW CREATE VIEW` reads back as the
+  statement that made it.
 - A value written with more digits than its decimal field keeps is refused rather than rounded,
   with the same `too_precise` code and sentence `WHERE price = 12.523` already gives.
 - **A decimal reads back as the value it is.** `SELECT price`, `sum(price)`, `min`, `max`, a

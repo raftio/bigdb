@@ -46,16 +46,35 @@ pub enum Shown {
     ///
     /// Three spellings and one meaning, because they are three dialects' words for the same
     /// question and there is nothing to be gained by knowing which one was typed.
+    ///
+    /// A view answers this too, with the columns it exposes rather than the base table's -
+    /// which is what makes a view visible to a client that draws a column tree.
     Columns { database: Option<String>, table: String },
-    /// `SHOW TABLES [FROM <database>]`: one row per table, in one database.
+    /// `SHOW TABLES [FROM <database>]`: one row per table **and one per view**, in one database.
+    ///
+    /// Both, under a `type` column saying which. That is what a JDBC driver asks for and what it
+    /// expects back; a listing that hid views would make one invisible to every BI tool while
+    /// still being queryable, which is the worst of the two answers.
     Tables { database: Option<String> },
+    /// `SHOW VIEWS [FROM <database>]`: one row per view, with the statement it holds.
+    ///
+    /// Not redundant with `SHOW TABLES`, which says a view exists but not what it means. This is
+    /// the listing an operator reads to find the view that is about to break.
+    Views { database: Option<String> },
     /// `SHOW DATABASES`, also spelled `SCHEMAS` and `DATASETS`: one row per database.
     ///
     /// The question every JDBC driver and BI tool opens with, which is most of why a database
     /// level exists at all - a client cannot draw a table tree without it.
     Databases,
-    /// `SHOW CREATE [TABLE] t`: one row, holding the statement that would recreate it.
-    Create { database: Option<String>, table: String },
+    /// `SHOW CREATE [TABLE | VIEW] t`: one row, holding the statement that would recreate it.
+    Create {
+        database: Option<String>,
+        table: String,
+        /// `VIEW` was written, so a table under that name is the wrong object rather than the
+        /// answer. Unwritten, the name is looked up as either - which is what somebody typing
+        /// `SHOW CREATE x` means, and what makes the bare form useful for exploring.
+        view: bool,
+    },
 }
 
 impl Shown {
@@ -69,7 +88,7 @@ impl Shown {
             Self::Columns { database: d, .. } | Self::Create { database: d, .. } => {
                 d.get_or_insert_with(|| database.to_string());
             }
-            Self::Tables { database: d } => {
+            Self::Tables { database: d } | Self::Views { database: d } => {
                 d.get_or_insert_with(|| database.to_string());
             }
             Self::Databases => {}

@@ -249,7 +249,8 @@ fn refusals_and_schema_errors_carry_their_codes_through_the_facade() {
     };
     // A join on a keyed column is answered; a cross join has no key to pair records on.
     assert_eq!(code("SELECT count(*) FROM tx, other"), "sql_no_joins");
-    assert_eq!(code("SELECT amount FROM tx"), "sql_projection_unsupported");
+    // A projection with no limit is a full scan rather than a refusal.
+    assert_eq!(code("SELECT amount FROM tx"), "accepted");
     // A write reaching `Api::sql` is refused because this is the un-clustered door: a write
     // goes to the shard owners, and an id it does not name is allocated by the schema leader.
     // `Cluster::sql` is the one that runs it - see `Api::plan_sql`.

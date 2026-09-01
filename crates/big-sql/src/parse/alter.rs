@@ -33,12 +33,13 @@ impl Parser<'_> {
     /// table stored every fact it already holds under.
     pub(super) fn alter_table(&mut self) -> Result<crate::ddl::Ddl> {
         if !self.word_is("TABLE") {
-            if self.word_is("VIEW") || self.word_is("MATERIALIZED") {
-                return Err(self.refuse(Refused::View));
+            if self.word_is("MATERIALIZED") {
+                return Err(self.refuse(Refused::MaterializedView));
             }
-            // `ALTER DATABASE`, `ALTER USER`, `ALTER INDEX`: a change this surface does not
-            // have, which is what the `Write` refusal already says. A database here carries a
-            // name and nothing else, so there is nothing about one to alter.
+            // `ALTER VIEW` joins `ALTER DATABASE`, `ALTER USER` and `ALTER INDEX`: a change this
+            // surface does not have, which is what the `Write` refusal already says. A view
+            // carries a name and a statement, and `CREATE OR REPLACE VIEW` changes the statement
+            // - so there is nothing left for an `ALTER` to reach.
             return Err(self.refuse(Refused::Write));
         }
         self.i += 1;
@@ -133,10 +134,21 @@ impl Parser<'_> {
             }
             return Ok(crate::ddl::Ddl::DropDatabase { name, if_exists, cascade });
         }
-        if !self.word_is("TABLE") {
-            if self.word_is("VIEW") || self.word_is("MATERIALIZED") {
-                return Err(self.refuse(Refused::View));
+        // `MATERIALIZED` before `VIEW`, so `DROP MATERIALIZED VIEW` gets the sentence about the
+        // thing it names rather than being read as a plain view drop.
+        if self.word_is("MATERIALIZED") {
+            return Err(self.refuse(Refused::MaterializedView));
+        }
+        if self.word_is("VIEW") {
+            self.i += 1;
+            let if_exists = self.if_exists(false)?;
+            let (database, name) = self.table_ref("a view name")?;
+            if self.peek().is_some() {
+                return Err(self.syntax("the end of the statement"));
             }
+            return Ok(crate::ddl::Ddl::DropView { database, name, if_exists });
+        }
+        if !self.word_is("TABLE") {
             return Err(self.refuse(Refused::Write));
         }
         self.i += 1;

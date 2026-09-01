@@ -85,6 +85,20 @@ impl Schema for Stub {
         })
     }
 
+    /// The order a column list would have declared them in, which is the order `SELECT *`
+    /// answers in. Written out rather than derived from the match above, because that match is
+    /// a lookup and this is an ordering - and the corpus asserts the ordering.
+    fn fields(&self, table: &str) -> Vec<String> {
+        if !self.has_table(table) {
+            return Vec::new();
+        }
+        ["amount", "price", "balance", "category", "country", "device", "visit", "active"]
+            .iter()
+            .filter(|f| self.field_class(table, f).is_some())
+            .map(|f| (*f).to_string())
+            .collect()
+    }
+
     /// `t` keeps its values and `u` does not, so that the refusal a projection meets over an
     /// index-only table is reachable from this corpus without a second schema.
     fn stores_values(&self, table: &str) -> bool {

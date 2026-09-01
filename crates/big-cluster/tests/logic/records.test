@@ -138,5 +138,5 @@ US       1
 query
 SHOW TABLES FORMAT TSV
 ----
-name  engine           fields
-tx    bitmap+columnar  4
+name  type        engine           fields
+tx    BASE TABLE  bitmap+columnar  4

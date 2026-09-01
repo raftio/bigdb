@@ -244,3 +244,28 @@ Count t
 └── all
 Probe t.amount per_mille=500
 └── all
+
+# Several columns and no `LIMIT`: a full scan that reads each of them back for every record the
+# `WHERE` selects. `SELECT a, b, c FROM t` is what it says everywhere else, and it says it here
+# too - at a point read per record per column, which is what the cut in `project.test` buys when
+# somebody writes one.
+plan
+SELECT country, price, amount FROM t
+----
+Project t.(country, price, amount)
+└── all
+
+shape
+SELECT country, price, amount FROM t
+----
+Table
+├── country
+├── price scale=2
+└── amount
+
+# The order of the columns is the order of the cells, not the order the fields were declared in.
+plan
+SELECT amount, country FROM t WHERE active = true
+----
+Project t.(amount, country)
+└── active = true

@@ -1,0 +1,230 @@
+# A view, read against real records.
+#
+# `big-sql` pins the two statements and the body rule, and `big-api` pins the substitution
+# against the calls it produces. What is left is the only claim neither of those can make: that
+# a statement reading a view comes back with the same *rows* as the statement it stands for.
+#
+# That is what this file is. Every view here is checked against the query written out by hand.
+
+statement
+CREATE TABLE tx (amount UINT(32), country SET, secret SET) ENGINE = 'bitmap+columnar'
+----
+
+statement
+INSERT INTO tx (amount, country, secret) VALUES (100, 'GB', 'a'), (900, 'US', 'b'), (500, 'GB', 'c'), (700, 'GB', 'd')
+----
+
+exec
+CREATE VIEW big AS SELECT amount, country AS cc FROM tx WHERE amount >= 500
+----
+view
+1
+
+## The view's filter applies whether or not the reader wrote one.
+
+query
+SELECT count(*) FROM big
+----
+count
+3
+
+query
+SELECT count(*) FROM tx WHERE amount >= 500
+----
+count
+3
+
+## And the reader's narrows it further, against the name the view exposes.
+
+query
+SELECT count(*) FROM big WHERE cc = 'GB'
+----
+count
+2
+
+query
+SELECT count(*) FROM tx WHERE amount >= 500 AND country = 'GB'
+----
+count
+2
+
+## Grouping through a view groups the column underneath, under the name it was exposed by.
+
+query rowsort
+SELECT cc, count(*) FROM big GROUP BY cc
+----
+cc  count
+GB  2
+US  1
+
+## Values read back through a view, which is where the rename has to survive all the way out.
+
+query
+SELECT amount FROM big WHERE cc = 'US'
+----
+amount
+900
+
+## What the view hides stays hidden, and says so.
+
+error
+SELECT secret FROM big
+----
+error: sql_view_column
+
+error
+SELECT count(*) FROM big WHERE secret = 'a'
+----
+error: sql_view_column
+
+# The underlying name is not a second spelling for the exposed one: renaming `country` to `cc`
+# makes `country` one of the columns this view hides.
+error
+SELECT count(*) FROM big WHERE country = 'GB'
+----
+error: sql_view_column
+
+# And none of it touches the table, which is what a view narrows access *through* rather than
+# access *to*.
+query
+SELECT count(*) FROM tx WHERE secret = 'a'
+----
+count
+1
+
+## A view over a view carries both filters down.
+
+exec
+CREATE VIEW big_gb AS SELECT amount FROM big WHERE cc = 'GB'
+----
+view
+1
+
+query
+SELECT count(*) FROM big_gb
+----
+count
+2
+
+query
+SELECT count(*) FROM tx WHERE amount >= 500 AND country = 'GB'
+----
+count
+2
+
+## Listings.
+
+query
+SHOW TABLES
+----
+name    type        engine           fields
+big     VIEW        NULL             2
+big_gb  VIEW        NULL             1
+tx      BASE TABLE  bitmap+columnar  3
+
+query
+SHOW VIEWS
+----
+name    statement
+big     SELECT amount, country AS cc FROM tx WHERE amount >= 500
+big_gb  SELECT amount FROM big WHERE cc = 'GB'
+
+# `DESCRIBE` answers with the columns the view exposes, under the names it exposes them by and
+# with the kinds of the columns underneath.
+
+query
+DESCRIBE big
+----
+name    kind  bit_depth  scale  granularity
+amount  int   32         NULL   NULL
+cc      set   32         NULL   NULL
+
+query
+SHOW CREATE VIEW big
+----
+statement
+CREATE VIEW big AS SELECT amount, country AS cc FROM tx WHERE amount >= 500
+
+## Redefining and dropping.
+
+# The same statement again changes nothing and is not an error.
+exec
+CREATE VIEW big AS SELECT amount, country AS cc FROM tx WHERE amount >= 500
+----
+view
+0
+
+# A different one needs the word.
+error
+CREATE VIEW big AS SELECT amount FROM tx
+----
+error: view_redefined
+
+exec
+CREATE OR REPLACE VIEW big AS SELECT amount, country AS cc FROM tx WHERE amount >= 700
+----
+view
+1
+
+query
+SELECT count(*) FROM big
+----
+count
+2
+
+exec
+DROP VIEW big_gb
+----
+dropped
+1
+
+# A view that is not there is an error, unless the statement said it might not be.
+error
+DROP VIEW big_gb
+----
+error: unknown_view
+
+exec
+DROP VIEW IF EXISTS big_gb
+----
+dropped
+0
+
+exec
+DROP VIEW big
+----
+dropped
+1
+
+# And the table is exactly as it was.
+query
+SELECT count(*) FROM tx
+----
+count
+4
+
+## A view and a table share one namespace, because a `FROM` resolves to one of them.
+
+exec
+CREATE VIEW v AS SELECT amount FROM tx
+----
+view
+1
+
+error
+CREATE TABLE v (a UINT(32))
+----
+error: view_name_taken
+
+error
+CREATE VIEW tx AS SELECT amount FROM tx
+----
+error: view_name_taken
+
+## A view over nothing is refused where it is written, not where it is read - which is also
+## what makes a cycle unrepresentable.
+
+error
+CREATE VIEW broken AS SELECT amount FROM nope
+----
+error: unknown_table

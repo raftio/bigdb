@@ -52,8 +52,9 @@ parser normalises it into exactly that, and the plan is the one a `GROUP BY` alr
 `SELECT *` answers with record ids under a column called `_record_id`, and nothing else — this engine
 stores facts as bits at `(row, record)` and has no row of values to hand back. Naming the columns
 instead is a projection, which reconstructs a value per record per column at a point read
-apiece; the cut is therefore part of the plan rather than a view of its answer, and a `LIMIT`
-between 1 and [`MAX_PROJECTION`] is required.
+apiece; the cut is therefore part of the plan rather than a view of its answer, and it bounds
+the reads rather than trimming them afterwards. A `LIMIT` is optional, and leaving it out asks
+for every matching record at that price.
 
 A window is a key and its bounds against the same time quantum column, fused out of the
 conjunction into one `Row`. A field with no views by time has no window to answer, and the
@@ -155,9 +156,11 @@ this engine holds bits at `(row, record)` rather than values to revisit. A `FLOA
 `DATE`, `UUID`, `JSON` or `BLOB` column names nothing this engine stores
 (`sql_unknown_column_type`).
 
-**The statements above a table, and the writes with no operation behind them** — a database or a
-schema (`sql_no_database`), a view materialised or not (`sql_no_views`), and `UPDATE`,
-`TRUNCATE`, `MERGE`, `REPLACE` and `CREATE INDEX` (`sql_read_only`), each of which is either a
+**The statements above a table, and the writes with no operation behind them** — a *session*
+(`sql_use_unsupported`: a database arrives with the request, so `USE` has nothing to leave
+behind), a **materialised** view (`sql_no_materialized_views`: a table plus a promise to keep it
+current, where a plain view is a name for a statement), and `UPDATE`,
+`TRUNCATE`, `MERGE`, `REPLACE`, `ALTER VIEW` and `CREATE INDEX` (`sql_read_only`), each of which is either a
 row this engine does not store or an index a bitmap already is. `DELETE FROM` shares that code
 and has its own sentence: a record is the bits set for it across every field, and
 `POST /table/{t}/delete` takes the ids to clear. `INSERT … SELECT` would write an answer back as

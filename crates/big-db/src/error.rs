@@ -64,6 +64,22 @@ pub enum DbError {
     /// be the same string everywhere a table travels as one - see
     /// [`crate::catalog::TableRef::parse`].
     NameSeparator(String),
+    /// A `SELECT` kept under a name, where there is none.
+    UnknownView(String),
+    /// A second `CREATE VIEW` for a name that already holds a different statement. `OR REPLACE`
+    /// is how somebody says they meant it; without it, overwriting silently would discard a
+    /// definition other statements are reading through.
+    ViewRedefined(String),
+    /// A view and a table in one database asking for one name. Both are things a `FROM`
+    /// resolves, so a name that was both would resolve to whichever was looked up first.
+    ViewNameTaken(String),
+    /// A view body past [`crate::catalog::MAX_VIEW_BYTES`]. The whole catalog is re-encoded on
+    /// any commit that dirties it, so an unbounded body makes one DDL commit unbounded too.
+    ViewTooLong {
+        view: String,
+        bytes: usize,
+        max: usize,
+    },
     /// A backup was aimed at a path that already holds something. Never overwritten: the
     /// caller who typed the wrong name is the one who needed the old file.
     BackupDestinationExists(std::path::PathBuf),
@@ -232,6 +248,21 @@ impl core::fmt::Display for DbError {
                 write!(f, "name `{name}` is longer than the {max}-byte limit")
             }
             Self::NameTaken(n) => write!(f, "the name `{n}` is already in use"),
+            Self::UnknownView(v) => write!(f, "no view named `{v}`"),
+            Self::ViewRedefined(v) => write!(
+                f,
+                "view `{v}` already holds a different statement; write \
+                 `CREATE OR REPLACE VIEW {v} AS ...` to change what it means"
+            ),
+            Self::ViewNameTaken(n) => write!(
+                f,
+                "`{n}` is already a table in this database; a view and a table share one \
+                 namespace, because a `FROM` has to resolve to exactly one of them"
+            ),
+            Self::ViewTooLong { view, bytes, max } => write!(
+                f,
+                "the statement for view `{view}` is {bytes} bytes, past the {max}-byte limit"
+            ),
             Self::BackupDestinationExists(p) => {
                 write!(f, "{} already exists; backups never overwrite", p.display())
             }
@@ -312,6 +343,10 @@ impl DbError {
             Self::WrongFieldKind { .. } => "wrong_field_kind",
             Self::NameTooLong { .. } => "name_too_long",
             Self::NameTaken(_) => "name_taken",
+            Self::UnknownView(_) => "unknown_view",
+            Self::ViewRedefined(_) => "view_redefined",
+            Self::ViewNameTaken(_) => "view_name_taken",
+            Self::ViewTooLong { .. } => "view_too_long",
             Self::BackupDestinationExists(_) => "backup_destination_exists",
             Self::BackupDestinationNotEmpty => "backup_destination_not_empty",
             Self::QueryTooLarge { .. } => "query_too_large",

@@ -28,6 +28,7 @@
 use crate::error::{ApiError, Result};
 use crate::result::{Datum, ResultSet};
 use crate::schema::{FieldInfo, TableInfo};
+use crate::views::ViewInfo;
 use big_db::catalog::FieldKind;
 use big_db::DbError;
 use big_sql::{Column as SqlColumn, ColumnKind as SqlColumnKind};
@@ -68,36 +69,94 @@ pub fn sql_kind_of(kind: FieldKind) -> SqlColumnKind {
 /// same rule about what is absent: a `scale` on a field that stores no decimal and a
 /// `granularity` on a field with no views by time are [`Datum::Null`] rather than zero, so that
 /// a reader need not know which kinds to ignore them for.
-pub fn describe(tables: &[TableInfo], table: &str) -> Result<ResultSet> {
+/// A view answers with **the columns it exposes**, under the names it exposes them by, each
+/// carrying the kind of the column underneath. A `DESCRIBE` that listed the base table's fields
+/// would undo the view in one statement.
+pub fn describe(tables: &[TableInfo], views: &[ViewInfo], table: &str) -> Result<ResultSet> {
+    let columns =
+        ["name", "kind", "bit_depth", "scale", "granularity"].map(str::to_string).to_vec();
+    if let Some(view) = find_view(views, table) {
+        let (base, exposed) = view.shape()?;
+        let under = find(tables, &base)?;
+        let rows = exposed
+            .iter()
+            .filter_map(|(shown, column)| {
+                // A column the base table no longer has: the view dangles, which is what a
+                // `DROP COLUMN` under a view leaves behind. Omitted rather than reported as a
+                // field of unknown kind - `SHOW CREATE VIEW` still says what it names.
+                let f = under.fields.iter().find(|f| f.name == *column)?;
+                let mut row = field_row(f);
+                row[0] = Datum::Text(shown.clone());
+                Some(row)
+            })
+            .collect();
+        return Ok(ResultSet { columns, rows });
+    }
     let info = find(tables, table)?;
-    Ok(ResultSet {
-        columns: ["name", "kind", "bit_depth", "scale", "granularity"].map(str::to_string).to_vec(),
-        rows: info.fields.iter().map(field_row).collect(),
-    })
+    Ok(ResultSet { columns, rows: info.fields.iter().map(field_row).collect() })
 }
 
-/// `SHOW TABLES`: one row per table.
+/// `SHOW TABLES`: one row per table **and one per view**.
 ///
 /// The engine is a column of its own because it is not derivable from anything else a client
 /// can see - the same argument `GET /schema` makes for reporting it - and the field count
 /// because the question after "which tables are there" is always "how big is this one".
-pub fn show_tables(tables: &[TableInfo], database: Option<&str>) -> ResultSet {
+///
+/// **Views are in the listing, under a `type` column.** That is what a JDBC driver asks for and
+/// what it expects back; a listing that hid them would leave a view queryable and invisible,
+/// which is the worst of the two answers. A view has no engine - it stores nothing - so that
+/// cell is [`Datum::Null`] rather than a made-up name, and its `fields` count is the columns it
+/// exposes.
+pub fn show_tables(tables: &[TableInfo], views: &[ViewInfo], database: Option<&str>) -> ResultSet {
     // `SHOW TABLES` with no `FROM` lists the request's own database, which the caller has
     // already resolved into `database`. Listing every database's tables under bare names would
     // answer with names that do not resolve from where they were asked.
     let database = database.unwrap_or(big_db::DEFAULT_DATABASE_NAME);
+    let mut rows: Vec<Vec<Datum>> = tables
+        .iter()
+        .filter(|t| t.database == database)
+        .map(|t| {
+            vec![
+                Datum::Text(t.name.clone()),
+                Datum::Text("BASE TABLE".to_string()),
+                Datum::Text(t.engine.as_str().to_string()),
+                Datum::Int(t.fields.len() as i128),
+            ]
+        })
+        .collect();
+    rows.extend(views.iter().filter(|v| v.database == database).map(|v| {
+        // A body that no longer parses counts no columns rather than failing the listing: a
+        // listing is how somebody finds the broken view, so it must not be what the broken view
+        // breaks.
+        let exposed = v.shape().map_or(0, |(_, c)| c.len());
+        vec![
+            Datum::Text(v.name.clone()),
+            Datum::Text("VIEW".to_string()),
+            Datum::Null,
+            Datum::Int(exposed as i128),
+        ]
+    }));
+    // One namespace, so one sorted listing: a client drawing a tree gets tables and views
+    // interleaved by name, which is where somebody looking for a name expects to find it.
+    rows.sort_by(|a, b| match (&a[0], &b[0]) {
+        (Datum::Text(x), Datum::Text(y)) => x.cmp(y),
+        _ => core::cmp::Ordering::Equal,
+    });
+    ResultSet { columns: ["name", "type", "engine", "fields"].map(str::to_string).to_vec(), rows }
+}
+
+/// `SHOW VIEWS`: one row per view, with the statement it holds.
+///
+/// Not redundant with `SHOW TABLES`, which says a view exists but not what it means. This is the
+/// listing an operator reads to find the view that a `DROP COLUMN` is about to break.
+pub fn show_views(views: &[ViewInfo], database: Option<&str>) -> ResultSet {
+    let database = database.unwrap_or(big_db::DEFAULT_DATABASE_NAME);
     ResultSet {
-        columns: ["name", "engine", "fields"].map(str::to_string).to_vec(),
-        rows: tables
+        columns: ["name", "statement"].map(str::to_string).to_vec(),
+        rows: views
             .iter()
-            .filter(|t| t.database == database)
-            .map(|t| {
-                vec![
-                    Datum::Text(t.name.clone()),
-                    Datum::Text(t.engine.as_str().to_string()),
-                    Datum::Int(t.fields.len() as i128),
-                ]
-            })
+            .filter(|v| v.database == database)
+            .map(|v| vec![Datum::Text(v.name.clone()), Datum::Text(v.text.clone())])
             .collect(),
     }
 }
@@ -126,7 +185,29 @@ pub fn show_databases(tables: &[TableInfo]) -> ResultSet {
 ///
 /// Rendered by `big-sql`, which owns the mapping between a type name and a field kind in both
 /// directions - so what comes out is a statement its own parser reads back as this same table.
-pub fn show_create(tables: &[TableInfo], table: &str) -> Result<ResultSet> {
+/// A view answers with the `CREATE VIEW` that would recreate it, built around the statement it
+/// stored - which round-trips exactly, because it is the text this crate was handed.
+///
+/// `view` is `SHOW CREATE VIEW`, where a table under that name is the wrong object rather than
+/// the answer. Unset, the name is looked up as either, which is what `SHOW CREATE x` means.
+pub fn show_create(
+    tables: &[TableInfo],
+    views: &[ViewInfo],
+    table: &str,
+    view: bool,
+) -> Result<ResultSet> {
+    if let Some(v) = find_view(views, table) {
+        // Qualified whenever it is not in the default database, for the reason the table branch
+        // states below: the statement has to recreate the view *where it is*.
+        let statement = format!("CREATE VIEW {} AS {}", v.qualified(), v.text);
+        return Ok(ResultSet {
+            columns: vec!["statement".to_string()],
+            rows: vec![vec![Datum::Text(statement)]],
+        });
+    }
+    if view {
+        return Err(ApiError::Db(DbError::UnknownView(table.to_string())));
+    }
     let info = find(tables, table)?;
     let columns: Vec<SqlColumn> = info
         .fields
@@ -176,4 +257,14 @@ fn find<'a>(tables: &'a [TableInfo], table: &str) -> Result<&'a TableInfo> {
         .iter()
         .find(|t| t.name == r.table && t.database == r.database)
         .ok_or_else(|| ApiError::Db(DbError::UnknownTable(table.to_string())))
+}
+
+/// The view of that name, if the name is a view.
+///
+/// `Option` rather than `Result` because every caller has a table branch to fall through to: a
+/// name is a view, or a table, or neither - and only the last of those is an error, said once
+/// by whichever branch runs out of places to look.
+fn find_view<'a>(views: &'a [ViewInfo], name: &str) -> Option<&'a ViewInfo> {
+    let r = big_db::TableRef::parse(name);
+    views.iter().find(|v| v.name == r.table && v.database == r.database)
 }

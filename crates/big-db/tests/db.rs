@@ -1282,3 +1282,112 @@ fn a_qualified_name_round_trips_through_the_string_form() {
     assert_eq!(big_db::TableRef::parse("tx"), big_db::TableRef::bare("tx"));
     assert_eq!(big_db::TableRef::bare("tx").to_string(), "tx");
 }
+
+/// **The first payload in this format that spans records.**
+///
+/// A catalog entry is a fixed 128 bytes and a `SELECT` is not, so a saved query is a header
+/// record plus text chunks cut every 104 bytes. What this pins is the reassembly: the chunks are
+/// joined and *then* validated as UTF-8, because a boundary lands wherever it lands - including
+/// inside a character, which is exactly what the multi-byte text below arranges.
+#[test]
+fn a_saved_query_survives_being_chunked_and_reassembled() {
+    let mut c = Catalog::new();
+    c.intern_table_with(big_db::DEFAULT_DATABASE, "tx", TableEngine::Bitmap).unwrap();
+    // Long enough to need several records, and made of characters wide enough that a 104-byte
+    // cut has to fall inside one of them.
+    let text = format!("SELECT amount FROM tx WHERE country = '{}'", "é".repeat(200));
+    assert!(text.len() > MAX_NAME_LEN * 3, "the body has to span records");
+    c.intern_saved_query(big_db::DEFAULT_DATABASE, "big", &text, false).unwrap();
+
+    let entries = c.encode();
+    let chunks = entries.iter().filter(|e| e[0] == big_db::catalog::KIND_SAVED_QUERY_TEXT).count();
+    assert!(chunks > 3, "{chunks} chunk(s) is not enough to be testing chunking");
+
+    let back = Catalog::from_entries(&entries).unwrap();
+    assert_eq!(back.saved_query(big_db::DEFAULT_DATABASE, "big").unwrap().text, text);
+}
+
+/// A torn set of chunks is skipped, not half-decoded.
+///
+/// The additive policy this format runs on says an unrecognised record is skipped; a *missing*
+/// one is the same situation from the other side, and a half-decoded `SELECT` is a statement
+/// nobody wrote. The header carries the total length so the decoder can tell - which is the
+/// whole reason it is written.
+#[test]
+fn a_saved_query_missing_a_chunk_is_skipped_rather_than_truncated() {
+    let mut c = Catalog::new();
+    let text = format!("SELECT amount FROM tx WHERE country = '{}'", "x".repeat(300));
+    c.intern_saved_query(big_db::DEFAULT_DATABASE, "big", &text, false).unwrap();
+    c.intern_saved_query(big_db::DEFAULT_DATABASE, "small", "SELECT amount FROM tx", false)
+        .unwrap();
+
+    // Drop one chunk out of the middle of the long one, the way a truncated file would.
+    let mut entries = c.encode();
+    let at = entries
+        .iter()
+        .position(|e| e[0] == big_db::catalog::KIND_SAVED_QUERY_TEXT)
+        .expect("the long body is in chunks");
+    entries.remove(at + 1);
+
+    let back = Catalog::from_entries(&entries).unwrap();
+    assert!(back.saved_query(big_db::DEFAULT_DATABASE, "big").is_none(), "half a statement");
+    // And only that one: a torn record is not a reason to lose the rest of the catalog.
+    let small = back.saved_query(big_db::DEFAULT_DATABASE, "small").expect("the intact one");
+    assert_eq!(small.text, "SELECT amount FROM tx");
+}
+
+/// A file written before views existed reads back with none, and every table exactly where it
+/// was - which is what "a reader skips kinds it does not recognise" buys in this direction too.
+#[test]
+fn a_catalog_written_before_views_existed_still_opens() {
+    let mut c = Catalog::new();
+    let sales = c.intern_database("sales").unwrap();
+    c.intern_table_with(sales, "orders", TableEngine::Bitmap).unwrap();
+    c.intern_table_with(big_db::DEFAULT_DATABASE, "tx", TableEngine::Bitmap).unwrap();
+    c.intern_saved_query(sales, "big", "SELECT amount FROM orders", false).unwrap();
+
+    // Exactly the entries an older build wrote: the two view kinds had no meaning, so it never
+    // produced one.
+    let entries: Vec<Vec<u8>> = c
+        .encode()
+        .into_iter()
+        .filter(|e| {
+            e[0] != big_db::catalog::KIND_SAVED_QUERY
+                && e[0] != big_db::catalog::KIND_SAVED_QUERY_TEXT
+        })
+        .collect();
+
+    let back = Catalog::from_entries(&entries).unwrap();
+    assert_eq!(back.saved_queries().count(), 0);
+    assert_eq!(back.lookup("sales.orders").unwrap().database, sales);
+    assert_eq!(back.lookup("tx").unwrap().database, big_db::DEFAULT_DATABASE);
+}
+
+/// A view and a table cannot share a name in one database, refused from both directions - so a
+/// `FROM` never has two things to choose between.
+#[test]
+fn a_view_and_a_table_hold_one_namespace_between_them() {
+    let mut c = Catalog::new();
+    c.intern_table_with(big_db::DEFAULT_DATABASE, "tx", TableEngine::Bitmap).unwrap();
+    let e = c.intern_saved_query(big_db::DEFAULT_DATABASE, "tx", "SELECT a FROM u", false);
+    assert_eq!(e.unwrap_err().code(), "view_name_taken");
+
+    c.intern_saved_query(big_db::DEFAULT_DATABASE, "big", "SELECT a FROM tx", false).unwrap();
+    let e = c.intern_table_with(big_db::DEFAULT_DATABASE, "big", TableEngine::Bitmap);
+    assert_eq!(e.unwrap_err().code(), "view_name_taken");
+
+    // The same name in another database is another object, which is what a namespace is for.
+    let sales = c.intern_database("sales").unwrap();
+    c.intern_table_with(sales, "big", TableEngine::Bitmap).unwrap();
+}
+
+/// A body past the ceiling is refused rather than stored and truncated - the rule a name over
+/// `MAX_NAME_LEN` follows, and for the same reason.
+#[test]
+fn a_view_body_past_the_ceiling_is_refused() {
+    let mut c = Catalog::new();
+    let huge = "x".repeat(big_db::catalog::MAX_VIEW_BYTES + 1);
+    let e = c.intern_saved_query(big_db::DEFAULT_DATABASE, "big", &huge, false);
+    assert_eq!(e.unwrap_err().code(), "view_too_long");
+    assert_eq!(c.saved_queries().count(), 0);
+}

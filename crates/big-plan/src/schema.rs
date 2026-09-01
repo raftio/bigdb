@@ -78,6 +78,17 @@ pub trait Schema {
     /// `None` when the field does not exist on that table.
     fn field_class(&self, table: &str, field: &str) -> Option<FieldClass>;
 
+    /// Every column the table declares, in the order it declared them.
+    ///
+    /// What `SELECT *` expands to, which is why it is here rather than left to the caller: the
+    /// statement is written before anything knows the table, so the list has to be filled in
+    /// where a schema is in reach.
+    ///
+    /// **Not defaulted.** An empty list is a real answer - a table with no fields - so a
+    /// default would be a `Schema` silently answering `SELECT *` with no columns at all, which
+    /// is a wrong answer rather than a missing one.
+    fn fields(&self, table: &str) -> Vec<String>;
+
     /// Whether this table keeps its values in column segments as well as, or instead of, an
     /// index.
     ///
@@ -91,4 +102,27 @@ pub trait Schema {
     fn stores_values(&self, _table: &str) -> bool {
         false
     }
+}
+
+/// The columns `SELECT *` expands to on this table, in declaration order.
+///
+/// **One function because two callers have to agree.** The plan reads these columns and the
+/// shape names them, and a plan reading three columns under a header of four is an answer that
+/// is wrong rather than absent - so neither side works the list out for itself.
+///
+/// Empty where there is nothing a projection could read: a table with no fields, or one whose
+/// engine keeps no values, where a keyed or boolean column has no read back from a record at
+/// all. Both cases fall back to record ids, which is what `SELECT *` answered before it
+/// expanded to anything.
+pub fn expanded_columns(schema: &impl Schema, table: &str) -> Vec<String> {
+    let stores_values = schema.stores_values(table);
+    schema
+        .fields(table)
+        .into_iter()
+        .filter(|f| match schema.field_class(table, f) {
+            Some(FieldClass::Integer { .. } | FieldClass::Signed) => true,
+            Some(FieldClass::Keyed(_) | FieldClass::Boolean) => stores_values,
+            None => false,
+        })
+        .collect()
 }

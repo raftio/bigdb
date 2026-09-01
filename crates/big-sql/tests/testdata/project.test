@@ -130,13 +130,37 @@ SELECT country FROM u LIMIT 10
 ----
 did not resolve: `a projection` is not allowed on `country`, which is a keyed field
 
-# A projection with no limit is refused: see refusals.test.
-error
+# A projection with no limit is a full scan: every record the `WHERE` selects, at a point read
+# per record per column. The plan says so by carrying no cut at all.
+plan
 SELECT amount FROM t
 ----
-sql_projection_unsupported
+Project t.(amount)
+└── all
 
-error
-SELECT amount, price FROM t
+shape
+SELECT amount FROM t
 ----
-sql_projection_unsupported
+Table
+└── amount
+
+plan
+SELECT amount, price FROM t WHERE country = 'GB'
+----
+Project t.(amount, price)
+└── country = 'GB'
+
+# A limit past what used to be the cap is a smaller ask than the statement above it, so there is
+# nothing left for a cap to protect.
+plan
+SELECT amount FROM t LIMIT 100000
+----
+Project t.(amount) limit=100000
+└── all
+
+# `LIMIT 0` reads nothing rather than being refused: it is the cut it says it is.
+plan
+SELECT amount FROM t LIMIT 0
+----
+Project t.(amount) limit=0
+└── all
