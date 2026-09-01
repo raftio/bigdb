@@ -1,0 +1,254 @@
+# Aggregates over real records, asked twice.
+#
+# Every `same` case runs the statement and the query-language call it translates into and
+# insists the two produce the identical value before the answer below is written down. A number
+# written by hand can be wrong in a way a test written from the same misunderstanding agrees
+# with; a disagreement between two surfaces cannot be anything but a bug in the translation.
+
+statement
+CREATE TABLE tx (amount UINT(32), price DECIMAL(10, 2), balance SIGNED(32), country SET, active BOOL)
+
+statement
+INSERT INTO tx (_record_id, amount, price, balance, country, active) VALUES
+  (1, 100, 1.50, -20, 'GB', true),
+  (2, 900, 12.25, 5, 'US', false),
+  (3, 500, 3.00, 0, 'GB', true),
+  (4, 700, 7.75, -1, 'FR', true),
+  (5, 200, 2.50, 40, 'US', true)
+
+same Count(All())
+SELECT count(*) FROM tx
+----
+count
+5
+
+same Count(Row(amount >= 500))
+SELECT count(*) FROM tx WHERE amount >= 500
+----
+count
+3
+
+same Count(Row(country="GB"))
+SELECT count(*) FROM tx WHERE country = 'GB'
+----
+count
+2
+
+same Count(Row(active=true))
+SELECT count(*) FROM tx WHERE active = true
+----
+count
+4
+
+same Count(Intersect(Row(country="GB"), Row(active=true)))
+SELECT count(*) FROM tx WHERE country = 'GB' AND active = true
+----
+count
+2
+
+same Count(Union(Row(country="GB"), Row(country="FR")))
+SELECT count(*) FROM tx WHERE country IN ('GB', 'FR')
+----
+count
+3
+
+same Count(Not(Row(active=true)))
+SELECT count(*) FROM tx WHERE NOT active = true
+----
+count
+1
+
+same Sum(All(), field=amount)
+SELECT sum(amount) FROM tx
+----
+sum
+2400
+
+same Sum(Row(country="GB"), field=amount)
+SELECT sum(amount) FROM tx WHERE country = 'GB'
+----
+sum
+600
+
+same Min(All(), field=amount)
+SELECT min(amount) FROM tx
+----
+min
+100
+
+same Max(All(), field=amount)
+SELECT max(amount) FROM tx
+----
+max
+900
+
+# A decimal field stores an integer, and the point is put back exactly once - here, at the last
+# step. Nothing above this line has gone through a float.
+same Sum(All(), field=price)
+SELECT sum(price) FROM tx
+----
+sum
+27.00
+
+same Min(All(), field=price)
+SELECT min(price) FROM tx
+----
+min
+1.50
+
+same Max(All(), field=price)
+SELECT max(price) FROM tx
+----
+max
+12.25
+
+# The bound converts on the way in against the same scale, so a written value finds the records
+# it was written about.
+same Count(Row(price >= 3.00))
+SELECT count(*) FROM tx WHERE price >= 3.00
+----
+count
+3
+
+query
+SELECT count(*) FROM tx WHERE price > 12
+----
+count
+1
+
+query
+SELECT count(*) FROM tx WHERE price > 12.00
+----
+count
+1
+
+# A signed field, where a negative bound is a bound rather than a mistake.
+same Count(Row(balance < 0))
+SELECT count(*) FROM tx WHERE balance < 0
+----
+count
+2
+
+same Sum(All(), field=balance)
+SELECT sum(balance) FROM tx
+----
+sum
+24
+
+same Min(All(), field=balance)
+SELECT min(balance) FROM tx
+----
+min
+-20
+
+# Several questions in one statement: one plan each, merged independently, joined into one row.
+query
+SELECT count(*), sum(amount), min(amount), max(amount) FROM tx
+----
+count  sum   min  max
+5      2400  100  900
+
+query
+SELECT count(*) AS n, sum(amount) AS total FROM tx WHERE country = 'GB'
+----
+n  total
+2  600
+
+# An average is a sum over a count, divided after the merge - which is the only place both
+# halves are whole.
+query
+SELECT avg(amount) FROM tx
+----
+avg
+480
+
+query
+SELECT avg(amount) FROM tx WHERE country = 'GB'
+----
+avg
+300
+
+# Over no records at all: a sum is zero and an extreme is nothing, and this surface has no null
+# for the sum to propagate through.
+query
+SELECT count(*), sum(amount), min(amount), max(amount), avg(amount) FROM tx WHERE amount > 10000
+----
+count  sum  min   max   avg
+0      0    NULL  NULL  NULL
+
+same Distinct(All(), field=country)
+SELECT count(DISTINCT country) FROM tx
+----
+count
+3
+
+query
+SELECT count(*), count(DISTINCT country) FROM tx
+----
+count  count
+5      3
+
+# Six spellings of an approximate distinct count, every one of them answered exactly.
+query
+SELECT uniq(country), uniqExact(country), uniqHLL12(country) FROM tx
+----
+count  count  count
+3      3      3
+
+# A ranking rendered as a list in one cell.
+query
+SELECT topK(2)(country) FROM tx
+----
+topK
+[GB, US]
+
+# `FILTER` and `countIf` are the same clause, and the corpus says so by answering identically.
+query
+SELECT count(*) AS all_of_them, count(*) FILTER (WHERE amount >= 500) AS big FROM tx
+----
+all_of_them  big
+5            3
+
+query
+SELECT countIf(amount >= 500) FROM tx
+----
+count
+3
+
+query
+SELECT countIf(active) FROM tx
+----
+count
+4
+
+query
+SELECT sum(amount) FILTER (WHERE country = 'GB') FROM tx
+----
+sum
+600
+
+# A quantile is a search: the bound moves until the count lands on the rank. Exact, because what
+# moves it is the merged count rather than any node's share of it.
+query
+SELECT median(amount) FROM tx
+----
+quantile
+500
+
+query
+SELECT quantile(0.25)(amount) FROM tx
+----
+quantile
+200
+
+query
+SELECT quantile(0.75)(amount) FROM tx
+----
+quantile
+700
+
+query
+SELECT min(amount), median(amount), max(amount) FROM tx
+----
+min  quantile  max
+100  500       900

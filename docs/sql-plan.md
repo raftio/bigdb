@@ -195,6 +195,11 @@ the merge rather than in a `Plan` variant, and it is now a failing test rather t
 The other two cover a ranking cut after the merge instead of at the owners, and a refusal that
 never reaches a peer because planning is pure.
 
+Those are the arguments. The breadth they are held over is data-driven and lives in files -
+around four hundred statements checked against the tree each translates into, another hundred and
+fifty against real records, the same corpus replayed over a socket, and generated predicates
+checked against ground truth. See [`sql-testing.md`](sql-testing.md).
+
 The benchmark, by contrast, is **single-node throughout** and says nothing about any of this;
 see [`bench/readme.md`](../bench/readme.md).
 
@@ -393,12 +398,12 @@ one of them.
 |---|---|---|
 | `LEFT`/`RIGHT`/`FULL`/`CROSS`/`NATURAL JOIN` | `sql_no_outer_joins` | An outer join produces a row for a record with no partner. What is computed here is arithmetic over per-key counts; there is no row to null out half of. |
 | A comma between tables | `sql_no_joins` | A cross join has no key to pair on. |
-| A third table | `sql_no_joins` | Would need a key all three share, which is a different question. |
+| A third table | `sql_no_joins` | Would need a key all three share, which is a different question. **v5 answers the case where there is one** — see [What v5 added](#what-v5-added-the-star). What stays refused is a table that would need two. |
 | `ON` that is not one equality, and `USING` | `sql_join_condition` | Two conditions pair on a composite key this index never stored. `USING` names one column for two tables that each keep their own dictionary. |
 | A bare column with two tables in scope | `sql_ambiguous_column` | Nothing here to guess with. |
 | A `WHERE` term mixing both tables under `OR` or `NOT` | `sql_join_filter` | Neither side can be filtered to it. |
 | `SELECT a.x, b.y FROM a JOIN b …` | `sql_unsupported` | A pair of records has no identity this engine stores. |
-| `avg` over a join | `sql_unsupported` | A ratio of two paired numbers, which is a cell holding two cells. Write the sum and the count. |
+| `avg` over a join | `sql_unsupported` | A ratio of two paired numbers, which is a cell holding two cells. Write the sum and the count. **Answered in v5** — it is one cell that folds both halves and then divides. |
 | `FILTER` over a join | `sql_unsupported` | It would leave the two sides disagreeing about which keys are in the join, and a key one side dropped is a pairing that never happened rather than a group with a zero in it. |
 
 ### What is still missing
@@ -538,3 +543,149 @@ point read apiece are the same fact seen from two other angles.
 
 That is not engineering time. It is the shape of the index, and it is the one thing on this page
 that a later version will not reverse.
+
+---
+
+## What v4 added: the statements that are not questions
+
+The first three versions were about one statement — `SELECT` — and everything else an OLAP
+surface is expected to have was refused at its first keyword by a single `Refused::Write`. That
+list divides cleanly in two, and v4 does both halves.
+
+### The half the engine could already do
+
+`INSERT INTO t (id, …) VALUES (…)`, `DROP TABLE [IF EXISTS]`, `CREATE TABLE IF NOT EXISTS`, and
+`DESCRIBE` / `SHOW TABLES` / `SHOW CREATE TABLE`. None of these needed anything new below
+`big-api`: the import path, `drop_table` and the schema snapshot were all reachable over HTTP
+already. What was missing was a way to say them in the language the rest of the session is
+written in.
+
+**An `INSERT` carries literals, not facts.** `big-sql` reads no schema — that is the invariant
+the whole crate rests on — so what a value *means* for a field is resolved one layer up, by the
+new `big_api::fact`. The import route now reads its lines with that same function, which turns a
+refactor into a checkable claim: `an_inserted_value_is_read_the_way_an_imported_one_is` writes
+one record each way and asks one question of both.
+
+**The record id is a column, and the server fills it in when a statement does not.** A fact is a
+bit at `(row, record)`, so the id is the address rather than a key — and `shard_of(record)` is
+also which node owns it, which is why nothing could defer the decision. An ETL that has its own
+ids writes them through `_record_id`; a statement that omits the column is allocated a run.
+
+The column is underscored because `id` is the name almost every schema wants for a column of its
+own, and reserving it would have cost users that name to buy the engine a coordinate.
+
+**The allocation goes where key interning already goes.** "One past the highest" has one right
+answer per cluster, and two coordinators computing it independently would compute the same number
+and write two records into one — which, unlike a refusal, nothing downstream could see. So the
+schema leader answers, before any fact is sent anywhere, and a leader that cannot be reached
+stops the statement. Two terms make up an allocation: one past the highest id **anywhere**,
+which keeps it clear of ids written by hand or through the import route (neither passes through
+the leader), and the leader's own floor, which keeps two allocations made before either has been
+committed from meeting. The first term costs one shard's read per node — fragments are keyed by
+shard in a `BTreeMap`, so the last one is the highest — and one round trip per statement rather
+than per row.
+
+### The half it cannot
+
+Float columns, the scalar function catalogue, `CASE WHEN`, `CAST`, `argMin`/`stddev`/`corr`,
+`INSERT … SELECT`, `CREATE DATABASE`, `CREATE VIEW`. Each of these now has a named refusal with
+its own reason, in place of a syntax error or a blanket "this surface writes no rows". The
+reasons are the same shape as the v3 ones: they are about the index rather than about time. There
+are no values per record until something reads them back, so nothing chooses between two of them;
+a keyed column and an integer column have no representation in common, so nothing converts; a
+fold that revisits each record's value has nothing to revisit.
+
+### The type change worth naming
+
+`Cluster::sql` used to answer `(Vec<Value>, Answer)` and now answers `(ResultSet, Format)`.
+
+A `Shape` describes how the answers *plans* produced become cells, and every one of its cells
+names a plan by index — which is why `Shape::rebase` exists. Three of the four kinds of statement
+make no plan at all. `sql_ddl` was already coping by building a `Shape::Row` whose one cell named
+`plan: 0` when there was no plan, and `DESCRIBE` would have had to fake one harder.
+
+So the last step moved down one layer, to the coordinator, where the same argument
+`big-api/src/result` already makes applies: a shape is only right once every owner has answered,
+and that is where every owner has answered. `big-http` lost a function and gained nothing to
+know. The public JSON did not change, which the byte-exact assertions in `big-http/tests/sql.rs`
+confirm without having been edited.
+
+### The decimal that did not round-trip
+
+A smoke test caught what the suite did not. `INSERT INTO p (price) VALUES (12.50)` stored 1250,
+`WHERE price = 12.50` found it — and `SELECT price` answered `1250`.
+
+Both halves were internally consistent and had been from the start: a comparison is converted by
+`big_plan::to_units` before it reaches the planner, and an answer was handed back in the units it
+merged in. Nothing was wrong with either. What was wrong is that a surface which takes `12.50`
+and answers `1250` has told the client something false about its own data, and both numbers are
+valid, so nothing in the answer could show which one it was.
+
+The conversion now happens at both ends. `Units` sits on a `Cell` exactly as `Threshold` sits on
+a `Having` — written as a field name by the lowering, resolved to a count of digits by
+`Shape::resolve`, which is already the one place a shape meets a schema. Everything between the
+plan and the merge still works in stored units, which is what keeps it exact; `Datum::Dec` is the
+last step and the only one that knows the scale. It carries the integer and the scale rather than
+an `f64`, because a decimal field stores an integer precisely so that no value passes through a
+float, and rendering one through a float would put back the error the storage layer avoided.
+
+`POST /table/{t}/query` still answers in units, and that is not a disagreement: its statements
+name fields rather than columns and its answers carry no schema, so what it hands back is what is
+stored. SQL names its columns and knows their fields, so it can put the point back.
+
+---
+
+## What v5 added: the star
+
+`SELECT count(*) FROM t JOIN u ON t.category = u.category JOIN v ON t.category = v.category` was
+refused at the second `JOIN`, and the table above says why: *"would need a key all three share,
+which is a different question."* It has one. The refusal was answering a question the statement
+had not asked.
+
+### The arithmetic did not change
+
+A join was already one grouped count per table and a product per key. A product over three is a
+product over two with one more term:
+
+| | two tables | any number |
+|---|---|---|
+| `count(*)` | `Σ_s \|A_s\| · \|B_s\|` | `Σ_s Π_i \|X_i,s\|` |
+| `sum(a.x)` | `Σ_s sum_A(x) · \|B_s\|` | `Σ_s sum_A(x) · Π_{i≠A} \|X_i,s\|` |
+| an extreme of `a.x` | the least `min_A(x)` over the keys `B` holds | the same, over the keys **every** other side holds |
+| `count(DISTINCT k)` | the keys both sides hold | the size of the intersection of all of them |
+
+So this is still no `Plan` variant and no merge arm. `Shape::Join` carries a `Vec` where it
+carried a pair, and a cell names the plan holding its own number plus the position that plan sits
+at — the sides it is scaled against are the shape's `keys`, which a cell cannot carry and stay
+`Copy`. Two tables print exactly as they did, which is how the golden corpus checks that the
+representation change is invisible.
+
+### The line is the chain, and it is one the index draws
+
+What makes several joins answerable is that **every table is grouped by exactly one column**.
+
+```sql
+FROM t JOIN u ON t.k = u.k JOIN v ON t.k = v.k   -- a star: all three keyed on k
+FROM t JOIN u ON t.k = u.k JOIN v ON u.k = v.k   -- the same star, written transitively
+FROM t JOIN u ON t.k = u.k JOIN v ON u.j = v.j   -- a chain: u keyed on k and on j
+```
+
+The chain asks `u` for `|B_{k,j}|` — one number per *pair* of its columns. That is a
+`GroupByPair`, which this engine has, and it is one pass over the second column per value of the
+first: the cost `GROUP BY a, b, c` is refused for and the reason `Shape::Pairs` carries a
+`left_max`. It is not out of reach; it is a second feature, with its own shape whose rows are
+tuples rather than keys, and its own answer to what `GROUP BY` means when there are two keys to
+group by. Refused as `sql_no_joins` until somebody wants it enough to answer those.
+
+An `ON` also has to name the table it is joining in on one side and a table already in `FROM` on
+the other. Two tables already in scope is a condition about neither of the tables that `JOIN` is
+about; a table further down the list is a name that is not in scope where it stands. Both are
+`sql_join_condition`.
+
+### The cap is counted in tables, not in plans
+
+`Calls::push` dedupes on `(table, call)`, so `FROM t a JOIN t b ON a.k = b.k JOIN t c ON a.k =
+c.k` is **one** call however many aliases are written — a fan-out cap counting plans would let a
+hundred-wide star through. So the width is checked against `MAX_CALLS` directly, before anything
+is pushed. A self-join is still right where it is accepted: two aliases of one table share a
+plan, and `Σ_s |X_s|²` is what that join is.

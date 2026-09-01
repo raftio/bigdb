@@ -20,16 +20,19 @@
 //! different answers to every question here.
 
 use super::Datum;
-use crate::{Absent, Of, RowId, Value};
+use crate::{Absent, Cell, Of, RowId, Value};
 
 /// One cell of a single-row answer.
 ///
 /// Split from [`number`] because one cell is not a number: `topK` holds the list of keys a
 /// ranking produced, and a list is what ClickHouse's `topK` answers with too.
-pub(super) fn scalar_cell(of: Of, values: &[Value], probes_at: usize) -> Datum {
-    match of {
+pub(super) fn scalar_cell(c: &Cell, values: &[Value], probes_at: usize) -> Datum {
+    let digits = c.units.digits();
+    match c.of {
         // A search's answer sits after every call's, which is what `Answer::calls` records.
-        Of::Probe { probe } => Datum::num(values.get(probes_at + probe).and_then(scalar_num)),
+        Of::Probe { probe } => {
+            Datum::num(values.get(probes_at + probe).and_then(scalar_num), digits)
+        }
         Of::Keys { plan } => {
             Datum::Keys(
                 values
@@ -43,7 +46,7 @@ pub(super) fn scalar_cell(of: Of, values: &[Value], probes_at: usize) -> Datum {
                     .collect(),
             )
         }
-        of => Datum::num(number(of, values, None)),
+        of => Datum::num(number(of, values, None), digits),
     }
 }
 
@@ -72,7 +75,7 @@ pub(super) fn number(of: Of, values: &[Value], row: Option<RowId>) -> Option<Num
         // no records - see `Absent`. Only a `FILTER` can put a shape in that position.
         // A join's cells are read by `joined`, which pairs by key string rather than by row.
         // A list of keys is not a number and is rendered by `scalar_cell`.
-        Of::Paired { .. } | Of::SharedKeys { .. } | Of::Keys { .. } => None,
+        Of::Paired { .. } | Of::SharedKeys | Of::PairedRatio { .. } | Of::Keys { .. } => None,
         Of::Group { plan, absent } => match group_num(values.get(plan)?, row?) {
             Some(n) => Some(n),
             None => match absent {
@@ -126,7 +129,7 @@ pub(super) enum Num {
     Real(f64),
 }
 
-fn as_f64(n: Num) -> f64 {
+pub(super) fn as_f64(n: Num) -> f64 {
     match n {
         Num::Int(v) => v as f64,
         Num::Real(v) => v,

@@ -1,0 +1,246 @@
+# The select list: what a statement asks for, and the plans behind it.
+#
+# One plan per question. `SELECT count(*), sum(amount)` is two, fanned out and merged
+# independently, and nothing below the shape learns they were written together.
+
+plan
+SELECT count(*) FROM t
+----
+Count t
+└── all
+
+plan
+SELECT count(*) FROM u
+----
+Count u
+└── all
+
+plan
+SELECT sum(amount) FROM t
+----
+Sum t.amount
+└── all
+
+plan
+SELECT min(amount) FROM t
+----
+Min t.amount
+└── all
+
+plan
+SELECT max(amount) FROM t
+----
+Max t.amount
+└── all
+
+plan
+SELECT sum(price) FROM t
+----
+Sum t.price
+└── all
+
+plan
+SELECT sum(balance) FROM t
+----
+Sum t.balance
+└── all
+
+# An alias changes the column name and nothing about the plan.
+plan
+SELECT count(*) AS n FROM t
+----
+Count t
+└── all
+
+plan
+SELECT min(amount) AS lowest FROM t
+----
+Min t.amount
+└── all
+
+# Two questions, two plans.
+plan
+SELECT count(*), sum(amount) FROM t
+----
+Count t
+└── all
+Sum t.amount
+└── all
+
+plan
+SELECT count(*), sum(amount), min(amount), max(amount) FROM t
+----
+Count t
+└── all
+Sum t.amount
+└── all
+Min t.amount
+└── all
+Max t.amount
+└── all
+
+# `avg` is not a plan this engine has: it is a sum over a count, divided after the merge.
+plan
+SELECT avg(amount) FROM t
+----
+Sum t.amount
+└── all
+Count t
+└── all
+
+# The count `avg` needs is the count already asked for, rather than a second identical plan.
+plan
+SELECT count(*), avg(amount) FROM t
+----
+Count t
+└── all
+Sum t.amount
+└── all
+
+plan
+SELECT count(DISTINCT category) FROM t
+----
+Distinct t.category
+└── all
+
+plan
+SELECT count(*), count(DISTINCT country) FROM t
+----
+Count t
+└── all
+Distinct t.country
+└── all
+
+# Six spellings of an approximate distinct count, every one of them answered exactly.
+plan
+SELECT uniq(country) FROM t
+----
+Distinct t.country
+└── all
+
+plan
+SELECT uniqExact(country) FROM t
+----
+Distinct t.country
+└── all
+
+plan
+SELECT uniqCombined(country) FROM t
+----
+Distinct t.country
+└── all
+
+plan
+SELECT uniqCombined64(country) FROM t
+----
+Distinct t.country
+└── all
+
+plan
+SELECT uniqHLL12(country) FROM t
+----
+Distinct t.country
+└── all
+
+plan
+SELECT uniqTheta(country) FROM t
+----
+Distinct t.country
+└── all
+
+# A ranking rendered as a list in one cell rather than as one row per key.
+plan
+SELECT topK(3)(country) FROM t
+----
+TopN t.country n=3
+└── all
+
+# `FILTER` and its ClickHouse spelling are the same clause reaching the same place.
+plan
+SELECT count(*) FILTER (WHERE amount >= 500) FROM t
+----
+Count t
+└── intersect
+    ├── all
+    └── amount >= 500
+
+plan
+SELECT countIf(amount >= 500) FROM t
+----
+Count t
+└── intersect
+    ├── all
+    └── amount >= 500
+
+plan
+SELECT count(*) AS all_of_them, count(*) FILTER (WHERE amount >= 500) AS big FROM t
+----
+Count t
+└── all
+Count t
+└── intersect
+    ├── all
+    └── amount >= 500
+
+plan
+SELECT sum(amount) FILTER (WHERE active = true) FROM t
+----
+Sum t.amount
+└── intersect
+    ├── all
+    └── active = true
+
+# A bare boolean column is a predicate, which is how `countIf(active)` has to read.
+plan
+SELECT countIf(active) FROM t
+----
+Count t
+└── intersect
+    ├── all
+    └── active = true
+
+# A quantile is a search rather than a plan: the bound moves until the count lands on the rank.
+plan
+SELECT median(amount) FROM t
+----
+Probe t.amount per_mille=500
+└── all
+
+plan
+SELECT quantile(0.9)(amount) FROM t
+----
+Probe t.amount per_mille=900
+└── all
+
+plan
+SELECT quantileExact(0.5)(amount) FROM t
+----
+Probe t.amount per_mille=500
+└── all
+
+plan
+SELECT quantile(0.99)(amount) FROM t WHERE active = true
+----
+Probe t.amount per_mille=990
+└── active = true
+
+# The ends of the range, which are levels rather than mistakes.
+plan
+SELECT quantile(0)(amount) FROM t
+----
+Probe t.amount per_mille=0
+└── all
+
+plan
+SELECT quantile(1)(amount) FROM t
+----
+Probe t.amount per_mille=1000
+└── all
+
+plan
+SELECT count(*), median(amount) FROM t
+----
+Count t
+└── all
+Probe t.amount per_mille=500
+└── all

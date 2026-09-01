@@ -39,6 +39,14 @@ pub enum ApiError {
     Sql(SqlError),
     /// Schema or ingest failed.
     Db(DbError),
+    /// A written value does not fit the field it was written to.
+    ///
+    /// Its own variant because it is neither a planning failure nor a storage one: the schema
+    /// is fine, the statement is well formed, and the value is simply not something that field
+    /// holds - `'GB'` into an integer, or three digits after the point on a decimal that keeps
+    /// two. The sentence is built by `fact::ValueError::why`, which is where both write paths
+    /// meet, so an import line and a SQL `INSERT` report the same mistake the same way.
+    Value(String),
 }
 
 impl From<ExecError> for ApiError {
@@ -65,6 +73,7 @@ impl core::fmt::Display for ApiError {
             Self::Query(e) => write!(f, "{e}"),
             Self::Sql(e) => write!(f, "{e}"),
             Self::Db(e) => write!(f, "{e}"),
+            Self::Value(why) => write!(f, "{why}"),
         }
     }
 }
@@ -80,6 +89,8 @@ impl ApiError {
             Self::Query(e) => e.code(),
             Self::Sql(e) => e.code(),
             Self::Db(e) => e.code(),
+            // The code an import line with the same mistake already carries.
+            Self::Value(_) => "malformed_line",
         }
     }
 }

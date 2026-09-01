@@ -611,6 +611,7 @@ dependencies = [
  "big-exec",
  "big-pager",
  "big-plan",
+ "big-testfile",
  "bytemuck",
  "proptest",
  "tempfile",
@@ -678,6 +679,7 @@ dependencies = [
  "big-pager",
  "big-plan",
  "big-sql",
+ "big-testfile",
  "tempfile",
 ]
 
@@ -735,7 +737,12 @@ name = "big-sql"
 version = "0.1.0"
 dependencies = [
  "big-plan",
+ "big-testfile",
 ]
+
+[[package]]
+name = "big-testfile"
+version = "0.1.0"
 
 [[package]]
 name = "bigdecimal"

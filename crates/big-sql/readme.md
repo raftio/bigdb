@@ -49,7 +49,7 @@ SELECT count(*)           FROM t
 `SELECT DISTINCT c` is not a special case: standard SQL defines it as `SELECT c GROUP BY c`, the
 parser normalises it into exactly that, and the plan is the one a `GROUP BY` already produced.
 
-`SELECT *` answers with record ids under a column called `id`, and nothing else — this engine
+`SELECT *` answers with record ids under a column called `_record_id`, and nothing else — this engine
 stores facts as bits at `(row, record)` and has no row of values to hand back. Naming the columns
 instead is a projection, which reconstructs a value per record per column at a point read
 apiece; the cut is therefore part of the plan rather than a view of its answer, and a `LIMIT`
@@ -76,6 +76,7 @@ the merged answer, at the coordinator, once — which is the only place several 
 | `count(DISTINCT x)` | The plan is a `Distinct`; this is the counting step, after every node has contributed to the groups. |
 | `avg(x)` | `sum(x) / count(*)`, which is two plans and a division. Doing the division here is doing it where both halves are whole. |
 | `FILTER (WHERE …)` | Leaves the statement's plans describing different groups, so a cell says what it holds for a group its plan said nothing about: `0` for a count or a sum, absent for an extreme. |
+| A decimal's scale | A decimal field stores an integer — `12.50` at scale two is 1250 — and everything up to the merge works in those units, which is what keeps all of it exact. The point goes back where the answer is written, so a value read back is the value that was written. `WHERE price = 12.50` converts on the way in; this is the same conversion on the way out. |
 | `UNION ALL` | Nothing here is a set operation over records. Each branch is a whole statement with its own plans, stacked as rendered rows — which is why it needed no engine change. |
 | `GROUP BY a, b` | **Not a composite key**, which this index never stored: for each value of the left column the records holding it are a set, and grouping *those* by the right is the ordinary grouping. One pass per value of the left, which is the bound the plan carries. |
 | `JOIN` | See below. |
@@ -129,17 +130,38 @@ Every one of these is refused by name, with a stable code, before anything runs.
 feature: a surface that accepted the syntax and answered something else would be worse than one
 that has no SQL at all.
 
-**Joins past the one that is exact** — a comma between tables or a third table
-(`sql_no_joins`), an outer or cross join (`sql_no_outer_joins`), `USING` or a condition that is
-not one equality (`sql_join_condition`), a column that does not say which table it belongs to
-(`sql_ambiguous_column`), a `WHERE` term mixing both tables under `OR` or `NOT`
-(`sql_join_filter`), and `avg` or a select of joined values over a join — a pair of records has
+**Joins past the ones that are exact** — any number of tables are joined when they are one
+*star* around one shared key. What is refused is a comma between tables, or a table two joins
+would key differently (`sql_no_joins`); an outer or cross join (`sql_no_outer_joins`); `USING`
+or a condition that is not one equality between the table being joined in and one already in
+`FROM` (`sql_join_condition`); a column that does not say which table it belongs to
+(`sql_ambiguous_column`); a `WHERE` term naming two tables under `OR` or `NOT`
+(`sql_join_filter`); and `avg` or a select of joined values over a join — a pair of records has
 no identity this engine stores.
 
 **Everything else that has no set operation behind it** — subqueries, CTEs, `INTERSECT`,
-`EXCEPT`, window functions, arithmetic or a function call in the select list, `LIKE`, `IS NULL`
-and `= NULL`, and every write. A plain `UNION` and `UNION DISTINCT` have their own code
-(`sql_union`): removing duplicate rows here would mean comparing rendered strings.
+`EXCEPT`, window functions, arithmetic in the select list, `LIKE`, `IS NULL` and `= NULL`. A
+plain `UNION` and `UNION DISTINCT` have their own code (`sql_union`): removing duplicate rows
+here would mean comparing rendered strings.
+
+**The computation this dialect has no evaluator for**, each named by what was asked for rather
+than by the evaluator that is missing: `CASE WHEN`, `if` and `coalesce` choose between two
+values per record, and there are no values per record until something reads them back — a
+condition selects a *set*, and `count(*) FILTER (WHERE …)` is how one statement asks about
+several. `CAST`, `toInt64` and `toString` convert between representations that do not convert: a
+keyed column is a string in a dictionary and an integer column is bit planes. `argMin`, `argMax`,
+`stddev`, `varPop` and `corr` need each record's value revisited against a running total, and
+this engine holds bits at `(row, record)` rather than values to revisit. A `FLOAT`, `DOUBLE`,
+`DATE`, `UUID`, `JSON` or `BLOB` column names nothing this engine stores
+(`sql_unknown_column_type`).
+
+**The statements above a table, and the writes with no operation behind them** — a database or a
+schema (`sql_no_database`), a view materialised or not (`sql_no_views`), and `UPDATE`,
+`TRUNCATE`, `MERGE`, `REPLACE` and `CREATE INDEX` (`sql_read_only`), each of which is either a
+row this engine does not store or an index a bitmap already is. `DELETE FROM` shares that code
+and has its own sentence: a record is the bits set for it across every field, and
+`POST /table/{t}/delete` takes the ids to clear. `INSERT … SELECT` would write an answer back as
+facts, and an answer here is counts and keys *about* records rather than records to copy.
 
 **Clauses answered in one shape and not another** — a `HAVING` naming an aggregate the answer
 does not carry or with no `GROUP BY`, an `ORDER BY` naming a second aggregate or a column that
@@ -151,3 +173,69 @@ three digits.
 
 See [`Refused`] for the code and the sentence each one produces — that enum *is* the list, so it
 cannot drift from what the crate does.
+
+## What it writes
+
+`INSERT INTO t (country, amount) VALUES ('GB', 100), ('US', 900)` — the facts
+`POST /table/{t}/import` writes, said as a statement.
+
+**It carries literals, not facts.** What a value *means* is the field's kind to decide — `'GB'`
+is a key to intern, `12.50` is 1250 units on a decimal of scale two, `now@1750000000` is a key
+and a moment — and deciding any of that here would be this crate reading a schema. So an
+[`Insert`] holds the literals exactly as written and `big_api::fact` turns each into a fact
+against the `FieldInfo` it is for. That is the same function the import route reads its lines
+with, so the two write paths cannot come to disagree about what a value means.
+
+**The record id is a column called `_record_id`, and writing it is optional.** A fact is a bit
+at `(row, record)`: the id is the address it is written to rather than a key generated for it,
+and `shard_of(record)` is also which node owns it. An ETL that already has its own ids writes
+them straight through — `INSERT INTO t (_record_id, country) VALUES (7, 'GB')` — and two
+statements writing one id write two facts about one record, exactly as two import lines do.
+
+Underscored because `id` belongs to whoever is writing the table. Taking the most natural column
+name in SQL for the engine's own coordinate would mean a table could not have an `id` field of
+its own, which is a name almost every schema wants; so the reserved one is spelled where nothing
+else will be, and a *field* called `_record_id` is refused instead (`sql_id_column`) — it could
+never be written through this surface, and would answer nothing while the record sat there.
+
+**A statement that leaves the column out is given ids by the schema leader.** "One past the
+highest" has one right answer per cluster, and two coordinators computing it independently would
+compute the same number and write two records into one — which, unlike a refusal, nothing
+downstream could see. So it is allocated where keys are interned, before any fact is sent
+anywhere, and a leader that cannot be reached stops the statement rather than guessing. The run
+is contiguous and in the order the rows were written, and it starts above every id that already
+exists — including ones written by hand or through the import route, which never pass through
+the leader at all.
+
+A statement carries at most [`MAX_INSERT_ROWS`] rows, because the text is lexed and then parsed
+into literals before the first fact is written — the batch is resident twice over. Volume goes
+through the import route, which holds one line at a time.
+
+**A value with more digits than its field keeps is refused, never rounded** (`too_precise`):
+`VALUES (12.523)` into a field of scale two would have to drop a digit, and dropping one
+silently answers a question nobody asked. It is the planner's own refusal, the one
+`WHERE price = 12.523` already gives — one code and one sentence, whichever half of a statement
+wrote the number.
+
+## The schema, changed and asked about
+
+`CREATE TABLE [IF NOT EXISTS] t (…) [ENGINE = …]`, `ALTER TABLE t ADD`/`DROP COLUMN`, and
+`DROP TABLE [IF EXISTS] t` — the changes the `/table` routes make, written as statements and
+applied as exactly those changes, so no node learns a second way to be told about a field.
+
+`IF NOT EXISTS` leaves a table that is already there **exactly as it is, fields included**. That
+is not the same as a `CREATE` that happens to be idempotent: an identical declaration interns to
+the same table below, but a column the table does not have yet would be *created*. "Make sure
+this exists" and "leave it alone if it does" are two requests, and only the second is safe to
+run against a table somebody has since altered.
+
+`DESCRIBE t` — with `DESC t`, `DESCRIBE TABLE t` and `SHOW COLUMNS FROM t` as the same question
+— answers one row per field. `SHOW TABLES` lists the tables with their engine and field count.
+`SHOW CREATE TABLE t` answers with the statement that recreates the table, rendered by
+[`render::create_table`], which is the inverse of the parser's own type table and lives beside it
+so the two cannot drift. All three read the catalog every node already holds: no plan, no
+fan-out, and a `read` token is enough.
+
+Each of the four kinds of statement is a variant of [`Sql`], and that is also how the edge
+decides what a statement costs: a schema change needs `admin`, an `INSERT` needs `write`, and a
+`SELECT` or a `DESCRIBE` reads. A fifth kind cannot be added without that decision being made.

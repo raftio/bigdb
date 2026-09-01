@@ -260,7 +260,7 @@ fn a_refusal_arrives_with_the_servers_own_code_and_sentence() {
     assert_eq!(r.code, exit::REFUSED);
     assert!(r.err.contains("[sql_no_joins]"), "{}", r.err);
     // The server's own words, verbatim.
-    assert!(r.err.contains("cross join"), "{}", r.err);
+    assert!(r.err.contains("comma between tables"), "{}", r.err);
     assert!(r.out.is_empty(), "a refusal printed to stdout: {}", r.out);
 }
 

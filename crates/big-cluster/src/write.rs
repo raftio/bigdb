@@ -231,6 +231,71 @@ impl<P: PagerMut + Sync> Cluster<P> {
         Ok(out)
     }
 
+    /// A run of `count` record ids nobody else will be given.
+    ///
+    /// **Allocated by the schema leader, for the reason keys are interned there.** Two
+    /// coordinators computing "one past the highest" would compute the same number and write
+    /// two records into one - and unlike a refusal, nothing downstream could see that it had
+    /// happened. So this goes through the one node whose job is to be the only one deciding,
+    /// and a leader that cannot be reached stops the statement rather than guessing.
+    ///
+    /// Answers the first id of the run; the caller takes `count` consecutive ids from it.
+    pub(super) fn allocate(&self, table: &str, count: u64) -> Result<RecordId> {
+        if self.config.leads_schema() {
+            return self.allocate_here(table, count);
+        }
+        let leader = self.config.leader_index();
+        let body = wire::AllocateRequest { table: table.to_string(), count }.encode();
+        let bytes = self.ask(leader, path::ALLOCATE, &body, None).map_err(|e| match e {
+            ClusterError::Unreachable { node, why, .. } => {
+                ClusterError::LeaderUnreachable { node, why }
+            }
+            other => other,
+        })?;
+        wire::get_u64_body(&bytes)
+            .map_err(|why| ClusterError::Wire { node: self.config.leader().name.clone(), why })
+    }
+
+    /// The leader's own half of [`Cluster::allocate`].
+    ///
+    /// Two terms, and both are needed. The first is one past the highest id **anywhere**, which
+    /// is what keeps an allocation clear of ids written explicitly or through the import route -
+    /// neither of which passes through here. The second is this leader's own floor, which keeps
+    /// two allocations made before either has been committed from being handed the same number.
+    ///
+    /// Public because the peer route calls it: a request from another coordinator is the same
+    /// allocation, made by the same node, for the same reason.
+    pub fn allocate_here(&self, table: &str, count: u64) -> Result<RecordId> {
+        // Held across the fan-out on purpose. It is one round trip per statement, and a lock
+        // released before the floor was raised would be a lock that decided nothing.
+        let mut floor = self.allocated.lock().unwrap_or_else(|e| e.into_inner());
+        let anywhere = self.next_record(table)?;
+        let from = anywhere.max(floor.get(table).copied().unwrap_or(0));
+        floor.insert(table.to_string(), from.saturating_add(count));
+        Ok(from)
+    }
+
+    /// One past the highest record id any node holds for a table.
+    ///
+    /// One shard's work per node - see `big_api::Api::max_record` - and one round trip per
+    /// statement that allocates, rather than per row. Zero for a table nobody has written to.
+    pub(super) fn next_record(&self, table: &str) -> Result<RecordId> {
+        let body = wire::TableRequest { table: table.to_string() }.encode();
+        let asked = self.candidates(0..self.config.range_count());
+        let answers =
+            self.fan_out_over(&asked, None, path::NEXT_RECORD, &body, wire::get_u64_body, || {
+                self.guard()?;
+                self.local_next_record(table)
+            })?;
+        Ok(answers.into_iter().map(|(_, next)| next).max().unwrap_or(0))
+    }
+
+    /// This node's share of that answer, which the peer route answers with.
+    pub fn local_next_record(&self, table: &str) -> Result<RecordId> {
+        let max = self.api.max_record(table).map_err(ClusterError::Local)?;
+        Ok(max.map_or(0, |m| m.saturating_add(1)))
+    }
+
     /// Asks the schema leader what these keys mean, assigning ids to the ones it has not seen.
     ///
     /// When the leader cannot be reached this is where a write introducing a new key stops.

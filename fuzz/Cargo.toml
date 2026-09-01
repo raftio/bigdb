@@ -6,6 +6,7 @@
 #
 #   cargo +nightly fuzz run parse_page
 #   cargo +nightly fuzz run parse_pql
+#   cargo +nightly fuzz run parse_sql
 #   cargo +nightly fuzz run container_ops
 #   cargo +nightly fuzz run btree_program
 [workspace]
@@ -28,6 +29,7 @@ big-container = { path = "../crates/big-container" }
 big-page = { path = "../crates/big-page" }
 big-pager = { path = "../crates/big-pager" }
 big-plan = { path = "../crates/big-plan" }
+big-sql = { path = "../crates/big-sql" }
 
 # A fuzzer that spends its time in debug assertions finds fewer inputs per hour, but the
 # assertions are a large part of what these targets are checking.
@@ -52,6 +54,13 @@ bench = false
 [[bin]]
 name = "parse_pql"
 path = "fuzz_targets/parse_pql.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_sql"
+path = "fuzz_targets/parse_sql.rs"
 test = false
 doc = false
 bench = false

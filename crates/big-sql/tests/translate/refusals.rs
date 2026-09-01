@@ -22,15 +22,22 @@ use super::common::*;
 /// stops being refused should break a test here rather than start being answered.
 #[test]
 fn every_refusal_names_itself() {
-    // A join on a keyed column is answered; what is refused is a pairing this engine has no
-    // key for, and a join condition that is not one equality.
+    // A join on a keyed column is answered - any number of tables, so long as they are one star
+    // around one key. What is refused is a pairing this engine has no key for, and a join
+    // condition that is not one equality.
     assert_eq!(code("SELECT count(*) FROM t, u"), "sql_no_joins");
+    // The chain: `u` keyed on `a` by one join and on `b` by the other, which would mean
+    // grouping it by both at once.
     assert_eq!(
-        code("SELECT count(*) FROM t JOIN u ON t.a = u.a JOIN v ON t.a = v.a"),
+        code("SELECT count(*) FROM t JOIN u ON t.a = u.a JOIN v ON u.b = v.b"),
         "sql_no_joins"
     );
     assert_eq!(code("SELECT count(*) FROM t LEFT JOIN u ON t.a = u.a"), "sql_no_outer_joins");
-    assert_eq!(code("SELECT count(*) FROM t CROSS JOIN u"), "sql_no_outer_joins");
+    // A cross join and a natural join name no key at all, which is what a comma between tables
+    // is - so they get that refusal and not the outer join one, whose sentence is about
+    // producing a row for a record with no partner.
+    assert_eq!(code("SELECT count(*) FROM t CROSS JOIN u"), "sql_no_joins");
+    assert_eq!(code("SELECT count(*) FROM t NATURAL JOIN u"), "sql_no_joins");
     assert_eq!(code("SELECT count(*) FROM t JOIN u USING (a)"), "sql_join_condition");
     assert_eq!(code("SELECT count(*) FROM t JOIN u ON t.a > u.a"), "sql_join_condition");
     assert_eq!(
@@ -46,8 +53,8 @@ fn every_refusal_names_itself() {
         code("SELECT count(*) FROM t JOIN u ON t.a = u.a WHERE t.amount > 1 OR u.amount > 1"),
         "sql_join_filter"
     );
-    // And the aggregates a join cannot answer.
-    assert_eq!(code("SELECT avg(t.amount) FROM t JOIN u ON t.a = u.a"), "sql_unsupported");
+    // And what a join cannot answer, which is a *row* of one rather than an aggregate over it:
+    // a pair of records has no identity this engine stores.
     assert_eq!(code("SELECT * FROM t JOIN u ON t.a = u.a"), "sql_unsupported");
     assert_eq!(code("SELECT count(*) FROM t WHERE amount IN (SELECT x FROM u)"), "sql_unsupported");
     assert_eq!(code("WITH x AS (SELECT 1) SELECT count(*) FROM t"), "sql_unsupported");
@@ -90,12 +97,45 @@ fn every_refusal_names_itself() {
         code(&format!("SELECT amount FROM t LIMIT {}", big_sql::MAX_PROJECTION + 1)),
         "sql_projection_unsupported"
     );
-    assert_eq!(code("INSERT INTO t (amount) VALUES (1)"), "sql_read_only");
+    // An `INSERT` is answered now - see `writes` - so what is refused is one that does not
+    // name the record it writes about.
+    // A column list is still required - without one the values would be positional against a
+    // field order the statement does not carry. The `id` column is not: leaving it out asks the
+    // server to allocate one.
+    assert_eq!(code("INSERT INTO t VALUES (1, 2)"), "sql_insert_shape");
+    assert_eq!(code("INSERT INTO t (_record_id, amount) VALUES ('seven', 2)"), "sql_insert_shape");
+    assert_eq!(code("INSERT INTO t (amount) SELECT amount FROM u"), "sql_unsupported");
+    // `id` is what a record is called, so a *field* of that name is one no `INSERT` could ever
+    // fill - refused where it is declared rather than where it silently answers nothing.
+    assert_eq!(code("CREATE TABLE t (_record_id UINT(32), a SET)"), "sql_id_column");
+    assert_eq!(code("ALTER TABLE t ADD COLUMN _record_id UINT(32)"), "sql_id_column");
     assert_eq!(code("DELETE FROM t"), "sql_read_only");
-    // `CREATE TABLE` is answered now; a column list on it is not, and says why.
-    assert_eq!(code("CREATE TABLE t (a int)"), "sql_no_column_list");
+    assert_eq!(code("DELETE FROM t WHERE amount > 5"), "sql_read_only");
+    // A column list is answered now - see `schema` - so what is refused is a type name that
+    // names nothing this engine stores, and the SQL that comes attached to one.
+    assert_eq!(code("CREATE TABLE t (a FLOAT)"), "sql_unknown_column_type");
+    assert_eq!(code("CREATE TABLE t (a INT NOT NULL)"), "sql_no_constraints");
+    assert_eq!(code("CREATE TABLE t (a DECIMAL)"), "sql_decimal_scale");
+    assert_eq!(code("CREATE TABLE t (a UINT(0))"), "sql_bit_depth");
     assert_eq!(code("CREATE INDEX i ON t (a)"), "sql_read_only");
-    assert_eq!(code("DROP TABLE t"), "sql_read_only");
+    // A table is dropped now - see `schema` - so what is refused is the two levels of naming
+    // that do not exist here, on whichever verb they were written with.
+    assert_eq!(code("DROP DATABASE d"), "sql_no_database");
+    assert_eq!(code("CREATE DATABASE d"), "sql_no_database");
+    assert_eq!(code("SHOW DATABASES"), "sql_no_database");
+    assert_eq!(code("USE d"), "sql_no_database");
+    assert_eq!(code("DROP VIEW v"), "sql_no_views");
+    assert_eq!(code("CREATE VIEW v AS SELECT count(*) FROM t"), "sql_no_views");
+    assert_eq!(code("CREATE MATERIALIZED VIEW v AS SELECT count(*) FROM t"), "sql_no_views");
+    // The three shapes of computation this dialect has no evaluator for, each named by what it
+    // asked for rather than by the evaluator that is missing.
+    assert_eq!(code("SELECT CASE WHEN amount > 5 THEN 1 ELSE 0 END FROM t"), "sql_unsupported");
+    assert_eq!(code("SELECT multiIf(amount > 5, 1, 0) FROM t"), "sql_unsupported");
+    assert_eq!(code("SELECT cast(amount AS BIGINT) FROM t"), "sql_unsupported");
+    assert_eq!(code("SELECT toString(amount) FROM t"), "sql_unsupported");
+    assert_eq!(code("SELECT argMax(amount, price) FROM t"), "sql_unsupported");
+    assert_eq!(code("SELECT stddevPop(amount) FROM t"), "sql_unsupported");
+    assert_eq!(code("SELECT corr(amount, price) FROM t"), "sql_unsupported");
     assert_eq!(code("SELECT count(*) FROM t WHERE country LIKE 'G%'"), "sql_unsupported");
     // Two aggregates are two plans, which is now answered. What is still refused is a select
     // list that is not one answer: a star beside an aggregate, or a bare column beside one.
@@ -144,7 +184,11 @@ fn a_refusal_says_what_it_is_and_what_exists_instead() {
     let e = translate("SELECT count(*) FROM t, u").unwrap_err();
     let SqlError::Refused { what, .. } = e else { panic!("expected a refusal, got {e:?}") };
     assert_eq!(what, Refused::Joins);
-    assert!(what.why().contains("cross join"), "{}", what.why());
+    // The sentence has to name the thing that was actually written - a comma - and the two
+    // spellings that mean the same, since all three arrive here.
+    assert!(what.why().contains("comma between tables"), "{}", what.why());
+    assert!(what.why().contains("CROSS JOIN"), "{}", what.why());
+    assert!(what.why().contains("NATURAL JOIN"), "{}", what.why());
 
     // A projection is answered now, so what this refusal names is the missing cut rather than
     // the clause: the sentence has to say both what it costs and what to write instead.

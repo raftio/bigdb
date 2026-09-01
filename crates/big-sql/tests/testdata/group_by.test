@@ -1,0 +1,298 @@
+# Grouping, and everything applied to the groups after the merge.
+#
+# `HAVING`, `ORDER BY` and the cut are not in the plan on purpose - see `crate::shape`. A group
+# under the threshold on one node can be over it once every node has contributed, so the plan
+# carries the grouping and the coordinator carries the rest. Where the plan *can* do the work,
+# it does: a plain descending ranking with a limit is a `TopN`, which ranks and truncates in one
+# pass, and that is visible here as the difference between two nearly identical statements.
+
+plan
+SELECT category, count(*) FROM t GROUP BY category
+----
+GroupBy t.category -> count
+└── all
+
+plan
+SELECT category FROM t GROUP BY category
+----
+Distinct t.category
+└── all
+
+plan
+SELECT category, sum(amount) FROM t GROUP BY category
+----
+GroupBy t.category -> sum(amount)
+└── all
+
+plan
+SELECT category, min(amount) FROM t GROUP BY category
+----
+GroupBy t.category -> min(amount)
+└── all
+
+plan
+SELECT category, max(amount) FROM t GROUP BY category
+----
+GroupBy t.category -> max(amount)
+└── all
+
+plan
+SELECT category, count(*), sum(amount) FROM t GROUP BY category
+----
+GroupBy t.category -> count
+└── all
+GroupBy t.category -> sum(amount)
+└── all
+
+plan
+SELECT category, avg(amount) FROM t GROUP BY category
+----
+GroupBy t.category -> sum(amount)
+└── all
+GroupBy t.category -> count
+└── all
+
+plan
+SELECT category, count(*) FROM t WHERE active = true GROUP BY category
+----
+GroupBy t.category -> count
+└── active = true
+
+plan
+SELECT country, count(*) FROM t GROUP BY country
+----
+GroupBy t.country -> count
+└── all
+
+# `SELECT DISTINCT c` is `GROUP BY c` with the counts not rendered.
+plan
+SELECT DISTINCT category FROM t
+----
+Distinct t.category
+└── all
+
+plan
+SELECT DISTINCT category FROM t WHERE amount >= 500
+----
+Distinct t.category
+└── amount >= 500
+
+# Two keyed columns. Not a composite key: for each value of the left the records holding it are
+# a set, and grouping those by the right is the ordinary grouping. So the cost is the number of
+# values on the left, which is why the plan carries that bound rather than having one applied to
+# its answer.
+plan
+SELECT category, country, count(*) FROM t GROUP BY category, country
+----
+GroupByPair t.(category, country) left_max=1000 -> count
+└── all
+
+plan
+SELECT DISTINCT category, country FROM t
+----
+GroupByPair t.(category, country) left_max=1000 -> count
+└── all
+
+plan
+SELECT category, country, sum(amount) FROM t GROUP BY category, country
+----
+GroupByPair t.(category, country) left_max=1000 -> sum(amount)
+└── all
+
+# A plain descending ranking with a limit is the one case the plan carries the cut itself.
+plan
+SELECT category, count(*) AS n FROM t GROUP BY category ORDER BY n DESC LIMIT 8
+----
+TopN t.category n=8
+└── all
+
+plan
+SELECT category, count(*) FROM t GROUP BY category ORDER BY count(*) DESC LIMIT 3
+----
+TopN t.category n=3
+└── all
+
+# An offset means the rows wanted begin further down than the limit describes, so the ranking
+# cannot be truncated to it.
+plan
+SELECT category, count(*) FROM t GROUP BY category ORDER BY count(*) DESC LIMIT 3 OFFSET 2
+----
+TopN t.category n=5
+└── all
+
+plan
+SELECT category, count(*) FROM t GROUP BY category ORDER BY count(*) ASC LIMIT 3
+----
+GroupBy t.category -> count
+└── all
+
+plan
+SELECT category, count(*) FROM t GROUP BY category ORDER BY category
+----
+GroupBy t.category -> count
+└── all
+
+plan
+SELECT category, count(*) FROM t GROUP BY category ORDER BY category DESC
+----
+GroupBy t.category -> count
+└── all
+
+plan
+SELECT category, count(*) FROM t GROUP BY category LIMIT 5
+----
+GroupBy t.category -> count
+└── all
+
+plan
+SELECT category, count(*) FROM t GROUP BY category LIMIT 5 OFFSET 5
+----
+GroupBy t.category -> count
+└── all
+
+# A `HAVING` cannot be answered before the merge either, so a `TopN` under one keeps its limit
+# in the shape: the plan cannot cut to `n` before the rows that fail the predicate are gone.
+plan
+SELECT category, count(*) FROM t GROUP BY category HAVING count(*) > 5
+----
+GroupBy t.category -> count
+└── all
+
+plan
+SELECT category, count(*) AS n FROM t GROUP BY category HAVING count(*) > 5 ORDER BY n DESC LIMIT 3
+----
+TopN t.category n=unbounded
+└── all
+
+plan
+SELECT category, sum(amount) FROM t GROUP BY category HAVING sum(amount) >= 500
+----
+GroupBy t.category -> sum(amount)
+└── all
+
+plan
+SELECT category, sum(price) FROM t GROUP BY category HAVING sum(price) >= 10.00
+----
+GroupBy t.category -> sum(price)
+└── all
+
+plan
+SELECT category, count(*) FROM t GROUP BY category ORDER BY count(*) DESC LIMIT 3 WITH TIES
+----
+GroupBy t.category -> count
+└── all
+
+# The shapes these produce, which is where every clause above actually lives.
+shape
+SELECT category, count(*) FROM t GROUP BY category
+----
+Groups keys=[#0]
+├── category = key
+└── count = group #0 else 0
+
+shape
+SELECT category FROM t GROUP BY category
+----
+Groups keys=[#0]
+└── category = key
+
+shape
+SELECT DISTINCT category FROM t
+----
+Groups keys=[#0]
+└── category = key
+
+shape
+SELECT category, count(*), sum(amount) FROM t GROUP BY category
+----
+Groups keys=[#0, #1]
+├── category = key
+├── count = group #0 else 0
+└── sum = group #1 else 0
+
+shape
+SELECT category, avg(amount) FROM t GROUP BY category
+----
+Groups keys=[#0, #1]
+├── category = key
+└── avg = #0 / #1
+
+shape
+SELECT category, sum(price) FROM t GROUP BY category
+----
+Groups keys=[#0]
+├── category = key
+└── sum = group #0 else 0 scale=2
+
+shape
+SELECT category, country, count(*) FROM t GROUP BY category, country
+----
+Pairs keys=[#0]
+├── category = key
+├── country = right key
+└── count = group #0 else 0
+
+shape
+SELECT category, count(*) AS n FROM t GROUP BY category ORDER BY n DESC LIMIT 8
+----
+Groups keys=[#0]
+├── category = key
+└── n = group #0 else 0
+
+shape
+SELECT category, count(*) FROM t GROUP BY category ORDER BY count(*) DESC LIMIT 3 OFFSET 2
+----
+Groups keys=[#0]
+├── category = key
+├── count = group #0 else 0
+└── cut: limit 3 offset 2
+
+shape
+SELECT category, count(*) FROM t GROUP BY category ORDER BY category DESC
+----
+Groups keys=[#0]
+├── category = key
+├── count = group #0 else 0
+└── order: key desc
+
+shape
+SELECT category, count(*) FROM t GROUP BY category HAVING count(*) > 5
+----
+Groups keys=[#0]
+├── category = key
+├── count = group #0 else 0
+└── having: group #0 else 0 > 5
+
+shape
+SELECT category, sum(price) FROM t GROUP BY category HAVING sum(price) >= 10.00
+----
+Groups keys=[#0]
+├── category = key
+├── sum = group #0 else 0 scale=2
+└── having: group #0 else 0 >= 1000
+
+shape
+SELECT category, count(*) FROM t GROUP BY category ORDER BY count(*) DESC LIMIT 3 WITH TIES
+----
+Groups keys=[#0]
+├── category = key
+├── count = group #0 else 0
+├── order: group #0 else 0 desc
+└── cut: limit 3 with ties
+
+# A `FILTER` is the one clause that leaves a statement's plans describing different groups: a
+# group every record of which the filter rejects is missing from that plan's answer entirely,
+# while the others still know it exists. What the cell holds for it is part of the shape.
+shape
+SELECT category, count(*) FILTER (WHERE amount >= 500) FROM t GROUP BY category
+----
+Groups keys=[#0, #1]
+├── category = key
+└── count = group #0 else 0
+
+shape
+SELECT category, min(amount) FILTER (WHERE active = true) FROM t GROUP BY category
+----
+Groups keys=[#0, #1]
+├── category = key
+└── min = group #0 else null

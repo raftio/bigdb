@@ -1,0 +1,142 @@
+# The two shapes that are about records rather than about counts of them.
+#
+# `SELECT *` answers with the identity of each match and nothing else. That is not a limitation
+# waiting to be lifted: this engine stores facts as bits at `(row, record)` and has no row of
+# values to hand back, so a column visibly called by the record's own name is worth more than a
+# table of values reconstructed at a point read apiece.
+#
+# A projection *does* read values back, and carries a mandatory limit for that reason: a
+# record's value in a bit-sliced field is not stored anywhere as a number, so reconstructing it
+# means one bit per plane per record per column. Affordable for a page, ruinous for a table -
+# and the difference between the two is exactly the number in `limit`, which is why it is part
+# of the plan rather than a view of its answer.
+
+plan
+SELECT * FROM t
+----
+Rows t
+└── all
+
+shape
+SELECT * FROM t
+----
+Records column=_record_id
+
+plan
+SELECT * FROM t WHERE active = true
+----
+Rows t
+└── active = true
+
+plan
+SELECT * FROM t WHERE country = 'GB' AND amount > 5
+----
+Rows t
+└── intersect
+    ├── country = 'GB'
+    └── amount > 5
+
+plan
+SELECT * FROM t LIMIT 10
+----
+Rows t
+└── all
+
+shape
+SELECT * FROM t LIMIT 10
+----
+Records column=_record_id limit=10
+
+plan
+SELECT amount FROM t LIMIT 10
+----
+Project t.(amount) limit=10
+└── all
+
+shape
+SELECT amount FROM t LIMIT 10
+----
+Table
+└── amount
+
+plan
+SELECT amount, price FROM t LIMIT 10
+----
+Project t.(amount, price) limit=10
+└── all
+
+shape
+SELECT amount, price FROM t LIMIT 10
+----
+Table
+├── amount
+└── price scale=2
+
+# The order the columns are written is the order the cells come in.
+plan
+SELECT price, amount FROM t LIMIT 10
+----
+Project t.(price, amount) limit=10
+└── all
+
+shape
+SELECT price, amount FROM t LIMIT 10
+----
+Table
+├── price scale=2
+└── amount
+
+plan
+SELECT amount AS a, price FROM t LIMIT 5
+----
+Project t.(amount, price) limit=5
+└── all
+
+shape
+SELECT amount AS a, price FROM t LIMIT 5
+----
+Table
+├── a
+└── price scale=2
+
+plan
+SELECT amount, price FROM t WHERE country = 'GB' LIMIT 10
+----
+Project t.(amount, price) limit=10
+└── country = 'GB'
+
+plan
+SELECT balance FROM t LIMIT 10
+----
+Project t.(balance) limit=10
+└── all
+
+# `u` keeps no values, so there is nothing to read back from a record there.
+plan
+SELECT amount FROM u LIMIT 10
+----
+Project u.(amount) limit=10
+└── all
+
+# A keyed column has no read back from a record to its string unless the values are stored.
+plan
+SELECT country FROM t LIMIT 10
+----
+Project t.(country) limit=10
+└── all
+
+plan
+SELECT country FROM u LIMIT 10
+----
+did not resolve: `a projection` is not allowed on `country`, which is a keyed field
+
+# A projection with no limit is refused: see refusals.test.
+error
+SELECT amount FROM t
+----
+sql_projection_unsupported
+
+error
+SELECT amount, price FROM t
+----
+sql_projection_unsupported

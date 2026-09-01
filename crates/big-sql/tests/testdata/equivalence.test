@@ -1,0 +1,186 @@
+# The claim the whole surface rests on: **SQL here is a translation, and this is what it
+# translates into.**
+#
+# Each case is one statement and the query-language call it means, and what is checked is that
+# the planner resolves both to the same plan. That is a stronger claim than "the statement
+# produced a plan", and it is stronger in the way that matters: the two surfaces spell an
+# equality differently - `Row(country="GB")` parses as a named argument, and the SQL lowering
+# emits a comparison - and a test at the AST level would be comparing two spellings. At the
+# plan level there is one thing to compare, so a disagreement cannot be anything but a bug in
+# the translation.
+#
+# The PQL is asked of the table the statement names, because the claim is about what the
+# statement means and the statement says which table. The block below each case is the plan both
+# of them resolved to.
+
+same Count(All())
+SELECT count(*) FROM t
+----
+Count t
+└── all
+
+same Count(Row(amount >= 500))
+SELECT count(*) FROM t WHERE amount >= 500
+----
+Count t
+└── amount >= 500
+
+same Count(Row(amount > 500))
+SELECT count(*) FROM t WHERE amount > 500
+----
+Count t
+└── amount > 500
+
+same Count(Row(country="GB"))
+SELECT count(*) FROM t WHERE country = 'GB'
+----
+Count t
+└── country = 'GB'
+
+same Count(Row(active=true))
+SELECT count(*) FROM t WHERE active = true
+----
+Count t
+└── active = true
+
+same Count(Row(balance > -5))
+SELECT count(*) FROM t WHERE balance > -5
+----
+Count t
+└── balance > -5 [signed]
+
+# The scale conversion, asked both ways. `12.50` against a field of scale two is 1250 stored,
+# and both surfaces have to get there or one of them is off by a factor of a hundred.
+same Count(Row(price >= 12.50))
+SELECT count(*) FROM t WHERE price >= 12.50
+----
+Count t
+└── price >= 1250
+
+same Count(Intersect(Row(country="GB"), Row(active=true)))
+SELECT count(*) FROM t WHERE country = 'GB' AND active = true
+----
+Count t
+└── intersect
+    ├── country = 'GB'
+    └── active = true
+
+same Count(Union(Row(country="GB"), Row(country="FR")))
+SELECT count(*) FROM t WHERE country IN ('GB', 'FR')
+----
+Count t
+└── union
+    ├── country = 'GB'
+    └── country = 'FR'
+
+same Count(Not(Row(active=true)))
+SELECT count(*) FROM t WHERE NOT active = true
+----
+Count t
+└── not
+    └── active = true
+
+same Count(Difference(Row(amount > 5), Row(country="GB")))
+SELECT count(*) FROM t WHERE amount > 5 AND NOT country = 'GB'
+----
+Count t
+└── minus
+    ├── amount > 5
+    └── country = 'GB'
+
+same Count(Intersect(Row(amount >= 5), Row(amount <= 9)))
+SELECT count(*) FROM t WHERE amount BETWEEN 5 AND 9
+----
+Count t
+└── intersect
+    ├── amount >= 5
+    └── amount <= 9
+
+same Sum(All(), field=amount)
+SELECT sum(amount) FROM t
+----
+Sum t.amount
+└── all
+
+same Sum(Row(country="GB"), field=amount)
+SELECT sum(amount) FROM t WHERE country = 'GB'
+----
+Sum t.amount
+└── country = 'GB'
+
+same Min(All(), field=amount)
+SELECT min(amount) FROM t
+----
+Min t.amount
+└── all
+
+same Max(Row(active=true), field=amount)
+SELECT max(amount) FROM t WHERE active = true
+----
+Max t.amount
+└── active = true
+
+same Distinct(All(), field=category)
+SELECT count(DISTINCT category) FROM t
+----
+Distinct t.category
+└── all
+
+same GroupBy(All(), field=country)
+SELECT country, count(*) FROM t GROUP BY country
+----
+GroupBy t.country -> count
+└── all
+
+same GroupBy(Row(active=true), field=country)
+SELECT country, count(*) FROM t WHERE active = true GROUP BY country
+----
+GroupBy t.country -> count
+└── active = true
+
+same GroupBy(All(), field=country, aggregate=Sum(field=amount))
+SELECT country, sum(amount) FROM t GROUP BY country
+----
+GroupBy t.country -> sum(amount)
+└── all
+
+same GroupBy(All(), field=country, aggregate=Max(field=amount))
+SELECT country, max(amount) FROM t GROUP BY country
+----
+GroupBy t.country -> max(amount)
+└── all
+
+same TopN(All(), field=country, n=2)
+SELECT country, count(*) AS n FROM t GROUP BY country ORDER BY n DESC LIMIT 2
+----
+TopN t.country n=2
+└── all
+
+# The bound is the number of values on the left, which is what the pair grouping costs. SQL
+# writes no number for it, so the lowering supplies the default - and the PQL has to name it,
+# because a plan that cut at a different bound would be a different plan.
+same GroupByPair(All(), left=category, right=country, n=1000)
+SELECT category, country, count(*) FROM t GROUP BY category, country
+----
+GroupByPair t.(category, country) left_max=1000 -> count
+└── all
+
+same Project(All(), field=amount, field=price, n=10)
+SELECT amount, price FROM t LIMIT 10
+----
+Project t.(amount, price) limit=10
+└── all
+
+same Row(visit="home", from=100, to=200)
+SELECT * FROM t WHERE visit = 'home' AND visit BETWEEN 100 AND 200
+----
+Rows t
+└── visit = 'home' in [100, 200]
+
+# The same question asked of the other table, which is what makes the table a parameter rather
+# than part of the text.
+same Count(Row(amount >= 500))
+SELECT count(*) FROM u WHERE amount >= 500
+----
+Count u
+└── amount >= 500

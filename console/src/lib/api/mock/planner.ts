@@ -21,8 +21,11 @@ const SQL_RULES: Array<{ re: RegExp; code: string; message: string; status?: num
   { re: /\b(?:IN|=|>|<)\s*\(\s*SELECT\b/i, code: "sql_unsupported", message: "subquery: one plan per statement" },
   { re: /\bOVER\s*\(/i, code: "sql_unsupported", message: "window functions need an ordered row stream" },
   { re: /\bIS\s+(?:NOT\s+)?NULL\b|\bNULL\b/i, code: "sql_no_nulls", message: "there are no nulls: a bit is set or it is not" },
-  { re: /\b(?:INSERT|UPDATE|DELETE|ALTER|TRUNCATE)\b/i, code: "sql_read_only", message: "this surface writes no rows" },
-  { re: /\bCREATE\s+TABLE\s+[A-Za-z_]\w*\s*\(/i, code: "sql_no_column_list", message: "CREATE TABLE takes no column list" },
+  { re: /\b(?:UPDATE|TRUNCATE|MERGE|REPLACE)\b/i, code: "sql_read_only", message: "a fact is a bit: there is no row to change in place" },
+  { re: /\bDELETE\s+FROM\b/i, code: "sql_read_only", message: "a record is bits across every field, not a row to delete" },
+  { re: /\bINSERT\b(?![^]*?\()/i, code: "sql_insert_shape", message: "an INSERT names the columns it writes" },
+  { re: /\b(?:CREATE|DROP|ALTER)\s+(?:DATABASE|SCHEMA)\b|\bUSE\s+[A-Za-z_]\w*/i, code: "sql_no_database", message: "there is no database above a table here" },
+  { re: /\b(?:CREATE|DROP)\s+(?:MATERIALIZED\s+)?VIEW\b/i, code: "sql_no_views", message: "nothing here stores a statement" },
   { re: /\bcount\s*\(\s*DISTINCT\s+[A-Za-z_]\w*\s*,/i, code: "sql_unsupported", message: "count(DISTINCT a, b) is a composite key this index never stored" },
 ];
 

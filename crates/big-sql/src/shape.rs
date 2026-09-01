@@ -227,6 +227,55 @@ pub struct GroupOrder {
     pub desc: bool,
 }
 
+/// What a number is measured in, before and after it has met a schema.
+///
+/// **A decimal field stores an integer**: `12.50` in a field of scale two is 1250 bit planes
+/// deep, and 1250 is what a `sum` over it merges to. So an answer that handed that number back
+/// unscaled would be off by a factor of a hundred - with both numbers valid, and nothing in the
+/// answer able to show which one it was. `WHERE price = 12.50` already converts; this is the
+/// same conversion on the way out, so that a value written by a statement reads back as the
+/// value that was written.
+///
+/// Two variants for the reason [`Threshold`] has two: the conversion is not optional, and
+/// making the unconverted form its own variant is what turns "remember to call
+/// [`Shape::resolve`]" into something the type says.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Units {
+    /// Digits after the point. Zero for a count, for a key, and for a field that stores whole
+    /// numbers - which is every field but a decimal.
+    Digits(u8),
+    /// The field the number came out of, until a schema has said what that field keeps.
+    ///
+    /// `table` is carried rather than taken from the statement for the reason
+    /// [`Threshold::Written`] carries it: a join has two, and only the lowering knows which
+    /// side an aggregate measured.
+    Written { table: String, field: String },
+}
+
+impl Default for Units {
+    fn default() -> Self {
+        Self::PLAIN
+    }
+}
+
+impl Units {
+    /// How many digits after the point, once resolved.
+    ///
+    /// An unresolved form answers zero, which is what it would have rendered as before there
+    /// was anything to resolve - reachable only through a shape built by hand, since
+    /// [`Shape::resolve`] runs on the one path a statement takes.
+    pub fn digits(&self) -> u8 {
+        match self {
+            Self::Digits(n) => *n,
+            Self::Written { .. } => 0,
+        }
+    }
+
+    /// The units of a number that is a count, a key, or anything else a field's scale does not
+    /// describe.
+    pub const PLAIN: Self = Self::Digits(0);
+}
+
 /// One column of an answer, and where its number comes from.
 ///
 /// **A cell names a plan by index**, into the statement's [`crate::Statement::calls`]. That
@@ -239,6 +288,34 @@ pub struct Cell {
     pub column: String,
     /// Which number goes in it.
     pub of: Of,
+    /// What that number is measured in - see [`Units`]. `Digits(0)` for everything but a
+    /// number that came out of a decimal field.
+    pub units: Units,
+}
+
+/// One column of a projection: the values of a field, read back per record.
+///
+/// Not a [`Cell`], because a projected column names no plan - a projection is one plan whose
+/// answer is already a table of rows, and the columns are the fields it read. It still needs
+/// [`Units`] for the same reason a cell does: a decimal read back unscaled is off by a factor
+/// of its scale.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Selected {
+    /// The column name, which is the alias when one was written.
+    pub column: String,
+    /// What the values in it are measured in.
+    pub units: Units,
+}
+
+impl Cell {
+    /// A cell whose number needs no scaling: a count, a key, or a field that stores whole
+    /// numbers.
+    ///
+    /// The units of a cell that reads a field are the field's, and only the lowering knows
+    /// which field that was - see [`Units::Written`].
+    pub fn plain(column: impl Into<String>, of: Of) -> Self {
+        Self { column: column.into(), of, units: Units::PLAIN }
+    }
 }
 
 /// What a cell reads.
@@ -291,17 +368,22 @@ pub enum Of {
         /// What this cell holds for a group that plan said nothing about.
         absent: Absent,
     },
-    /// Two per-key numbers, one from each side of a join, made into one.
+    /// One side's per-key number, made one with every other side's, over a join.
     ///
-    /// Which side is which does not matter for a product and does for an extreme, so `left` is
-    /// always the plan carrying the number and `right` the one that only says whether the other
-    /// side holds the key at all.
+    /// The cell names only the plan carrying the number; the sides it is scaled against are
+    /// [`Shape::Join::keys`], which is what says how many tables the join has. A cell cannot
+    /// carry them itself and stay [`Copy`], and would be saying twice what the shape already
+    /// says once.
     Paired {
         /// The plan whose per-key number this cell is about.
-        left: usize,
-        /// The plan the other side of the join is counted by.
-        right: usize,
-        /// How the two become one.
+        plan: usize,
+        /// Which of [`Shape::Join::keys`] that plan belongs to.
+        ///
+        /// **An index into the join's keys, not into the statement's calls** - which is why
+        /// [`Of::rebase`] moves `plan` along and leaves this alone, and why [`Of::plans`] does
+        /// not report it.
+        side: usize,
+        /// How this side's number and the others' become one.
         how: Pairing,
     },
     /// The keys one plan produced, as a list in a single cell.
@@ -314,12 +396,28 @@ pub enum Of {
         /// Index into the statement's calls.
         plan: usize,
     },
-    /// How many keys both sides of a join hold — `count(DISTINCT <the join key>)`.
-    SharedKeys {
-        /// The left side's grouped count.
-        left: usize,
-        /// The right side's.
-        right: usize,
+    /// How many keys every side of a join holds — `count(DISTINCT <the join key>)`.
+    ///
+    /// Names no plan: the sides are [`Shape::Join::sides`], and this is the size of their
+    /// intersection.
+    SharedKeys,
+    /// One paired number over another, over a join — `avg` of one table's column.
+    ///
+    /// **The two halves are folded before they are divided**, which is the whole reason this is
+    /// a variant rather than an [`Of::Ratio`] of two cells. Each side of the fraction is scaled
+    /// by the same per-key product `Π_{i≠side}`, and that product is *inside both sums*: it
+    /// does not cancel, so `Σ_s (top_s / bottom_s)` is a different number from
+    /// `(Σ_s top_s) / (Σ_s bottom_s)` and only the second is the average.
+    ///
+    /// Flat rather than two nested [`Of`]s because a cell has to stay [`Copy`]. Both plans move
+    /// under [`Of::rebase`]; `side` is a position among the join's sides and does not.
+    PairedRatio {
+        /// The plan holding this side's total.
+        top: usize,
+        /// The plan holding this side's record count, which is what the total is an average of.
+        bottom: usize,
+        /// Which of [`Shape::Join::sides`] both plans belong to.
+        side: usize,
     },
 }
 
@@ -344,6 +442,68 @@ pub enum Absent {
     Null,
 }
 
+/// One table of a join: how it is keyed, and whether a row of the join needs it.
+///
+/// Not part of a [`Cell`], which names only the plan carrying its own number. Which sides exist
+/// and how they are keyed is a fact about the *join*, said once here rather than once per cell -
+/// and a cell could not carry it and stay [`Copy`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct JoinSide {
+    /// The plan that answers for this side, and what it is keyed by.
+    pub keyed: Keying,
+    /// Whether this side must hold a point for that point to be a row of the join.
+    ///
+    /// **The whole of inner and outer, in one flag.** The rows of a join are the points every
+    /// required side holds; with no side required they are the points *any* side holds. An
+    /// inner join requires every side, which is the only thing this surface lowers today; a
+    /// `LEFT JOIN` would require the left one, and a `FULL` one none.
+    pub required: bool,
+}
+
+/// How a side of a join is keyed, and the plan that says so.
+///
+/// One enum rather than a plan and a separate arity, because the arity *is* which plan variant
+/// answered: no axis is a `Count`, one is a `Distinct`, and two would be a `GroupByPair`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Keying {
+    /// One axis of the join's key space: a `Distinct` over that column.
+    By {
+        /// Index into the statement's calls.
+        plan: usize,
+        /// Which of the join's axes this side's keys are values of.
+        axis: u8,
+    },
+}
+
+impl Keying {
+    /// Every plan this side reads, by index into the statement's calls.
+    ///
+    /// Exhaustive with no fallback arm on purpose: a side that gains a second plan and is not
+    /// named here is a plan [`Shape::plans`] does not report, which is a number nobody reads and
+    /// an answer that is quietly short.
+    pub fn plans(self) -> Vec<usize> {
+        match self {
+            Self::By { plan, .. } => vec![plan],
+        }
+    }
+
+    /// The plan this side is answered by, for a caller reading one number out of it.
+    pub fn plan(self) -> usize {
+        match self {
+            Self::By { plan, .. } => plan,
+        }
+    }
+
+    /// The same side, reading a plan `by` further along the statement's list.
+    ///
+    /// The axis is a position in the join's own key space and does not move; only the plan does.
+    fn rebase(self, by: usize) -> Self {
+        match self {
+            Self::By { plan, axis } => Self::By { plan: plan + by, axis },
+        }
+    }
+}
+
 /// How a join turns one key's two numbers into the cell's number.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Pairing {
@@ -364,22 +524,25 @@ pub enum Pairing {
 }
 
 impl Of {
-    /// Every plan this cell reads.
+    /// Every plan this cell reads **by index into the statement's calls**.
     ///
     /// **A grouped answer is driven by the union of the groups its plans produced**, and with
     /// `UNION ALL` a statement's flat list holds other branches' plans too - so which plans a
     /// shape may look at has to come from the shape rather than from the length of the list.
+    ///
+    /// A join's other sides are not here: [`Of::Paired`] names them by position in
+    /// [`Shape::Join::keys`] and [`Of::SharedKeys`] names them not at all, so a caller after
+    /// every plan a *shape* reads wants [`Shape::plans`] rather than this.
     pub fn plans(self) -> Vec<usize> {
         match self {
-            Self::Key | Self::RightKey | Self::Probe { .. } => Vec::new(),
+            Self::Key | Self::RightKey | Self::Probe { .. } | Self::SharedKeys => Vec::new(),
             Self::Value { plan }
             | Self::Groups { plan }
             | Self::Keys { plan }
-            | Self::Group { plan, .. } => vec![plan],
+            | Self::Group { plan, .. }
+            | Self::Paired { plan, .. } => vec![plan],
             Self::Ratio { plan, over } => vec![plan, over],
-            Self::Paired { left, right, .. } | Self::SharedKeys { left, right } => {
-                vec![left, right]
-            }
+            Self::PairedRatio { top, bottom, .. } => vec![top, bottom],
         }
     }
 
@@ -389,10 +552,11 @@ impl Of {
             Self::Value { plan }
             | Self::Groups { plan }
             | Self::Keys { plan }
-            | Self::Group { plan, .. } => Some(plan),
-            Self::Ratio { plan, .. } | Self::Paired { left: plan, .. } => Some(plan),
-            Self::SharedKeys { left, .. } => Some(left),
-            Self::Key | Self::RightKey | Self::Probe { .. } => None,
+            | Self::Group { plan, .. }
+            | Self::Paired { plan, .. }
+            | Self::Ratio { plan, .. }
+            | Self::PairedRatio { top: plan, .. } => Some(plan),
+            Self::Key | Self::RightKey | Self::Probe { .. } | Self::SharedKeys => None,
         }
     }
 }
@@ -435,7 +599,7 @@ pub enum Shape {
     Table {
         /// The columns, in the order the select list wrote them, which is the order the cells
         /// come in.
-        columns: Vec<String>,
+        columns: Vec<Selected>,
     },
     /// Several answers, one after the other.
     ///
@@ -465,24 +629,37 @@ pub enum Shape {
         /// `OFFSET`, `LIMIT` and `WITH TIES`, applied last.
         cut: Cut,
     },
-    /// An equi-join between two tables on a keyed column.
+    /// An equi-join between two or more tables on a keyed column they all share.
     ///
-    /// **What is joined is the key's string, and it is joined after both sides have been
+    /// **What is joined is the key's string, and it is joined after every side has been
     /// merged.** A record is a set of bits in one table and there is no pointer to another, so
-    /// what two tables share is the string a keyed column was interned from. The row ids behind
+    /// what the tables share is the string a keyed column was interned from. The row ids behind
     /// those strings are per `(table, field)` and have no reason to agree, which is why the
     /// join cannot happen in a plan and is not one.
     ///
-    /// For each key `s` the join is the Cartesian product of the records holding `s` on each
-    /// side, so `count(*)` is `|A_s| · |B_s|` summed over every shared key, `sum(a.x)` is
-    /// `sum_A(x) · |B_s|` summed the same way, and a `min` is the smallest of one side's
-    /// minima over the keys the other side holds at all. Every one of those is arithmetic over
-    /// per-key numbers that an ordinary single-table grouping already produces — which is why a
-    /// join adds no `Plan` variant and no merge arm.
+    /// For each key `s` the join is the Cartesian product of the records holding `s` on every
+    /// side, so `count(*)` is `Π_i |X_i,s|` summed over every shared key, `sum(a.x)` is
+    /// `sum_A(x) · Π_{i≠A} |X_i,s|` summed the same way, and a `min` is the smallest of one
+    /// side's minima over the keys every other side holds at all. Every one of those is
+    /// arithmetic over per-key numbers that an ordinary single-table grouping already produces
+    /// — which is why a join of any width adds no `Plan` variant and no merge arm.
+    ///
+    /// Three tables are a *star*: every one of them grouped by the one key they share. A table
+    /// that would need a second key column is a chain, and is refused before it gets here -
+    /// grouping one table by two columns at once is a pass over the second per value of the
+    /// first, which is a cost this surface does not take.
     Join {
-        /// The two plans whose keys *are* the join: one grouped count per side, left then
-        /// right. A key both of them hold is a row of the join; a key only one holds is not.
-        keys: (usize, usize),
+        /// How many key coordinates a row of this join has.
+        ///
+        /// One for a star, which is every join this surface lowers. Kept as a number rather
+        /// than read off the sides because it is the join's own width: it says how wide a point
+        /// of the key space is, and every side's axis has to name one of them.
+        axes: u8,
+        /// One per table, in the order `FROM` wrote them.
+        ///
+        /// A point every *required* side holds is a row of the join; a point any required side
+        /// is missing is not.
+        sides: Vec<JoinSide>,
         /// The columns, in the order written.
         cells: Vec<Cell>,
         /// `GROUP BY` the join key: one row per shared key. Without it the answer is one row,
@@ -541,21 +718,61 @@ impl Shape {
             Self::Union { branches } => branches.first().map(Shape::columns).unwrap_or_default(),
             Self::Pairs { cells, .. } => cells.iter().map(|c| c.column.as_str()).collect(),
             Self::Records { column, .. } => vec![column.as_str()],
-            Self::Table { columns } => columns.iter().map(String::as_str).collect(),
+            Self::Table { columns } => columns.iter().map(|c| c.column.as_str()).collect(),
             Self::Row { cells } | Self::Groups { cells, .. } | Self::Join { cells, .. } => {
                 cells.iter().map(|c| c.column.as_str()).collect()
             }
         }
     }
 
-    /// Turns every written threshold into the units the answer is in.
+    /// Every cell in this shape, a union's branches included.
+    ///
+    /// Companion to [`Shape::columns`], which answers the same walk with only the names. This
+    /// one is for a caller that has to check what each cell *reads* - which plan, and whether
+    /// the statement made it. A shape naming a plan that does not exist is a panic waiting for
+    /// whoever assembles the rows, a long way from the text that caused it.
+    pub fn cells(&self) -> Vec<&Cell> {
+        match self {
+            Self::Records { .. } | Self::Table { .. } => Vec::new(),
+            Self::Union { branches } => branches.iter().flat_map(Shape::cells).collect(),
+            Self::Row { cells }
+            | Self::Groups { cells, .. }
+            | Self::Pairs { cells, .. }
+            | Self::Join { cells, .. } => cells.iter().collect(),
+        }
+    }
+
+    /// Every plan this shape reads, a union's branches included.
+    ///
+    /// Companion to [`Shape::cells`], and the one a caller checking a shape against a
+    /// statement's calls wants: a shape names plans its cells do not. The rows of a grouping
+    /// are driven by `keys`, and a join's cells are scaled against sides they name only by
+    /// position - so walking the cells alone would miss every plan that decides which rows
+    /// there are.
+    pub fn plans(&self) -> Vec<usize> {
+        let driving = match self {
+            Self::Groups { keys, .. } | Self::Pairs { keys, .. } => keys.clone(),
+            Self::Join { sides, .. } => sides.iter().flat_map(|s| s.keyed.plans()).collect(),
+            Self::Row { .. } | Self::Records { .. } | Self::Table { .. } | Self::Union { .. } => {
+                Vec::new()
+            }
+        };
+        driving.into_iter().chain(self.cells().iter().flat_map(|c| c.of.plans())).collect()
+    }
+
+    /// Puts every written threshold and every cell's units against the schema.
     ///
     /// **The one part of a shape that needs a schema**, and it is split out for the reason the
     /// rest of this crate is schema-free: [`crate::translate`] stays a pure function of the
     /// text, testable at parser speed, and the single step that has to ask what a field is
     /// happens in the same place and at the same time as the planning that already does.
     ///
-    /// The conversion itself is [`big_plan::to_units`] — the planner's own, not a copy. A
+    /// Two conversions, and they are the two ends of one: a threshold is written as a value and
+    /// compared against a stored integer, so it converts on the way in; a cell holds that stored
+    /// integer and is read as a value, so it converts on the way out. Skipping either is off by
+    /// a factor of the scale, with both numbers valid and nothing in the answer able to show it.
+    ///
+    /// The inward conversion is [`big_plan::to_units`] — the planner's own, not a copy. A
     /// `HAVING sum(price) >= 100.00` means what `WHERE price >= 100.00` means, because it is
     /// the same code deciding.
     pub fn resolve(self, schema: &impl Schema) -> Result<Self, PlanError> {
@@ -569,16 +786,35 @@ impl Shape {
                 })),
             }
         };
+        let all = |cells: Vec<Cell>| -> Result<Vec<Cell>, PlanError> {
+            cells
+                .into_iter()
+                .map(|c| Ok(Cell { units: resolve_units(schema, c.units)?, ..c }))
+                .collect()
+        };
         Ok(match self {
+            Self::Row { cells } => Self::Row { cells: all(cells)? },
             Self::Groups { keys, cells, having, order, cut } => {
-                Self::Groups { keys, cells, having: one(having)?, order, cut }
+                Self::Groups { keys, cells: all(cells)?, having: one(having)?, order, cut }
             }
             Self::Pairs { keys, cells, having, order, cut } => {
-                Self::Pairs { keys, cells, having: one(having)?, order, cut }
+                Self::Pairs { keys, cells: all(cells)?, having: one(having)?, order, cut }
             }
-            Self::Join { keys, cells, per_key, having, order, cut } => {
-                Self::Join { keys, cells, per_key, having: one(having)?, order, cut }
-            }
+            Self::Join { axes, sides, cells, per_key, having, order, cut } => Self::Join {
+                axes,
+                sides,
+                cells: all(cells)?,
+                per_key,
+                having: one(having)?,
+                order,
+                cut,
+            },
+            Self::Table { columns } => Self::Table {
+                columns: columns
+                    .into_iter()
+                    .map(|c| Ok(Selected { units: resolve_units(schema, c.units)?, ..c }))
+                    .collect::<Result<Vec<_>, PlanError>>()?,
+            },
             Self::Union { branches } => Self::Union {
                 branches: branches
                     .into_iter()
@@ -615,6 +851,7 @@ impl Shape {
                         Of::Probe { probe } => Of::Probe { probe: probe + by },
                         other => other,
                     },
+                    units: c.units,
                 })
                 .collect()
         };
@@ -634,7 +871,10 @@ impl Shape {
             return self;
         }
         let cells = |cells: Vec<Cell>| -> Vec<Cell> {
-            cells.into_iter().map(|c| Cell { column: c.column, of: c.of.rebase(by) }).collect()
+            cells
+                .into_iter()
+                .map(|c| Cell { column: c.column, of: c.of.rebase(by), units: c.units })
+                .collect()
         };
         let having =
             |h: Option<Having>| h.map(|h| Having { of: h.of.rebase(by), op: h.op, value: h.value });
@@ -663,8 +903,12 @@ impl Shape {
                 order: order(o),
                 cut,
             },
-            Self::Join { keys, cells: c, per_key, having: h, order: o, cut } => Self::Join {
-                keys: (keys.0 + by, keys.1 + by),
+            Self::Join { axes, sides, cells: c, per_key, having: h, order: o, cut } => Self::Join {
+                axes,
+                sides: sides
+                    .into_iter()
+                    .map(|s| JoinSide { keyed: s.keyed.rebase(by), required: s.required })
+                    .collect(),
                 cells: cells(c),
                 per_key,
                 having: having(h),
@@ -690,12 +934,16 @@ impl Of {
             Self::Keys { plan } => Self::Keys { plan: plan + by },
             Self::Group { plan, absent } => Self::Group { plan: plan + by, absent },
             Self::Ratio { plan, over } => Self::Ratio { plan: plan + by, over: over + by },
-            Self::Paired { left, right, how } => {
-                Self::Paired { left: left + by, right: right + by, how }
+            // `side` is a position in the join's own keys rather than in the statement's
+            // calls, so it stays where it is while the plan it points past moves along.
+            Self::Paired { plan, side, how } => Self::Paired { plan: plan + by, side, how },
+            // Both halves are plans and both move; `side` is a position among the join's own
+            // sides, so it stays where it is.
+            Self::PairedRatio { top, bottom, side } => {
+                Self::PairedRatio { top: top + by, bottom: bottom + by, side }
             }
-            Self::SharedKeys { left, right } => {
-                Self::SharedKeys { left: left + by, right: right + by }
-            }
+            // Names no plan of its own: the sides are the join's keys, which the shape rebased.
+            Self::SharedKeys => Self::SharedKeys,
             Self::Key => Self::Key,
             Self::RightKey => Self::RightKey,
             // A probe is not a plan, and its index moves with the probes rather than the calls.
@@ -708,6 +956,22 @@ impl Of {
 ///
 /// The field's class is what turns `100.00` into `10000` on a decimal with two places, and
 /// what refuses a bound a field cannot hold.
+/// How many digits after the point a field keeps, for a number that came out of it.
+///
+/// A field that is not a decimal keeps none, which is what every other class answers - and a
+/// field nobody has is the planner's error, the same one a condition on it would raise.
+fn resolve_units(schema: &impl Schema, u: Units) -> Result<Units, PlanError> {
+    let Units::Written { table, field } = u else { return Ok(u) };
+
+    let class = schema
+        .field_class(&table, &field)
+        .ok_or_else(|| PlanError::UnknownField { table: table.clone(), field: field.clone() })?;
+    Ok(match class {
+        FieldClass::Integer { scale } => Units::Digits(scale),
+        _ => Units::PLAIN,
+    })
+}
+
 fn resolve_threshold(schema: &impl Schema, t: Threshold) -> Result<Threshold, PlanError> {
     let Threshold::Written { table, field, value } = t else { return Ok(t) };
 

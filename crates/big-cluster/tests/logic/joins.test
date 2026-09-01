@@ -1,0 +1,140 @@
+# An equi-join, run against two real tables.
+#
+# For each shared key the join is the Cartesian product of the records holding it on each side,
+# so `count(*)` is `|A_s| * |B_s|` summed over every shared key. The numbers below are the point
+# of this file: a key only one side holds contributes nothing, and a key both sides hold several
+# times contributes the product rather than the sum.
+
+statement
+CREATE TABLE orders (amount UINT(32), country SET)
+
+statement
+CREATE TABLE shops (staff UINT(32), country SET)
+
+statement
+INSERT INTO orders (_record_id, amount, country) VALUES
+  (1, 100, 'GB'),
+  (2, 900, 'US'),
+  (3, 500, 'GB'),
+  (4, 700, 'FR')
+
+statement
+INSERT INTO shops (_record_id, staff, country) VALUES
+  (1, 3, 'GB'),
+  (2, 9, 'GB'),
+  (3, 4, 'US'),
+  (4, 2, 'DE')
+
+# `GB` is two orders and two shops, `US` is one and one, `FR` and `DE` are held by one side
+# only. So the join has five rows: 2*2 + 1*1.
+query
+SELECT count(*) FROM orders o JOIN shops s ON o.country = s.country
+----
+count
+5
+
+# How many keys both sides hold, which is the one distinct count a join answers.
+query
+SELECT count(DISTINCT o.country) FROM orders o JOIN shops s ON o.country = s.country
+----
+count
+2
+
+# A sum is the same arithmetic with the sum standing in for one side's count: `GB` contributes
+# 600*2 and `US` contributes 900*1.
+query
+SELECT sum(o.amount) FROM orders o JOIN shops s ON o.country = s.country
+----
+sum
+2100
+
+# An extreme is not scaled by the other side: repeating a value does not make it smaller. What
+# the other side decides is only whether the key is in the join at all - which is why `FR`'s 700
+# is absent from this rather than being the maximum.
+query
+SELECT min(o.amount) FROM orders o JOIN shops s ON o.country = s.country
+----
+min
+100
+
+query
+SELECT max(o.amount) FROM orders o JOIN shops s ON o.country = s.country
+----
+max
+900
+
+# A predicate on one side narrows that side and leaves the other whole.
+query
+SELECT count(*) FROM orders o JOIN shops s ON o.country = s.country WHERE s.staff > 5
+----
+count
+2
+
+query
+SELECT count(*) FROM orders o JOIN shops s ON o.country = s.country WHERE o.amount >= 500
+----
+count
+3
+
+# One row per shared key rather than one row folding all of them.
+query
+SELECT o.country, count(*) FROM orders o JOIN shops s ON o.country = s.country GROUP BY o.country
+----
+country  count
+GB       4
+US       1
+
+query
+SELECT o.country, sum(o.amount) FROM orders o JOIN shops s ON o.country = s.country GROUP BY o.country
+----
+country  sum
+GB       1200
+US       900
+
+query
+SELECT o.country, count(*) AS n FROM orders o JOIN shops s ON o.country = s.country GROUP BY o.country ORDER BY n DESC LIMIT 1
+----
+country  n
+GB       4
+
+query
+SELECT o.country, count(*) FROM orders o JOIN shops s ON o.country = s.country GROUP BY o.country HAVING count(*) > 1
+----
+country  count
+GB       4
+
+# A join over a key neither side shares is a join with no rows, which is an answer rather than
+# an error.
+statement
+CREATE TABLE elsewhere (country SET)
+
+statement
+INSERT INTO elsewhere (_record_id, country) VALUES (1, 'JP')
+
+query
+SELECT count(*) FROM orders o JOIN elsewhere e ON o.country = e.country
+----
+count
+NULL
+
+# `avg` over a join, which is the case that says the two halves are folded before they divide.
+#
+# `GB` holds two orders totalling 600 against two shops, `US` one order of 900 against one shop.
+# The join repeats each GB order twice and the US order once, so the total over the join is
+# 600*2 + 900*1 = 2100 over 2*2 + 1*1 = 5 rows: an average of 420.
+#
+# The mean of the per-key means would be (300 + 900) / 2 = 600, which is the number this cell
+# exists not to answer - and neither number could be worked out by one owner alone.
+query
+SELECT avg(o.amount) FROM orders o JOIN shops s ON o.country = s.country
+----
+avg
+420
+
+# Per key it is that key's own mean, because the other side's count scales both halves alike.
+query
+SELECT o.country, avg(o.amount) FROM orders o JOIN shops s ON o.country = s.country GROUP BY o.country
+----
+country  avg
+GB       300
+US       900

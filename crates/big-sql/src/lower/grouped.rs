@@ -14,7 +14,7 @@
 
 //! `GROUP BY` one keyed column, with the aggregates of it the select list asked for.
 
-use super::measure::{field_of, measure_of, names, Measure};
+use super::measure::{field_of, measure_of, names, units_of, Measure};
 use super::pql::{as_expr, call_of, field_arg, named};
 use super::{answer, count_plan, rows_of, Ask, Calls, Statement};
 use crate::ast::{Agg, HavingAgg, Item, Name, OrderKey, Proj, Select};
@@ -57,7 +57,7 @@ pub(super) fn grouped(
         calls.push(table, call_of("Distinct", vec![rows.clone(), field_arg(group)]))?;
     }
 
-    let cells = cells_of(select, &measures);
+    let cells = cells_of(select, table, &measures);
     let having = having_of(select, table, &measures)?;
 
     let Ordering { ranked, order } = ordering(select, group, &measures)?;
@@ -220,7 +220,7 @@ fn measures_of(
 }
 
 /// The columns, in select-list order, which is the only order the caller asked for.
-fn cells_of(select: &Select, measures: &[(Measure, Of)]) -> Vec<Cell> {
+fn cells_of(select: &Select, table: &str, measures: &[(Measure, Of)]) -> Vec<Cell> {
     let mut next = measures.iter().map(|(_, of)| *of);
     select
         .items
@@ -231,6 +231,7 @@ fn cells_of(select: &Select, measures: &[(Measure, Of)]) -> Vec<Cell> {
                 Proj::Column(_) => Of::Key,
                 _ => next.next().expect("one measure per aggregate, in select-list order"),
             },
+            units: units_of(table, &i.proj),
         })
         .collect()
 }

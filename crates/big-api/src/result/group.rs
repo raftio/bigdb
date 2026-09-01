@@ -21,10 +21,11 @@
 
 use super::{Datum, Row};
 use crate::{
-    Absent, Cell, Cut, Group, GroupOrder, Having, Of, OrderBy, Pair, Pairing, RowId, Value,
+    Absent, Cell, Cut, Group, GroupOrder, Having, JoinSide, Of, OrderBy, Pair, Pairing, RowId,
+    Value,
 };
 
-use super::num::{cmp_num, int_of, number, scalar_num, Num};
+use super::num::{as_f64, cmp_num, int_of, number, scalar_num, Num};
 
 /// The rows of a grouped answer, joined across every plan the statement made.
 ///
@@ -108,7 +109,7 @@ pub(super) fn grouped(
                     Of::Key => find(&of_each, row)
                         .and_then(|g| g.key.as_deref())
                         .map_or(Datum::Null, Datum::text),
-                    of => Datum::num(number(of, values, Some(row))),
+                    of => Datum::num(number(of, values, Some(row)), c.units.digits()),
                 })
                 .collect()
         })
@@ -214,7 +215,7 @@ pub(super) fn paired(
                     Of::RightKey => {
                         found.and_then(|p| p.right.key.as_deref()).map_or(Datum::Null, Datum::text)
                     }
-                    of => Datum::num(number(of, row)),
+                    of => Datum::num(number(of, row), c.units.digits()),
                 })
                 .collect()
         })
@@ -234,7 +235,7 @@ fn pair_order<'a>(
     (l.is_none(), l, row.0, r.is_none(), r, row.1)
 }
 
-/// The rows of a join: one per key both sides hold, or one folding all of them.
+/// The rows of a join: one per key every side holds, or one folding all of them.
 ///
 /// **The join is on the key's string.** Row ids are per `(table, field)` and two tables have no
 /// reason to agree about them, so the strings are what pair up - and they are complete by the
@@ -243,7 +244,7 @@ fn pair_order<'a>(
 /// unnamed one.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn joined(
-    keys: (usize, usize),
+    sides: &[JoinSide],
     cells: &[Cell],
     per_key: bool,
     having: Option<&Having>,
@@ -251,34 +252,28 @@ pub(super) fn joined(
     cut: Cut,
     values: &[Value],
 ) -> Vec<Row> {
-    let side = |plan: usize| -> std::collections::BTreeMap<&str, &Group> {
-        values
-            .get(plan)
-            .and_then(Value::as_groups)
-            .unwrap_or(&[])
-            .iter()
-            .filter_map(|g| g.key.as_deref().map(|k| (k, g)))
-            .collect()
-    };
-    let (left, right) = (side(keys.0), side(keys.1));
+    let read = Reader::of(sides.to_vec(), cells, having, order, values);
 
-    // The keys in the join, in key order. An inner join is the intersection: a key only one
-    // side holds pairs with nothing, which is no rows rather than a row of nulls.
-    let mut shared: Vec<&str> = left.keys().copied().filter(|k| right.contains_key(k)).collect();
+    // The points of the join, in order. An inner join is the intersection: a key any one side is
+    // missing pairs with nothing, which is no rows rather than a row of nulls.
+    let mut space = read.row_space();
 
     if !per_key {
-        return vec![cells.iter().map(|c| Datum::num(cell(values, &shared, c.of, None))).collect()];
+        return vec![cells
+            .iter()
+            .map(|c| Datum::num(read.cell(c.of, &space, None), c.units.digits()))
+            .collect()];
     }
 
     // `HAVING`, then `ORDER BY`, then `OFFSET`, then `LIMIT`, which is the order SQL specifies
     // and the order the grouped shape applies them in.
-    let all = shared.clone();
-    shared.retain(|k| match having {
-        Some(h) => h.keeps(int_of(cell(values, &all, h.of, Some(k)))),
+    let all = space.clone();
+    space.retain(|at| match having {
+        Some(h) => h.keeps(int_of(read.cell(h.of, &all, Some(*at)))),
         None => true,
     });
     if let Some(o) = order {
-        shared.sort_by(|a, b| {
+        space.sort_by(|a, b| {
             let by_key = a.cmp(b);
             match o.by {
                 OrderBy::Key => {
@@ -288,68 +283,234 @@ pub(super) fn joined(
                         by_key
                     }
                 }
-                OrderBy::Value { of } => cmp_num(
-                    cell(values, &all, of, Some(a)),
-                    cell(values, &all, of, Some(b)),
-                    o.desc,
-                )
-                .then(by_key),
+                OrderBy::Value { of } => {
+                    cmp_num(read.cell(of, &all, Some(*a)), read.cell(of, &all, Some(*b)), o.desc)
+                        .then(by_key)
+                }
             }
         });
     }
 
-    let all2 = all.clone();
-    let ties = |a: &&str, b: &&str| match order {
+    let ties = |a: &Point<'_>, b: &Point<'_>| match order {
         None => false,
         Some(o) => match o.by {
             OrderBy::Key => a == b,
-            OrderBy::Value { of } => {
-                cell(values, &all2, of, Some(a)) == cell(values, &all2, of, Some(b))
-            }
+            OrderBy::Value { of } => read.cell(of, &all, Some(*a)) == read.cell(of, &all, Some(*b)),
         },
     };
 
-    cut_rows(shared, cut, ties)
+    cut_rows(space, cut, ties)
         .into_iter()
-        .map(|key| {
+        .map(|at| {
             cells
                 .iter()
                 .map(|c| match c.of {
-                    Of::Key => Datum::text(key),
-                    of => Datum::num(cell(values, &all, of, Some(key))),
+                    Of::Key => at.axis(0).map_or(Datum::Null, Datum::text),
+                    of => Datum::num(read.cell(of, &all, Some(at)), c.units.digits()),
                 })
                 .collect()
         })
         .collect()
 }
 
-/// One number a join's cell holds: for one key, or for the whole join when `key` is `None`.
+/// One row of the join's key space: the value of each axis the join pairs on.
 ///
-/// `shared` is every key in the join, which the folded form walks and `count(DISTINCT k)`
-/// counts.
-fn cell(values: &[Value], shared: &[&str], of: Of, key: Option<&str>) -> Option<Num> {
-    match of {
-        Of::Key => None,
-        Of::SharedKeys { .. } => Some(Num::Int(shared.len() as i128)),
-        Of::Paired { left, right, how } => match key {
-            Some(key) => pair(values, left, right, key, how),
-            // Folded over every key in the join: a product sums, because that is how many pairs
-            // there are altogether; an extreme takes the extreme of the extremes.
-            None => shared.iter().filter_map(|k| pair(values, left, right, k, how)).fold(
-                None,
-                |acc: Option<Num>, n| {
-                    Some(match (acc, how) {
-                        (None, _) => n,
-                        (Some(a), Pairing::Product) => Num::Int(as_i128(a) + as_i128(n)),
-                        (Some(a), Pairing::Least) if as_i128(n) < as_i128(a) => n,
-                        (Some(a), Pairing::Greatest) if as_i128(n) > as_i128(a) => n,
-                        (Some(a), _) => a,
-                    })
-                },
-            ),
-        },
-        // No other cell is reachable through a shape the lowering produces for a join.
-        _ => None,
+/// An enum of fixed widths rather than a list, because the width is a fact about the join rather
+/// than about the row - and because a list would allocate once per point in a walk that already
+/// costs points times cells. Derived `Ord` is the lexicographic order the cut and `ORDER BY` on
+/// the key already assume the points arrive in.
+///
+/// One axis is every join this surface lowers. The shape is an enum so that the two joins it
+/// does not lower yet can arrive as variants rather than as a second walk: a cross join has no
+/// axis at all and pairs at a single point, and a composite or chained key has two.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub(super) enum Point<'a> {
+    /// One shared key.
+    One(&'a str),
+}
+
+impl<'a> Point<'a> {
+    /// The key at one axis, or `None` where this point has no such axis.
+    fn axis(self, n: u8) -> Option<&'a str> {
+        match (self, n) {
+            (Self::One(k), 0) => Some(k),
+            (Self::One(_), _) => None,
+        }
+    }
+}
+
+/// One plan's groups, by the key each was interned from.
+type ByKey<'a> = std::collections::BTreeMap<&'a str, &'a Group>;
+
+/// Every plan a join's shape reads, indexed by key rather than walked per lookup.
+///
+/// A join asks the same question of the same plan once per key and once per cell, and a plan's
+/// groups arrive as a vector - so a scan per lookup costs the product of three lengths. Built
+/// once, over the plans the shape actually names: with `UNION ALL` the statement's list holds
+/// other branches' answers too, and indexing those would be work for rows this branch is not
+/// about.
+struct Reader<'a> {
+    /// The join's tables, in the order the shape named them.
+    sides: Vec<JoinSide>,
+    by_plan: std::collections::BTreeMap<usize, ByKey<'a>>,
+}
+
+impl<'a> Reader<'a> {
+    fn of(
+        sides: Vec<JoinSide>,
+        cells: &[Cell],
+        having: Option<&Having>,
+        order: Option<GroupOrder>,
+        values: &'a [Value],
+    ) -> Self {
+        let mut wanted: Vec<usize> = sides.iter().flat_map(|s| s.keyed.plans()).collect();
+        for c in cells {
+            wanted.extend(c.of.plans());
+        }
+        if let Some(h) = having {
+            wanted.extend(h.of.plans());
+        }
+        if let Some(GroupOrder { by: OrderBy::Value { of }, .. }) = order {
+            wanted.extend(of.plans());
+        }
+        // A group with no string cannot be paired and is left out rather than fused with every
+        // other unnamed one.
+        let by_plan = wanted
+            .into_iter()
+            .map(|p| {
+                let by_key: ByKey<'a> = values
+                    .get(p)
+                    .and_then(Value::as_groups)
+                    .unwrap_or(&[])
+                    .iter()
+                    .filter_map(|g| g.key.as_deref().map(|k| (k, g)))
+                    .collect();
+                (p, by_key)
+            })
+            .collect();
+        Self { sides, by_plan }
+    }
+
+    /// The points of the join: the keys every side holds, in key order.
+    ///
+    /// A `BTreeMap`'s keys are already sorted, so the intersection comes out sorted too - which
+    /// the ordering and the cut both rely on.
+    fn row_space(&self) -> Vec<Point<'a>> {
+        let sides: Vec<&ByKey<'a>> =
+            self.sides.iter().filter_map(|s| self.by_plan.get(&s.keyed.plan())).collect();
+        let Some((first, rest)) = sides.split_first() else { return Vec::new() };
+        first
+            .keys()
+            .copied()
+            .filter(|k| rest.iter().all(|m| m.contains_key(k)))
+            .map(Point::One)
+            .collect()
+    }
+
+    /// One plan's number at one point, or `None` where it said nothing about it.
+    fn num(&self, plan: usize, at: Point<'_>) -> Option<Num> {
+        let key = at.axis(0)?;
+        scalar_num(&self.by_plan.get(&plan)?.get(key)?.value)
+    }
+
+    /// What one side of the join contributes at one point.
+    ///
+    /// The one function every kind of side goes through: the number it multiplies into the
+    /// product, or `None` where the side holds nothing there. Today every side is keyed on the
+    /// one axis, so this is a lookup - which is the point of naming it rather than inlining it.
+    fn side_num(&self, side: usize, at: Point<'_>) -> Option<Num> {
+        self.num(self.sides.get(side)?.keyed.plan(), at)
+    }
+
+    /// One number a join's cell holds: at one point, or folded over the whole space.
+    ///
+    /// `space` is every point of the join, which the folded form walks and `count(DISTINCT k)`
+    /// counts.
+    fn cell(&self, of: Of, space: &[Point<'a>], at: Option<Point<'_>>) -> Option<Num> {
+        match of {
+            Of::Key => None,
+            Of::SharedKeys => Some(Num::Int(space.len() as i128)),
+            Of::Paired { plan, side, how } => match at {
+                Some(at) => self.pair(plan, side, at, how),
+                // Folded over every point of the join: a product sums, because that is how many
+                // pairs there are altogether; an extreme takes the extreme of the extremes.
+                None => space.iter().filter_map(|at| self.pair(plan, side, *at, how)).fold(
+                    None,
+                    |acc: Option<Num>, n| {
+                        Some(match (acc, how) {
+                            (None, _) => n,
+                            (Some(a), Pairing::Product) => Num::Int(as_i128(a) + as_i128(n)),
+                            (Some(a), Pairing::Least) if as_i128(n) < as_i128(a) => n,
+                            (Some(a), Pairing::Greatest) if as_i128(n) > as_i128(a) => n,
+                            (Some(a), _) => a,
+                        })
+                    },
+                ),
+            },
+            // **Folded, then divided** - which is why this is not two cells and a division.
+            // Both halves are scaled by the same per-key product, and that product is inside
+            // both sums rather than outside the fraction, so it cancels nowhere: the mean of
+            // the per-key means is a different number from the mean over the join.
+            Of::PairedRatio { top, bottom, side } => {
+                let sum = |plan| match at {
+                    Some(at) => self.pair(plan, side, at, Pairing::Product),
+                    None => space
+                        .iter()
+                        .filter_map(|at| self.pair(plan, side, *at, Pairing::Product))
+                        .fold(None, |acc: Option<Num>, n| {
+                            Some(Num::Int(acc.map_or(0, as_i128) + as_i128(n)))
+                        }),
+                };
+                let over = as_f64(sum(bottom)?);
+                // No records is no average, which is `null` rather than a division by zero -
+                // the same answer `min` gives over nothing, for the same reason.
+                if over == 0.0 {
+                    return None;
+                }
+                Some(Num::Real(as_f64(sum(top)?) / over))
+            }
+            // No other cell is reachable through a shape the lowering produces for a join.
+            _ => None,
+        }
+    }
+
+    /// One point's per-side numbers, made into one: this side's, and every other side's.
+    ///
+    /// `None` when the plan carrying the number said nothing about the point, which for a point
+    /// in the join means it had no records under it - a `min` over nothing rather than a zero.
+    fn pair(&self, plan: usize, side: usize, at: Point<'_>, how: Pairing) -> Option<Num> {
+        // Only a shape nobody lowered can name a side the join does not have.
+        if side >= self.sides.len() {
+            return None;
+        }
+        let mine = self.num(plan, at)?;
+        match how {
+            // Every record on one side pairs with every record on every other, at this point.
+            // Checked, because sixteen sides of counts is a product `i128` need not hold - and
+            // `None` is the answer every caller here already reads as "no number".
+            Pairing::Product => {
+                let mut n = as_i128(mine);
+                for i in 0..self.sides.len() {
+                    if i != side {
+                        n = n.checked_mul(as_i128(self.side_num(i, at)?))?;
+                    }
+                }
+                Some(Num::Int(n))
+            }
+            // The other sides decide only whether the point is in the join. Repeating a value
+            // does not make it larger or smaller, so this side's number stands as it is - but
+            // it stands only where there is something to pair with. **Asked rather than assumed
+            // from the point being in the space**: an intersection guarantees it and a cross
+            // join or an outer one does not, and an extreme over no pairs is `null`.
+            Pairing::Least | Pairing::Greatest => {
+                for i in 0..self.sides.len() {
+                    if i != side {
+                        self.side_num(i, at)?;
+                    }
+                }
+                Some(mine)
+            }
+        }
     }
 }
 
@@ -376,29 +537,6 @@ fn cut_rows<T>(rows: Vec<T>, cut: Cut, ties_with: impl Fn(&T, &T) -> bool) -> Ve
     }
     out.truncate(end);
     out
-}
-
-/// One key's two per-key numbers, made into one.
-///
-/// `None` when either side said nothing about the key, which for a key in the join means the
-/// plan carrying the number had no records under it - a `min` over nothing rather than a zero.
-fn pair(values: &[Value], left: usize, right: usize, key: &str, how: Pairing) -> Option<Num> {
-    let by_key = |plan: usize| -> Option<Num> {
-        values
-            .get(plan)?
-            .as_groups()?
-            .iter()
-            .find(|g| g.key.as_deref() == Some(key))
-            .and_then(|g| scalar_num(&g.value))
-    };
-    let mine = by_key(left)?;
-    match how {
-        // Every record on one side pairs with every record on the other.
-        Pairing::Product => Some(Num::Int(as_i128(mine) * as_i128(by_key(right)?))),
-        // The other side decides only whether the key is in the join at all. Repeating a value
-        // does not make it larger or smaller.
-        Pairing::Least | Pairing::Greatest => by_key(right).map(|_| mine),
-    }
 }
 
 fn as_i128(n: Num) -> i128 {

@@ -20,7 +20,39 @@
 //! have to be computed.
 
 use crate::ast::{Agg, HavingAgg, Item, Name, Proj};
-use crate::shape::{Absent, Of};
+use crate::shape::{Absent, Of, Units};
+
+/// What the number one select-list entry produces is measured in.
+///
+/// **Whichever entries read a field's values are in that field's units**, and a decimal field
+/// stores an integer - so a `sum` over one merges to 1250 where the values were 12.50. Naming
+/// the field here is what lets [`crate::Shape::resolve`] scale it back on the way out, against
+/// the same schema `WHERE price = 12.50` is converted against.
+///
+/// A count is in records and a `topK` answers with keys, so neither has a field to be measured
+/// in. An average is a quotient of a sum in the field's units by a count, so it is in them too.
+pub(super) fn units_of(table: &str, proj: &Proj) -> Units {
+    let Some(field) = field_measured(proj) else { return Units::PLAIN };
+    // **The table, not the qualifier.** A qualifier may be an alias - `FROM tx AS t` makes
+    // `t.amount` a column of `tx` - and what resolves a field is the name the catalog knows.
+    // With one table in the statement there is nothing else it could belong to; a join has two,
+    // and resolves the qualifier through its own scope before it gets here.
+    Units::Written { table: table.to_string(), field: field.column.clone() }
+}
+
+/// The column an entry's number comes out of, or `None` when it does not come out of one.
+pub(super) fn field_measured(proj: &Proj) -> Option<&Name> {
+    match proj {
+        Proj::Agg { field, .. } | Proj::Avg(field) | Proj::Quantile { field, .. } => Some(field),
+        // A count is in records, a `topK` answers with keys, a key is not a number, and a star
+        // is record ids.
+        Proj::Count
+        | Proj::CountDistinct(_)
+        | Proj::TopKeys { .. }
+        | Proj::Star
+        | Proj::Column(_) => None,
+    }
+}
 
 /// What one aggregate in the select list measures.
 ///

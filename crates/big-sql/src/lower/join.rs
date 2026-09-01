@@ -12,128 +12,178 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! `FROM a JOIN b ON a.k = b.k`, as arithmetic over what each side already counts.
+//! `FROM a JOIN b ON a.k = b.k`, and every further table on the same key, as arithmetic over
+//! what each side already counts.
 //!
 //! **Nothing here pairs records.** A record is a set of bits in one table and there is no
 //! pointer to another; even the row ids behind a keyed column are per `(table, field)` and have
-//! no reason to agree. What two tables share is the string a keyed column was interned from.
+//! no reason to agree. What the tables share is the string a keyed column was interned from.
 //!
-//! For each key both sides hold, the join is the Cartesian product of the records holding it,
-//! so every aggregate over it is arithmetic over two per-key numbers an ordinary single-table
-//! grouping already produces. That is why a join is two ordinary plans and a `Shape::Join`, and
-//! why it needed no `Plan` variant and no merge arm.
+//! For each key every side holds, the join is the Cartesian product of the records holding it,
+//! so every aggregate over it is arithmetic over per-key numbers an ordinary single-table
+//! grouping already produces: `count(*)` is `Σ_s Π_i |X_i,s|`. That is why a join is one
+//! ordinary plan per table and a `Shape::Join`, and why it needed no `Plan` variant and no merge
+//! arm - at two tables or at ten.
+//!
+//! **What the width costs is the shape of the `FROM`, not the arithmetic.** Every table has to
+//! be grouped by exactly one column, which makes the joins a *star* around one shared key. A
+//! table joined on two different columns is a chain, and would have to be grouped by both at
+//! once - a pass over the second column per value of the first, which is the cost
+//! `GROUP BY a, b, c` is already refused for.
 
 use super::cond::rows;
-use super::measure::{measure_of, names, Measure};
+use super::measure::{field_measured, measure_of, names, Measure};
 use super::pql::{as_expr, call, call_of, field_arg, named};
-use super::{answer, Calls, Statement};
-use crate::ast::{Agg, Cond, HavingAgg, Item, Name, OrderKey, Proj, Select, Source};
+use super::{answer, Calls, Statement, MAX_CALLS};
+use crate::ast::{Agg, Cond, HavingAgg, Item, Join, Name, OrderKey, Proj, Select, Source};
 use crate::error::{Refused, Result, SqlError};
-use crate::shape::{Cell, Cut, GroupOrder, Having, Of, OrderBy, Pairing, Shape, Threshold};
+use crate::shape::{
+    Cell, Cut, GroupOrder, Having, JoinSide, Keying, Of, OrderBy, Pairing, Shape, Threshold, Units,
+};
 use big_plan::ast::{Call, Expr, Literal};
 
-/// Which of a join's two tables a column belongs to.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Side {
-    Left,
-    Right,
-}
+/// Which of a join's tables a column belongs to: a position in `FROM` order.
+///
+/// The same number a cell's `side` is and a `Shape::Join`'s `keys` are indexed by, which is why
+/// it is a position rather than a name.
+type Side = usize;
 
-impl Side {
-    fn other(self) -> Self {
-        match self {
-            Self::Left => Self::Right,
-            Self::Right => Self::Left,
-        }
-    }
-}
-
-/// The two tables a join has in scope, under the names the statement calls them by.
+/// The tables a join has in scope, under the names the statement calls them by.
+///
+/// `FROM` first, then each `JOIN`'s table in the order written - so a join's new table is always
+/// the one at its own position plus one, which is what lets `star_keys` tell a table being
+/// brought in from one already here.
 struct Scope<'a> {
-    left: &'a Source,
-    right: &'a Source,
+    sources: Vec<&'a Source>,
 }
 
-impl Scope<'_> {
+impl<'a> Scope<'a> {
+    fn of(select: &'a Select) -> Self {
+        let sources =
+            std::iter::once(&select.from).chain(select.joins.iter().map(|j| &j.source)).collect();
+        Self { sources }
+    }
+
     /// Which table a column belongs to.
     ///
     /// **A qualifier is required.** The translation resolves names before it has ever seen a
-    /// schema, so an unqualified column in a two-table statement is a name nothing here can
-    /// decide - and picking the left one because it was written first would be guessing.
+    /// schema, so an unqualified column in a joined statement is a name nothing here can
+    /// decide - and picking the first table because it was written first would be guessing.
     fn side(&self, name: &Name, at: usize) -> Result<Side> {
         let refuse = || SqlError::Refused { what: Refused::Ambiguous, at };
         let q = name.qualifier.as_deref().ok_or_else(refuse)?;
-        if q == self.left.label() {
-            Ok(Side::Left)
-        } else if q == self.right.label() {
-            Ok(Side::Right)
-        } else {
-            Err(refuse())
-        }
+        self.sources.iter().position(|s| s.label() == q).ok_or_else(refuse)
     }
 
-    fn table(&self, side: Side) -> &str {
-        match side {
-            Side::Left => &self.left.table,
-            Side::Right => &self.right.table,
+    fn table(&self, side: Side) -> &'a str {
+        &self.sources[side].table
+    }
+
+    /// Refuses two tables in scope under one name, which no qualifier could tell apart.
+    fn distinct_labels(&self, joins: &[Join]) -> Result<()> {
+        for (i, s) in self.sources.iter().enumerate() {
+            if self.sources[..i].iter().any(|e| e.label() == s.label()) {
+                // `FROM tx JOIN tx ON ...`, where no qualifier can name one of them.
+                let at = joins.get(i.saturating_sub(1)).map_or(0, |j| j.at);
+                return Err(SqlError::Refused { what: Refused::Ambiguous, at });
+            }
         }
+        Ok(())
     }
 }
 
-/// `FROM a JOIN b ON a.k = b.k`, as arithmetic over what each side already answers.
+/// One key column per table, which is what makes several joins a star rather than a chain.
 ///
-/// **Nothing here is a join in the sense of pairing records.** For each key both sides hold, the
-/// join is the Cartesian product of the records holding it, and every aggregate over that
-/// product is a product of two per-key numbers: `count(*)` is `|A_s| · |B_s|`, `sum(a.x)` is
-/// `sum_A(x) · |B_s|`, an extreme is one side's extreme over the keys the other holds. So the
-/// two calls this makes are ordinary single-table groupings, each fanned out and merged exactly
-/// as it would be alone, and the join itself is a [`Shape::Join`] applied to the merged answers.
+/// A `JOIN` names the table it brings in on one side of its `ON` and a table already in `FROM`
+/// on the other, and the column it names on each is that table's key. A table named twice has
+/// to be named on the same column both times: a second key column would mean grouping it by
+/// both at once, which is a pass over one column per value of the other.
+fn star_keys<'a>(joins: &'a [Join], scope: &Scope<'_>) -> Result<Vec<&'a Name>> {
+    let mut keys: Vec<Option<&Name>> = vec![None; scope.sources.len()];
+    for (n, join) in joins.iter().enumerate() {
+        let new = n + 1;
+        let refuse = |what| SqlError::Refused { what, at: join.at };
+        let (l, r) = (scope.side(&join.left, join.at)?, scope.side(&join.right, join.at)?);
+        // One side is the table being joined in, the other one already in scope. Two already in
+        // scope is a condition about neither of the tables this `JOIN` is about; a table not
+        // joined in yet is a forward reference to a name that is not in scope where it stands.
+        let known = match (l == new, r == new) {
+            (true, false) => r,
+            (false, true) => l,
+            _ => return Err(refuse(Refused::JoinOn)),
+        };
+        if known >= new {
+            return Err(refuse(Refused::JoinOn));
+        }
+        for (side, name) in [(l, &join.left), (r, &join.right)] {
+            match keys[side] {
+                None => keys[side] = Some(name),
+                // The same column under either table's spelling: still one key, still a star.
+                Some(k) if k.column == name.column => {}
+                // A second key column on one table: the chain join.
+                Some(_) => return Err(refuse(Refused::Joins)),
+            }
+        }
+    }
+    Ok(keys
+        .into_iter()
+        .map(|k| k.expect("every table is keyed by the join that brought it in"))
+        .collect())
+}
+
+/// `FROM a JOIN b ON a.k = b.k`, and every further table on that key, as arithmetic over what
+/// each side already answers.
+///
+/// **Nothing here is a join in the sense of pairing records.** For each key every side holds,
+/// the join is the Cartesian product of the records holding it, and every aggregate over that
+/// product is a product of per-key numbers: `count(*)` is `Π_i |X_i,s|`, `sum(a.x)` is
+/// `sum_A(x) · Π_{i≠A} |X_i,s|`, an extreme is one side's extreme over the keys every other side
+/// holds. So the calls this makes are ordinary single-table groupings, one per table, each fanned
+/// out and merged exactly as it would be alone; the join itself is a [`Shape::Join`] applied to
+/// the merged answers.
 pub(super) fn joined(
     select: &Select,
-    join: &crate::ast::Join,
     stars: &[&Item],
     columns: &[(&Item, Name)],
     aggregates: &[&Item],
 ) -> Result<Statement> {
-    let scope = Scope { left: &select.from, right: &join.source };
-    if scope.left.label() == scope.right.label() {
-        // `FROM tx JOIN tx ON ...`, where no qualifier can name one of them.
-        return Err(SqlError::Refused { what: Refused::Ambiguous, at: join.at });
-    }
+    let scope = Scope::of(select);
+    scope.distinct_labels(&select.joins)?;
     if let Some(item) = stars.first() {
         // A pair of records has no identity this engine stores, so there is nothing for a star
         // to answer with.
         return Err(SqlError::Refused { what: Refused::JoinShape, at: item.at });
     }
-
-    let (key_left, key_right) = join_key(join, &scope)?;
-
-    // Each table's own conditions. A term that names both is refused rather than applied to
-    // one of them.
-    let (cond_left, cond_right) = match &select.filter {
-        None => (None, None),
-        Some(cond) => split(cond, &scope, 0)?,
-    };
-    let rows_left = cond_left.as_ref().map_or_else(|| call("All", vec![]), rows);
-    let rows_right = cond_right.as_ref().map_or_else(|| call("All", vec![]), rows);
-
     let at = select.items.first().map_or(0, |i| i.at);
-    let mut calls = Calls::new(at);
-    // The two plans whose keys are the join. Pushed first and unconditionally: they are what
-    // says which keys are in it, and every cell is arithmetic against one of them.
-    let count_left = calls.push(scope.table(Side::Left), grouped_count(&rows_left, key_left))?;
-    let count_right =
-        calls.push(scope.table(Side::Right), grouped_count(&rows_right, key_right))?;
+    // **One grouped count per table, and the calls cannot say so themselves**: `Calls::push`
+    // dedupes on `(table, call)`, so a star of aliases of one table collapses to a single call
+    // and a hundred of them would slip past the cap. Checked before the `WHERE` is split, which
+    // carries one bit per side and would run out of word before it ran out of tables.
+    if scope.sources.len() > MAX_CALLS {
+        return Err(SqlError::Refused { what: Refused::TooManyCalls, at });
+    }
 
-    let sides = Sides {
-        scope: &scope,
-        key_left,
-        key_right,
-        count_left,
-        count_right,
-        rows_left,
-        rows_right,
+    let keys = star_keys(&select.joins, &scope)?;
+
+    // Each table's own conditions. A term that names two of them is refused rather than applied
+    // to one.
+    let conds = match &select.filter {
+        None => vec![None; scope.sources.len()],
+        Some(cond) => split(cond, &scope, 0, scope.sources.len())?,
     };
+    let rows_of: Vec<Expr> =
+        conds.iter().map(|c| c.as_ref().map_or_else(|| call("All", vec![]), rows)).collect();
+
+    let mut calls = Calls::new(at);
+    // The plans whose keys are the join. Pushed first and unconditionally, in `FROM` order: they
+    // are what says which keys are in it, and every cell is arithmetic against them.
+    let counts = keys
+        .iter()
+        .enumerate()
+        .map(|(i, key)| calls.push(scope.table(i), grouped_count(&rows_of[i], key)))
+        .collect::<Result<Vec<_>>>()?;
+
+    let sides = Sides { scope: &scope, keys, counts, rows: rows_of };
     let per_key = sides.grouping(select, columns, at)?;
 
     let mut measures: Vec<(Measure, Of)> = Vec::new();
@@ -141,13 +191,30 @@ pub(super) fn joined(
         measures.push((measure_of(item), sides.cell(item, per_key, &mut calls)?));
     }
 
+    // Which table each entry's number comes out of, resolved through the scope because a
+    // qualifier here may be any side's name or any side's alias. Done before the cells so that
+    // a name naming none of them is the refusal `Scope::side` gives rather than a guess.
+    let units = select
+        .items
+        .iter()
+        .map(|i| match field_measured(&i.proj) {
+            None => Ok(Units::PLAIN),
+            Some(field) => Ok(Units::Written {
+                table: scope.table(scope.side(field, i.at)?).to_string(),
+                field: field.column.clone(),
+            }),
+        })
+        .collect::<Result<Vec<_>>>()?;
+
     // Column order follows the select list, which is the only order the caller asked for.
     let mut next = measures.iter().map(|(_, of)| *of);
     let cells: Vec<Cell> = select
         .items
         .iter()
-        .map(|i| Cell {
+        .zip(units)
+        .map(|(i, units)| Cell {
             column: i.column(),
+            units,
             of: match i.proj {
                 Proj::Column(_) => Of::Key,
                 _ => next.next().expect("one measure per aggregate, in select-list order"),
@@ -157,7 +224,7 @@ pub(super) fn joined(
 
     let having = join_having(select, &scope, &measures, per_key)?;
 
-    let order = join_ordering(select, key_left, key_right, &scope, &measures, per_key)?;
+    let order = join_ordering(select, &sides, &measures, per_key)?;
     if !per_key && (select.limit.is_some() || select.offset.is_some()) {
         // A `LIMIT` on one row of numbers is a client that thinks it is paging something.
         return Err(SqlError::Refused { what: Refused::Shape, at });
@@ -169,7 +236,17 @@ pub(super) fn joined(
         answer: answer(
             select,
             Shape::Join {
-                keys: (count_left, count_right),
+                // One axis, and every side keyed on it and required: the star, which is the
+                // only join this surface lowers.
+                axes: 1,
+                sides: sides
+                    .counts
+                    .iter()
+                    .map(|plan| JoinSide {
+                        keyed: Keying::By { plan: *plan, axis: 0 },
+                        required: true,
+                    })
+                    .collect(),
                 cells,
                 per_key,
                 having,
@@ -181,25 +258,6 @@ pub(super) fn joined(
                 },
             },
         ),
-    })
-}
-
-/// The join's own columns, normalised so `left` is the left table's whichever way round the
-/// `ON` was written.
-fn join_key<'a>(join: &'a crate::ast::Join, scope: &Scope<'_>) -> Result<(&'a Name, &'a Name)> {
-    Ok(match scope.side(&join.left, join.at)? {
-        Side::Left => {
-            if scope.side(&join.right, join.at)? != Side::Right {
-                return Err(SqlError::Refused { what: Refused::JoinOn, at: join.at });
-            }
-            (&join.left, &join.right)
-        }
-        Side::Right => {
-            if scope.side(&join.right, join.at)? != Side::Left {
-                return Err(SqlError::Refused { what: Refused::JoinOn, at: join.at });
-            }
-            (&join.right, &join.left)
-        }
     })
 }
 
@@ -217,6 +275,11 @@ fn join_having(
     }
     let of =
         names(&h.agg, measures).ok_or(SqlError::Refused { what: Refused::Having, at: h.at })?;
+    // An average is fractional and this comparison is not. Rounding one into the other would
+    // answer a question next to the one that was asked - the same refusal a grouping gives.
+    if matches!(of, Of::PairedRatio { .. }) {
+        return Err(SqlError::Refused { what: Refused::Having, at: h.at });
+    }
     let value = match having_field(&h.agg, scope, h.at)? {
         Some((table, field)) => Threshold::Written { table, field, value: h.value.clone() },
         None => match h.value {
@@ -227,64 +290,48 @@ fn join_having(
     Ok(Some(Having { of, op: h.op, value }))
 }
 
-/// The four things a join needs to know per side, in one value.
+/// The three things a join needs to know per side, in one value.
 ///
-/// These used to be three closures over locals, which meant the aggregate loop could only live
-/// where they did. A side is left or right; what changes with it is which key pairs the records,
-/// which plan counts them, and which half of the `WHERE` narrows them.
+/// These used to be closures over locals, which meant the aggregate loop could only live where
+/// they did. A side is a position in `FROM` order; what changes with it is which column keys the
+/// records, which plan counts them, and which part of the `WHERE` narrows them. All three lists
+/// are as long as the join is wide, and indexed by the same number a cell's `side` is.
 struct Sides<'a> {
     scope: &'a Scope<'a>,
-    key_left: &'a Name,
-    key_right: &'a Name,
-    count_left: usize,
-    count_right: usize,
-    rows_left: Expr,
-    rows_right: Expr,
+    keys: Vec<&'a Name>,
+    counts: Vec<usize>,
+    rows: Vec<Expr>,
 }
 
 impl<'a> Sides<'a> {
     /// The column this side is joined on.
     fn key(&self, side: Side) -> &'a Name {
-        match side {
-            Side::Left => self.key_left,
-            Side::Right => self.key_right,
-        }
+        self.keys[side]
     }
 
-    /// The plan holding this side's per-key record counts.
-    fn count(&self, side: Side) -> usize {
-        match side {
-            Side::Left => self.count_left,
-            Side::Right => self.count_right,
-        }
-    }
-
-    /// The records this side's half of the `WHERE` leaves.
+    /// The records this side's part of the `WHERE` leaves.
     fn rows(&self, side: Side) -> Expr {
-        match side {
-            Side::Left => self.rows_left.clone(),
-            Side::Right => self.rows_right.clone(),
-        }
+        self.rows[side].clone()
     }
 
-    /// One aggregate over the join, as the pair of per-key numbers it is arithmetic over.
+    /// One aggregate over the join, as the per-key numbers it is arithmetic over.
     ///
-    /// **Nothing here pairs records.** For each key both sides hold the join is the Cartesian
+    /// **Nothing here pairs records.** For each key every side holds the join is the Cartesian
     /// product of the records holding it, so every aggregate over that product is a product of
-    /// two per-key numbers - which is why each of these is an [`Of::Paired`] naming two plans
-    /// rather than a plan of its own.
+    /// per-key numbers - which is why each of these is an [`Of::Paired`] naming one plan and the
+    /// position it sits at rather than a plan of its own.
     fn cell(&self, item: &Item, per_key: bool, calls: &mut Calls) -> Result<Of> {
         if item.filter.is_some() {
-            // A `FILTER` narrows one aggregate's records. Over a join that would leave the two
+            // A `FILTER` narrows one aggregate's records. Over a join that would leave the
             // sides disagreeing about which keys are in it, and a key one side dropped is a
             // pairing that never happened rather than a group with a zero in it.
             return Err(SqlError::Refused { what: Refused::JoinShape, at: item.at });
         }
         Ok(match &item.proj {
-            // Every record on one side pairs with every record on the other, under each key.
-            Proj::Count => {
-                Of::Paired { left: self.count_left, right: self.count_right, how: Pairing::Product }
-            }
+            // Every record on one side pairs with every record on every other, under each key.
+            // Counted from the first side, which is as good as any: the product is over all of
+            // them and the shape names them in `keys`.
+            Proj::Count => Of::Paired { plan: self.counts[0], side: 0, how: Pairing::Product },
             Proj::Agg { func, field } => {
                 let side = self.scope.side(field, item.at)?;
                 let plan = calls.push(
@@ -292,8 +339,8 @@ impl<'a> Sides<'a> {
                     grouped_aggregate(&self.rows(side), self.key(side), *func, field),
                 )?;
                 Of::Paired {
-                    left: plan,
-                    right: self.count(side.other()),
+                    plan,
+                    side,
                     // A total is scaled by how many times each record is repeated in the
                     // product; an extreme is not - repeating a value does not make it larger.
                     how: match func {
@@ -310,15 +357,23 @@ impl<'a> Sides<'a> {
                 if field.column != self.key(side).column || per_key {
                     return Err(SqlError::Refused { what: Refused::JoinShape, at: item.at });
                 }
-                Of::SharedKeys { left: self.count_left, right: self.count_right }
+                Of::SharedKeys
             }
-            // An average over a join is a ratio of two of these, which is a cell holding two
-            // cells. Refused with a sentence saying to write the two halves.
-            Proj::Avg(_)
-            | Proj::TopKeys { .. }
-            | Proj::Quantile { .. }
-            | Proj::Star
-            | Proj::Column(_) => {
+            // An average over a join is that side's total over that side's record count, and
+            // **both are folded before they are divided**: each is scaled by the same per-key
+            // product, which is inside both sums rather than outside the fraction, so the mean
+            // of the per-key means is a different number and not the one asked for.
+            Proj::Avg(field) => {
+                let side = self.scope.side(field, item.at)?;
+                let top = calls.push(
+                    self.scope.table(side),
+                    grouped_aggregate(&self.rows(side), self.key(side), Agg::Sum, field),
+                )?;
+                // This side's own per-key record count, which is the plan the join is built out
+                // of - so an average costs one call rather than two.
+                Of::PairedRatio { top, bottom: self.counts[side], side }
+            }
+            Proj::TopKeys { .. } | Proj::Quantile { .. } | Proj::Star | Proj::Column(_) => {
                 return Err(SqlError::Refused { what: Refused::JoinShape, at: item.at })
             }
         })
@@ -327,7 +382,7 @@ impl<'a> Sides<'a> {
     /// Whether the answer is one row per key, and that the `GROUP BY` names the key it must.
     ///
     /// `GROUP BY` the join key is the only grouping a join has: the key is what pairs the
-    /// records, so it is the only column both sides agree about.
+    /// records, so it is the only column every side agrees about.
     fn grouping(&self, select: &Select, columns: &[(&Item, Name)], at: usize) -> Result<bool> {
         let per_key = match select.group_by.as_slice() {
             [] => false,
@@ -385,9 +440,7 @@ fn having_field(
 /// The `ORDER BY` of a join, which orders the keys in it.
 fn join_ordering(
     select: &Select,
-    key_left: &Name,
-    key_right: &Name,
-    scope: &Scope<'_>,
+    sides: &Sides<'_>,
     measures: &[(Measure, Of)],
     per_key: bool,
 ) -> Result<Option<GroupOrder>> {
@@ -417,12 +470,17 @@ fn join_ordering(
                 None => return Err(refuse()),
             }
         }
-        OrderKey::Avg(_) => return Err(refuse()),
+        // Answered now that a join has an average to order by, and by the same lookup every
+        // other aggregate uses: it has to be one the select list produced.
+        OrderKey::Avg(field) => match names(&HavingAgg::Avg(field.clone()), measures) {
+            Some(of) => OrderBy::Value { of },
+            None => return Err(refuse()),
+        },
         OrderKey::Name(n) => match value_names.iter().find(|(c, _)| *c == n.column) {
             Some((_, of)) => OrderBy::Value { of: *of },
-            // The join key, under either table's spelling or an alias of it.
-            None if n.column == key_left.column || n.column == key_right.column => OrderBy::Key,
-            None if n.qualifier.is_some() && scope.side(n, order.at).is_ok() => {
+            // The join key, under any table's spelling or an alias of it.
+            None if sides.keys.iter().any(|k| k.column == n.column) => OrderBy::Key,
+            None if n.qualifier.is_some() && sides.scope.side(n, order.at).is_ok() => {
                 return Err(refuse())
             }
             None => return Err(refuse()),
@@ -436,40 +494,36 @@ fn join_ordering(
     })
 }
 
-/// A `WHERE` split into each table's own half.
+/// A `WHERE` split into each table's own conditions, one entry per side.
 ///
 /// **Only an `AND` can be split.** `a.x = 1 OR b.y = 2` selects pairs where either side
 /// matched, and neither side can be filtered to that on its own - so it is refused rather than
 /// applied to one of them and quietly answering something narrower.
-fn split(cond: &Cond, scope: &Scope<'_>, at: usize) -> Result<(Option<Cond>, Option<Cond>)> {
+fn split(cond: &Cond, scope: &Scope<'_>, at: usize, n: usize) -> Result<Vec<Option<Cond>>> {
     if let Cond::And(a, b) = cond {
-        let (la, ra) = split(a, scope, at)?;
-        let (lb, rb) = split(b, scope, at)?;
-        return Ok((both(la, lb), both(ra, rb)));
+        let (a, b) = (split(a, scope, at, n)?, split(b, scope, at, n)?);
+        return Ok(a.into_iter().zip(b).map(|(x, y)| both(x, y)).collect());
     }
-    match touches(cond, scope, at)? {
-        (true, false) => Ok((Some(cond.clone()), None)),
-        (false, true) => Ok((None, Some(cond.clone()))),
-        // A term naming both tables, or - impossibly, since a condition always names a
-        // column - neither.
-        _ => Err(SqlError::Refused { what: Refused::JoinFilter, at }),
+    let mask = touches(cond, scope, at)?;
+    // A term naming two tables, or - impossibly, since a condition always names a column - none.
+    if mask.count_ones() != 1 {
+        return Err(SqlError::Refused { what: Refused::JoinFilter, at });
     }
+    let mut out = vec![None; n];
+    out[mask.trailing_zeros() as usize] = Some(cond.clone());
+    Ok(out)
 }
 
-/// Which of a join's tables a condition mentions.
-fn touches(cond: &Cond, scope: &Scope<'_>, at: usize) -> Result<(bool, bool)> {
+/// Which of a join's tables a condition mentions, as one bit per side.
+///
+/// A bitmask rather than a list because the recursion unions two of these at every `AND`, and
+/// the width it has to hold is the fan-out cap - which `joined` checks before calling this.
+fn touches(cond: &Cond, scope: &Scope<'_>, at: usize) -> Result<u32> {
     Ok(match cond {
-        Cond::And(a, b) | Cond::Or(a, b) => {
-            let (la, ra) = touches(a, scope, at)?;
-            let (lb, rb) = touches(b, scope, at)?;
-            (la || lb, ra || rb)
-        }
+        Cond::And(a, b) | Cond::Or(a, b) => touches(a, scope, at)? | touches(b, scope, at)?,
         Cond::Not(inner) => touches(inner, scope, at)?,
         Cond::Cmp { field, .. } | Cond::In { field, .. } | Cond::Between { field, .. } => {
-            match scope.side(field, at)? {
-                Side::Left => (true, false),
-                Side::Right => (false, true),
-            }
+            1 << scope.side(field, at)?
         }
     })
 }

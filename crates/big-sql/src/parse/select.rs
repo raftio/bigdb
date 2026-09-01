@@ -18,7 +18,6 @@ use super::Parser;
 use crate::ast::{Cond, Having, HavingAgg, Join, Order, OrderKey, Proj, Select, Source};
 use crate::error::{Refused, Result, SqlError};
 use crate::lex::Tok;
-use crate::shape::Format;
 use big_plan::Literal;
 
 impl Parser<'_> {
@@ -48,7 +47,7 @@ impl Parser<'_> {
         if self.peek() == Some(&Tok::Comma) {
             return Err(self.refuse(Refused::Joins));
         }
-        let join = self.join()?;
+        let joins = self.joins()?;
 
         // `PREWHERE` is ClickHouse's hint to filter on a cheap column before reading the rest
         // of the row. **Here it selects exactly the set `WHERE` would**, because there is no
@@ -156,20 +155,12 @@ impl Parser<'_> {
 
         // Last, because it is about the bytes rather than the answer - and because ClickHouse
         // puts it last.
-        let format = if self.eat_word("FORMAT") {
-            let name = self.bare_ident("a format name after FORMAT")?;
-            match Format::of(&name) {
-                Some(f) => f,
-                None => return Err(self.refuse(Refused::Format)),
-            }
-        } else {
-            Format::default()
-        };
+        let format = self.format()?;
 
         Ok(Select {
             items,
             from,
-            join,
+            joins,
             filter,
             group_by,
             having,
@@ -224,19 +215,44 @@ impl Parser<'_> {
         KEYWORDS.iter().any(|k| self.word_is(k))
     }
 
-    /// `[INNER] JOIN <source> ON <name> = <name>`, or nothing.
+    /// `[INNER] JOIN <source> ON <name> = <name>`, as many times as they are written.
     ///
     /// **The refusals here are the shape of the engine, not a stage of implementation.** An
     /// outer join has to produce a row for a record with no partner, and what this engine
     /// answers about a join is arithmetic over per-key counts - there is no row to null out
     /// half of. A `USING` clause names one column for both tables, which cannot be written
-    /// when each side keeps its own dictionary. A second `JOIN` would need a key three tables
-    /// share, which is a different question again.
-    pub(super) fn join(&mut self) -> Result<Option<Join>> {
+    /// when each side keeps its own dictionary.
+    ///
+    /// The two lists below are two different mistakes, and they used to be one. An outer join
+    /// names a key and asks for the records that have no partner under it; a cross join and a
+    /// natural join name **no key at all** - which is the same thing a comma between tables is,
+    /// and it already has its own refusal saying so. Sending them to [`Refused::OuterJoin`] meant
+    /// somebody who wrote `CROSS JOIN` was told about nulling out half a row, which is not what
+    /// they asked for and not why it was refused.
+    ///
+    /// **Nothing here bounds how many there are.** Whether several joins are one star around
+    /// one key is a question about the columns they name, and the parser has no scope to ask it
+    /// in - so it is the lowering that says so, where the sentence can name the table that
+    /// would have needed two keys.
+    pub(super) fn joins(&mut self) -> Result<Vec<Join>> {
+        let mut out = Vec::new();
+        while let Some(join) = self.join()? {
+            out.push(join);
+        }
+        Ok(out)
+    }
+
+    /// One `JOIN`, or nothing when the next word does not begin one.
+    fn join(&mut self) -> Result<Option<Join>> {
         let at = self.at();
-        for kw in ["LEFT", "RIGHT", "FULL", "CROSS", "NATURAL"] {
+        for kw in ["LEFT", "RIGHT", "FULL"] {
             if self.word_is(kw) {
                 return Err(self.refuse(Refused::OuterJoin));
+            }
+        }
+        for kw in ["CROSS", "NATURAL"] {
+            if self.word_is(kw) {
+                return Err(self.refuse(Refused::Joins));
             }
         }
         self.eat_word("INNER");
@@ -260,10 +276,6 @@ impl Parser<'_> {
         if self.word_is("AND") || self.word_is("OR") {
             return Err(self.refuse(Refused::JoinOn));
         }
-        if self.word_is("JOIN") || self.word_is("INNER") {
-            return Err(self.refuse(Refused::Joins));
-        }
-
         Ok(Some(Join { source, left, right, at }))
     }
 

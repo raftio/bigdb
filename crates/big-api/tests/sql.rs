@@ -23,6 +23,11 @@
 use big_api::*;
 use big_db::catalog::FieldKind;
 
+/// The record's own column name, which `SELECT *` answers under.
+fn big_sql_record_column() -> String {
+    big_api::RECORD_COLUMN.to_string()
+}
+
 fn stocked() -> Api<big_pager::MemPager> {
     let api = Api::in_memory().unwrap();
     api.create_table("tx").unwrap();
@@ -121,9 +126,7 @@ fn the_shape_says_how_the_answer_becomes_columns() {
     // The plan is a `Distinct`; the counting is the shape's job, after any merge.
     assert_eq!(
         shape,
-        Shape::Row {
-            cells: vec![Cell { column: "count".to_string(), of: Of::Groups { plan: 0 } }]
-        }
+        Shape::Row { cells: vec![Cell::plain("count".to_string(), Of::Groups { plan: 0 })] }
     );
     assert_eq!(value.as_groups().unwrap().len(), 3);
 
@@ -131,7 +134,7 @@ fn the_shape_says_how_the_answer_becomes_columns() {
     assert_eq!(shape.columns(), vec!["country", "count"]);
 
     let (value, shape) = one(&api, "SELECT * FROM tx WHERE active = true");
-    assert_eq!(shape, Shape::Records { column: "id".to_string(), limit: None });
+    assert_eq!(shape, Shape::Records { column: big_sql_record_column(), limit: None });
     assert_eq!(value.as_rows().unwrap().cardinality(), 4);
 }
 
@@ -152,9 +155,11 @@ fn several_aggregates_are_several_plans_over_the_same_records() {
         answer.shape,
         Shape::Row {
             cells: vec![
-                Cell { column: "count".to_string(), of: Of::Value { plan: 0 } },
-                Cell { column: "sum".to_string(), of: Of::Value { plan: 1 } },
-                Cell { column: "max".to_string(), of: Of::Value { plan: 2 } },
+                Cell::plain("count".to_string(), Of::Value { plan: 0 }),
+                // Resolved, because a shape that reached here has met the schema: `amount`
+                // keeps no digits after the point, so its cells are plain.
+                Cell::plain("sum", Of::Value { plan: 1 }),
+                Cell::plain("max", Of::Value { plan: 2 }),
             ]
         }
     );
@@ -197,8 +202,8 @@ fn a_repeated_question_is_one_plan() {
         answer.shape,
         Shape::Row {
             cells: vec![
-                Cell { column: "count".to_string(), of: Of::Value { plan: 0 } },
-                Cell { column: "avg".to_string(), of: Of::Ratio { plan: 1, over: 0 } },
+                Cell::plain("count".to_string(), Of::Value { plan: 0 }),
+                Cell::plain("avg", Of::Ratio { plan: 1, over: 0 }),
             ]
         }
     );
@@ -245,7 +250,13 @@ fn refusals_and_schema_errors_carry_their_codes_through_the_facade() {
     // A join on a keyed column is answered; a cross join has no key to pair records on.
     assert_eq!(code("SELECT count(*) FROM tx, other"), "sql_no_joins");
     assert_eq!(code("SELECT amount FROM tx"), "sql_projection_unsupported");
+    // A write reaching `Api::sql` is refused because this is the un-clustered door: a write
+    // goes to the shard owners, and an id it does not name is allocated by the schema leader.
+    // `Cluster::sql` is the one that runs it - see `Api::plan_sql`.
     assert_eq!(code("INSERT INTO tx (amount) VALUES (1)"), "sql_read_only");
+    assert_eq!(code("INSERT INTO tx (_record_id, amount) VALUES (1, 2)"), "sql_read_only");
+    // A column list is still required, and that is the parser's refusal rather than this door's.
+    assert_eq!(code("INSERT INTO tx VALUES (1)"), "sql_insert_shape");
     // The same codes the query language gives, because they are the same mistakes.
     assert_eq!(code("SELECT count(*) FROM nope"), "unknown_table");
     assert_eq!(code("SELECT count(*) FROM tx WHERE nope = 1"), "unknown_field");
@@ -261,7 +272,7 @@ fn a_statement_can_be_planned_without_being_run() {
     assert_eq!(plans[0].table(), "tx");
     assert_eq!(
         answer.shape,
-        Shape::Row { cells: vec![Cell { column: "count".to_string(), of: Of::Value { plan: 0 } }] }
+        Shape::Row { cells: vec![Cell::plain("count".to_string(), Of::Value { plan: 0 })] }
     );
     assert!(api.plan_sql("SELECT count(*) FROM nope").is_err());
 }

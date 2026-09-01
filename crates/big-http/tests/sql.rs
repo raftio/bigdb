@@ -58,7 +58,7 @@ fn every_answer_shape_comes_back_as_columns_and_rows() {
 
     // `SELECT *` is record ids, under a column that says so.
     let (_, body) = send(addr, "POST", "/sql", "SELECT * FROM tx WHERE country = 'GB'");
-    assert_eq!(body, r#"{"columns":["id"],"rows":[[1],[3]]}"#);
+    assert_eq!(body, r#"{"columns":["_record_id"],"rows":[[1],[3]]}"#);
 }
 
 /// A ranking is cut by the plan, and `LIMIT` on an unranked grouping cuts the shape.
@@ -74,7 +74,7 @@ fn limit_applies_where_the_statement_put_it() {
     assert_eq!(body, r#"{"columns":["country","n"],"rows":[["GB",2]]}"#);
 
     let (_, body) = send(addr, "POST", "/sql", "SELECT * FROM tx LIMIT 2");
-    assert_eq!(body, r#"{"columns":["id"],"rows":[[1],[2]]}"#);
+    assert_eq!(body, r#"{"columns":["_record_id"],"rows":[[1],[2]]}"#);
 }
 
 /// Nothing matched is `null`, not zero: a minimum over an empty set is absent, and a result set
@@ -94,11 +94,11 @@ fn a_refusal_and_a_schema_mistake_get_different_statuses() {
     let addr = stocked(6);
 
     // A join on a keyed column is answered, so the refusal here is the pairing that has no
-    // key: a comma between tables is a cross join.
+    // key, which is what a comma between tables is.
     let (status, body) = send(addr, "POST", "/sql", "SELECT count(*) FROM tx, other");
     assert_eq!(status, 400);
     assert!(body.contains(r#""code":"sql_no_joins""#), "{body}");
-    assert!(body.contains("cross join"), "{body}");
+    assert!(body.contains("comma between tables"), "{body}");
 
     let (status, body) = send(addr, "POST", "/sql", "SELECT amount FROM tx");
     assert_eq!(status, 400);
@@ -316,7 +316,9 @@ shop 3 b
         "SELECT shop, sum(price) FROM s GROUP BY shop HAVING sum(price) >= 10.00",
     );
     assert_eq!(status, 200, "{body}");
-    assert_eq!(body, r#"{"columns":["shop","sum"],"rows":[["a",1250]]}"#);
+    // And the total comes back as the value it is, not as the integer it is stored as: the
+    // threshold was converted on the way in, so the answer is converted on the way out.
+    assert_eq!(body, r#"{"columns":["shop","sum"],"rows":[["a",12.50]]}"#);
 
     // A whole number is the same conversion: `10` on a two-place field is `1000` units, which
     // `b`'s total of `300` is still under.
@@ -326,7 +328,9 @@ shop 3 b
         "/sql",
         "SELECT shop, sum(price) FROM s GROUP BY shop HAVING sum(price) >= 10",
     );
-    assert_eq!(body, r#"{"columns":["shop","sum"],"rows":[["a",1250]]}"#);
+    // And the total comes back as the value it is, not as the integer it is stored as: the
+    // threshold was converted on the way in, so the answer is converted on the way out.
+    assert_eq!(body, r#"{"columns":["shop","sum"],"rows":[["a",12.50]]}"#);
 
     // More digits than the field stores is refused rather than rounded, exactly as in a
     // `WHERE`, and with the same code and the same status - because it is the same code
@@ -347,7 +351,9 @@ shop 3 b
         "/sql",
         "SELECT shop, sum(price) FROM s GROUP BY shop ORDER BY sum(price) DESC LIMIT 1",
     );
-    assert_eq!(body, r#"{"columns":["shop","sum"],"rows":[["a",1250]]}"#);
+    // And the total comes back as the value it is, not as the integer it is stored as: the
+    // threshold was converted on the way in, so the answer is converted on the way out.
+    assert_eq!(body, r#"{"columns":["shop","sum"],"rows":[["a",12.50]]}"#);
 }
 
 /// Several aggregates in one statement come back as one row of cells.
@@ -633,17 +639,19 @@ fn a_projection_reads_every_column_it_names_and_says_so_when_there_is_nothing_th
     let (status, _) = send(addr, "POST", "/table/p/import", "qty 1 3\nprice 1 1250\nqty 2 7\n");
     assert_eq!(status, 200);
 
-    // Column order follows the select list, and a decimal comes back in the units it is stored
-    // in - exactly as a `sum` over it does.
+    // Column order follows the select list, and a decimal comes back as the value it is: the
+    // field keeps two digits, so the 1250 units it stores are 12.50.
     let (status, body) = send(addr, "POST", "/sql", "SELECT qty, price FROM p LIMIT 10");
     assert_eq!(status, 200, "{body}");
-    assert_eq!(body, r#"{"columns":["qty","price"],"rows":[[3,1250],[7,null]]}"#);
+    assert_eq!(body, r#"{"columns":["qty","price"],"rows":[[3,12.50],[7,null]]}"#);
 
     let (_, body) = send(addr, "POST", "/sql", "SELECT price, qty FROM p LIMIT 10");
-    assert_eq!(body, r#"{"columns":["price","qty"],"rows":[[1250,3],[null,7]]}"#);
+    assert_eq!(body, r#"{"columns":["price","qty"],"rows":[[12.50,3],[null,7]]}"#);
 
-    // The same projection in the query language, which is where SQL's translation has to land
-    // for it to be a translation at all.
+    // **The query language answers in units, and that is not a disagreement.** It has no schema
+    // in the statement and no scale in the answer - `Project` names fields, not types - so what
+    // it hands back is what is stored. SQL names its columns and knows their fields, so it can
+    // put the point back. The plan underneath is the same one either way.
     let (status, body) =
         send(addr, "POST", "/table/p/query", "Project(All(), field=qty, field=price, n=10)");
     assert_eq!(status, 200, "{body}");
@@ -865,18 +873,449 @@ fn an_unknown_engine_in_sql_is_refused() {
     assert!(body.contains(r#""code":"unknown_engine_name""#), "{body}");
 }
 
-/// A column list is refused by name, with the sentence the writer needs: fields are declared
-/// separately here because a field kind may be a set, a mutex or a time quantum, none of which
-/// a SQL type names.
+/// A column list creates the fields it declares, as the field changes it already is.
+///
+/// End to end on purpose: what this claims is not that the parser read `TEXT`, which
+/// `big-sql`'s own suite says, but that a field created this way is indistinguishable from one
+/// created over `POST /table/{t}/field/{f}` - same kind, same depth, same scale in `/schema`.
 #[test]
-fn a_column_list_on_create_table_is_refused_by_name() {
-    let addr = spawn(2);
-    let (status, body) = send(addr, "POST", "/sql", "CREATE TABLE t (amount int)");
-    assert_eq!(status, 400, "{body}");
-    assert!(body.contains(r#""code":"sql_no_column_list""#), "{body}");
+fn a_column_list_creates_the_fields_it_declares() {
+    let addr = spawn(4);
 
-    // Everything else that writes is still refused as it was.
+    let (status, body) = send(
+        addr,
+        "POST",
+        "/sql",
+        "CREATE TABLE events (
+           country TEXT,
+           device  MUTEX,
+           active  BOOL,
+           amount  INT,
+           small   SMALLINT,
+           delta   BIGINT SIGNED,
+           price   DECIMAL(10, 2),
+           visit   TIMEQUANTUM
+         ) ENGINE = 'bitmap+columnar'",
+    );
+    assert_eq!(status, 200, "{body}");
+    // Still the table's id in one cell, because a column list does not change what a `CREATE`
+    // answers with - only how much of the schema one statement says.
+    assert_eq!(body, r#"{"columns":["table"],"rows":[[0]]}"#);
+
+    let (_, body) = send(addr, "GET", "/schema", "");
+    assert!(body.contains(r#""name":"events","engine":"bitmap+columnar""#), "{body}");
+    for field in [
+        r#""name":"country","kind":"set""#,
+        r#""name":"device","kind":"mutex""#,
+        r#""name":"active","kind":"bool""#,
+        r#""name":"amount","kind":"int","bit_depth":32"#,
+        r#""name":"small","kind":"int","bit_depth":16"#,
+        r#""name":"delta","kind":"signedint","bit_depth":64"#,
+        // Ten digits need 34 bits, which is what the precision bought.
+        r#""name":"price","kind":"decimal","bit_depth":34,"scale":2"#,
+        r#""name":"visit","kind":"timequantum""#,
+    ] {
+        assert!(body.contains(field), "missing {field} in {body}");
+    }
+
+    // And the fields work: a fact written against them lands and counts.
+    assert_eq!(send(addr, "POST", "/table/events/import", "country 1 vn\namount 1 4200\n").0, 200);
+    let (_, body) = send(addr, "POST", "/sql", "SELECT count(*) FROM events WHERE country = 'vn'");
+    assert_eq!(body, r#"{"columns":["count"],"rows":[[1]]}"#);
+}
+
+/// The column list is optional, and the fields it declares are still the field routes' to add.
+#[test]
+fn a_column_list_is_one_way_to_say_a_schema_and_not_the_only_one() {
+    let addr = spawn(4);
+    assert_eq!(send(addr, "POST", "/sql", "CREATE TABLE t (a SET)").0, 200);
+    // A field added afterwards over the route it has always had.
+    assert_eq!(send(addr, "POST", "/table/t/field/b?kind=int&bit_depth=8", "").0, 200);
+
+    let (_, body) = send(addr, "GET", "/schema", "");
+    assert!(body.contains(r#""name":"a","kind":"set""#), "{body}");
+    assert!(body.contains(r#""name":"b","kind":"int","bit_depth":8"#), "{body}");
+}
+
+/// What a column list will not take, refused before anything is created.
+///
+/// The second half is the claim worth having: a statement refused for its column list leaves
+/// no table behind, because every kind, depth and scale is decided while the statement is
+/// parsed and the first change goes out only after all of them are.
+#[test]
+fn a_column_list_is_judged_before_the_table_is_created() {
+    let addr = spawn(7);
+
+    for (sql, code) in [
+        ("CREATE TABLE t (a FLOAT)", "sql_unknown_column_type"),
+        ("CREATE TABLE t (a INT NOT NULL)", "sql_no_constraints"),
+        ("CREATE TABLE t (a DECIMAL)", "sql_decimal_scale"),
+        ("CREATE TABLE t (a UINT(65))", "sql_bit_depth"),
+    ] {
+        let (status, body) = send(addr, "POST", "/sql", sql);
+        assert_eq!(status, 400, "{body}");
+        assert!(body.contains(&format!(r#""code":"{code}""#)), "{sql}: {body}");
+    }
+
+    // Nothing was created by any of them.
+    let (_, body) = send(addr, "GET", "/schema", "");
+    assert!(!body.contains(r#""name":"t""#), "{body}");
+
+    // A table nobody has is a 404, judged here before any node is told to drop anything -
+    // and `IF EXISTS` makes it a request that was already satisfied.
     let (status, body) = send(addr, "POST", "/sql", "DROP TABLE t");
+    assert_eq!(status, 404, "{body}");
+    assert!(body.contains(r#""code":"unknown_table""#), "{body}");
+    let (status, body) = send(addr, "POST", "/sql", "DROP TABLE IF EXISTS t");
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body, r#"{"columns":["dropped"],"rows":[[0]]}"#);
+}
+
+/// `ALTER TABLE` adds and drops fields, which is the whole of what the engine can do to one.
+///
+/// End to end, because the claim is not that the parser read `ADD COLUMN` - `big-sql`'s suite
+/// says that - but that the field it creates is the field the route creates, and that a fact
+/// written against it lands.
+#[test]
+fn alter_table_adds_and_drops_the_fields_it_names() {
+    let addr = spawn(7);
+    let (s0, b0) = send(addr, "POST", "/sql", "CREATE TABLE events (country TEXT, legacy INT)");
+    assert_eq!(s0, 200, "{b0}");
+
+    let (status, body) = send(
+        addr,
+        "POST",
+        "/sql",
+        "ALTER TABLE events
+           ADD COLUMN price DECIMAL(10, 2),
+           ADD COLUMN visit TIMEQUANTUM,
+           DROP COLUMN legacy",
+    );
+    assert_eq!(status, 200, "{body}");
+    // How many fields changed, not an id: three changes have no single id to answer with.
+    assert_eq!(body, r#"{"columns":["fields"],"rows":[[3]]}"#);
+
+    let (_, body) = send(addr, "GET", "/schema", "");
+    assert!(body.contains(r#""name":"price","kind":"decimal","bit_depth":34,"scale":2"#), "{body}");
+    assert!(body.contains(r#""name":"visit","kind":"timequantum""#), "{body}");
+    assert!(!body.contains(r#""name":"legacy""#), "{body}");
+
+    // The added field works like any other: a decimal fact is its units, and the planner
+    // resolves the literal in the query against the scale the column declared.
+    assert_eq!(send(addr, "POST", "/table/events/import", "price 1 1250\n").0, 200);
+    let (_, body) = send(addr, "POST", "/sql", "SELECT count(*) FROM events WHERE price > 5");
+    assert_eq!(body, r#"{"columns":["count"],"rows":[[1]]}"#);
+}
+
+/// Every clause is judged before the first one is applied.
+#[test]
+fn an_alter_that_names_a_field_wrongly_changes_nothing() {
+    let addr = spawn(7);
+    assert_eq!(send(addr, "POST", "/sql", "CREATE TABLE t (a SET)").0, 200);
+
+    // The second clause is the bad one, and the first must not have happened. `422` because
+    // the name that is wrong is in the body, which is where `status::db` puts a field.
+    let (status, body) =
+        send(addr, "POST", "/sql", "ALTER TABLE t ADD COLUMN b INT, DROP COLUMN nope");
+    assert_eq!(status, 422, "{body}");
+    assert!(body.contains(r#""code":"unknown_field""#), "{body}");
+
+    // Adding a field that is already there, and altering a table that is not.
+    let (status, body) = send(addr, "POST", "/sql", "ALTER TABLE t ADD COLUMN a SET");
+    assert_eq!(status, 409, "{body}");
+    assert!(body.contains(r#""code":"field_redefined""#), "{body}");
+    let (status, body) = send(addr, "POST", "/sql", "ALTER TABLE nope ADD COLUMN a SET");
+    assert_eq!(status, 404, "{body}");
+    assert!(body.contains(r#""code":"unknown_table""#), "{body}");
+
+    let (_, body) = send(addr, "GET", "/schema", "");
+    assert!(!body.contains(r#""name":"b""#), "{body}");
+
+    // What the engine cannot do to a field, refused with what to do instead.
+    let (status, body) = send(addr, "POST", "/sql", "ALTER TABLE t MODIFY a BIGINT");
     assert_eq!(status, 400, "{body}");
-    assert!(body.contains(r#""code":"sql_read_only""#), "{body}");
+    assert!(body.contains(r#""code":"sql_no_alter_column""#), "{body}");
+    assert!(body.contains("copy into it"), "{body}");
+}
+
+/// `INSERT`, end to end: the facts it writes are the facts a query then counts.
+#[test]
+fn rows_written_by_a_statement_are_read_back_by_one() {
+    let addr = spawn(8);
+    assert_eq!(send(addr, "POST", "/sql", "CREATE TABLE tx (amount INT, country TEXT)").0, 200);
+
+    // The answer is the rows the client wrote, not the facts they came to - that number is the
+    // statement's cost rather than its meaning.
+    let (status, body) = send(
+        addr,
+        "POST",
+        "/sql",
+        "INSERT INTO tx (_record_id, amount, country) VALUES (1, 100, 'GB'), (2, 900, 'US')",
+    );
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body, r#"{"columns":["inserted"],"rows":[[2]]}"#);
+
+    let (_, body) = send(addr, "POST", "/sql", "SELECT count(*) FROM tx WHERE country = 'GB'");
+    assert_eq!(body, r#"{"columns":["count"],"rows":[[1]]}"#);
+    let (_, body) = send(addr, "POST", "/sql", "SELECT sum(amount) FROM tx");
+    assert_eq!(body, r#"{"columns":["sum"],"rows":[[1000]]}"#);
+    // The ids the statement named are the records that exist, because the id *is* the record.
+    let (_, body) = send(addr, "POST", "/sql", "SELECT * FROM tx");
+    assert_eq!(body, r#"{"columns":["_record_id"],"rows":[[1],[2]]}"#);
+    // Writing the same id again writes about the same record, exactly as two import lines do.
+    assert_eq!(
+        send(addr, "POST", "/sql", "INSERT INTO tx (_record_id, amount) VALUES (1, 700)").0,
+        200
+    );
+    let (_, body) = send(addr, "POST", "/sql", "SELECT count(*) FROM tx");
+    assert_eq!(body, r#"{"columns":["count"],"rows":[[2]]}"#);
+}
+
+/// **The test that makes one shared `big_api::fact` a checkable claim rather than a refactor.**
+///
+/// The import route and an `INSERT` write into the same fields, and a field's kind is what
+/// decides how a value is read. If the two disagreed - about `true`, about `key@seconds`, about
+/// how many units `12.50` is - one table would hold two conventions and no query could tell
+/// which line wrote which. So the same record is written both ways and asked about once.
+#[test]
+fn a_value_written_as_a_statement_reads_the_way_an_imported_one_does() {
+    let addr = spawn(12);
+    assert_eq!(
+        send(
+            addr,
+            "POST",
+            "/sql",
+            "CREATE TABLE t (n INT, balance SIGNED, price DECIMAL(10, 2),
+                             country TEXT, active BOOL, visit TIMEQUANTUM)"
+        )
+        .0,
+        200
+    );
+
+    // Record 1 the old way. A decimal takes the units it stores, which is what a line of an
+    // import has always meant.
+    let (status, body) = send(
+        addr,
+        "POST",
+        "/table/t/import",
+        "n 1 100\nbalance 1 -5\nprice 1 1250\ncountry 1 GB\nactive 1 true\nvisit 1 home@1750000000\n",
+    );
+    assert_eq!(status, 200, "{body}");
+
+    // Record 2 the new way. A literal carries its own scale, so `12.50` is written as the same
+    // 1250 units - which is also what `WHERE price = 12.50` compares against.
+    let (status, body) = send(
+        addr,
+        "POST",
+        "/sql",
+        "INSERT INTO t (_record_id, n, balance, price, country, active, visit)
+         VALUES (2, 100, -5, 12.50, 'GB', true, 'home@1750000000')",
+    );
+    assert_eq!(status, 200, "{body}");
+
+    // Every field answers for both records, which is the claim.
+    for (sql, expected) in [
+        ("SELECT count(*) FROM t WHERE n = 100", 2),
+        ("SELECT count(*) FROM t WHERE balance = -5", 2),
+        ("SELECT count(*) FROM t WHERE price = 12.50", 2),
+        ("SELECT count(*) FROM t WHERE country = 'GB'", 2),
+        ("SELECT count(*) FROM t WHERE active = true", 2),
+        ("SELECT count(*) FROM t WHERE visit = 'home'", 2),
+        // The moment landed too, in the views a window reads - which is the half of a time
+        // quantum fact that is easy to write and lose.
+        ("SELECT count(*) FROM t WHERE visit = 'home' AND visit BETWEEN 1749000000 AND 1751000000", 2),
+    ] {
+        let (status, body) = send(addr, "POST", "/sql", sql);
+        assert_eq!(status, 200, "{sql}: {body}");
+        assert_eq!(body, format!(r#"{{"columns":["count"],"rows":[[{expected}]]}}"#), "{sql}");
+    }
+}
+
+/// A statement that names anything wrongly writes none of it.
+#[test]
+fn an_insert_that_names_a_column_wrongly_writes_nothing() {
+    let addr = spawn(8);
+    assert_eq!(send(addr, "POST", "/sql", "CREATE TABLE t (n INT)").0, 200);
+
+    // A field nobody has: `422`, because the name that is wrong is in the body.
+    let (status, body) =
+        send(addr, "POST", "/sql", "INSERT INTO t (_record_id, nope) VALUES (1, 5)");
+    assert_eq!(status, 422, "{body}");
+    assert!(body.contains(r#""code":"unknown_field""#), "{body}");
+    // A table nobody has.
+    let (status, body) = send(addr, "POST", "/sql", "INSERT INTO nope (_record_id) VALUES (1)");
+    assert_eq!(status, 404, "{body}");
+    assert!(body.contains(r#""code":"unknown_table""#), "{body}");
+    // A value the field cannot hold, reported the way the import route reports the same
+    // mistake - the two read it with one function, so they say one thing about it.
+    let (status, body) =
+        send(addr, "POST", "/sql", "INSERT INTO t (_record_id, n) VALUES (1, 'five')");
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains(r#""code":"malformed_line""#), "{body}");
+    assert!(body.contains("needs a number"), "{body}");
+    // The second row is the bad one, and the first must not have landed: the whole batch is
+    // resolved before any of it is written.
+    let (status, _) =
+        send(addr, "POST", "/sql", "INSERT INTO t (_record_id, n) VALUES (1, 5), (2, 'x')");
+    assert_eq!(status, 400);
+
+    let (_, body) = send(addr, "POST", "/sql", "SELECT count(*) FROM t");
+    assert_eq!(body, r#"{"columns":["count"],"rows":[[0]]}"#);
+}
+
+/// `IF NOT EXISTS` is about the fields as much as the table, which is why it is a flag on the
+/// statement rather than a shrug at whatever error came back.
+#[test]
+fn if_not_exists_leaves_a_table_and_its_fields_alone() {
+    let addr = spawn(8);
+    assert_eq!(send(addr, "POST", "/sql", "CREATE TABLE t (a SET)").0, 200);
+
+    // A second run of a setup script that has since grown a column. **The table is left exactly
+    // as it is**: `b` is not created, and the answer is that nothing was.
+    let (status, body) = send(addr, "POST", "/sql", "CREATE TABLE IF NOT EXISTS t (a SET, b INT)");
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body, r#"{"columns":["table"],"rows":[[0]]}"#);
+    let (_, body) = send(addr, "GET", "/schema", "");
+    assert!(!body.contains(r#""name":"b""#), "{body}");
+
+    // Without the clause the same statement *adds* `b`, because a declaration identical to what
+    // is already there is idempotent below and a new field is simply a new field. Which is the
+    // difference the flag names: "make sure this exists" and "leave it alone if it does" are two
+    // requests, and only one of them is safe to run against a table somebody has since altered.
+    let (status, body) = send(addr, "POST", "/sql", "CREATE TABLE t (a SET, b INT)");
+    assert_eq!(status, 200, "{body}");
+    let (_, body) = send(addr, "GET", "/schema", "");
+    assert!(body.contains(r#""name":"b""#), "{body}");
+
+    // A declaration that contradicts what is there is refused either way: `IF NOT EXISTS` says
+    // what to do about a table that exists, not what a field means.
+    let (status, body) = send(addr, "POST", "/sql", "CREATE TABLE t (a INT)");
+    assert_eq!(status, 409, "{body}");
+    assert!(body.contains(r#""code":"field_redefined""#), "{body}");
+}
+
+/// `DROP TABLE`, which reaches exactly what `DELETE /table/{t}` reaches.
+#[test]
+fn a_table_dropped_by_statement_is_gone_and_dropping_it_again_is_idempotent() {
+    let addr = spawn(7);
+    assert_eq!(send(addr, "POST", "/sql", "CREATE TABLE t (a SET)").0, 200);
+    assert_eq!(send(addr, "POST", "/sql", "INSERT INTO t (_record_id, a) VALUES (1, 'x')").0, 200);
+
+    let (status, body) = send(addr, "POST", "/sql", "DROP TABLE t");
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body, r#"{"columns":["dropped"],"rows":[[1]]}"#);
+    let (_, body) = send(addr, "GET", "/schema", "");
+    assert!(!body.contains(r#""name":"t""#), "{body}");
+
+    // Twice is an error; twice with `IF EXISTS` is a request that was already satisfied.
+    let (status, body) = send(addr, "POST", "/sql", "DROP TABLE t");
+    assert_eq!(status, 404, "{body}");
+    let (status, body) = send(addr, "POST", "/sql", "DROP TABLE IF EXISTS t");
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body, r#"{"columns":["dropped"],"rows":[[0]]}"#);
+}
+
+/// `DESCRIBE` and `SHOW`, which read the catalog every node holds.
+#[test]
+fn the_catalog_answers_in_sql_what_the_schema_route_answers_in_json() {
+    let addr = spawn(6);
+    assert_eq!(
+        send(
+            addr,
+            "POST",
+            "/sql",
+            "CREATE TABLE t (n INT, price DECIMAL(10, 2), visit TIMEQUANTUM)"
+        )
+        .0,
+        200
+    );
+
+    // One row per field, and the two numbers that are absent rather than zero: a scale on a
+    // field that stores no decimal, a granularity on a field with no views by time.
+    let (status, body) = send(addr, "POST", "/sql", "DESCRIBE t");
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body,
+        r#"{"columns":["name","kind","bit_depth","scale","granularity"],"rows":[["n","int",32,null,null],["price","decimal",34,2,null],["visit","timequantum",0,null,null]]}"#
+    );
+
+    let (_, body) = send(addr, "POST", "/sql", "SHOW TABLES");
+    assert_eq!(
+        body,
+        r#"{"columns":["name","engine","fields"],"rows":[["t","bitmap+columnar",3]]}"#
+    );
+
+    // `FORMAT` is the same clause a `SELECT` takes, and means the same thing.
+    let (_, body) = send(addr, "POST", "/sql", "SHOW TABLES FORMAT TSV");
+    assert_eq!(body, "t\tbitmap+columnar\t3\n");
+
+    let (status, body) = send(addr, "POST", "/sql", "DESCRIBE nope");
+    assert_eq!(status, 404, "{body}");
+    assert!(body.contains(r#""code":"unknown_table""#), "{body}");
+}
+
+/// **`SHOW CREATE TABLE` answers with a statement that creates the same table.**
+///
+/// Not "a statement that looks right": it is posted back to a fresh server and the two schemas
+/// are compared. That is what keeps the renderer and the parser's type table inverses of each
+/// other across a layer boundary, where a unit test cannot see both ends.
+#[test]
+fn a_shown_create_statement_recreates_the_table_it_describes() {
+    let source = spawn(3);
+    let declared = "CREATE TABLE t (a SET, b MUTEX, c BOOL, d TIMEQUANTUM,
+                                    n UINT(12), s SIGNED(20), price DECIMAL(10, 2))";
+    assert_eq!(send(source, "POST", "/sql", declared).0, 200);
+
+    let (status, body) = send(source, "POST", "/sql", "SHOW CREATE TABLE t");
+    assert_eq!(status, 200, "{body}");
+    let statement = body
+        .split_once(r#""rows":[[""#)
+        .and_then(|(_, rest)| rest.rsplit_once(r#""]]}"#))
+        .map(|(s, _)| s.replace("\\n", "\n"))
+        .unwrap_or_else(|| panic!("no statement in {body}"));
+
+    let fresh = spawn(2);
+
+    let (status, body) = send(fresh, "POST", "/sql", &statement);
+    assert_eq!(status, 200, "{statement} -> {body}");
+
+    let (_, from_source) = send(source, "GET", "/schema", "");
+    let (_, from_fresh) = send(fresh, "GET", "/schema", "");
+    assert_eq!(from_fresh, from_source, "recreated from `{statement}`");
+}
+
+/// A statement that names no `id` is given one, and the ids keep going up across statements.
+///
+/// End to end because the allocation is not the parser's: it is one past the highest id
+/// anywhere, asked of the schema leader before a fact is sent. What that means on one node is
+/// what this checks; what it means on several is that the same leader answers.
+#[test]
+fn a_record_id_is_allocated_when_the_statement_does_not_name_one() {
+    let addr = spawn(9);
+    assert_eq!(send(addr, "POST", "/sql", "CREATE TABLE t (n INT, country TEXT)").0, 200);
+
+    // An empty table starts at zero, and a run is contiguous and in the order written.
+    let (status, body) =
+        send(addr, "POST", "/sql", "INSERT INTO t (n, country) VALUES (10, 'GB'), (20, 'US')");
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body, r#"{"columns":["inserted"],"rows":[[2]]}"#);
+    let (_, body) = send(addr, "POST", "/sql", "SELECT * FROM t");
+    assert_eq!(body, r#"{"columns":["_record_id"],"rows":[[0],[1]]}"#);
+
+    // The next statement carries on above them rather than starting again.
+    assert_eq!(send(addr, "POST", "/sql", "INSERT INTO t (n) VALUES (30)").0, 200);
+    let (_, body) = send(addr, "POST", "/sql", "SELECT * FROM t");
+    assert_eq!(body, r#"{"columns":["_record_id"],"rows":[[0],[1],[2]]}"#);
+
+    // **Above an id written by hand, too.** Allocation is one past the highest that exists, not
+    // a counter of its own - so a statement that names an id cannot be overwritten by one that
+    // does not, whichever order they arrive in.
+    assert_eq!(send(addr, "POST", "/sql", "INSERT INTO t (_record_id, n) VALUES (100, 40)").0, 200);
+    assert_eq!(send(addr, "POST", "/sql", "INSERT INTO t (n) VALUES (50)").0, 200);
+    let (_, body) = send(addr, "POST", "/sql", "SELECT * FROM t");
+    assert_eq!(body, r#"{"columns":["_record_id"],"rows":[[0],[1],[2],[100],[101]]}"#);
+
+    // Each row is its own record: the values went where the ids say they did.
+    let (_, body) = send(addr, "POST", "/sql", "SELECT count(*) FROM t WHERE country = 'GB'");
+    assert_eq!(body, r#"{"columns":["count"],"rows":[[1]]}"#);
 }

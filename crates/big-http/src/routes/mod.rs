@@ -61,6 +61,8 @@
 //! POST   /internal/import          facts, with their row ids already fixed  write
 //! POST   /internal/delete          record ids this node owns             write
 //! POST   /internal/intern          what do these keys mean (leader only) write
+//! POST   /internal/allocate        a run of record ids (leader only)       write
+//! POST   /internal/next-record     how far this node's ids reach           read
 //! POST   /internal/ddl             one schema change, already ruled legal   admin
 //! POST   /internal/digest          what do you hold, as one number        read
 //! POST   /internal/raft            one message of the agreement           admin
@@ -193,6 +195,8 @@ enum Target<'a> {
     PeerImport,
     PeerDelete,
     PeerIntern,
+    PeerAllocate,
+    PeerNextRecord,
     PeerDdl,
     PeerDigest,
     PeerRaft,
@@ -222,6 +226,8 @@ impl Target<'_> {
                 | Self::PeerImport
                 | Self::PeerDelete
                 | Self::PeerIntern
+                | Self::PeerAllocate
+                | Self::PeerNextRecord
                 | Self::PeerDdl
                 | Self::PeerRaft
                 | Self::PeerSchema
@@ -261,7 +267,12 @@ impl Target<'_> {
             | Self::PeerFragment
             | Self::PeerKeys
             | Self::PeerSchema => Some(Role::Read),
-            Self::PeerImport | Self::PeerDelete | Self::PeerIntern => Some(Role::Write),
+            Self::PeerImport | Self::PeerDelete | Self::PeerIntern | Self::PeerAllocate => {
+                Some(Role::Write)
+            }
+            // Reading how far a table's ids reach is a read, and it is asked of every node
+            // rather than of the leader.
+            Self::PeerNextRecord => Some(Role::Read),
             Self::PeerDdl => Some(Role::Admin),
             // The agreement decides which node serves which range. A credential that can vote
             // is a credential that can decide where every read goes, which is more than write.
@@ -304,6 +315,8 @@ fn resolve<'a>(method: &str, segments: &[&'a str]) -> Option<Target<'a>> {
         ("POST", ["internal", "import"]) => Target::PeerImport,
         ("POST", ["internal", "delete"]) => Target::PeerDelete,
         ("POST", ["internal", "intern"]) => Target::PeerIntern,
+        ("POST", ["internal", "allocate"]) => Target::PeerAllocate,
+        ("POST", ["internal", "next-record"]) => Target::PeerNextRecord,
         ("POST", ["internal", "ddl"]) => Target::PeerDdl,
         ("POST", ["internal", "digest"]) => Target::PeerDigest,
         ("POST", ["internal", "raft"]) => Target::PeerRaft,
@@ -391,6 +404,8 @@ pub fn dispatch<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request) -> Response
         Target::PeerImport => peer_import(ctx, req),
         Target::PeerDelete => peer_delete(ctx, req),
         Target::PeerIntern => peer_intern(ctx, req),
+        Target::PeerAllocate => peer_allocate(ctx, req),
+        Target::PeerNextRecord => peer_next_record(ctx, req),
         Target::PeerDdl => peer_ddl(ctx, req),
         Target::PeerDigest => peer_digest(ctx),
         Target::PeerRaft => peer_raft(ctx, req),

@@ -49,6 +49,18 @@ pub enum Datum {
     Null,
     /// A count, a total, or an extreme, in the units the field stores.
     Int(i128),
+    /// A number out of a decimal field, with the digits that field keeps.
+    ///
+    /// **Not an `f64`.** A decimal field stores an integer precisely so that no value passes
+    /// through a float on its way in - see `big_plan::Literal::Dec` - and rendering one through
+    /// a float on the way out would put back exactly the error the storage layer went to
+    /// trouble to avoid. The point is placed when the cell is written instead.
+    Dec {
+        /// The stored number, in the units the field keeps.
+        units: i128,
+        /// How many of its digits are after the point.
+        scale: u8,
+    },
     /// The quotient an average is.
     Real(f64),
     /// A row key, as the string it was interned from.
@@ -58,22 +70,33 @@ pub enum Datum {
 }
 
 impl Datum {
-    /// One cell of a projected row.
-    fn projected(p: &big_exec::Projection) -> Self {
+    /// One cell of a projected row, in the units its column is in.
+    fn projected(p: &big_exec::Projection, digits: u8) -> Self {
         match p {
             big_exec::Projection::Absent => Self::Null,
-            big_exec::Projection::Int(v) => Self::Int(*v),
+            big_exec::Projection::Int(v) => Self::num(Some(Num::Int(*v)), digits),
             big_exec::Projection::Text(s) => Self::Text(s.clone()),
             big_exec::Projection::Texts(v) => Self::Keys(v.clone()),
         }
     }
 
-    /// A number that may not be there.
-    fn num(n: Option<Num>) -> Self {
-        match n {
-            None => Datum::Null,
-            Some(Num::Int(v)) => Datum::Int(v),
-            Some(Num::Real(v)) => Datum::Real(v),
+    /// A number that may not be there, in the units the cell says it is in.
+    ///
+    /// **Where a decimal stops being an integer.** Everything up to here - the plan, the
+    /// fan-out, the merge, the `HAVING` - works in the units the field stores, which is what
+    /// keeps all of it exact. This is the last step, and the only one that has to know the
+    /// scale.
+    ///
+    /// An average is already a quotient and already a float, so it is divided rather than
+    /// pointed: `sum(price) / count(*)` over units is the answer in units, and the value it
+    /// stands for is that over ten to the scale.
+    fn num(n: Option<Num>, digits: u8) -> Self {
+        match (n, digits) {
+            (None, _) => Datum::Null,
+            (Some(Num::Int(v)), 0) => Datum::Int(v),
+            (Some(Num::Int(units)), scale) => Datum::Dec { units, scale },
+            (Some(Num::Real(v)), 0) => Datum::Real(v),
+            (Some(Num::Real(v)), scale) => Datum::Real(v / 10f64.powi(i32::from(scale))),
         }
     }
 
@@ -83,6 +106,24 @@ impl Datum {
     }
 }
 
+/// A number in a field's units, with the point put back where the scale says.
+///
+/// Exact by construction: the digits are the stored integer's, and the point is placed among
+/// them rather than computed. Nothing here goes through a float, which is the whole reason a
+/// decimal field stores an integer in the first place.
+pub fn fixed(units: i128, scale: u8) -> String {
+    if scale == 0 {
+        return units.to_string();
+    }
+    let scale = usize::from(scale);
+    // Padded to at least one digit before the point, so five hundredths reads `0.05` rather
+    // than `.05` - which is a number some readers take and some refuse.
+    let digits = format!("{:0>width$}", units.unsigned_abs(), width = scale + 1);
+    let point = digits.len() - scale;
+    let sign = if units < 0 { "-" } else { "" };
+    format!("{sign}{}.{}", &digits[..point], &digits[point..])
+}
+
 /// A result set: the columns a statement named, and the rows its answers came to.
 #[derive(Clone, PartialEq, Debug)]
 pub struct ResultSet {
@@ -90,6 +131,17 @@ pub struct ResultSet {
     pub columns: Vec<String>,
     /// The rows. Each is as wide as `columns`.
     pub rows: Vec<Row>,
+}
+
+/// A result set of one row and one cell, which is what a statement that changed something
+/// answers with.
+///
+/// **Not a `Shape`.** A `Shape` describes how the answers *plans* produced become cells, and
+/// every one of its cells names a plan by index; a schema change makes no plan, so building one
+/// here would mean naming a plan that does not exist and then reading a value out of a list
+/// that was never filled. The number is already the answer, so this says so.
+pub fn one_cell(column: &str, value: Datum) -> ResultSet {
+    ResultSet { columns: vec![column.to_string()], rows: vec![vec![value]] }
 }
 
 /// Assembles a statement's answers into the rows its shape asks for.
@@ -109,7 +161,7 @@ pub fn result_set(answer: &Answer, values: &[Value]) -> ResultSet {
 fn rows_of(shape: &Shape, values: &[Value], probes_at: usize) -> Vec<Row> {
     match shape {
         Shape::Row { cells } => {
-            vec![cells.iter().map(|c| scalar_cell(c.of, values, probes_at)).collect()]
+            vec![cells.iter().map(|c| scalar_cell(c, values, probes_at)).collect()]
         }
 
         Shape::Records { limit, .. } => match values.first().and_then(Value::as_rows) {
@@ -124,7 +176,7 @@ fn rows_of(shape: &Shape, values: &[Value], probes_at: usize) -> Vec<Row> {
         // Nothing to do but render: the plan carried the columns and the cut, because a
         // projection's cost is a point read per record per column and a cut applied here would
         // be one applied after paying for it.
-        Shape::Table { .. } => values
+        Shape::Table { columns } => values
             .first()
             .and_then(Value::as_table)
             .unwrap_or(&[])
@@ -132,7 +184,13 @@ fn rows_of(shape: &Shape, values: &[Value], probes_at: usize) -> Vec<Row> {
             // Every shape a projected cell can be already has a `Datum`: the result set was
             // built to carry keys and lists of keys because a grouping answers with them, and a
             // projected keyed column is the same string arriving by a different route.
-            .map(|p| p.values.iter().map(Datum::projected).collect())
+            .map(|p| {
+                p.values
+                    .iter()
+                    .zip(columns)
+                    .map(|(v, c)| Datum::projected(v, c.units.digits()))
+                    .collect()
+            })
             .collect(),
 
         Shape::Groups { keys, cells, having, order, cut } => {
@@ -143,8 +201,8 @@ fn rows_of(shape: &Shape, values: &[Value], probes_at: usize) -> Vec<Row> {
             paired(keys, cells, having.as_ref(), *order, *cut, values)
         }
 
-        Shape::Join { keys, cells, per_key, having, order, cut } => {
-            joined(*keys, cells, *per_key, having.as_ref(), *order, *cut, values)
+        Shape::Join { sides, cells, per_key, having, order, cut, .. } => {
+            joined(sides, cells, *per_key, having.as_ref(), *order, *cut, values)
         }
 
         // `UNION ALL`: each branch's rows, one after the other. The branches read the same flat

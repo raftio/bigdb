@@ -4,7 +4,7 @@ const hsl = (v: string) => `hsl(var(${v}) / <alpha-value>)`;
 
 export default {
   darkMode: "class",
-  content: ["./index.html", "./src/**/*.{ts,tsx}"],
+  content: ["./index.html", "./docs/**/*.html", "./src/**/*.{ts,tsx}"],
   theme: {
     extend: {
       colors: {

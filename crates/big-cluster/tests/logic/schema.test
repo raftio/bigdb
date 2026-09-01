@@ -1,0 +1,206 @@
+# The statements that are not questions: what they change, and what they answer with.
+#
+# Each answers with one number in a one-cell row, so a client reading `/sql` gets a result set
+# rather than a second response shape to learn. `CREATE TABLE` answers with the table's id,
+# `ALTER TABLE` with how many fields it changed - a count, because a statement may add three
+# and drop one and no single id is the answer to that - and `DROP TABLE` with how many tables
+# went, which is one or none.
+#
+# None of them is a transaction. What makes that bearable is that everything decidable has been
+# decided before the first change goes out: kinds, depths and scales while the statement was
+# parsed, and the engine name and the fields it names here, before anything is applied.
+
+exec
+CREATE TABLE tx (amount UINT(32), country SET)
+----
+table
+0
+
+exec
+ALTER TABLE tx ADD COLUMN active BOOL
+----
+fields
+1
+
+exec
+ALTER TABLE tx ADD COLUMN price DECIMAL(10, 2), ADD COLUMN city SET
+----
+fields
+2
+
+exec
+ALTER TABLE tx DROP COLUMN city
+----
+fields
+1
+
+# A question about the catalog is answered by the catalog, and goes to no node at all.
+query
+DESCRIBE tx
+----
+name     kind     bit_depth  scale  granularity
+amount   int      32         NULL   NULL
+country  set      32         NULL   NULL
+active   bool     32         NULL   NULL
+price    decimal  34         2      NULL
+
+query
+SHOW TABLES
+----
+name  engine           fields
+tx    bitmap+columnar  4
+
+query
+SHOW CREATE TABLE tx
+----
+statement
+CREATE TABLE tx (
+    amount UINT(32),
+    country SET,
+    active BOOL,
+    price DECIMAL(10, 2)
+) ENGINE = 'bitmap+columnar'
+
+# `IF NOT EXISTS` answers first, before the engine name is resolved and before any column is
+# created. The table alone is already idempotent below - an identical declaration interns to the
+# same id - but its fields are not, so without this a second run of a setup script would fail on
+# the column list rather than on the table.
+exec
+CREATE TABLE IF NOT EXISTS tx (amount UINT(32), country SET)
+----
+table
+0
+
+exec
+CREATE TABLE other (a SET)
+----
+table
+1
+
+exec
+DROP TABLE other
+----
+dropped
+1
+
+# A table nobody has is a request already satisfied, which is what makes a teardown script
+# re-runnable.
+exec
+DROP TABLE IF EXISTS other
+----
+dropped
+0
+
+error
+DROP TABLE other
+----
+error: unknown_table
+
+# Writes, and what each of them costs in facts.
+exec
+INSERT INTO tx (_record_id, amount, country, active) VALUES (1, 100, 'GB', true)
+----
+inserted
+1
+
+exec
+INSERT INTO tx (_record_id, amount, country, active) VALUES (2, 900, 'US', false), (3, 500, 'GB', true)
+----
+inserted
+2
+
+query
+SELECT count(*) FROM tx
+----
+count
+3
+
+query
+SELECT country, count(*) FROM tx GROUP BY country
+----
+country  count
+GB       2
+US       1
+
+# Without a record column the server allocates one, which is the whole difference between the
+# two forms of this statement.
+exec
+INSERT INTO tx (amount, country, active) VALUES (400, 'FR', true)
+----
+inserted
+1
+
+query
+SELECT count(*) FROM tx
+----
+count
+4
+
+query rowsort
+SELECT country, count(*) FROM tx GROUP BY country
+----
+country  count
+FR       1
+GB       2
+US       1
+
+# A write to a record that already holds facts sets more of them rather than replacing the
+# record: this is an index of facts, not a table of rows.
+exec
+INSERT INTO tx (_record_id, price) VALUES (1, 12.50)
+----
+inserted
+1
+
+query
+SELECT count(*), sum(price) FROM tx
+----
+count  sum
+4      12.50
+
+# A column the table does not have, and a table nobody has.
+error
+INSERT INTO tx (_record_id, nope) VALUES (9, 1)
+----
+error: unknown_field
+
+error
+INSERT INTO nope (_record_id) VALUES (1)
+----
+error: unknown_table
+
+error
+SELECT count(*) FROM nope
+----
+error: unknown_table
+
+error
+SELECT count(*) FROM tx WHERE nope = 1
+----
+error: unknown_field
+
+error
+SELECT nope FROM tx LIMIT 1
+----
+error: unknown_field
+
+error
+DESCRIBE nope
+----
+error: unknown_table
+
+# An aggregate over a column that keeps no number.
+error
+SELECT sum(country) FROM tx
+----
+error: operator_not_allowed
+
+error
+SELECT count(*) FROM tx WHERE country > 5
+----
+error: operator_not_allowed
+
+error
+SELECT count(*) FROM tx WHERE amount = 'GB'
+----
+error: operator_not_allowed

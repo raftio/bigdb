@@ -113,7 +113,7 @@ fn records_answer_with_one_id_per_row() {
 
 #[test]
 fn a_projection_renders_the_values_the_plan_already_cut() {
-    let shape = Shape::Table { columns: vec!["amount".to_string(), "score".to_string()] };
+    let shape = Shape::Table { columns: vec![plain_column("amount"), plain_column("score")] };
     let values = vec![Value::Table(vec![
         Projected { record: 1, values: vec![Projection::Int(100), Projection::Absent] },
         Projected { record: 2, values: vec![Projection::Int(250), Projection::Int(7)] },
@@ -124,6 +124,62 @@ fn a_projection_renders_the_values_the_plan_already_cut() {
     assert_eq!(
         set.rows,
         vec![vec![Datum::Int(100), Datum::Null], vec![Datum::Int(250), Datum::Int(7)],]
+    );
+}
+
+/// **Where a decimal stops being an integer.** A column of scale two holds 1250 and means
+/// 12.50, and this is the last step that knows the difference - everything before it works in
+/// the units the field stores, which is what keeps it exact.
+#[test]
+fn a_decimal_column_is_rendered_with_the_point_its_field_keeps() {
+    let shape = Shape::Table { columns: vec![scaled_column("price", 2), plain_column("qty")] };
+    let values = vec![Value::Table(vec![
+        Projected { record: 1, values: vec![Projection::Int(1250), Projection::Int(3)] },
+        // Fewer digits than the scale, which is where a naive placing of the point drops the
+        // leading zero and answers `.05`.
+        Projected { record: 2, values: vec![Projection::Int(5), Projection::Absent] },
+    ])];
+
+    let set = result_set(&answer(shape), &values);
+
+    assert_eq!(
+        set.rows,
+        vec![
+            vec![Datum::Dec { units: 1250, scale: 2 }, Datum::Int(3)],
+            vec![Datum::Dec { units: 5, scale: 2 }, Datum::Null],
+        ]
+    );
+    assert_eq!(big_api::fixed(1250, 2), "12.50");
+    assert_eq!(big_api::fixed(5, 2), "0.05");
+    assert_eq!(big_api::fixed(-5, 2), "-0.05");
+    // A scale of zero is the integer itself, which is every field but a decimal.
+    assert_eq!(big_api::fixed(1250, 0), "1250");
+}
+
+/// A scalar cell out of a decimal field: a `sum`, a `min`, a quantile.
+#[test]
+fn a_decimal_total_carries_the_scale_its_field_keeps() {
+    let scaled = |column: &str, of: Of, scale: u8| big_api::Cell {
+        column: column.to_string(),
+        of,
+        units: big_api::Units::Digits(scale),
+    };
+    let shape = Shape::Row {
+        cells: vec![
+            scaled("sum", Of::Value { plan: 0 }, 2),
+            cell("count", Of::Value { plan: 1 }),
+            // An average is already a quotient and already a float, so it is divided rather
+            // than pointed.
+            scaled("avg", Of::Ratio { plan: 0, over: 1 }, 2),
+        ],
+    };
+    let values = vec![Value::Sum(1250), Value::Count(2)];
+
+    let set = result_set(&answer(shape), &values);
+
+    assert_eq!(
+        set.rows,
+        vec![vec![Datum::Dec { units: 1250, scale: 2 }, Datum::Int(2), Datum::Real(6.25)]]
     );
 }
 

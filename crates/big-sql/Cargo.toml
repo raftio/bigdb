@@ -12,3 +12,6 @@ readme = "readme.md"
 # translation test costs what a parser test costs.
 [dependencies]
 big-plan = { path = "../big-plan", version = "0.1.0" }
+
+[dev-dependencies]
+big-testfile = { path = "../big-testfile" }

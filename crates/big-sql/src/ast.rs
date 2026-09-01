@@ -78,6 +78,10 @@ impl Source {
 /// *string* a keyed column was interned from. For each such string the join is the Cartesian
 /// product of the records holding it on each side, and every aggregate over that product is a
 /// product of per-key numbers both sides already produce. See [`crate::Shape::Join`].
+///
+/// Several of these are a **star**: every table grouped by the one key they all share. A table
+/// that would need a second key column is a chain, and is refused - grouping one table by two
+/// columns at once is a pass over the second per value of the first.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Join {
     /// The table being joined in.
@@ -109,8 +113,12 @@ pub struct Select {
     pub items: Vec<Item>,
     /// The table named in `FROM`.
     pub from: Source,
-    /// `JOIN`, absent for a statement about one table. A second one is refused.
-    pub join: Option<Join>,
+    /// `JOIN`, one per table past the first, in the order written. Empty for a statement about
+    /// one table.
+    ///
+    /// Every one of them has to key its table on the same column the others do: what makes
+    /// several joins answerable is that they are one star around one shared key.
+    pub joins: Vec<Join>,
     /// `WHERE`, absent when every record is in play.
     pub filter: Option<Cond>,
     /// `GROUP BY`, at most one column.
@@ -165,7 +173,9 @@ impl Item {
         match &self.alias {
             Some(a) => a.clone(),
             None => match &self.proj {
-                Proj::Star => "id".to_string(),
+                // The record id, under the name an `INSERT` writes it by - they are the
+                // same number, and `id` is left free for a field of that name.
+                Proj::Star => crate::insert::RECORD_COLUMN.to_string(),
                 Proj::Column(c) => c.column.clone(),
                 Proj::Count | Proj::CountDistinct(_) => "count".to_string(),
                 Proj::Agg { func, .. } => func.name().to_string(),

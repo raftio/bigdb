@@ -20,7 +20,7 @@
 //! column — and the number of those is what it costs, which is why [`MAX_LEFT`] travels in the
 //! plan rather than being applied to the answer.
 
-use super::measure::{field_of, measure_of, names, Measure};
+use super::measure::{field_of, measure_of, names, units_of, Measure};
 use super::pql::{as_expr, call_of, field_arg, named};
 use super::{answer, rows_of, Calls, Statement};
 use crate::ast::{HavingAgg, Item, Name, OrderKey, Proj, Select};
@@ -118,6 +118,7 @@ pub(super) fn pairs(
                 Proj::Column(_) => Of::RightKey,
                 _ => next.next().expect("one measure per aggregate, in select-list order"),
             },
+            units: units_of(table, &i.proj),
         })
         .collect();
 

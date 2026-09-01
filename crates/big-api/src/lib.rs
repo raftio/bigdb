@@ -30,11 +30,13 @@
 #![deny(missing_docs)]
 
 pub mod error;
+pub mod fact;
+pub mod introspect;
 pub mod result;
 pub mod schema;
 
 pub use error::{ApiError, Result};
-pub use result::{result_set, Datum, ResultSet, Row};
+pub use result::{fixed, one_cell, result_set, Datum, ResultSet, Row};
 pub use schema::{FieldInfo, TableInfo};
 
 // Everything below appears in a signature on this page, and a type a caller cannot name is a
@@ -58,10 +60,14 @@ pub use big_plan::{Plan, Rows};
 // The SQL surface's two public shapes. `Shape` appears in the return type of `Api::sql`, so a
 // caller that renders an answer has to be able to name it.
 pub use big_sql::{
-    Absent, Answer, Ask, Cell, Cut, Format, GroupOrder, Having, Of, OrderBy, Pairing,
-    Probe as SqlProbe, Refused, Shape, Statement as SqlStatement, Threshold,
+    Absent, Answer, Ask, Cell, Cut, Format, GroupOrder, Having, JoinSide, Keying, Of, OrderBy,
+    Pairing, Probe as SqlProbe, Refused, Selected, Shape, Statement as SqlStatement, Threshold,
+    Units,
 };
-pub use big_sql::{Ddl as SqlDdl, Sql};
+pub use big_sql::{
+    Alter as SqlAlter, Column as SqlColumn, ColumnKind as SqlColumnKind, Ddl as SqlDdl,
+    Insert as SqlInsert, Show as SqlShow, Shown as SqlShown, Sql, RECORD_COLUMN,
+};
 
 use big_db::{At, Db};
 use std::sync::atomic::AtomicBool;
@@ -592,13 +598,35 @@ impl<P: PagerMut + Sync> Api<P> {
     pub fn plan_sql(&self, text: &str) -> Result<(Vec<Plan>, Vec<SqlProbe>, Answer)> {
         match big_sql::translate(text)? {
             big_sql::Sql::Query(s) => self.plan_statement(s),
-            // Reachable only through the un-clustered path, which has no schema leader to send
-            // a change to. A coordinator classifies first - see `Api::translate`.
-            big_sql::Sql::Ddl(_) => Err(ApiError::Sql(big_sql::SqlError::Refused {
-                what: big_sql::Refused::Write,
-                at: 0,
-            })),
+            // The three statements that are not questions have no plan to resolve: a schema
+            // change goes to the leader, an insert goes to the shard owners, and a listing is
+            // already in this node's catalog. Reachable only through the un-clustered path; a
+            // coordinator classifies first - see `Api::translate`.
+            big_sql::Sql::Ddl(_) | big_sql::Sql::Insert(_) | big_sql::Sql::Show(_) => {
+                Err(ApiError::Sql(big_sql::SqlError::Refused {
+                    what: big_sql::Refused::Write,
+                    at: 0,
+                }))
+            }
         }
+    }
+
+    /// `DESCRIBE t`: this node's fields for one table, as rows.
+    ///
+    /// Over the snapshot rather than the catalog directly, which is what makes the three
+    /// listings pure functions - and testable with neither a pager nor a socket.
+    pub fn describe(&self, table: &str) -> Result<ResultSet> {
+        introspect::describe(&self.schema(), table)
+    }
+
+    /// `SHOW TABLES`: every table this node holds.
+    pub fn show_tables(&self) -> ResultSet {
+        introspect::show_tables(&self.schema())
+    }
+
+    /// `SHOW CREATE TABLE t`: the statement that would recreate one table.
+    pub fn show_create(&self, table: &str) -> Result<ResultSet> {
+        introspect::show_create(&self.schema(), table)
     }
 
     /// Parses and translates a statement without resolving it against the schema.
@@ -777,6 +805,14 @@ impl<P: PagerMut + Sync> Api<P> {
     ) -> Result<Vec<RecordId>> {
         let from = after.map_or(0, |a| a.saturating_add(1));
         Ok(self.db.read().scan_records(table, from, limit)?)
+    }
+
+    /// The highest record id this node holds for a table, or `None` when it holds none.
+    ///
+    /// One shard's work rather than the table's - see `DbRead::max_record`. This is what a
+    /// record id is allocated above, and in a cluster it is one owner's share of the answer.
+    pub fn max_record(&self, table: &str) -> Result<Option<RecordId>> {
+        Ok(self.db.read().max_record(table)?)
     }
 
     /// What a commit currently promises.

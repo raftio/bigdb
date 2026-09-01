@@ -15,7 +15,18 @@
 //! Tokens to [`Select`]. Recursive descent, with the refusals placed where the construct is.
 //!
 //! ```text
-//! statement := [WITH literal AS ident (',' literal AS ident)*] select
+//! statement := create | alter | drop | insert | show
+//!            | [WITH literal AS ident (',' literal AS ident)*] select
+//! create    := CREATE TABLE [IF NOT EXISTS] ident
+//!              ['(' column (',' column)* ')'] [ENGINE '=' engine]
+//! alter     := ALTER TABLE ident change (',' change)*
+//! change    := ADD [COLUMN] column | DROP [COLUMN] ident
+//! drop      := DROP TABLE [IF EXISTS] ident
+//! column    := ident type      -- see `Parser::column_type` for the type names
+//! insert    := INSERT [INTO] ident '(' ident (',' ident)* ')' VALUES tuple (',' tuple)*
+//! tuple     := '(' literal (',' literal)* ')'
+//! show      := (DESCRIBE | DESC) [TABLE] ident | SHOW COLUMNS FROM ident
+//!            | SHOW TABLES | SHOW CREATE [TABLE] ident       [FORMAT ident]
 //! select    := SELECT list FROM source [JOIN source ON name '=' name]
 //!              [PREWHERE cond] [WHERE cond] [GROUP BY name] [HAVING having]
 //!              [ORDER BY order] [LIMIT n [WITH TIES]] [OFFSET n] [FORMAT ident]
@@ -45,7 +56,9 @@
 
 use crate::ast::{Name, Query, Select};
 use crate::error::{Refused, Result, SqlError};
+use crate::insert::Insert;
 use crate::lex::{lex, Tok, Token};
+use crate::show::Show;
 use big_plan::Literal;
 
 /// How deep a `WHERE` clause may nest before it is refused.
@@ -64,6 +77,8 @@ pub const MAX_DEPTH: usize = big_plan::parse::MAX_DEPTH;
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Parsed {
     Query(Query),
+    Insert(Insert),
+    Show(Show),
     Ddl(crate::ddl::Ddl),
 }
 
@@ -93,15 +108,36 @@ pub fn parse(input: &str) -> Result<Parsed> {
 
     match word.to_ascii_uppercase().as_str() {
         "SELECT" => {}
-        // `CREATE TABLE` is the one schema change this surface takes. Everything else that
-        // writes is still refused by name, including the rest of `CREATE`: a surface that grew
-        // `CREATE INDEX` by accident would be a surface nobody chose.
+        // Each of these rules on its second word, so that `CREATE DATABASE` and `CREATE VIEW`
+        // get the sentence that is about them rather than the one about writes in general: a
+        // surface that grew `CREATE INDEX` by accident would be a surface nobody chose.
         "CREATE" => {
             p.i += 1;
             return p.create_table().map(Parsed::Ddl);
         }
-        "INSERT" | "UPDATE" | "DELETE" | "DROP" | "ALTER" | "TRUNCATE" | "REPLACE" | "MERGE"
-        | "UPSERT" => return Err(p.refuse(Refused::Write)),
+        // `ALTER TABLE` adds and drops fields, which is the whole of what the engine below can
+        // do to one.
+        "ALTER" => {
+            p.i += 1;
+            return p.alter_table().map(Parsed::Ddl);
+        }
+        "DROP" => {
+            p.i += 1;
+            return p.drop_table().map(Parsed::Ddl);
+        }
+        "INSERT" => {
+            p.i += 1;
+            return p.insert().map(Parsed::Insert);
+        }
+        "DESCRIBE" | "DESC" | "SHOW" => return p.show().map(Parsed::Show),
+        // `DELETE FROM` has its own sentence: what it asks for exists, as record ids sent to
+        // `POST /table/{t}/delete`, and the reason it is not a statement here is that a record
+        // is not a row.
+        "DELETE" => return Err(p.refuse(Refused::DeleteRows)),
+        "USE" => return Err(p.refuse(Refused::Database)),
+        "UPDATE" | "TRUNCATE" | "REPLACE" | "MERGE" | "UPSERT" => {
+            return Err(p.refuse(Refused::Write))
+        }
         _ => {
             return Err(SqlError::Syntax {
                 at: p.at(),
@@ -293,66 +329,18 @@ impl Parser<'_> {
         Ok(Name::bare(first))
     }
 
-    // ------------------------------------------------------------------------------------
-    // Schema
-    // ------------------------------------------------------------------------------------
-
-    /// `CREATE TABLE <name> [ENGINE = <engine>]`, with `CREATE` already consumed.
+    /// A non-negative whole number written literally.
     ///
-    /// No column list, and that is the engine's own shape rather than a shortcut: a table and
-    /// its fields are two statements here because they are two requests, and a column syntax
-    /// would need a mapping from SQL types onto field kinds that have no SQL analogue - a set,
-    /// a mutex, a time quantum. Inventing one silently would be inventing a dialect.
-    pub(super) fn create_table(&mut self) -> Result<crate::ddl::Ddl> {
-        if !self.word_is("TABLE") {
-            // Every other `CREATE` is still refused by name. The message a `Write` refusal
-            // gives already says this surface does not write, which is the right sentence for
-            // `CREATE INDEX` and `CREATE VIEW` alike.
-            return Err(self.refuse(Refused::Write));
-        }
-        self.i += 1;
-        let table = self.bare_ident("a table name")?;
-
-        // Named rather than answered as a syntax error. `CREATE TABLE t (a int)` *is* a
-        // statement and the writer knows what they meant; what they need to hear is that fields
-        // are declared separately here and why, not that a bracket was unexpected.
-        if matches!(self.peek(), Some(Tok::LParen)) {
-            return Err(self.refuse(Refused::ColumnList));
-        }
-
-        let engine = if self.word_is("ENGINE") {
-            self.i += 1;
-            if !self.eat(&Tok::Op("=")) {
-                return Err(self.syntax("= after ENGINE"));
-            }
-            Some(self.engine_name()?)
-        } else {
-            None
-        };
-
-        if self.peek().is_some() {
-            return Err(self.syntax("the end of the statement"));
-        }
-        Ok(crate::ddl::Ddl::CreateTable { table, engine })
-    }
-
-    /// An engine name, bare or quoted.
-    ///
-    /// Quoted is not decoration: `bitmap+columnar` contains a character the lexer has no token
-    /// for, so that one has to be written `'bitmap+columnar'`. The bare form exists because
-    /// `ENGINE = columnar` is what anyone coming from another column store will type, and
-    /// refusing it over punctuation nobody can see would be a poor first impression.
-    ///
-    /// Which names are real is not decided here. This crate links no storage crate, and a
-    /// second copy of the engine list would be a second copy to drift.
-    fn engine_name(&mut self) -> Result<String> {
+    /// Not [`Parser::literal`]: a `WITH` binding has no business standing in for a bit depth,
+    /// and a negative scale is not a thing the catalog stores.
+    pub(super) fn small_number(&mut self, want: &'static str) -> Result<u64> {
         match self.peek() {
-            Some(Tok::Str(s)) | Some(Tok::Word(s)) | Some(Tok::Quoted(s)) => {
-                let s = s.clone();
+            Some(Tok::Num(Literal::Int(n))) => {
+                let n = *n;
                 self.i += 1;
-                Ok(s)
+                Ok(n)
             }
-            _ => Err(self.syntax("an engine name, like columnar or 'bitmap+columnar'")),
+            _ => Err(self.syntax(want)),
         }
     }
 
@@ -410,6 +398,12 @@ impl Parser<'_> {
     }
 }
 
+mod alter;
 mod cond;
+mod create;
+/// The forward half of the decimal depth rule, for [`crate::render`] to invert.
+pub(crate) use create::decimal_bits;
+mod insert;
 mod item;
 mod select;
+mod show;

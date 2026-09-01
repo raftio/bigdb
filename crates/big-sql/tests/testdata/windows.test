@@ -1,0 +1,96 @@
+# Time windows over a time quantum column.
+#
+# A time quantum field carries a key *and* a time, so the window is written as a key and its
+# bounds against the same column. The plan reads the views by day that only such a field writes.
+#
+# Against a plain set column there are no such views, and the read would come back *empty* -
+# not an error, but a window that matched nothing, which is exactly what a window that cannot be
+# answered looks like from the outside. That is why `FieldClass::Keyed` carries which kind it is
+# and why the last two cases here are refusals rather than empty answers.
+#
+# Those two are refused by the *planner*, not by the translation, and the corpus shows it: the
+# translation is a pure function of the text and has no schema to ask which kind of keyed column
+# `country` is. So they are `plan` cases whose answer is a refusal, not `error` cases - which is
+# the honest place to draw the line, since it is where the engine draws it.
+
+plan
+SELECT count(*) FROM t WHERE visit = 'home'
+----
+Count t
+└── visit = 'home'
+
+plan
+SELECT count(*) FROM t WHERE visit = 'home' AND visit BETWEEN 100 AND 200
+----
+Count t
+└── visit = 'home' in [100, 200]
+
+plan
+SELECT count(*) FROM t WHERE visit = 'home' AND visit >= 100
+----
+Count t
+└── visit = 'home' in [100, ..]
+
+plan
+SELECT count(*) FROM t WHERE visit = 'home' AND visit <= 200
+----
+Count t
+└── visit = 'home' in [.., 200]
+
+plan
+SELECT count(*) FROM t WHERE visit = 'home' AND visit > 100
+----
+Count t
+└── visit = 'home' in [100, ..]
+
+plan
+SELECT count(*) FROM t WHERE visit = 'home' AND visit < 200
+----
+Count t
+└── visit = 'home' in [.., 200]
+
+# The order the two halves are written in does not change the window.
+plan
+SELECT count(*) FROM t WHERE visit BETWEEN 100 AND 200 AND visit = 'home'
+----
+Count t
+└── visit = 'home' in [100, 200]
+
+# A window beside an unrelated predicate, which stays an ordinary intersection.
+plan
+SELECT count(*) FROM t WHERE visit = 'home' AND visit >= 100 AND amount > 5
+----
+Count t
+└── intersect
+    ├── visit = 'home' in [100, ..]
+    └── amount > 5
+
+plan
+SELECT sum(amount) FROM t WHERE visit = 'home' AND visit BETWEEN 100 AND 200
+----
+Sum t.amount
+└── visit = 'home' in [100, 200]
+
+plan
+SELECT category, count(*) FROM t WHERE visit = 'home' AND visit BETWEEN 100 AND 200 GROUP BY category
+----
+GroupBy t.category -> count
+└── visit = 'home' in [100, 200]
+
+# Grouping *by* the time quantum column, which is a keyed column like any other.
+plan
+SELECT visit, count(*) FROM t GROUP BY visit
+----
+GroupBy t.visit -> count
+└── all
+
+# Bounds against a column with no views to read them from.
+plan
+SELECT count(*) FROM t WHERE country = 'GB' AND country BETWEEN 100 AND 200
+----
+did not resolve: `a time window` is not allowed on `country`, which is a keyed field
+
+plan
+SELECT count(*) FROM t WHERE device = 'phone' AND device BETWEEN 100 AND 200
+----
+did not resolve: `a time window` is not allowed on `device`, which is a mutex field

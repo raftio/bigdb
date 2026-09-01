@@ -22,6 +22,7 @@ big-plan = { path = "../big-plan", version = "0.1.0" }
 bytemuck = "1"
 
 [dev-dependencies]
+big-testfile = { path = "../big-testfile" }
 proptest = "1"
 # The agreement writes its state to a file, and a test of that needs somewhere to put one.
 tempfile = "3"

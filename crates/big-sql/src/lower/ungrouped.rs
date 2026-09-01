@@ -14,11 +14,12 @@
 
 //! `SELECT *`, a projection of stored values, or aggregates over the whole filtered set.
 
+use super::measure::units_of;
 use super::pql::{as_call, call_of, field_arg, named};
 use super::{answer, rows_of, Ask, Calls, Probe, Statement, MAX_PROJECTION};
 use crate::ast::{Item, Name, Proj, Select};
 use crate::error::{Refused, Result, SqlError};
-use crate::shape::{Cell, Of, Shape};
+use crate::shape::{Cell, Of, Selected, Shape, Units};
 use big_plan::ast::{Expr, Literal};
 
 /// `SELECT *`, or aggregates over the whole filtered set.
@@ -66,7 +67,18 @@ pub(super) fn ungrouped(
             probes: Vec::new(),
             answer: answer(
                 select,
-                Shape::Table { columns: columns.iter().map(|(item, _)| item.column()).collect() },
+                Shape::Table {
+                    columns: columns
+                        .iter()
+                        .map(|(item, name)| Selected {
+                            column: item.column(),
+                            units: Units::Written {
+                                table: table.to_string(),
+                                field: name.column.clone(),
+                            },
+                        })
+                        .collect(),
+                },
             ),
         });
     }
@@ -149,7 +161,7 @@ pub(super) fn ungrouped(
             }
             Proj::Star | Proj::Column(_) => unreachable!("sorted into the other two buckets"),
         };
-        cells.push(Cell { column: item.column(), of });
+        cells.push(Cell { column: item.column(), of, units: units_of(table, &item.proj) });
     }
 
     Ok(Statement { calls: calls.out, probes, answer: answer(select, Shape::Row { cells }) })

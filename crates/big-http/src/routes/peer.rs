@@ -130,6 +130,34 @@ pub(super) fn peer_intern<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request) -
     }
 }
 
+/// A run of record ids, which only the schema leader hands out.
+///
+/// The same shape as interning, and for the same reason: two coordinators deciding "one past
+/// the highest" would decide the same number and write two records into one.
+pub(super) fn peer_allocate<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request) -> Response {
+    let request = match wire::AllocateRequest::decode(&req.body) {
+        Ok(r) => r,
+        Err(e) => return unreadable(&e),
+    };
+    match ctx.cluster.allocate_here(&request.table, request.count) {
+        Ok(from) => Response::binary(wire::put_u64_body(from)),
+        Err(e) => super::from_cluster(&e),
+    }
+}
+
+/// One past the highest record id this node holds, which is its share of the answer the leader
+/// allocates above.
+pub(super) fn peer_next_record<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request) -> Response {
+    let request = match wire::TableRequest::decode(&req.body) {
+        Ok(r) => r,
+        Err(e) => return unreadable(&e),
+    };
+    match ctx.cluster.local_next_record(&request.table) {
+        Ok(next) => Response::binary(wire::put_u64_body(next)),
+        Err(e) => super::from_cluster(&e),
+    }
+}
+
 /// One schema change the leader has already ruled legal.
 pub(super) fn peer_ddl<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request) -> Response {
     let op = match wire::Ddl::decode(&req.body) {

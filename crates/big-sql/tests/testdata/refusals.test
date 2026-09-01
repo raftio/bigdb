@@ -1,0 +1,724 @@
+# What this surface refuses, and the code each refusal carries.
+#
+# **The refusal list is the feature.** Somebody who writes a join has a question, and "syntax
+# error" does not tell them the engine has no joins to give - so every refusal here carries a
+# stable code and a sentence saying what exists instead. The codes are what a client branches
+# on, so they are what this file pins; the sentences are checked where they are written.
+#
+# The reasons have collapsed into a few. Outer joins, rows of a join, window functions,
+# `groupArray`, `SELECT *` with values - every one of them asks for **a row**, and a record here
+# is a set of bits at `(row, record)` with no row of values to hand back. That is not
+# engineering time; it is the shape of the index.
+
+## A join is one equality between two keyed columns two tables share.
+
+error
+SELECT count(*) FROM t, u
+----
+sql_no_joins
+
+# A cross join and a natural join name no key to pair on, which is what a comma between tables
+# is - so they carry that refusal rather than the outer join one, whose sentence is about
+# producing a row for a record with no partner.
+error
+SELECT count(*) FROM t CROSS JOIN u
+----
+sql_no_joins
+
+error
+SELECT count(*) FROM t NATURAL JOIN u
+----
+sql_no_joins
+
+# A third table is answered when it is the same star - every table keyed on the one column they
+# all share. The *chain*, where one table would have to be grouped by two columns at once, is
+# refused as `sql_no_joins` too; it is not recorded here, and `translate/refusals.rs` is where it
+# is asserted.
+
+# An `ON` has to name the table it is joining in. Two tables already in scope is a condition
+# about neither of the tables this `JOIN` is about, and a table further down the list is a name
+# that is not in scope where it stands.
+error
+SELECT count(*) FROM t JOIN u ON t.category = u.category JOIN v ON t.category = u.category
+----
+sql_join_condition
+
+error
+SELECT count(*) FROM t JOIN u ON t.category = v.category JOIN v ON t.category = v.category
+----
+sql_join_condition
+
+error
+SELECT count(*) FROM t LEFT JOIN u ON t.category = u.category
+----
+sql_no_outer_joins
+
+error
+SELECT count(*) FROM t RIGHT JOIN u ON t.category = u.category
+----
+sql_no_outer_joins
+
+error
+SELECT count(*) FROM t FULL OUTER JOIN u ON t.category = u.category
+----
+sql_no_outer_joins
+
+error
+SELECT count(*) FROM t JOIN u ON t.category = u.category AND t.country = u.country
+----
+sql_join_condition
+
+error
+SELECT count(*) FROM t JOIN u USING (category)
+----
+sql_join_condition
+
+error
+SELECT count(*) FROM t JOIN u ON t.category > u.category
+----
+sql_join_condition
+
+## With a join in the statement every column has to say which table it belongs to: the
+## translation resolves names before it ever sees a schema, so there is nothing here to guess
+## with.
+
+error
+SELECT sum(amount) FROM t JOIN u ON t.category = u.category
+----
+sql_ambiguous_column
+
+error
+SELECT count(*) FROM t a JOIN u b ON a.category = b.category WHERE amount > 5
+----
+sql_ambiguous_column
+
+error
+SELECT sum(x.amount) FROM t a JOIN u b ON a.category = b.category
+----
+sql_ambiguous_column
+
+## A predicate over a join has to be answerable on one side: the two sides are counted
+## separately and only meet per key.
+
+error
+SELECT count(*) FROM t a JOIN u b ON a.category = b.category WHERE a.amount > 1 OR b.amount > 1
+----
+sql_join_filter
+
+## Over a join this surface answers count, sum, min, max, avg and the shared-key count. What it
+## has no answer for is a *row* of one: a pair of records has no identity this engine stores.
+
+error
+SELECT * FROM t a JOIN u b ON a.category = b.category
+----
+sql_unsupported
+
+## An ordering the answer has no value to sort on.
+
+error
+SELECT category, count(*) FROM t GROUP BY category ORDER BY country
+----
+sql_unsupported_order
+
+error
+SELECT count(*) FROM t ORDER BY count(*) DESC
+----
+sql_unsupported_order
+
+error
+SELECT * FROM t ORDER BY amount
+----
+sql_unsupported_order
+
+## There is no null here, so there is nothing for `IS NULL` to be true of.
+
+error
+SELECT count(*) FROM t WHERE amount IS NULL
+----
+sql_no_nulls
+
+error
+SELECT count(*) FROM t WHERE amount IS NOT NULL
+----
+sql_no_nulls
+
+error
+SELECT count(*) FROM t WHERE amount = NULL
+----
+sql_no_nulls
+
+## A projection reads values back at a point read per record per column, so it needs a limit.
+
+error
+SELECT amount FROM t
+----
+sql_projection_unsupported
+
+error
+SELECT amount, price FROM t
+----
+sql_projection_unsupported
+
+error
+SELECT *, count(*) FROM t
+----
+sql_unsupported
+
+## `UNION` removes duplicate rows, and a row here is a rendered answer rather than a stored
+## tuple.
+
+error
+SELECT count(*) FROM t UNION SELECT count(*) FROM u
+----
+sql_union
+
+error
+SELECT count(*) FROM t UNION DISTINCT SELECT count(*) FROM u
+----
+sql_union
+
+error
+SELECT count(*) FROM t INTERSECT SELECT count(*) FROM u
+----
+sql_unsupported
+
+error
+SELECT count(*) FROM t EXCEPT SELECT count(*) FROM u
+----
+sql_unsupported
+
+## A quantile level is a fraction between zero and one, to three digits - which is the
+## resolution the search works in. `0` and `1` are the ends of that range and are accepted; a
+## whole number that is neither is not a fraction at all.
+
+error
+SELECT quantile(1.5)(amount) FROM t
+----
+sql_quantile_level
+
+error
+SELECT quantile(2)(amount) FROM t
+----
+sql_quantile_level
+
+error
+SELECT quantile(0.5555)(amount) FROM t
+----
+sql_quantile_level
+
+error
+SELECT quantile(amount) FROM t
+----
+sql_quantile_level
+
+## Writes this surface does not take, and the statements that are not questions.
+
+error
+UPDATE t SET amount = 1
+----
+sql_read_only
+
+error
+DELETE FROM t WHERE amount > 5
+----
+sql_read_only
+
+error
+TRUNCATE TABLE t
+----
+sql_read_only
+
+error
+INSERT INTO t (amount) SELECT amount FROM u
+----
+sql_unsupported
+
+## An `INSERT` whose tuples do not match its column list.
+
+error
+INSERT INTO t (_record_id, country) VALUES (1, 'GB', 2)
+----
+parse_error
+
+error
+INSERT INTO t (_record_id, country) VALUES (1)
+----
+parse_error
+
+error
+INSERT INTO t VALUES (1, 'GB')
+----
+sql_insert_shape
+
+error
+INSERT INTO t (_record_id) VALUES ('seven')
+----
+sql_insert_shape
+
+error
+INSERT INTO t (_record_id) VALUES (1.5)
+----
+sql_insert_shape
+
+error
+INSERT INTO t (_record_id) VALUES (-1)
+----
+sql_insert_shape
+
+## The reserved record column cannot be declared as a field: an `INSERT` could never fill it.
+
+error
+CREATE TABLE t (_record_id UINT(32))
+----
+sql_id_column
+
+error
+CREATE TABLE t (a SET, _RECORD_ID INT)
+----
+sql_id_column
+
+error
+ALTER TABLE t ADD COLUMN _record_id UINT(32)
+----
+sql_id_column
+
+
+## Databases, views and the objects this engine does not have.
+
+error
+CREATE DATABASE d
+----
+sql_no_database
+
+error
+DROP DATABASE d
+----
+sql_no_database
+
+error
+SHOW DATABASES
+----
+sql_no_database
+
+error
+SHOW SCHEMAS
+----
+sql_no_database
+
+error
+CREATE VIEW v AS SELECT count(*) FROM t
+----
+sql_no_views
+
+error
+CREATE MATERIALIZED VIEW v AS SELECT count(*) FROM t
+----
+sql_no_views
+
+error
+DROP VIEW v
+----
+sql_no_views
+
+error
+CREATE INDEX i ON t (a)
+----
+sql_read_only
+
+error
+SHOW INDEX FROM t
+----
+parse_error
+
+## A field's bit planes *are* its depth and its kind decides how every fact in it was routed, so
+## altering either would mean rewriting every fact ever written to it.
+
+error
+ALTER TABLE t MODIFY a BIGINT
+----
+sql_no_alter_column
+
+error
+ALTER TABLE t MODIFY COLUMN a BIGINT
+----
+sql_no_alter_column
+
+error
+ALTER TABLE t ALTER COLUMN a TYPE BIGINT
+----
+sql_no_alter_column
+
+error
+ALTER TABLE t CHANGE a b BIGINT
+----
+sql_no_alter_column
+
+error
+ALTER TABLE t RENAME TO u
+----
+sql_no_rename
+
+error
+ALTER TABLE t RENAME COLUMN a TO b
+----
+sql_no_rename
+
+error
+ALTER TABLE t ENGINE = columnar
+----
+sql_no_alter_engine
+
+## Constraints, and the widths that are not bit depths.
+
+error
+CREATE TABLE t (a INT NOT NULL)
+----
+sql_no_constraints
+
+error
+CREATE TABLE t (a INT NULL)
+----
+sql_no_constraints
+
+error
+CREATE TABLE t (a INT DEFAULT 0)
+----
+sql_no_constraints
+
+error
+CREATE TABLE t (a TEXT COMMENT 'why')
+----
+sql_no_constraints
+
+error
+CREATE TABLE t (a INT PRIMARY KEY)
+----
+sql_no_constraints
+
+error
+CREATE TABLE t (a INT UNIQUE)
+----
+sql_no_constraints
+
+error
+CREATE TABLE t (a INT CHECK (a > 0))
+----
+sql_no_constraints
+
+error
+CREATE TABLE t (a INT AUTO_INCREMENT)
+----
+sql_no_constraints
+
+error
+CREATE TABLE t (a INT REFERENCES u (b))
+----
+sql_no_constraints
+
+error
+ALTER TABLE t ADD PRIMARY KEY (a)
+----
+sql_no_constraints
+
+error
+ALTER TABLE t ADD CONSTRAINT c CHECK (a > 0)
+----
+sql_no_constraints
+
+error
+ALTER TABLE t ADD INDEX i (a)
+----
+sql_no_constraints
+
+# A length on a key bounds nothing: keys are stored whole, with nothing to truncate.
+error
+CREATE TABLE t (a VARCHAR(255))
+----
+sql_no_constraints
+
+# A display width is not a bit depth. `INT(11)` is eleven digits where it was written and would
+# be eleven bits here, which stops at 2047 - so it is refused, not reinterpreted.
+error
+CREATE TABLE t (a INT(11))
+----
+sql_unknown_column_type
+
+error
+CREATE TABLE t (a BIGINT(20))
+----
+sql_unknown_column_type
+
+## Types with no field kind behind them.
+
+error
+CREATE TABLE t (a FLOAT)
+----
+sql_unknown_column_type
+
+error
+CREATE TABLE t (a DOUBLE)
+----
+sql_unknown_column_type
+
+error
+CREATE TABLE t (a JSON)
+----
+sql_unknown_column_type
+
+error
+CREATE TABLE t (a BLOB)
+----
+sql_unknown_column_type
+
+error
+CREATE TABLE t (a UUID)
+----
+sql_unknown_column_type
+
+error
+CREATE TABLE t (a DATE)
+----
+sql_unknown_column_type
+
+## A decimal's scale and a field's depth, both decided while the statement is parsed.
+
+error
+CREATE TABLE t (a DECIMAL)
+----
+sql_decimal_scale
+
+error
+CREATE TABLE t (a NUMERIC)
+----
+sql_decimal_scale
+
+error
+CREATE TABLE t (a DECIMAL(10))
+----
+sql_decimal_scale
+
+error
+CREATE TABLE t (a DECIMAL(2, 5))
+----
+sql_decimal_scale
+
+error
+CREATE TABLE t (a DECIMAL(25, 2))
+----
+sql_bit_depth
+
+error
+CREATE TABLE t (a UINT(0))
+----
+sql_bit_depth
+
+error
+CREATE TABLE t (a UINT(65))
+----
+sql_bit_depth
+
+error
+CREATE TABLE t (a SIGNED(65))
+----
+sql_bit_depth
+
+## Expressions, which have nowhere to run: a record is a set of bits, and there is no row for
+## `amount * 2` to be evaluated against.
+
+error
+SELECT amount * 2 FROM t
+----
+sql_unsupported
+
+error
+SELECT cast(amount AS BIGINT) FROM t
+----
+sql_unsupported
+
+error
+SELECT toString(amount) FROM t
+----
+sql_unsupported
+
+error
+SELECT toDate(visit) FROM t
+----
+sql_unsupported
+
+error
+SELECT CASE WHEN amount > 5 THEN 1 ELSE 0 END FROM t
+----
+sql_unsupported
+
+error
+SELECT multiIf(amount > 5, 1, 0) FROM t
+----
+sql_unsupported
+
+error
+SELECT coalesce(amount, 0) FROM t
+----
+sql_unsupported
+
+error
+SELECT count(*) FROM t WHERE country LIKE 'G%'
+----
+sql_unsupported
+
+## Aggregates that need values this index does not keep.
+
+error
+SELECT stddevPop(amount) FROM t
+----
+sql_unsupported
+
+error
+SELECT corr(amount, price) FROM t
+----
+sql_unsupported
+
+error
+SELECT argMax(amount, price) FROM t
+----
+sql_unsupported
+
+error
+SELECT any(amount) FROM t
+----
+sql_unsupported
+
+error
+SELECT groupArray(amount) FROM t
+----
+sql_unsupported
+
+
+## Rows, in every spelling.
+
+error
+SELECT row_number() OVER () FROM t
+----
+sql_unsupported
+
+error
+SELECT count(*) OVER (PARTITION BY category) FROM t
+----
+sql_unsupported
+
+error
+SELECT DISTINCT ON (category) category FROM t
+----
+sql_unsupported
+
+## A subquery, and a `WITH` whose body is a select.
+
+error
+SELECT count(*) FROM t WHERE amount IN (SELECT amount FROM u)
+----
+sql_unsupported
+
+error
+WITH x AS (SELECT 1) SELECT count(*) FROM t
+----
+sql_unsupported
+
+error
+SELECT count(*) FROM (SELECT * FROM t)
+----
+parse_error
+
+## `HAVING` without a grouping, and the offset a grouped answer cannot take.
+
+error
+SELECT count(*) FROM t HAVING count(*) > 5
+----
+sql_unsupported
+
+error
+SELECT count(*) FROM t LIMIT 1 OFFSET 5
+----
+sql_unsupported
+
+## A statement asking more questions than one round of fan-out will carry.
+
+error
+SELECT sum(amount) FILTER (WHERE amount > 0), sum(amount) FILTER (WHERE amount > 1), sum(amount) FILTER (WHERE amount > 2), sum(amount) FILTER (WHERE amount > 3), sum(amount) FILTER (WHERE amount > 4), sum(amount) FILTER (WHERE amount > 5), sum(amount) FILTER (WHERE amount > 6), sum(amount) FILTER (WHERE amount > 7), sum(amount) FILTER (WHERE amount > 8), sum(amount) FILTER (WHERE amount > 9), sum(amount) FILTER (WHERE amount > 10), sum(amount) FILTER (WHERE amount > 11), sum(amount) FILTER (WHERE amount > 12), sum(amount) FILTER (WHERE amount > 13), sum(amount) FILTER (WHERE amount > 14), sum(amount) FILTER (WHERE amount > 15), sum(amount) FILTER (WHERE amount > 16) FROM t
+----
+sql_too_many_aggregates
+
+## An output format this surface does not write.
+
+error
+SELECT count(*) FROM t FORMAT Arrow
+----
+sql_unknown_format
+
+error
+SHOW TABLES FORMAT Parquet
+----
+sql_unknown_format
+
+## Text that is not a statement.
+
+error
+SELECT count(*) FROM
+----
+parse_error
+
+error
+SELECT count(*) FROM t WHERE amount >
+----
+parse_error
+
+error
+SELECT count(*) FROM t WHERE country = 'unterminated
+----
+parse_error
+
+error
+SELECT count(*) FROM t LIMIT 5 trailing
+----
+parse_error
+
+error
+CREATE TABLE t (a)
+----
+parse_error
+
+error
+CREATE TABLE t (SET)
+----
+parse_error
+
+error
+DROP TABLE
+----
+parse_error
+
+error
+DROP TABLE a, b
+----
+parse_error
+
+error
+SHOW
+----
+parse_error
+
+error
+DESCRIBE
+----
+parse_error
+
+error
+SELECT count(*) FROM t WHERE amount > 99999999999999999999999
+----
+parse_error
+
+## Nested past the depth the recursive parser will take, which is a limit rather than a
+## judgement about the query.
+
+error
+SELECT count(*) FROM t WHERE ((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((amount > 1))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))
+----
+query_too_deep

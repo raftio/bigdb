@@ -1,0 +1,106 @@
+# `FORMAT`: how the bytes are spelled, which is not part of the shape.
+#
+# A shape says what the answer *is* - which columns, in which order, cut to what length. This
+# says how those cells are written out. A client that asks the same question in TSV and in JSON
+# asked one question, and the two are answered from the same cells rather than each re-deriving
+# them.
+
+shape
+SELECT count(*) FROM t
+----
+Row
+└── count = #0
+
+shape
+SELECT count(*) FROM t FORMAT JSON
+----
+Row
+└── count = #0
+
+shape
+SELECT count(*) FROM t FORMAT JSONCompact
+----
+Row
+└── count = #0
+
+shape
+SELECT count(*) FROM t FORMAT TSV
+----
+Row format=tsv
+└── count = #0
+
+shape
+SELECT count(*) FROM t FORMAT TabSeparated
+----
+Row format=tsv
+└── count = #0
+
+shape
+SELECT count(*) FROM t FORMAT TSVWithNames
+----
+Row format=tsv_with_names
+└── count = #0
+
+shape
+SELECT count(*) FROM t FORMAT TabSeparatedWithNames
+----
+Row format=tsv_with_names
+└── count = #0
+
+shape
+SELECT count(*) FROM t FORMAT CSV
+----
+Row format=csv
+└── count = #0
+
+shape
+SELECT count(*) FROM t FORMAT CSVWithNames
+----
+Row format=csv_with_names
+└── count = #0
+
+# The clause is the last thing in the statement, after everything that shapes the answer.
+shape
+SELECT category, count(*) FROM t GROUP BY category ORDER BY count(*) DESC LIMIT 3 FORMAT TSV
+----
+Groups keys=[#0] format=tsv
+├── category = key
+└── count = group #0 else 0
+
+shape
+SELECT * FROM t LIMIT 10 FORMAT CSV
+----
+Records column=_record_id limit=10 format=csv
+
+# The plan is the same whichever way the answer is written.
+plan
+SELECT count(*) FROM t FORMAT TSV
+----
+Count t
+└── all
+
+# `SHOW` takes the same clause, so that it pipes into a shell like everything else here.
+show
+SHOW TABLES
+----
+Tables
+
+show
+SHOW TABLES FORMAT TSV
+----
+Tables format=tsv
+
+show
+DESCRIBE t FORMAT CSVWithNames
+----
+Columns t format=csv_with_names
+
+error
+SELECT count(*) FROM t FORMAT Arrow
+----
+sql_unknown_format
+
+error
+SELECT count(*) FROM t FORMAT Parquet
+----
+sql_unknown_format

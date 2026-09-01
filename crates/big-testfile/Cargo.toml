@@ -1,0 +1,13 @@
+[package]
+name = "big-testfile"
+description = "The data-driven test file format the SQL corpora are written in: parse, run, rewrite"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+# Nothing. This crate reads text files and compares strings, and a test harness that pulls in a
+# dependency tree is a test harness whose own failures have to be diagnosed.
+[dependencies]

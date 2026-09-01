@@ -1,0 +1,59 @@
+# Questions about the catalog, which the catalog already holds the answer to.
+#
+# Three spellings of "what columns does this table have", because they are three dialects' words
+# for one question and there is nothing to be gained by knowing which one was typed.
+
+show
+DESCRIBE events
+----
+Columns events
+
+show
+DESC events
+----
+Columns events
+
+show
+DESCRIBE TABLE events
+----
+Columns events
+
+show
+SHOW COLUMNS FROM events
+----
+Columns events
+
+show
+SHOW FIELDS FROM events
+----
+Columns events
+
+show
+SHOW TABLES
+----
+Tables
+
+show
+SHOW CREATE TABLE events
+----
+Create events
+
+show
+SHOW CREATE events
+----
+Create events
+
+show
+DESCRIBE events FORMAT CSVWithNames
+----
+Columns events format=csv_with_names
+
+show
+SHOW TABLES FORMAT TSV
+----
+Tables format=tsv
+
+show
+SHOW CREATE TABLE events FORMAT TSVWithNames
+----
+Create events format=tsv_with_names

@@ -189,6 +189,47 @@ impl<'db, P: Pager + Sync> DbRead<'db, P> {
         Ok(counts.into_iter().sum())
     }
 
+    /// The highest record id this node holds for a table, or `None` when it holds none.
+    ///
+    /// **One shard's work, not the table's.** Fragments are keyed by shard in a `BTreeMap`, so
+    /// the last one is the highest, and the answer is the highest bit set in its exists row.
+    /// Everything below that shard is skipped without being read - which is what makes this
+    /// usable on the path that allocates a record id, where the alternative is scanning every
+    /// record to find the end of them.
+    ///
+    /// This node's own view. In a cluster a table's shards are spread over its owners, so the
+    /// highest id anywhere is the highest of these - see `big_cluster::Cluster::max_record`,
+    /// which is where that fan-out lives.
+    pub fn max_record(&self, table: &str) -> Result<Option<RecordId>> {
+        let t = self
+            .catalog
+            .table(table)
+            .map(|t| t.id)
+            .ok_or_else(|| DbError::UnknownTable(table.to_string()))?;
+
+        // Descending, and it stops at the first shard that holds a record: a shard whose
+        // fragment exists but whose exists row is empty is possible after a delete, so "the
+        // last fragment" is not quite "the last record".
+        let mut shards: Vec<FragmentKey> = self
+            .catalog
+            .fragments_of_field(t, EXISTS_FIELD, STANDARD_VIEW)
+            .map(|(k, _)| *k)
+            .collect();
+        shards.sort_unstable_by_key(|k| core::cmp::Reverse(k.shard));
+
+        self.checkpoint()?;
+        for key in shards {
+            self.checkpoint()?;
+            let Some(frag) = self.frag(&key) else { continue };
+            let rows = frag.row(EXISTS_ROW)?;
+            self.charge(rows.byte_size())?;
+            if let Some(max) = rows.records_from(key.shard, key.shard * SHARD_WIDTH).max() {
+                return Ok(Some(max));
+            }
+        }
+        Ok(None)
+    }
+
     /// A page of record ids from a table, ascending, starting at `from`.
     ///
     /// The cursor. **There is no cursor object**, and that is the design rather than a

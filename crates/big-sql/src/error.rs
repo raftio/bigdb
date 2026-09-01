@@ -28,17 +28,20 @@ use big_plan::PlanError;
 /// stable code and a sentence naming what to do instead, when there is something to do.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Refused {
-    /// A join this engine cannot pair records for: a comma between tables, or a third table.
+    /// A join this engine cannot pair records for: one that names no key at all - a comma
+    /// between tables, `CROSS JOIN`, `NATURAL JOIN` - or one that would need a table grouped by
+    /// two keys at once.
     Joins,
-    /// An outer join, which has to produce a row for a record with no partner.
+    /// An outer join, which names a key and then has to produce a row for a record with no
+    /// partner under it.
     OuterJoin,
     /// A join condition that is not one equality between two columns.
     JoinOn,
     /// An aggregate, or a select list, a join cannot answer.
     JoinShape,
-    /// A column that does not say which of a join's two tables it belongs to.
+    /// A column that does not say which of a join's tables it belongs to.
     Ambiguous,
-    /// A `WHERE` term that mixes both tables of a join where they cannot be separated.
+    /// A `WHERE` term that names two of a join's tables where they cannot be separated.
     JoinFilter,
     /// A subquery, a CTE, or `UNION` between two selects.
     Subquery,
@@ -58,12 +61,48 @@ pub enum Refused {
     Null,
     /// Selecting stored values without the cut that bounds what it costs.
     Projection,
-    /// A window over a time quantum field.
-    TimeWindow,
-    /// `INSERT`, `UPDATE`, `DELETE`, or a schema change other than `CREATE TABLE`.
+    /// `UPDATE`, `TRUNCATE`, `MERGE`, or a schema change this engine has no operation behind.
     Write,
-    /// A column list on `CREATE TABLE`.
-    ColumnList,
+    /// An `INSERT` with no column list, which would be positional against a field order the
+    /// statement does not carry.
+    InsertColumns,
+    /// An `id` that is not a whole number.
+    InsertId,
+    /// A field declared as `_record_id`, which is the name the record itself answers under.
+    IdColumn,
+    /// `INSERT ... SELECT`, which would write an answer back as facts.
+    InsertSelect,
+    /// More rows in one `INSERT` than a statement may carry.
+    InsertSize,
+    /// `DELETE FROM`, which asks for a row this engine does not store.
+    DeleteRows,
+    /// `CREATE DATABASE`, `USE`, or anything else naming a level above a table.
+    Database,
+    /// A view, materialised or not: nothing here stores a statement.
+    View,
+    /// `CASE WHEN`, `if`, `multiIf`, `coalesce` — choosing between two values per record.
+    Case,
+    /// `CAST`, `toInt64`, `toString`: a conversion between representations that do not convert.
+    Cast,
+    /// An aggregate this engine has no fold for — `argMin`, `stddev`, `corr`, `any`.
+    Aggregate,
+    /// `MODIFY`, `ALTER COLUMN` or `CHANGE`: a field's kind and depth are what its bit planes
+    /// are, and there is no operation below that changes either.
+    AlterKind,
+    /// `RENAME`, on a table or a column. Names are what resolve a fact all the way down, and
+    /// nothing below renames one.
+    Rename,
+    /// `ALTER TABLE ... ENGINE =`, which asks a table to store something else than it does.
+    AlterEngine,
+    /// A type name in a column list that names nothing this engine stores.
+    ColumnType,
+    /// A column constraint - `NOT NULL`, `PRIMARY KEY`, `DEFAULT` - which is a promise about
+    /// rows, and there are no rows here to make it about.
+    Constraint,
+    /// `DECIMAL` or `NUMERIC` written without the precision and scale that say what it holds.
+    DecimalScale,
+    /// A bit depth outside the 1..=64 a bit-sliced value can occupy.
+    BitDepth,
     /// A select list this dialect cannot turn into one plan.
     Shape,
     /// A `WHERE` term that is not a comparison — `LIKE`, and anything else with no set
@@ -80,6 +119,111 @@ pub enum Refused {
 }
 
 impl Refused {
+    /// Every refusal this dialect has, so a test can walk the list rather than remember it.
+    ///
+    /// **This exists to be checked against the corpus.** A refusal without a case is a sentence
+    /// nobody has read since it was written, and the whole claim of this list is that each one
+    /// tells somebody what exists instead - so `tests/gates.rs` insists every code here is
+    /// reached by a statement in `tests/testdata`.
+    ///
+    /// Kept honest by [`Refused::rank`] below, whose exhaustive match will not compile until a
+    /// new variant is named - and by a test asserting that every rank appears here exactly once,
+    /// which is what catches naming one and forgetting to add it.
+    pub const ALL: [Self; 40] = [
+        Self::Joins,
+        Self::OuterJoin,
+        Self::JoinOn,
+        Self::JoinShape,
+        Self::Ambiguous,
+        Self::JoinFilter,
+        Self::Subquery,
+        Self::Having,
+        Self::Window,
+        Self::Order,
+        Self::Offset,
+        Self::Expression,
+        Self::MultiDistinct,
+        Self::Null,
+        Self::Projection,
+        Self::Write,
+        Self::InsertColumns,
+        Self::InsertId,
+        Self::IdColumn,
+        Self::InsertSelect,
+        Self::InsertSize,
+        Self::DeleteRows,
+        Self::Database,
+        Self::View,
+        Self::Case,
+        Self::Cast,
+        Self::Aggregate,
+        Self::AlterKind,
+        Self::Rename,
+        Self::AlterEngine,
+        Self::ColumnType,
+        Self::Constraint,
+        Self::DecimalScale,
+        Self::BitDepth,
+        Self::Shape,
+        Self::Predicate,
+        Self::TooManyCalls,
+        Self::Format,
+        Self::Union,
+        Self::Quantile,
+    ];
+
+    /// Where this refusal sits in [`Refused::ALL`], and the reason that list can be trusted.
+    ///
+    /// The match is exhaustive, so a variant added to the enum and not named here is a
+    /// compile error rather than a hole in the coverage gate.
+    ///
+    /// Public because its only caller is the test below and one in `tests/gates.rs`, and a
+    /// private one would be dead code in every build that is not a test build.
+    pub fn rank(self) -> usize {
+        match self {
+            Self::Joins => 0,
+            Self::OuterJoin => 1,
+            Self::JoinOn => 2,
+            Self::JoinShape => 3,
+            Self::Ambiguous => 4,
+            Self::JoinFilter => 5,
+            Self::Subquery => 6,
+            Self::Having => 7,
+            Self::Window => 8,
+            Self::Order => 9,
+            Self::Offset => 10,
+            Self::Expression => 11,
+            Self::MultiDistinct => 12,
+            Self::Null => 13,
+            Self::Projection => 14,
+            Self::Write => 15,
+            Self::InsertColumns => 16,
+            Self::InsertId => 17,
+            Self::IdColumn => 18,
+            Self::InsertSelect => 19,
+            Self::InsertSize => 20,
+            Self::DeleteRows => 21,
+            Self::Database => 22,
+            Self::View => 23,
+            Self::Case => 24,
+            Self::Cast => 25,
+            Self::Aggregate => 26,
+            Self::AlterKind => 27,
+            Self::Rename => 28,
+            Self::AlterEngine => 29,
+            Self::ColumnType => 30,
+            Self::Constraint => 31,
+            Self::DecimalScale => 32,
+            Self::BitDepth => 33,
+            Self::Shape => 34,
+            Self::Predicate => 35,
+            Self::TooManyCalls => 36,
+            Self::Format => 37,
+            Self::Union => 38,
+            Self::Quantile => 39,
+        }
+    }
+
     /// The stable identifier a client branches on.
     ///
     /// Several variants share `sql_unsupported`: they differ in which construct was written,
@@ -95,9 +239,22 @@ impl Refused {
             Self::Order => "sql_unsupported_order",
             Self::Null => "sql_no_nulls",
             Self::Projection => "sql_projection_unsupported",
-            Self::TimeWindow => "sql_no_time_window",
-            Self::Write => "sql_read_only",
-            Self::ColumnList => "sql_no_column_list",
+            // A `DELETE` shares `sql_read_only` with the other writes this surface does not
+            // take: what the client does about it is the same in both cases, which is the rule
+            // this list follows.
+            Self::Write | Self::DeleteRows => "sql_read_only",
+            Self::InsertColumns | Self::InsertId => "sql_insert_shape",
+            Self::IdColumn => "sql_id_column",
+            Self::InsertSize => "sql_insert_too_large",
+            Self::Database => "sql_no_database",
+            Self::View => "sql_no_views",
+            Self::AlterKind => "sql_no_alter_column",
+            Self::Rename => "sql_no_rename",
+            Self::AlterEngine => "sql_no_alter_engine",
+            Self::ColumnType => "sql_unknown_column_type",
+            Self::Constraint => "sql_no_constraints",
+            Self::DecimalScale => "sql_decimal_scale",
+            Self::BitDepth => "sql_bit_depth",
             Self::TooManyCalls => "sql_too_many_aggregates",
             Self::Format => "sql_unknown_format",
             Self::Union => "sql_union",
@@ -110,6 +267,10 @@ impl Refused {
             | Self::MultiDistinct
             | Self::Shape
             | Self::JoinShape
+            | Self::InsertSelect
+            | Self::Case
+            | Self::Cast
+            | Self::Aggregate
             | Self::Predicate => "sql_unsupported",
         }
     }
@@ -121,9 +282,13 @@ impl Refused {
     pub fn why(self) -> &'static str {
         match self {
             Self::Joins => {
-                "a join here pairs records through a keyed column two tables share, written as \
-                 `FROM a JOIN b ON a.k = b.k`. A comma between tables is a cross join, which \
-                 has no key to pair on, and a third table would need a key all three share"
+                "a join here pairs records through a keyed column the tables share, written as \
+                 `FROM a JOIN b ON a.k = b.k` and repeated for each further table - every one \
+                 of them keyed on the same column. A comma between tables, `CROSS JOIN` and \
+                 `NATURAL JOIN` name no key to pair on - the first two pair everything with \
+                 everything, and the third asks the schema to choose - and a table joined on \
+                 two different columns would have to be grouped by both at once, which is a \
+                 pass over the second per value of the first"
             }
             Self::OuterJoin => {
                 "only an inner join is answered. An outer join has to produce a row for a \
@@ -132,16 +297,17 @@ impl Refused {
                  null out half of"
             }
             Self::JoinOn => {
-                "a join is one equality between two keyed columns, as `ON a.k = b.k`. Two \
-                 conditions would pair on a composite key this index never stored, and `USING` \
-                 names one column for two tables that each keep their own dictionary"
+                "a join is one equality between two keyed columns, as `ON a.k = b.k`, \
+                 naming the table being joined in on one side and a table already in `FROM` on \
+                 the other. Two conditions would pair on a composite key this index never \
+                 stored, and `USING` names one column for two tables that each keep their own \
+                 dictionary"
             }
             Self::JoinShape => {
-                "over a join this surface answers `count(*)`, `sum`, `min` and `max` of one \
-                 table's column, and `count(DISTINCT <the join key>)` - each of which is \
-                 arithmetic over the per-key counts both sides produce. `avg` is not among \
-                 them: write the sum and the count and divide. There are no joined rows of \
-                 values to select, because a pair of records has no identity this engine stores"
+                "over a join this surface answers `count(*)`, `sum`, `min`, `max` and `avg` of \
+                 one table's column, and `count(DISTINCT <the join key>)` - each of which is \
+                 arithmetic over the per-key counts every side produces. What it has no answer \
+                 for is a *row* of a join: a pair of records has no identity this engine stores"
             }
             Self::Ambiguous => {
                 "with a join in the statement every column has to say which table it belongs \
@@ -150,7 +316,7 @@ impl Refused {
             }
             Self::JoinFilter => {
                 "a `WHERE` over a join is each table's own conditions, combined with `AND`. A \
-                 term that mixes both tables under `OR` or `NOT` selects records neither side \
+                 term that names two of them under `OR` or `NOT` selects records neither side \
                  can be filtered to on its own"
             }
             Self::Subquery => {
@@ -198,20 +364,131 @@ impl Refused {
                  all - it has no read back from a record to its string - so count it, \
                  aggregate it, or group by it"
             }
-            Self::TimeWindow => {
-                "a window is a key and its bounds written against the same time quantum \
-                 column - `visit = 'home' AND visit BETWEEN <seconds> AND <seconds>`, or one \
-                 bound alone with `>=` or `<=`. A field with no views by time has no window to \
-                 answer, only every record it ever held"
-            }
             Self::Write => {
-                "this surface writes no rows and changes no schema but a table's; write with \
-                 `POST /table/{t}/import` and use the `/table` routes for the rest"
+                "the writes on this surface are `INSERT INTO t (...) VALUES (...)`, \
+                 `CREATE TABLE`, `ALTER TABLE ... ADD`/`DROP COLUMN` and `DROP TABLE`. \
+                 `UPDATE` has no row to change in place - a fact is a bit at `(row, record)`, \
+                 so changing one means writing the new fact and clearing the old - and \
+                 `TRUNCATE`, `MERGE`, `REPLACE` and `CREATE INDEX` are each a statement with no \
+                 operation behind it here: a bitmap is already the index. Write facts in volume \
+                 with `POST /table/{t}/import` and use the `/table` routes for the rest"
             }
-            Self::ColumnList => {
-                "`CREATE TABLE` here takes no column list: a field kind may be a set, a mutex \
-                 or a time quantum, none of which a SQL type names. Declare fields with \
-                 `POST /table/{t}/field/{f}?kind=...`"
+            Self::InsertColumns => {
+                "an `INSERT` names the columns it writes, as `INSERT INTO t (country, amount) \
+                 VALUES ('GB', 100)`. This translation holds no schema - which is what keeps it a \
+                 translation - so `INSERT INTO t VALUES (...)` would be positional against a \
+                 field order that is not in the statement and that the next `ALTER TABLE ... \
+                 ADD` moves"
+            }
+            Self::InsertId => {
+                "an `id` is a whole number: a fact is a bit at `(row, record)`, so the id is \
+                 the address it is written to rather than a name for what is written there - \
+                 which is why `POST /table/{t}/import` names the record on every line, why \
+                 `POST /table/{t}/delete` takes ids, and why `SELECT *` answers with nothing \
+                 else. Write one, as `INSERT INTO t (_record_id, country) VALUES (7, 'GB')`, or leave \
+                 the column out and the server allocates one"
+            }
+            Self::IdColumn => {
+                "`_record_id` is what a record is called here, not a field it can hold: \
+                 `SELECT *` answers with it, `INSERT INTO t (_record_id, ...)` writes about it, \
+                 and `POST /table/{t}/delete` takes it. A field of that name could never be \
+                 written through this surface - an `INSERT` would read the value as the record \
+                 to write *about* - so a condition on it would answer nothing while the record \
+                 sat there. It is spelled with the underscore precisely so that `id` is free \
+                 for a field of yours"
+            }
+            Self::InsertSelect => {
+                "`INSERT ... SELECT` would write an answer back as facts, and there is nothing \
+                 between the two: an answer here is counts and keys *about* a set of records \
+                 rather than records to copy, and `SELECT *` gives ids because a record has no \
+                 row of values to read out. Select what you want and write it back with \
+                 `POST /table/{t}/import`"
+            }
+            Self::InsertSize => {
+                "an `INSERT` carries at most 10000 rows, because the whole statement is lexed \
+                 and parsed into literals before the first fact is written - so the batch is \
+                 resident twice over before any of it lands. `POST /table/{t}/import` is the \
+                 route for volume: one fact per line, with no statement to hold"
+            }
+            Self::DeleteRows => {
+                "there is no row here to delete: a record is the bits set for it across every \
+                 field, and removing it means clearing each of them. `POST /table/{t}/delete` \
+                 takes the record ids to clear, one per line - which is the `SELECT *` of the \
+                 same `WHERE`, written back"
+            }
+            Self::Database => {
+                "there is no database above a table here. A node holds one catalog, and a \
+                 table's name is what resolves a fact from a client all the way to a bitmap, so \
+                 `db.t` would name a level nothing below this has. `CREATE TABLE`, `DROP TABLE` \
+                 and `SHOW TABLES` are the whole of the namespace"
+            }
+            Self::View => {
+                "a view is a statement kept under a name and re-planned at every read, and \
+                 nothing here stores a statement: the catalog holds tables, fields and keys. \
+                 Write the `SELECT` where it is used, or create a table and write the answer \
+                 into it - which is the materialised half, said out loud"
+            }
+            Self::Case => {
+                "there is nothing here that chooses between two values per record, because \
+                 there are no values per record until something reads them back. A condition \
+                 selects a *set*, and `count(*) FILTER (WHERE ...)` - or `countIf(...)` - is \
+                 how one statement asks about several sets at once"
+            }
+            Self::Cast => {
+                "a value's type is its field's, decided when the field was created: a keyed \
+                 column is a string in a dictionary and an integer column is bit planes, and \
+                 neither has a representation the other could be read as. A column that should \
+                 be counted as a number is an `INT` field, and one that should be grouped is a \
+                 `SET`"
+            }
+            Self::Aggregate => {
+                "the aggregates here are `count`, `sum`, `min`, `max`, `avg`, `uniq` (which is \
+                 `count(DISTINCT x)`), `topK` and `quantile`, each of which is a fold over bit \
+                 planes or over a grouping - which is why every one of them is exact. `argMin`, \
+                 `argMax`, `stddev`, `varPop` and `corr` need each record's value revisited \
+                 against a running total, and this engine holds bits at `(row, record)` rather \
+                 than values to revisit"
+            }
+            Self::AlterKind => {
+                "a field's kind decides how every fact in it was routed and its bit depth is \
+                 how many bitmaps hold a value, so neither can change without rewriting every \
+                 fact ever written to it. Add a second field, copy into it, and drop the first \
+                 - which is three statements because it is three changes, not one hidden \
+                 inside a `MODIFY` that would look free"
+            }
+            Self::Rename => {
+                "names are what resolve a fact from a client all the way to a bitmap, and \
+                 nothing below this renames one. A new name means a new field or table, the \
+                 facts copied into it, and the old one dropped"
+            }
+            Self::AlterEngine => {
+                "the engine a table stores under is fixed when it is created: it decides what \
+                 is written for every fact, and the facts already written were written under \
+                 the old one. Create a second table under the engine you want and copy into it"
+            }
+            Self::ColumnType => {
+                "a column takes one of `SET`, `MUTEX`, `BOOL`, `TIMEQUANTUM`, `SIGNED`, \
+                 `UINT(bits)`, `DECIMAL(precision, scale)`, or a SQL spelling of one of those: \
+                 `TEXT`, `VARCHAR`, `CHAR` and `STRING` are a set, `TINYINT`, `SMALLINT`, \
+                 `INT`, `INTEGER` and `BIGINT` are an unsigned integer of 8, 16, 32, 32 and 64 \
+                 bits, `BOOLEAN` is a bool, and `TIMESTAMP` and `DATETIME` are a time quantum. \
+                 There is nothing here a float, a date, a blob or a JSON document lands in"
+            }
+            Self::Constraint => {
+                "a column list here declares fields and nothing else: there are no rows for \
+                 `PRIMARY KEY` to be unique over, no nulls for `NOT NULL` to exclude, and no \
+                 write path that would apply a `DEFAULT` to a record nobody wrote a fact for"
+            }
+            Self::DecimalScale => {
+                "a decimal is written `DECIMAL(precision, scale)` - digits in total, then \
+                 digits after the point. Neither is optional: `DECIMAL` alone is an integer \
+                 wearing a different name, and `price > 5` means `> 500` on a field with two \
+                 digits after the point, so the number a comparison is against depends on it"
+            }
+            Self::BitDepth => {
+                "a value occupies between 1 and 64 bits here, one bitmap per bit. Wider than \
+                 64 is wider than the integer a value is read back into; narrower than 1 is no \
+                 value at all"
             }
             Self::Shape => {
                 "a statement answers one question: an aggregate, or a grouped column and one \
@@ -240,9 +517,10 @@ impl Refused {
                  produces"
             }
             Self::TooManyCalls => {
-                "a select list asks for one plan per aggregate, and each is fanned out and \
-                 merged on its own - so the number of them is what the statement costs in \
-                 round trips. Ask for at most 16, counting `avg` as two: a sum and a count"
+                "a select list asks for one plan per aggregate and a join for one per table, \
+                 and each is fanned out and merged on its own - so the number of them is what \
+                 the statement costs in round trips. Ask for at most 16, counting `avg` as \
+                 two: a sum and a count"
             }
         }
     }
@@ -348,3 +626,28 @@ impl core::error::Error for SqlError {}
 
 /// This crate's `Result`.
 pub type Result<T> = core::result::Result<T, SqlError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The half [`Refused::rank`]'s exhaustive match cannot claim on its own: a variant can be
+    /// given a rank and still be left out of [`Refused::ALL`], and the list is what the coverage
+    /// gate walks.
+    #[test]
+    fn every_refusal_is_in_the_list_exactly_once() {
+        let mut ranks: Vec<usize> = Refused::ALL.iter().map(|r| r.rank()).collect();
+        ranks.sort_unstable();
+        assert_eq!(ranks, (0..Refused::ALL.len()).collect::<Vec<_>>());
+    }
+
+    /// Every refusal says something, and the two halves are different jobs: the code is what a
+    /// client branches on, and the sentence is what a person reads.
+    #[test]
+    fn every_refusal_carries_a_code_and_a_reason() {
+        for refused in Refused::ALL {
+            assert!(refused.code().starts_with("sql_"), "{refused:?}");
+            assert!(refused.why().len() > 20, "{refused:?} says too little");
+        }
+    }
+}

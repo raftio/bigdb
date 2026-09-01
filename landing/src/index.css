@@ -168,6 +168,13 @@
   }
 }
 
+/* Print: a docs page on paper is the prose column and nothing else — the two rails are
+   navigation, and navigation does not print. */
+@media print {
+  body { background: #fff; color: #000; }
+  a[href^="http"]::after { content: " (" attr(href) ")"; font-size: 0.85em; color: #555; }
+}
+
 /* Motion: fast and functional, ≤150ms — and none at all when asked. */
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {

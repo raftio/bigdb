@@ -234,8 +234,8 @@ fn lower_one(select: &Select) -> Result<Statement> {
         }
     }
 
-    if let Some(join) = &select.join {
-        return join::joined(select, join, &stars, &columns, &aggregates);
+    if !select.joins.is_empty() {
+        return join::joined(select, &stars, &columns, &aggregates);
     }
 
     let table = &select.from.table;

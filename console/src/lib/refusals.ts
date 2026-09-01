@@ -89,21 +89,55 @@ export const REFUSALS: Record<string, Refusal> = {
   },
   sql_read_only: {
     code: "sql_read_only",
-    construct: "INSERT / UPDATE / DELETE",
-    reason: "This surface writes no rows: a commit is pages → fsync → meta flip, not a statement.",
-    instead: "Write with `POST /table/{t}/import`, one fact per line. Remove with `POST /table/{t}/delete`.",
+    construct: "UPDATE / DELETE / TRUNCATE",
+    reason:
+      "A fact is one bit at (row, record), so there is no row to change in place and none to delete: changing one means writing the new fact and clearing the old.",
+    instead:
+      "Write with `INSERT INTO t (id, …) VALUES (…)` or `POST /table/{t}/import`. Remove records with `POST /table/{t}/delete`, which takes their ids.",
     topic: "writes",
   },
-  sql_no_column_list: {
-    code: "sql_no_column_list",
-    construct: "CREATE TABLE (columns…)",
-    reason: "A field kind may be a set, a mutex or a time quantum — none of which a SQL type names.",
-    instead: "`CREATE TABLE t` takes no column list; declare each field with `POST /table/{t}/field/{f}?kind=…`.",
+  sql_insert_shape: {
+    code: "sql_insert_shape",
+    construct: "INSERT without a column list",
+    reason:
+      "A column list is what says which field each value is for, and this translation holds no schema — the values would be positional against a field order the statement does not carry.",
+    instead:
+      "Name the columns: `INSERT INTO t (country, amount) VALUES ('GB', 100)`. The record id is optional; write `_record_id` to choose one, or leave it out and the server allocates.",
+    topic: "writes",
+  },
+  sql_id_column: {
+    code: "sql_id_column",
+    construct: "a field called _record_id",
+    reason:
+      "`_record_id` is what a record is called here, not a field it can hold — an INSERT reads that column as the record to write about, so a field of that name could never be filled.",
+    instead:
+      "Name the field something else; `id` is free, which is why the reserved one is underscored. The record id is already there: `SELECT *` answers with it, and leaving it out of an INSERT has the server allocate one.",
     topic: "ddl",
-    rewrite: (q) => {
-      const m = q.match(/CREATE\s+TABLE\s+([A-Za-z_][\w]*)/i);
-      return m ? `CREATE TABLE ${m[1]}` : null;
-    },
+  },
+  sql_insert_too_large: {
+    code: "sql_insert_too_large",
+    construct: "INSERT of more than 10,000 rows",
+    reason:
+      "The whole statement is lexed and parsed into literals before the first fact is written, so the batch is resident twice over.",
+    instead: "`POST /table/{t}/import`, one fact per line, with no statement to hold.",
+    topic: "writes",
+  },
+  sql_no_database: {
+    code: "sql_no_database",
+    construct: "CREATE / DROP DATABASE, USE",
+    reason:
+      "There is no database above a table here: a node holds one catalog, and a table's name is what resolves a fact all the way to a bitmap.",
+    instead: "`CREATE TABLE`, `DROP TABLE` and `SHOW TABLES` are the whole of the namespace.",
+    topic: "ddl",
+  },
+  sql_no_views: {
+    code: "sql_no_views",
+    construct: "CREATE VIEW / MATERIALIZED VIEW",
+    reason:
+      "Nothing here stores a statement — the catalog holds tables, fields and keys, and a view is a statement kept under a name.",
+    instead:
+      "Write the SELECT where it is used, or create a table and write the answer into it — the materialised half, said out loud.",
+    topic: "ddl",
   },
   sql_ambiguous_column: {
     code: "sql_ambiguous_column",

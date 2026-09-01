@@ -1,0 +1,232 @@
+# `CREATE TABLE`, and what each type name means.
+#
+# The mapping from a SQL type name onto a field kind is this crate's dialect: there is no field
+# kind spelled `TEXT` anywhere below it. `TEXT` is a `Set` because a keyed field is what a
+# string lands in, and `BIGINT` is 64 bits because that is what `BIGINT` has always been.
+#
+# A column list is not a transaction. A table and its fields are separate changes below this
+# crate, and there is no journal that would let a half-applied batch be undone. What the list
+# buys is one round of validation before anything is created - every kind, depth and scale here
+# is decided while the statement is parsed, so the failure it can still leave behind is a node
+# that went quiet mid-way, never a `DECIMAL` somebody forgot to give a scale.
+
+ddl
+CREATE TABLE events
+----
+CreateTable events
+
+ddl
+CREATE TABLE events ()
+----
+CreateTable events
+
+ddl
+CREATE TABLE IF NOT EXISTS events (a SET)
+----
+CreateTable events if_not_exists
+└── a set depth=32
+
+ddl
+CREATE TABLE events ENGINE = columnar
+----
+CreateTable events engine=columnar
+
+ddl
+CREATE TABLE events ENGINE = 'bitmap+columnar'
+----
+CreateTable events engine=bitmap+columnar
+
+# The native spellings, which are the ones `SHOW CREATE` writes back.
+ddl
+CREATE TABLE t (a SET, b MUTEX, c BOOL, d TIMEQUANTUM, e SIGNED, f UINT(12))
+----
+CreateTable t
+├── a set depth=32
+├── b mutex depth=32
+├── c bool depth=32
+├── d timequantum depth=32
+├── e signed depth=32
+└── f int depth=12
+
+ddl
+CREATE TABLE t (a SIGNED, b SIGNED(12))
+----
+CreateTable t
+├── a signed depth=32
+└── b signed depth=12
+
+ddl
+CREATE TABLE t (a UINT(1), b UINT(12), c UINT(64))
+----
+CreateTable t
+├── a int depth=1
+├── b int depth=12
+└── c int depth=64
+
+# The SQL spellings, and what each of them lands on. A width that this engine cannot honour -
+# `VARCHAR(255)`, `INT(11)` - is refused rather than reinterpreted; see refusals.test for why a
+# display width is not a bit depth.
+ddl
+CREATE TABLE t (a TEXT, b VARCHAR, c CHAR, d STRING)
+----
+CreateTable t
+├── a set depth=32
+├── b set depth=32
+├── c set depth=32
+└── d set depth=32
+
+ddl
+CREATE TABLE t (a TINYINT, b SMALLINT, c INT, d INTEGER, e BIGINT)
+----
+CreateTable t
+├── a int depth=8
+├── b int depth=16
+├── c int depth=32
+├── d int depth=32
+└── e int depth=64
+
+ddl
+CREATE TABLE t (a INT UNSIGNED, b BIGINT SIGNED, c SMALLINT SIGNED)
+----
+CreateTable t
+├── a int depth=32
+├── b signed depth=64
+└── c signed depth=16
+
+ddl
+CREATE TABLE t (a BOOLEAN, b TIMESTAMP, c DATETIME)
+----
+CreateTable t
+├── a bool depth=32
+├── b timequantum depth=32
+└── c timequantum depth=32
+
+ddl
+CREATE TABLE t (a TEXT, b BIGINT, c BOOLEAN, d TIMESTAMP)
+----
+CreateTable t
+├── a set depth=32
+├── b int depth=64
+├── c bool depth=32
+└── d timequantum depth=32
+
+# A decimal keeps its scale, which is what every value written to it is converted against.
+ddl
+CREATE TABLE t (a DECIMAL(10, 2), b NUMERIC(4, 4), c DECIMAL(19, 0))
+----
+CreateTable t
+├── a decimal depth=34 scale=2
+├── b decimal depth=14 scale=4
+└── c decimal depth=64 scale=0
+
+# A comment inside a column list is a comment, and a trailing one is still a column list.
+ddl
+CREATE TABLE t (a SET, -- the key
+ b INT)
+----
+CreateTable t
+├── a set depth=32
+└── b int depth=32
+
+ddl
+DROP TABLE events
+----
+DropTable events
+
+ddl
+DROP TABLE IF EXISTS events
+----
+DropTable events if_exists
+
+ddl
+ALTER TABLE events ADD COLUMN region TEXT
+----
+AlterTable events
+└── add region set depth=32
+
+ddl
+ALTER TABLE t ADD a SET
+----
+AlterTable t
+└── add a set depth=32
+
+ddl
+ALTER TABLE t ADD COLUMN a SET, ADD COLUMN b BIGINT
+----
+AlterTable t
+├── add a set depth=32
+└── add b int depth=64
+
+ddl
+ALTER TABLE t DROP COLUMN a
+----
+AlterTable t
+└── drop a
+
+ddl
+ALTER TABLE t DROP a
+----
+AlterTable t
+└── drop a
+
+ddl
+ALTER TABLE t ADD COLUMN a DECIMAL(10, 2), DROP COLUMN b
+----
+AlterTable t
+├── add a decimal depth=34 scale=2
+└── drop b
+
+# `SHOW CREATE` is the inverse of the table above, written from the same mapping so the two
+# cannot drift apart. The native spelling comes back whichever spelling went in: `TEXT` and
+# `SET` create the same field, and answering with the name of the thing that exists is more use
+# than answering with the name somebody happened to type.
+render
+CREATE TABLE t (a SET, b MUTEX, c BOOL, d TIMEQUANTUM, e SIGNED, f UINT(12))
+----
+CREATE TABLE t (
+    a SET,
+    b MUTEX,
+    c BOOL,
+    d TIMEQUANTUM,
+    e SIGNED(32),
+    f UINT(12)
+)
+
+render
+CREATE TABLE t (a TEXT, b VARCHAR, c BIGINT, d BOOLEAN, e TIMESTAMP)
+----
+CREATE TABLE t (
+    a SET,
+    b SET,
+    c UINT(64),
+    d BOOL,
+    e TIMEQUANTUM
+)
+
+render
+CREATE TABLE t (a DECIMAL(10, 2), b NUMERIC(4, 4))
+----
+CREATE TABLE t (
+    a DECIMAL(10, 2),
+    b DECIMAL(4, 4)
+)
+
+render
+CREATE TABLE t (a INT UNSIGNED, b BIGINT SIGNED)
+----
+CREATE TABLE t (
+    a UINT(32),
+    b SIGNED(64)
+)
+
+render
+CREATE TABLE t ()
+----
+CREATE TABLE t
+
+render
+CREATE TABLE t (a SET) ENGINE = columnar
+----
+CREATE TABLE t (
+    a SET
+) ENGINE = columnar

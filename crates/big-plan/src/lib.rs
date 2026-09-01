@@ -24,12 +24,14 @@
 
 pub mod ast;
 pub mod error;
+pub mod explain;
 pub mod parse;
 pub mod plan;
 pub mod schema;
 
 pub use ast::{Call, Expr, Literal};
 pub use error::{PlanError, Result};
+pub use explain::explain;
 pub use parse::parse;
 pub use plan::{plan, to_units, CmpOp, Plan, Rows};
 pub use schema::{FieldClass, Keyed, Schema};

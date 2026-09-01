@@ -15,6 +15,7 @@
 //! What a statement lowers to: the calls, and the shape that reads their answers.
 
 use super::common::*;
+use big_sql::{Selected, Units};
 
 /// The six questions the analytical benchmark asks, in both languages.
 ///
@@ -44,37 +45,33 @@ fn the_six_benchmark_questions_plan_identically() {
 
 #[test]
 fn the_aggregates_and_their_shapes() {
+    // A sum reads a field, so its cell remembers which one until a schema says what that
+    // field keeps - see `Units`. `resolve` turns it into digits; translation never sees one.
     assert_eq!(
         translate("SELECT sum(amount) FROM t").unwrap().answer.shape,
-        Shape::Row { cells: vec![Cell { column: "sum".to_string(), of: Of::Value { plan: 0 } }] }
+        Shape::Row { cells: vec![measured("sum", Of::Value { plan: 0 }, "t", "amount")] }
     );
     assert_eq!(
         translate("SELECT min(amount) AS lowest FROM t").unwrap().answer.shape,
-        Shape::Row {
-            cells: vec![Cell { column: "lowest".to_string(), of: Of::Value { plan: 0 } }]
-        }
+        Shape::Row { cells: vec![measured("lowest", Of::Value { plan: 0 }, "t", "amount")] }
     );
     same("SELECT max(amount) FROM t", "Max(All(), field=amount)");
     assert_eq!(
         translate("SELECT count(DISTINCT category) FROM t").unwrap().answer.shape,
-        Shape::Row {
-            cells: vec![Cell { column: "count".to_string(), of: Of::Groups { plan: 0 } }]
-        }
+        Shape::Row { cells: vec![Cell::plain("count".to_string(), Of::Groups { plan: 0 })] }
     );
     assert_eq!(
         translate("SELECT * FROM t WHERE active = true LIMIT 10").unwrap().answer.shape,
-        Shape::Records { column: "id".to_string(), limit: Some(10) }
+        // The record's own name, underscored so that `id` stays free for a field.
+        Shape::Records { column: big_sql::RECORD_COLUMN.to_string(), limit: Some(10) }
     );
     assert_eq!(
         translate("SELECT category, count(*) FROM t GROUP BY category").unwrap().answer.shape,
         Shape::Groups {
             keys: vec![0],
             cells: vec![
-                Cell { column: "category".to_string(), of: Of::Key },
-                Cell {
-                    column: "count".to_string(),
-                    of: Of::Group { plan: 0, absent: Absent::Zero }
-                },
+                Cell::plain("category".to_string(), Of::Key),
+                Cell::plain("count".to_string(), Of::Group { plan: 0, absent: Absent::Zero }),
             ],
             having: None,
             order: None,
@@ -87,8 +84,8 @@ fn the_aggregates_and_their_shapes() {
         Shape::Groups {
             keys: vec![0],
             cells: vec![
-                Cell { column: "n".to_string(), of: Of::Group { plan: 0, absent: Absent::Zero } },
-                Cell { column: "category".to_string(), of: Of::Key },
+                Cell::plain("n".to_string(), Of::Group { plan: 0, absent: Absent::Zero }),
+                Cell::plain("category".to_string(), Of::Key),
             ],
             having: None,
             order: None,
@@ -106,11 +103,8 @@ fn the_aggregates_and_their_shapes() {
         Shape::Groups {
             keys: vec![0],
             cells: vec![
-                Cell { column: "category".to_string(), of: Of::Key },
-                Cell {
-                    column: "count".to_string(),
-                    of: Of::Group { plan: 0, absent: Absent::Zero }
-                },
+                Cell::plain("category".to_string(), Of::Key),
+                Cell::plain("count".to_string(), Of::Group { plan: 0, absent: Absent::Zero }),
             ],
             having: None,
             order: None,
@@ -131,10 +125,23 @@ fn a_projection_carries_its_cut_in_the_plan() {
         "SELECT amount, price FROM t WHERE country = 'GB' LIMIT 10",
         "Project(Row(country=\"GB\"), field=amount, field=price, n=10)",
     );
-    // Column order and names follow the select list, aliases included.
+    // Column order and names follow the select list, aliases included - and each column
+    // remembers the field it reads, so a decimal is scaled back on the way out. Unresolved
+    // here, because translation sees no schema: `Shape::resolve` turns these into digits.
     assert_eq!(
         translate("SELECT amount AS a, price FROM t LIMIT 5").unwrap().answer.shape,
-        Shape::Table { columns: vec!["a".to_string(), "price".to_string()] }
+        Shape::Table {
+            columns: vec![
+                Selected {
+                    column: "a".to_string(),
+                    units: Units::Written { table: "t".to_string(), field: "amount".to_string() },
+                },
+                Selected {
+                    column: "price".to_string(),
+                    units: Units::Written { table: "t".to_string(), field: "price".to_string() },
+                },
+            ],
+        }
     );
     // The two spellings of the cut must not both apply: the shape has no limit of its own.
     let Shape::Table { .. } = translate("SELECT amount FROM t LIMIT 5").unwrap().answer.shape

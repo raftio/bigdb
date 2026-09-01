@@ -122,10 +122,11 @@ plan answers at all - a quantile, which is the value at a rank - the coordinator
 moves a bound and asks an ordinary `Count` until the count lands on the rank. A statement
 therefore carries two lists, calls and probes, because a call is asked once and a probe is asked
 until it converges. A join is the clearest case: `FROM a JOIN b ON a.k = b.k` is
-two ordinary single-table groupings, one per table, and what makes it a join is that for each key
-both sides hold, the answer is the product of their per-key numbers. Multiplying at each owner
-and summing would be a plausible number that is wrong, so the arithmetic waits until both sides
-have been merged. Where it asks several questions at once, it makes several plans, each fanned out and
+one ordinary single-table grouping per table, and what makes it a join is that for each key every
+side holds, the answer is the product of their per-key numbers. That is why the width is free:
+a third table on the same key is a third grouping and one more term in the product. Multiplying
+at each owner and summing would be a plausible number that is wrong, so the arithmetic waits
+until every side has been merged. Where it asks several questions at once, it makes several plans, each fanned out and
 merged exactly as if it had been written alone; the row is assembled afterwards. Neither of those
 taught the layers below anything, which is the point: **a statement's cost is the number of plans
 in it, and its reach is bounded by what one plan can be.** The one exception is deliberate and

@@ -52,7 +52,7 @@ pub(super) fn query<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request, table: 
     }
 }
 
-/// `POST /sql` - one `SELECT`, answered as a result set.
+/// `POST /sql` - one statement, answered as a result set.
 ///
 /// No query string: `LIMIT` is part of the statement, and a second way to say the same thing is
 /// a second way for a client to contradict itself. The deadline, the cancellation flag and the
@@ -63,23 +63,27 @@ pub(super) fn sql<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request) -> Respon
         Ok(t) => t.trim(),
         Err(e) => return e.into_response(),
     };
-    // **A schema change over `/sql` needs `admin`, not the `read` this route is authorised
-    // with.** The role check in `dispatch` runs before any body is decoded, which is what keeps
-    // it cheap and is why it cannot know what statement arrived; the route's role is therefore a
-    // floor, and a statement is allowed to raise it. Without this a read-only token could create
-    // tables - the same power `POST /table/{t}` demands `admin` for.
+    // **The route's role is a floor, and the statement raises it.** The check in `dispatch` runs
+    // before any body is decoded, which is what keeps it cheap and is why it cannot know what
+    // statement arrived. Without this a read-only token could create tables and write facts -
+    // the same powers `POST /table/{t}` and `POST /table/{t}/import` demand their own roles for.
     //
     // Classified by the parser rather than by sniffing the first word, so there is one
-    // definition of what a schema change is and the check cannot disagree with the executor.
-    match ctx.cluster.classify(text) {
-        Ok(big_api::Sql::Ddl(_)) => {
-            if let Some(refusal) = super::require(ctx.auth, req, Role::Admin) {
-                return refusal;
-            }
+    // definition of what each kind of statement is and the check cannot disagree with the
+    // executor. `Sql` is matched exhaustively here on purpose: a fifth kind of statement cannot
+    // be added without this deciding what it costs.
+    let raised = match ctx.cluster.classify(text) {
+        Ok(big_api::Sql::Ddl(_)) => Some(Role::Admin),
+        Ok(big_api::Sql::Insert(_)) => Some(Role::Write),
+        // A `SELECT` and a `DESCRIBE` both read, which the route's floor already covers. A
+        // statement that does not translate is refused below, by the path that has an error to
+        // report - nothing here needs to decide that twice.
+        Ok(big_api::Sql::Query(_)) | Ok(big_api::Sql::Show(_)) | Err(_) => None,
+    };
+    if let Some(role) = raised {
+        if let Some(refusal) = super::require(ctx.auth, req, role) {
+            return refusal;
         }
-        // A statement that does not translate is refused below, by the path that has an error
-        // to report. Nothing here needs to decide that twice.
-        Ok(big_api::Sql::Query(_)) | Err(_) => {}
     }
 
     let opts =
@@ -88,9 +92,7 @@ pub(super) fn sql<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request) -> Respon
         // The statement's `FORMAT` decides both the bytes and the type they are declared as: a
         // client that asked for TSV and was told `application/json` was answered twice, once
         // wrongly.
-        Ok((value, answer)) => {
-            Response::text(answer.format.content_type(), json::result_set(&answer, &value))
-        }
+        Ok((set, format)) => Response::text(format.content_type(), json::result_set(format, &set)),
         Err(e) => from_cluster(&e),
     }
 }
@@ -352,40 +354,19 @@ fn parse_into<'a>(
         // matches a fact to its resolved field by address instead of by `memcmp`. It also
         // outlives the line, which a borrowed fact wants anyway.
         let field = *name;
-        let bad = |what: String| ParseError { line: n, status: 400, code: "malformed_line", what };
-        facts.push(match info.kind {
-            FieldKind::SignedInt => match value.parse::<i64>() {
-                Ok(v) => Fact::Signed { field, record, value: v },
-                Err(_) => {
-                    return Err(bad(format!("`{field}` needs a signed number, got `{value}`")))
-                }
-            },
-            FieldKind::Int | FieldKind::Decimal => match value.parse::<u64>() {
-                Ok(v) => Fact::Int { field, record, value: v },
-                Err(_) => return Err(bad(format!("`{field}` needs a number, got `{value}`"))),
-            },
-            FieldKind::Bool => match value {
-                "true" => Fact::Bool { field, record, value: true },
-                "false" => Fact::Bool { field, record, value: false },
-                other => return Err(bad(format!("`{field}` needs true or false, got `{other}`"))),
-            },
-            // **A time quantum field takes `key@seconds`.** The field's kind decides how a
-            // value is read, which is already true of every other kind here - and without a
-            // moment the field can be filled and still have no views by day for a window to
-            // read. A key with no `@` is still a key: the views are an addition, not a
-            // requirement.
-            FieldKind::TimeQuantum => match value.rsplit_once('@') {
-                None => Fact::Key { field, record, value },
-                Some((key, at)) => match at.parse::<i64>() {
-                    Ok(unix_seconds) => Fact::Time { field, record, value: key, unix_seconds },
-                    Err(_) => {
-                        return Err(bad(format!(
-                            "`{field}` takes `key@seconds`, and `{at}` is not a number"
-                        )))
-                    }
-                },
-            },
-            _ => Fact::Key { field, record, value },
+        // **How a value is read is `big_api::fact`'s to decide, not this route's.** A SQL
+        // `INSERT` writes the same facts into the same fields, and two implementations of "what
+        // does `true` mean on a boolean field" would be two conventions in one table.
+        facts.push(match big_api::fact::from_text(field, info, record, value) {
+            Ok(fact) => fact,
+            Err(e) => {
+                return Err(ParseError {
+                    line: n,
+                    status: 400,
+                    code: "malformed_line",
+                    what: e.why(field, value),
+                })
+            }
         });
     }
     Ok(seen)

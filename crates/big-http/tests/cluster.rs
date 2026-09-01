@@ -284,7 +284,7 @@ fn sql_is_answered_across_nodes_and_merged() {
     // Record ids come back from both owners, in order.
     assert_eq!(
         ok(b, "POST", "/sql", "SELECT * FROM tx WHERE country = 'GB'"),
-        format!("{{\"columns\":[\"id\"],\"rows\":[[1],[{}]]}}", WIDTH + 1)
+        format!("{{\"columns\":[\"_record_id\"],\"rows\":[[1],[{}]]}}", WIDTH + 1)
     );
 }
 

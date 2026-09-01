@@ -1,0 +1,316 @@
+// Copyright 2026 Bany
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! `CREATE TABLE`, and the column types a field kind is spelled with.
+
+use super::Parser;
+use crate::ddl::{Column, ColumnKind};
+use crate::error::{Refused, Result};
+use crate::lex::Tok;
+
+impl Parser<'_> {
+    /// `CREATE TABLE [IF NOT EXISTS] <name> [(<column>, ...)] [ENGINE = <engine>]`, with
+    /// `CREATE` consumed.
+    ///
+    /// ```text
+    /// column := ident type
+    /// type   := SET | MUTEX | BOOL | BOOLEAN | TIMEQUANTUM | TIMESTAMP | DATETIME
+    ///         | TEXT | VARCHAR | CHAR | STRING
+    ///         | TINYINT | SMALLINT | INT | INTEGER | BIGINT   [UNSIGNED | SIGNED]
+    ///         | UINT '(' bits ')' | SIGNED [ '(' bits ')' ]
+    ///         | (DECIMAL | NUMERIC) '(' precision ',' scale ')'
+    /// ```
+    ///
+    /// The list is optional because a table with no fields is a real thing here - it is what
+    /// `POST /table/{t}` creates - and because the field routes are still a way to add one to a
+    /// table that already exists. A column list is the way to say the whole shape in one
+    /// statement.
+    pub(super) fn create_table(&mut self) -> Result<crate::ddl::Ddl> {
+        if !self.word_is("TABLE") {
+            // Every other `CREATE` is refused by name, and the two that have their own sentence
+            // say it: there is no database above a table here, and nothing stores a statement.
+            if self.word_is("DATABASE") || self.word_is("SCHEMA") {
+                return Err(self.refuse(Refused::Database));
+            }
+            if self.word_is("VIEW") || self.word_is("MATERIALIZED") {
+                return Err(self.refuse(Refused::View));
+            }
+            return Err(self.refuse(Refused::Write));
+        }
+        self.i += 1;
+        let if_not_exists = self.if_exists(true)?;
+        let table = self.bare_ident("a table name")?;
+
+        let columns = if self.eat(&Tok::LParen) { self.column_list()? } else { Vec::new() };
+
+        // After the list, not before it: `CREATE TABLE t (a SET) ENGINE = columnar` is the
+        // order every other dialect puts these in, and the order somebody writes them without
+        // being told.
+        let engine = if self.word_is("ENGINE") {
+            self.i += 1;
+            if !self.eat(&Tok::Op("=")) {
+                return Err(self.syntax("= after ENGINE"));
+            }
+            Some(self.engine_name()?)
+        } else {
+            None
+        };
+
+        if self.peek().is_some() {
+            return Err(self.syntax("the end of the statement"));
+        }
+        Ok(crate::ddl::Ddl::CreateTable { table, engine, columns, if_not_exists })
+    }
+
+    /// `IF [NOT] EXISTS`, or nothing.
+    ///
+    /// One function for both spellings because the only difference is the word in the middle,
+    /// and because half a clause - an `IF` with nothing after it - has to be a syntax error in
+    /// both. Reading it as a table named `IF` would create one.
+    pub(super) fn if_exists(&mut self, negated: bool) -> Result<bool> {
+        if !self.eat_word("IF") {
+            return Ok(false);
+        }
+        if negated {
+            self.expect_word("NOT", "NOT EXISTS after IF")?;
+        }
+        self.expect_word("EXISTS", "EXISTS")?;
+        Ok(true)
+    }
+
+    /// The columns, with `(` consumed and `)` eaten here.
+    ///
+    /// A name may repeat as far as this crate can tell - it holds no schema and would be
+    /// guessing at what a second `country SET` means. It means the same refusal a second
+    /// `POST /table/t/field/country` gets, raised where the field is created.
+    fn column_list(&mut self) -> Result<Vec<Column>> {
+        let mut columns = Vec::new();
+        // `CREATE TABLE t ()` is a table with no fields written the long way, and refusing it
+        // would be refusing a statement whose meaning is not in doubt.
+        if self.eat(&Tok::RParen) {
+            return Ok(columns);
+        }
+        loop {
+            let at = self.at();
+            let name = self.bare_ident("a column name")?;
+            // Refused where it is declared rather than where it fails to be written. A field
+            // called `id` is one an `INSERT` can never fill - it would read the value as the
+            // record to write about - so it would sit empty while `SELECT *` showed the very
+            // records it was meant to hold.
+            if name.eq_ignore_ascii_case(crate::insert::RECORD_COLUMN) {
+                return Err(self.refuse_at(Refused::IdColumn, at));
+            }
+            columns.push(self.column_type(name)?);
+            if self.eat(&Tok::Comma) {
+                continue;
+            }
+            self.expect(&Tok::RParen, ", or ) after the columns")?;
+            return Ok(columns);
+        }
+    }
+
+    /// One type name, and whatever it takes in brackets.
+    ///
+    /// **This is the only place in the crate that decides what a word means.** Everywhere else
+    /// a name is passed on for a layer that holds a schema to resolve; here there is nothing to
+    /// resolve against, because no field kind is spelled `TEXT` anywhere below. So the mapping
+    /// is written out rather than inferred, and a name not on it is refused with the list.
+    ///
+    /// [`crate::render::create_table`] is the way back, and is the reason a type name that came
+    /// from here round-trips: the two are inverses of one table, so they have to be read
+    /// together when either changes.
+    pub(super) fn column_type(&mut self, name: String) -> Result<Column> {
+        use ColumnKind::*;
+
+        let at = self.at();
+        let Some(word) = self.word().map(str::to_ascii_uppercase) else {
+            return Err(self.syntax("a column type"));
+        };
+        self.i += 1;
+
+        // Widths are the ones the names have always meant, so `BIGINT` costs 64 bitmaps and
+        // `SMALLINT` costs 16 - which is the whole of what a bit depth decides here. A display
+        // width in brackets is refused below rather than read as a depth: `INT(11)` is eleven
+        // digits where MySQL wrote it and eleven bits here, and eleven bits stop at 2047.
+        let column = match word.as_str() {
+            "SET" => Column { name, kind: Set, bit_depth: KEYLESS_DEPTH, scale: None },
+            "MUTEX" => Column { name, kind: Mutex, bit_depth: KEYLESS_DEPTH, scale: None },
+            "BOOL" | "BOOLEAN" => {
+                Column { name, kind: Bool, bit_depth: KEYLESS_DEPTH, scale: None }
+            }
+            "TIMEQUANTUM" | "TIMESTAMP" | "DATETIME" => {
+                Column { name, kind: TimeQuantum, bit_depth: KEYLESS_DEPTH, scale: None }
+            }
+            // A length on a key is a bound on nothing: keys are stored whole, and there is no
+            // truncation or padding for a `VARCHAR(255)` to describe.
+            "TEXT" | "VARCHAR" | "CHAR" | "STRING" => {
+                if self.peek() == Some(&Tok::LParen) {
+                    return Err(self.refuse(Refused::Constraint));
+                }
+                Column { name, kind: Set, bit_depth: KEYLESS_DEPTH, scale: None }
+            }
+            "TINYINT" | "SMALLINT" | "INT" | "INTEGER" | "BIGINT" => {
+                if self.peek() == Some(&Tok::LParen) {
+                    return Err(self.refuse(Refused::ColumnType));
+                }
+                let bit_depth = match word.as_str() {
+                    "TINYINT" => 8,
+                    "SMALLINT" => 16,
+                    "BIGINT" => 64,
+                    _ => 32,
+                };
+                // `INT UNSIGNED` is what every integer here already is, and `BIGINT SIGNED` is
+                // the sign convention asked for by the name it has in SQL - so both are read
+                // rather than refused over a word that says what was meant.
+                let kind = if self.eat_word("SIGNED") {
+                    Signed
+                } else {
+                    self.eat_word("UNSIGNED");
+                    Int
+                };
+                Column { name, kind, bit_depth, scale: None }
+            }
+            // The two native spellings, which exist because the SQL names carry a fixed width
+            // and a bit-sliced field is cheaper the narrower it is: every plane is one more
+            // bitmap a range query intersects.
+            "UINT" => Column { name, kind: Int, bit_depth: self.bit_depth()?, scale: None },
+            "SIGNED" => {
+                let bit_depth =
+                    if self.peek() == Some(&Tok::LParen) { self.bit_depth()? } else { 32 };
+                Column { name, kind: Signed, bit_depth, scale: None }
+            }
+            "DECIMAL" | "NUMERIC" => self.decimal(name)?,
+            _ => return Err(self.refuse_at(Refused::ColumnType, at)),
+        };
+
+        // Constraints are refused after the type rather than at the type, so that the refusal
+        // points at `NOT NULL` and says what is wrong with it - and not at a `DECIMAL` that was
+        // written perfectly well.
+        if self.at_constraint() {
+            return Err(self.refuse(Refused::Constraint));
+        }
+        Ok(column)
+    }
+
+    /// `DECIMAL(precision, scale)`, with the type name consumed.
+    ///
+    /// Both numbers, always. `DECIMAL(10)` is SQL for ten digits and no fraction, and reading
+    /// it here as a scale of ten would turn a pasted definition into a field where `price > 5`
+    /// asks about five ten-billionths - so the one-argument form is refused rather than given a
+    /// meaning it does not have anywhere else.
+    ///
+    /// The precision buys the bit depth: enough bits to hold every number of that many digits,
+    /// which is what the writer said the column holds. Deriving it is not a guess - 10^p - 1
+    /// needs `ceil(p * log2(10))` bits and no fewer - and it means nobody has to translate
+    /// digits into bitmaps by hand.
+    fn decimal(&mut self, name: String) -> Result<Column> {
+        if self.peek() != Some(&Tok::LParen) {
+            return Err(self.refuse(Refused::DecimalScale));
+        }
+        self.i += 1;
+        let precision = self.small_number("the precision, in digits")?;
+        if !self.eat(&Tok::Comma) {
+            return Err(self.refuse(Refused::DecimalScale));
+        }
+        let scale = self.small_number("the scale, in digits after the point")?;
+        self.expect(&Tok::RParen, ") after the scale")?;
+
+        // A scale wider than the number itself describes a value with no digits before the
+        // point that the precision leaves room for, which is a definition nobody meant to
+        // write. And `i8` is what the catalog stores a scale in.
+        if precision == 0 || scale > precision || scale > i8::MAX as u64 {
+            return Err(self.refuse(Refused::DecimalScale));
+        }
+        let bits = decimal_bits(precision);
+        if !(1..=64).contains(&bits) {
+            return Err(self.refuse(Refused::BitDepth));
+        }
+        Ok(Column {
+            name,
+            kind: ColumnKind::Decimal,
+            bit_depth: bits as u32,
+            scale: Some(scale as i8),
+        })
+    }
+
+    /// `( bits )`, bounded where a bit-sliced value is bounded.
+    fn bit_depth(&mut self) -> Result<u32> {
+        self.expect(&Tok::LParen, "( and a number of bits")?;
+        let bits = self.small_number("a number of bits")?;
+        self.expect(&Tok::RParen, ") after the number of bits")?;
+        if !(1..=64).contains(&bits) {
+            return Err(self.refuse(Refused::BitDepth));
+        }
+        Ok(bits as u32)
+    }
+
+    /// Whether what follows a type is a constraint rather than the end of the column.
+    ///
+    /// Named one by one rather than "anything that is not a comma": a word this list does not
+    /// have is a typo in the type, and `syntax` pointing at it is more use than a refusal
+    /// telling somebody there are no constraints when they did not write one.
+    pub(super) fn at_constraint(&self) -> bool {
+        const CONSTRAINTS: [&str; 10] = [
+            "NOT",
+            "NULL",
+            "PRIMARY",
+            "UNIQUE",
+            "DEFAULT",
+            "REFERENCES",
+            "CHECK",
+            "KEY",
+            "AUTO_INCREMENT",
+            "COMMENT",
+        ];
+        CONSTRAINTS.iter().any(|c| self.word_is(c))
+    }
+
+    /// An engine name, bare or quoted.
+    ///
+    /// Quoted is not decoration: `bitmap+columnar` contains a character the lexer has no token
+    /// for, so that one has to be written `'bitmap+columnar'`. The bare form exists because
+    /// `ENGINE = columnar` is what anyone coming from another column store will type, and
+    /// refusing it over punctuation nobody can see would be a poor first impression.
+    ///
+    /// Which names are real is not decided here. This crate links no storage crate, and a
+    /// second copy of the engine list would be a second copy to drift.
+    fn engine_name(&mut self) -> Result<String> {
+        match self.peek() {
+            Some(Tok::Str(s)) | Some(Tok::Word(s)) | Some(Tok::Quoted(s)) => {
+                let s = s.clone();
+                self.i += 1;
+                Ok(s)
+            }
+            _ => Err(self.syntax("an engine name, like columnar or 'bitmap+columnar'")),
+        }
+    }
+}
+
+/// What a field that stores no number carries as its depth.
+///
+/// Nothing reads it - a set has no bit planes - but the field route defaults to it, and a set
+/// created in a column list should be the same row in `/schema` as a set created over
+/// `POST /table/{t}/field/{f}?kind=set`. Two spellings of one field that differ in a number
+/// nobody uses is a difference somebody will eventually have to explain.
+pub(crate) const KEYLESS_DEPTH: u32 = 32;
+
+/// How many bits a decimal of `precision` digits needs.
+///
+/// `f64::log2(10)` rounded up, kept as an integer ratio so this is exact for every precision a
+/// `u64` could hold: 10^p needs at most ceil(p * 10 / 3) bits. A function rather than a line
+/// because [`crate::render`] has to invert it, and an inverse of a formula written twice is an
+/// inverse of neither.
+pub(crate) fn decimal_bits(precision: u64) -> u64 {
+    precision.saturating_mul(10).div_ceil(3)
+}

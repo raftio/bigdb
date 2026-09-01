@@ -1,0 +1,287 @@
+# An equi-join between two tables on a keyed column.
+#
+# What is joined is the key's *string*, and it is joined after both sides have been merged. A
+# record is a set of bits in one table and there is no pointer to another, so what two tables
+# share is the string a keyed column was interned from - the row ids behind those strings are
+# per `(table, field)` and have no reason to agree.
+#
+# So a join makes two plans, one per side, each a grouped count by the join key. Everything the
+# join *is* happens above them, in the shape: for each shared key the join is the Cartesian
+# product of the records on each side, so `count(*)` is the product summed over shared keys and
+# a `min` is the smallest of one side's minima over the keys the other side holds at all. That
+# is why a join adds no `Plan` variant and no merge arm.
+
+plan
+SELECT count(*) FROM t JOIN u ON t.category = u.category
+----
+Distinct t.category
+└── all
+Distinct u.category
+└── all
+
+shape
+SELECT count(*) FROM t JOIN u ON t.category = u.category
+----
+Join keys=(#0, #1)
+└── count = product(#0, #1)
+
+plan
+SELECT count(*) FROM t INNER JOIN u ON t.category = u.category
+----
+Distinct t.category
+└── all
+Distinct u.category
+└── all
+
+# Aliases, which is how the columns say which side they belong to.
+plan
+SELECT count(*) FROM t a JOIN u b ON a.category = b.category
+----
+Distinct t.category
+└── all
+Distinct u.category
+└── all
+
+shape
+SELECT count(*) FROM t a JOIN u b ON a.category = b.category
+----
+Join keys=(#0, #1)
+└── count = product(#0, #1)
+
+# A predicate on one side narrows that side's plan and leaves the other whole.
+plan
+SELECT count(*) FROM t a JOIN u b ON a.category = b.category WHERE a.amount > 5
+----
+Distinct t.category
+└── amount > 5
+Distinct u.category
+└── all
+
+plan
+SELECT count(*) FROM t a JOIN u b ON a.category = b.category WHERE b.active = true
+----
+Distinct t.category
+└── all
+Distinct u.category
+└── active = true
+
+plan
+SELECT count(*) FROM t a JOIN u b ON a.category = b.category WHERE a.amount > 5 AND b.active = true
+----
+Distinct t.category
+└── amount > 5
+Distinct u.category
+└── active = true
+
+# A sum over a join is the same arithmetic with the sum standing in for one side's count.
+plan
+SELECT sum(a.amount) FROM t a JOIN u b ON a.category = b.category
+----
+Distinct t.category
+└── all
+Distinct u.category
+└── all
+GroupBy t.category -> sum(amount)
+└── all
+
+shape
+SELECT sum(a.amount) FROM t a JOIN u b ON a.category = b.category
+----
+Join keys=(#0, #1)
+└── sum = product(#2, #1)
+
+# An extreme is not scaled by the other side: repeating a value does not make it smaller. What
+# the other side decides is only whether the key is in the join at all.
+plan
+SELECT min(a.amount) FROM t a JOIN u b ON a.category = b.category
+----
+Distinct t.category
+└── all
+Distinct u.category
+└── all
+GroupBy t.category -> min(amount)
+└── all
+
+shape
+SELECT min(a.amount) FROM t a JOIN u b ON a.category = b.category
+----
+Join keys=(#0, #1)
+└── min = least(#2, #1)
+
+shape
+SELECT max(a.amount) FROM t a JOIN u b ON a.category = b.category
+----
+Join keys=(#0, #1)
+└── max = greatest(#2, #1)
+
+# How many keys both sides hold, which is the one distinct count a join answers.
+plan
+SELECT count(DISTINCT a.category) FROM t a JOIN u b ON a.category = b.category
+----
+Distinct t.category
+└── all
+Distinct u.category
+└── all
+
+shape
+SELECT count(DISTINCT a.category) FROM t a JOIN u b ON a.category = b.category
+----
+Join keys=(#0, #1)
+└── count = shared(#0, #1)
+
+# `GROUP BY` the join key: one row per shared key rather than one row folding all of them.
+plan
+SELECT a.category, count(*) FROM t a JOIN u b ON a.category = b.category GROUP BY a.category
+----
+Distinct t.category
+└── all
+Distinct u.category
+└── all
+
+shape
+SELECT a.category, count(*) FROM t a JOIN u b ON a.category = b.category GROUP BY a.category
+----
+Join keys=(#0, #1) per_key
+├── category = key
+└── count = product(#0, #1)
+
+shape
+SELECT a.category, count(*) AS n FROM t a JOIN u b ON a.category = b.category GROUP BY a.category ORDER BY n DESC LIMIT 3
+----
+Join keys=(#0, #1) per_key
+├── category = key
+├── n = product(#0, #1)
+├── order: product(#0, #1) desc
+└── cut: limit 3
+
+shape
+SELECT a.category, count(*) FROM t a JOIN u b ON a.category = b.category GROUP BY a.category HAVING count(*) > 5
+----
+Join keys=(#0, #1) per_key
+├── category = key
+├── count = product(#0, #1)
+└── having: product(#0, #1) > 5
+
+# Joining on the other keyed column both tables have.
+plan
+SELECT count(*) FROM t a JOIN u b ON a.country = b.country
+----
+Distinct t.country
+└── all
+Distinct u.country
+└── all
+
+## A star: any number of tables, every one of them keyed on the one column they share.
+#
+# The arithmetic generalises without changing: for each key every side holds, the join is the
+# Cartesian product of the records on all of them, so `count(*)` is `Σ_s Π_i |X_i,s|` and a
+# total is scaled by every other side's count rather than by one. Which is why this is still one
+# grouped count per table and a shape - no `Plan` variant, no merge arm, at two tables or at ten.
+
+plan
+SELECT count(*) FROM t JOIN u ON t.category = u.category JOIN v ON t.category = v.category
+----
+Distinct t.category
+└── all
+Distinct u.category
+└── all
+Distinct v.category
+└── all
+
+shape
+SELECT count(*) FROM t JOIN u ON t.category = u.category JOIN v ON t.category = v.category
+----
+Join keys=(#0, #1, #2)
+└── count = product(#0, #1, #2)
+
+# Written transitively, and the same star: `u`'s key is `category` in both of its joins, so all
+# three tables are grouped by the one column and nothing here is a chain. The shape it lowers to
+# is the one above, to the character.
+shape
+SELECT count(*) FROM t JOIN u ON t.category = u.category JOIN v ON u.category = v.category
+----
+Join keys=(#0, #1, #2)
+└── count = product(#0, #1, #2)
+
+# A total over a star is scaled by *every* other side, and an extreme by none of them - which is
+# the two-table rule unchanged, because repeating a value still does not make it larger.
+shape
+SELECT sum(a.amount), max(c.amount) FROM t a JOIN u b ON a.category = b.category JOIN v c ON a.category = c.category
+----
+Join keys=(#0, #1, #2)
+├── sum = product(#3, #1, #2)
+└── max = greatest(#4, #0, #1)
+
+# One row per key the star holds, with the clauses applied after the merge as ever.
+shape
+SELECT a.category, count(*) FROM t a JOIN u b ON a.category = b.category JOIN v c ON a.category = c.category GROUP BY a.category ORDER BY count(*) DESC LIMIT 3
+----
+Join keys=(#0, #1, #2) per_key
+├── category = key
+├── count = product(#0, #1, #2)
+├── order: product(#0, #1, #2) desc
+└── cut: limit 3
+
+# `count(DISTINCT k)` over a star is how many keys all three hold, which is the intersection the
+# shape already walks - so it names no plan of its own.
+shape
+SELECT count(DISTINCT a.category) FROM t a JOIN u b ON a.category = b.category JOIN v c ON a.category = c.category
+----
+Join keys=(#0, #1, #2)
+└── count = shared(#0, #1, #2)
+
+# Each table's own `WHERE`, split three ways.
+plan
+SELECT count(*) FROM t a JOIN u b ON a.category = b.category JOIN v c ON a.category = c.category WHERE a.amount > 1 AND b.amount > 2 AND c.amount > 3
+----
+Distinct t.category
+└── amount > 1
+Distinct u.category
+└── amount > 2
+Distinct v.category
+└── amount > 3
+
+## `avg` over a join, which is a total over a count and both are folded before they are divided.
+#
+# Not the mean of the per-key means. Each half is scaled by the same per-key product, and that
+# product is *inside both sums* rather than outside the fraction - so it cancels nowhere, and
+# `Σ_s (sum_s · Π) / Σ_s (count_s · Π)` is the average of the join while `Σ_s (sum_s / count_s)`
+# is a number about nothing. Which is why this is one cell rather than two and a division.
+#
+# It costs one call, not two: the denominator is the side's own grouped count, which is the plan
+# the join was already built out of.
+
+plan
+SELECT avg(a.amount) FROM t a JOIN u b ON a.category = b.category
+----
+Distinct t.category
+└── all
+Distinct u.category
+└── all
+GroupBy t.category -> sum(amount)
+└── all
+
+shape
+SELECT avg(a.amount) FROM t a JOIN u b ON a.category = b.category
+----
+Join keys=(#0, #1)
+└── avg = ratio(#2 / #0, #1)
+
+# Per key, and measuring the other side - the side a cell names is the side both of its halves
+# come from, and the scaling is by every other.
+shape
+SELECT a.category, avg(b.amount) FROM t a JOIN u b ON a.category = b.category GROUP BY a.category
+----
+Join keys=(#0, #1) per_key
+├── category = key
+└── avg = ratio(#2 / #1, #0)
+
+# An ordering by an average, which a join could not carry while the average was refused.
+shape
+SELECT a.category, avg(a.amount) AS m FROM t a JOIN u b ON a.category = b.category GROUP BY a.category ORDER BY m DESC LIMIT 3
+----
+Join keys=(#0, #1) per_key
+├── category = key
+├── m = ratio(#2 / #0, #1)
+├── order: ratio(#2 / #0, #1) desc
+└── cut: limit 3

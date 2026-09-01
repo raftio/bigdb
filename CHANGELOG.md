@@ -14,6 +14,51 @@ Nothing has been released yet. `0.1.0` is the version in the manifests, not a ve
 can install. What is below is the state the first release will describe, not a diff against a
 predecessor.
 
+### SQL
+
+- **`avg` over a join is answered.** One cell rather than two and a division: each half is
+  scaled by the same per-key product, and that product is inside both sums rather than outside
+  the fraction - so `Σ sum_s·Π / Σ count_s·Π` is the average of the join and the mean of the
+  per-key means is a different number. `ORDER BY` an average over a join follows; `HAVING` on one
+  stays refused, because an average is fractional and that comparison is not.
+- **A join takes any number of tables**, so long as they are one *star* around the key they
+  share: `FROM t JOIN u ON t.k = u.k JOIN v ON t.k = v.k`. Still one grouped count per table and
+  a product per key, so still no `Plan` variant and no merge arm. A table two joins would key
+  differently is a *chain* — it would have to be grouped by both columns at once — and stays
+  `sql_no_joins`, as does a `FROM` wider than the fan-out cap.
+- **Rows can be written in SQL**: `INSERT INTO t (country, amount) VALUES ('GB', 100)`, which
+  writes the facts `POST /table/{t}/import` writes. A statement carries at most 10,000 rows;
+  volume goes through the import route. Needs a `write` token.
+- **Record ids are allocated when a statement does not name one.** The column is `_record_id` —
+  underscored so that `id` stays free for a field of yours — and writing it is optional: an ETL
+  that has its own ids passes them straight through. Allocation is the schema leader's, where
+  key interning already happens, because "one past the highest" has one right answer per cluster
+  and two coordinators computing it independently would write two records into one. A leader
+  that cannot be reached stops the statement rather than guessing. `SELECT *` answers under the
+  same name, and a *field* called `_record_id` is refused (`sql_id_column`).
+- **`DROP TABLE [IF EXISTS]`** and **`CREATE TABLE IF NOT EXISTS`**. `IF NOT EXISTS` leaves a
+  table that is already there exactly as it is, fields included, which is what makes a setup
+  script re-runnable against a table somebody has since altered.
+- **The catalog answers in SQL**: `DESCRIBE t` (also `DESC`, `DESCRIBE TABLE`,
+  `SHOW COLUMNS FROM`), `SHOW TABLES`, and `SHOW CREATE TABLE t`, which answers with the
+  statement that would recreate the table. All three read what `GET /schema` reads and need only
+  a `read` token.
+- **Named refusals for the SQL this engine cannot answer**, in place of a syntax error or a
+  blanket "this surface writes no rows": `CASE WHEN` and `if` (`sql_unsupported`), `CAST` and
+  `toString`, `argMin`/`stddev`/`corr`, `INSERT … SELECT`, `DELETE FROM` (`sql_read_only`),
+  `CREATE`/`DROP`/`ALTER DATABASE` and `USE` (`sql_no_database`), and views
+  (`sql_no_views`). Each says what the engine's shape makes impossible and what exists instead.
+- A value written with more digits than its decimal field keeps is refused rather than rounded,
+  with the same `too_precise` code and sentence `WHERE price = 12.523` already gives.
+- **A decimal reads back as the value it is.** `SELECT price`, `sum(price)`, `min`, `max`, a
+  quantile and a grouped total over a field of scale two now answer `12.50` where they answered
+  `1250` — the same conversion `WHERE price = 12.50` already made on the way in, made on the way
+  out. Exact: the answer carries the stored integer and the field's scale, and no value passes
+  through a float. `POST /table/{t}/query` still answers in stored units, because its statements
+  name fields rather than columns and its answers carry no schema to place the point with.
+- `POST /sql` raises the role the statement needs: `admin` for a schema change, `write` for an
+  `INSERT`, and the route's own `read` for a `SELECT` or a `DESCRIBE`.
+
 ### Storage
 
 - **A table declares a storage engine at creation**: `bitmap`, `bitmap+columnar` (the default a

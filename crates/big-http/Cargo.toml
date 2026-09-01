@@ -33,3 +33,4 @@ big-sql = { path = "../big-sql", version = "0.1.0" }
 # `auth` writes a token file and then checks its mode, and the cluster tests give a restarting
 # node somewhere to keep the state a restart may not lose.
 tempfile = "3"
+big-testfile = { path = "../big-testfile" }

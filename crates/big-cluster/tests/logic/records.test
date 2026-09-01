@@ -1,0 +1,142 @@
+# The two answers that are about records rather than about counts of them, and the formats they
+# can be written in.
+
+statement
+CREATE TABLE tx (amount UINT(32), price DECIMAL(10, 2), country SET, active BOOL)
+
+statement
+INSERT INTO tx (_record_id, amount, price, country, active) VALUES
+  (1, 100, 1.50, 'GB', true),
+  (2, 900, 12.25, 'US', false),
+  (3, 500, 3.00, 'GB', true),
+  (4, 700, 7.75, 'FR', true)
+
+# `SELECT *` answers with the identity of each match and nothing else. This engine stores facts
+# as bits at `(row, record)` and has no row of values to hand back, so a column visibly called
+# by the record's own name is worth more than a table of values reconstructed at a point read
+# apiece.
+query
+SELECT * FROM tx
+----
+_record_id
+1
+2
+3
+4
+
+query
+SELECT * FROM tx WHERE country = 'GB'
+----
+_record_id
+1
+3
+
+query
+SELECT * FROM tx WHERE active = true AND amount >= 500
+----
+_record_id
+3
+4
+
+query
+SELECT * FROM tx LIMIT 2
+----
+_record_id
+1
+2
+
+# A projection does read values back, and carries a mandatory limit for it: a record's value in
+# a bit-sliced field is not stored anywhere as a number, so reconstructing it is one bit per
+# plane per record per column.
+query
+SELECT amount FROM tx LIMIT 10
+----
+amount
+100
+900
+500
+700
+
+query
+SELECT amount, price FROM tx LIMIT 10
+----
+amount  price
+100     1.50
+900     12.25
+500     3.00
+700     7.75
+
+query
+SELECT price, amount FROM tx LIMIT 10
+----
+price  amount
+1.50   100
+12.25  900
+3.00   500
+7.75   700
+
+query
+SELECT amount AS a FROM tx LIMIT 2
+----
+a
+100
+900
+
+query
+SELECT amount FROM tx WHERE country = 'GB' LIMIT 10
+----
+amount
+100
+500
+
+# A record holding no value in the column reads as nothing rather than as zero, which is the
+# difference between "no fact was written" and "zero was written".
+statement
+INSERT INTO tx (_record_id, country) VALUES (5, 'DE')
+
+query
+SELECT amount FROM tx LIMIT 10
+----
+amount
+100
+900
+500
+700
+NULL
+
+query
+SELECT * FROM tx
+----
+_record_id
+1
+2
+3
+4
+5
+
+# The formats, which change the bytes and nothing about the answer. What this corpus checks is
+# the answer, so every one of them prints the same cells - the bytes are `big-http`'s to check,
+# and it does.
+query
+SELECT country, count(*) FROM tx GROUP BY country FORMAT TSV
+----
+country  count
+DE       1
+FR       1
+GB       2
+US       1
+
+query
+SELECT country, count(*) FROM tx GROUP BY country FORMAT CSVWithNames
+----
+country  count
+DE       1
+FR       1
+GB       2
+US       1
+
+query
+SHOW TABLES FORMAT TSV
+----
+name  engine           fields
+tx    bitmap+columnar  4

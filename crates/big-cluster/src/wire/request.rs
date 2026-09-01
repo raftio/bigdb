@@ -181,6 +181,60 @@ impl InternRequest {
     }
 }
 
+/// `POST /internal/allocate`: a run of record ids nobody else will be given.
+///
+/// Only the schema leader answers, for the reason `/internal/intern` exists: two coordinators
+/// handing out one id would write two records into one, and nothing downstream could see that
+/// it had happened.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct AllocateRequest {
+    pub table: String,
+    /// How many consecutive ids the caller needs. A whole statement asks once.
+    pub count: u64,
+}
+
+impl AllocateRequest {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        put_str(&mut out, &self.table);
+        put_u64(&mut out, self.count);
+        out
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut r = Reader::new(bytes);
+        let table = r.str()?;
+        let count = r.u64()?;
+        finished(&r)?;
+        Ok(Self { table, count })
+    }
+}
+
+/// `POST /internal/next-record`: one past the highest record id this node holds, or zero.
+///
+/// A table name and nothing else. One past the highest rather than the highest itself, so that
+/// an empty table and a table holding record zero are told apart without an `Option` on the
+/// wire.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct TableRequest {
+    pub table: String,
+}
+
+impl TableRequest {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        put_str(&mut out, &self.table);
+        out
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut r = Reader::new(bytes);
+        let table = r.str()?;
+        finished(&r)?;
+        Ok(Self { table })
+    }
+}
+
 /// A list of record ids, which is what `/internal/records` answers with.
 pub fn put_records(out: &mut Vec<u8>, ids: &[RecordId]) {
     put_count(out, ids.len());

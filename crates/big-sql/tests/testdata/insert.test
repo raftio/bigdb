@@ -1,0 +1,97 @@
+# `INSERT`, which is a list of literals for the layer that holds a schema to turn into facts.
+#
+# Nothing here decides what a value means: the translation has no schema, so `'GB'` is a string
+# and `100` is a number, and which field kind each lands in is decided where the schema is. What
+# this surface does decide is the *shape* - every tuple as wide as the column list, and which
+# column, if any, is the record id.
+#
+# `id=allocated` is the whole of the difference between the two forms. Without a `_record_id`
+# column the server allocates one, which is why the parser finds the column here rather than
+# leaving every reader to search the list for it.
+#
+# The reserved name is underscored because `id` belongs to whoever is writing the table: a
+# record id is the engine's own coordinate rather than a key the data chose, and taking the most
+# natural column name in SQL for it would mean a table could not have an `id` field of its own.
+# The last case below is exactly that - a column called `id`, which is an ordinary field.
+
+insert
+INSERT INTO tx (_record_id, country, amount) VALUES (1, 'GB', 100)
+----
+Insert tx (_record_id, country, amount) id_at=0
+└── 1, 'GB', 100
+
+insert
+INSERT INTO tx (_record_id, country, amount) VALUES (1, 'GB', 100), (2, 'US', 900)
+----
+Insert tx (_record_id, country, amount) id_at=0
+├── 1, 'GB', 100
+└── 2, 'US', 900
+
+insert
+INSERT INTO tx (country, amount) VALUES ('GB', 100), ('US', 900)
+----
+Insert tx (country, amount) id=allocated
+├── 'GB', 100
+└── 'US', 900
+
+# The id need not be written first.
+insert
+INSERT INTO tx (country, _record_id, amount) VALUES ('GB', 7, 100)
+----
+Insert tx (country, _record_id, amount) id_at=1
+└── 'GB', 7, 100
+
+insert
+INSERT INTO tx (_RECORD_ID, country) VALUES (1, 'GB')
+----
+Insert tx (_RECORD_ID, country) id_at=0
+└── 1, 'GB'
+
+insert
+INSERT INTO tx (_record_id) VALUES (1)
+----
+Insert tx (_record_id) id_at=0
+└── 1
+
+insert
+INSERT INTO tx (_record_id) VALUES (1), (2), (3)
+----
+Insert tx (_record_id) id_at=0
+├── 1
+├── 2
+└── 3
+
+# A decimal keeps the scale it was written with, because `1.50` and `1.5` are two different
+# statements against a field of scale two - see the conversion in where.test.
+insert
+INSERT INTO tx (_record_id, price) VALUES (1, 12.50)
+----
+Insert tx (_record_id, price) id_at=0
+└── 1, 12.50
+
+insert
+INSERT INTO tx (_record_id, price) VALUES (1, 12.5)
+----
+Insert tx (_record_id, price) id_at=0
+└── 1, 12.5
+
+insert
+INSERT INTO tx (_record_id, balance) VALUES (1, -5)
+----
+Insert tx (_record_id, balance) id_at=0
+└── 1, -5
+
+insert
+INSERT INTO tx (_record_id, active) VALUES (1, true), (2, false)
+----
+Insert tx (_record_id, active) id_at=0
+├── 1, true
+└── 2, false
+
+# An ordinary field that happens to be called `id`, which the server allocates a record for
+# like any other write that names no record.
+insert
+INSERT INTO tx (id, country) VALUES (7, 'GB')
+----
+Insert tx (id, country) id=allocated
+└── 7, 'GB'

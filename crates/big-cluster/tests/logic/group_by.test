@@ -1,0 +1,264 @@
+# Grouping over real records, and everything applied to the groups after the merge.
+#
+# `HAVING` runs before the ordering and the limit, which is the order SQL specifies and the only
+# order that is right here: a group under the threshold on one node can be over it once every
+# node has contributed, so filtering earlier would answer a different question.
+
+statement
+CREATE TABLE tx (amount UINT(32), price DECIMAL(10, 2), country SET, city SET, active BOOL)
+
+statement
+INSERT INTO tx (_record_id, amount, price, country, city, active) VALUES
+  (1, 100, 1.50, 'GB', 'LDN', true),
+  (2, 900, 12.25, 'US', 'NYC', false),
+  (3, 500, 3.00, 'GB', 'LDN', true),
+  (4, 700, 7.75, 'FR', 'PAR', true),
+  (5, 200, 2.50, 'US', 'SFO', true),
+  (6, 300, 4.00, 'GB', 'MAN', true)
+
+same GroupBy(All(), field=country)
+SELECT country, count(*) FROM tx GROUP BY country
+----
+country  count
+FR       1
+GB       3
+US       2
+
+same GroupBy(Row(active=true), field=country)
+SELECT country, count(*) FROM tx WHERE active = true GROUP BY country
+----
+country  count
+FR       1
+GB       3
+US       1
+
+same GroupBy(All(), field=country, aggregate=Sum(field=amount))
+SELECT country, sum(amount) FROM tx GROUP BY country
+----
+country  sum
+FR       700
+GB       900
+US       1100
+
+same GroupBy(All(), field=country, aggregate=Min(field=amount))
+SELECT country, min(amount) FROM tx GROUP BY country
+----
+country  min
+FR       700
+GB       100
+US       200
+
+same GroupBy(All(), field=country, aggregate=Max(field=amount))
+SELECT country, max(amount) FROM tx GROUP BY country
+----
+country  max
+FR       700
+GB       500
+US       900
+
+same GroupBy(All(), field=country, aggregate=Sum(field=price))
+SELECT country, sum(price) FROM tx GROUP BY country
+----
+country  sum
+FR       7.75
+GB       8.50
+US       14.75
+
+# Two aggregates over one grouping: the cells read different plans and the rows are joined on
+# the group's row id after each plan has been merged on its own.
+query
+SELECT country, count(*), sum(amount) FROM tx GROUP BY country
+----
+country  count  sum
+FR       1      700
+GB       3      900
+US       2      1100
+
+query
+SELECT country, count(*), avg(amount) FROM tx GROUP BY country
+----
+country  count  avg
+FR       1      700
+GB       3      300
+US       2      550
+
+# `SELECT DISTINCT c` is the same grouping with the counts not rendered.
+same Distinct(All(), field=country)
+SELECT DISTINCT country FROM tx
+----
+country
+FR
+GB
+US
+
+query
+SELECT DISTINCT country FROM tx WHERE amount >= 500
+----
+country
+FR
+GB
+US
+
+# Ordering. Groups arrive ordered by key, so ascending by key asks for what it was going to get;
+# everything else is a sort at the coordinator, except the descending ranking a `TopN` carries.
+query
+SELECT country, count(*) FROM tx GROUP BY country ORDER BY country
+----
+country  count
+FR       1
+GB       3
+US       2
+
+query
+SELECT country, count(*) FROM tx GROUP BY country ORDER BY country DESC
+----
+country  count
+US       2
+GB       3
+FR       1
+
+query
+SELECT country, count(*) FROM tx GROUP BY country ORDER BY count(*) DESC
+----
+country  count
+GB       3
+US       2
+FR       1
+
+query
+SELECT country, count(*) FROM tx GROUP BY country ORDER BY count(*) ASC
+----
+country  count
+FR       1
+US       2
+GB       3
+
+same TopN(All(), field=country, n=2)
+SELECT country, count(*) AS n FROM tx GROUP BY country ORDER BY n DESC LIMIT 2
+----
+country  n
+GB       3
+US       2
+
+query
+SELECT country, sum(amount) FROM tx GROUP BY country ORDER BY sum(amount) DESC
+----
+country  sum
+US       1100
+GB       900
+FR       700
+
+query
+SELECT country, count(*) FROM tx GROUP BY country LIMIT 2
+----
+country  count
+FR       1
+GB       3
+
+query
+SELECT country, count(*) FROM tx GROUP BY country LIMIT 2 OFFSET 1
+----
+country  count
+GB       3
+US       2
+
+# `WITH TIES` keeps every further row the ordering cannot separate from the last one taken,
+# which is why it cannot be a plan's own cut: the answer is longer than the limit says.
+query
+SELECT country, count(*) FROM tx GROUP BY country ORDER BY count(*) DESC LIMIT 1 WITH TIES
+----
+country  count
+GB       3
+
+query
+SELECT country, count(*) FROM tx GROUP BY country HAVING count(*) > 1
+----
+country  count
+GB       3
+US       2
+
+query
+SELECT country, count(*) FROM tx GROUP BY country HAVING count(*) = 1
+----
+country  count
+FR       1
+
+query
+SELECT country, sum(amount) FROM tx GROUP BY country HAVING sum(amount) >= 900
+----
+country  sum
+GB       900
+US       1100
+
+# A threshold written as a decimal converts against the field's scale, the same way a `WHERE`
+# bound does - it is the same code deciding, which is what keeps the two from disagreeing.
+query
+SELECT country, sum(price) FROM tx GROUP BY country HAVING sum(price) >= 10.00
+----
+country  sum
+US       14.75
+
+# A `HAVING` on an average is refused: the number a group carries is an integer in the field's
+# units and an average is a quotient, so the comparison would be between two different things.
+error
+SELECT country, avg(amount) FROM tx GROUP BY country HAVING avg(amount) > 300
+----
+error: sql_unsupported
+
+# `HAVING` before the ordering and the cut: the ranking here is over the groups that survived.
+query
+SELECT country, count(*) AS n FROM tx GROUP BY country HAVING count(*) > 1 ORDER BY n DESC LIMIT 1
+----
+country  n
+GB       3
+
+# Two keyed columns. Not a composite key: for each value of the left the records holding it are
+# a set, and grouping those by the right is the ordinary grouping.
+query
+SELECT country, city, count(*) FROM tx GROUP BY country, city
+----
+country  city  count
+FR       PAR   1
+GB       LDN   2
+GB       MAN   1
+US       NYC   1
+US       SFO   1
+
+query
+SELECT country, city, sum(amount) FROM tx GROUP BY country, city
+----
+country  city  sum
+FR       PAR   700
+GB       LDN   600
+GB       MAN   300
+US       NYC   900
+US       SFO   200
+
+query
+SELECT DISTINCT country, city FROM tx
+----
+country  city
+FR       PAR
+GB       LDN
+GB       MAN
+US       NYC
+US       SFO
+
+# A group every record of which the filter rejects is missing from that plan's answer entirely,
+# while the others still know it exists. A count reads zero for it and an extreme reads nothing,
+# which is what those already answer over no records.
+query
+SELECT country, count(*) FILTER (WHERE amount >= 500) FROM tx GROUP BY country
+----
+country  count
+FR       1
+GB       1
+US       1
+
+query
+SELECT country, min(amount) FILTER (WHERE amount >= 500) FROM tx GROUP BY country
+----
+country  min
+FR       700
+GB       500
+US       900

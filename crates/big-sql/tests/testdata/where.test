@@ -1,0 +1,325 @@
+# `WHERE`: which records, and what each field's class does to the bound it is written against.
+#
+# The interesting cases are the ones where the same syntax lands on different plans. `= 'GB'`
+# and `= true` and `= 500` are one operator in the grammar and three plans below it, and which
+# one it becomes is decided by the schema rather than by the text.
+
+plan
+SELECT count(*) FROM t WHERE amount > 500
+----
+Count t
+└── amount > 500
+
+plan
+SELECT count(*) FROM t WHERE amount >= 500
+----
+Count t
+└── amount >= 500
+
+plan
+SELECT count(*) FROM t WHERE amount < 500
+----
+Count t
+└── amount < 500
+
+plan
+SELECT count(*) FROM t WHERE amount <= 500
+----
+Count t
+└── amount <= 500
+
+plan
+SELECT count(*) FROM t WHERE amount = 500
+----
+Count t
+└── amount = 500
+
+plan
+SELECT count(*) FROM t WHERE amount != 500
+----
+Count t
+└── amount != 500
+
+plan
+SELECT count(*) FROM t WHERE amount <> 500
+----
+Count t
+└── amount != 500
+
+# A keyed column compares against a string, for equality and nothing else.
+plan
+SELECT count(*) FROM t WHERE country = 'GB'
+----
+Count t
+└── country = 'GB'
+
+plan
+SELECT count(*) FROM t WHERE country != 'GB'
+----
+did not resolve: `!=` is not allowed on `country`, which is a keyed field
+
+plan
+SELECT count(*) FROM t WHERE device = 'phone'
+----
+Count t
+└── device = 'phone'
+
+plan
+SELECT count(*) FROM t WHERE active = true
+----
+Count t
+└── active = true
+
+plan
+SELECT count(*) FROM t WHERE active = false
+----
+Count t
+└── active = false
+
+# A signed field takes a negative bound, which is a mistake against an unsigned one.
+plan
+SELECT count(*) FROM t WHERE balance > -5
+----
+Count t
+└── balance > -5 [signed]
+
+plan
+SELECT count(*) FROM t WHERE balance = -5
+----
+Count t
+└── balance = -5 [signed]
+
+plan
+SELECT count(*) FROM t WHERE balance >= 0
+----
+Count t
+└── balance >= 0 [signed]
+
+# `price` has scale two, so the written value is converted into the units the field stores.
+# This is the conversion that would be off by a factor of a hundred if it were skipped, with
+# both numbers valid and nothing in the answer able to say which one it was.
+plan
+SELECT count(*) FROM t WHERE price > 12.50
+----
+Count t
+└── price > 1250
+
+plan
+SELECT count(*) FROM t WHERE price = 12.50
+----
+Count t
+└── price = 1250
+
+plan
+SELECT count(*) FROM t WHERE price > 12.5
+----
+Count t
+└── price > 1250
+
+plan
+SELECT count(*) FROM t WHERE price > 12
+----
+Count t
+└── price > 1200
+
+# The same number against a field with no scale, for the difference to be visible.
+plan
+SELECT count(*) FROM t WHERE amount > 12
+----
+Count t
+└── amount > 12
+
+plan
+SELECT count(*) FROM t WHERE amount > 5 AND active = true
+----
+Count t
+└── intersect
+    ├── amount > 5
+    └── active = true
+
+plan
+SELECT count(*) FROM t WHERE amount > 5 OR amount < 2
+----
+Count t
+└── union
+    ├── amount > 5
+    └── amount < 2
+
+plan
+SELECT count(*) FROM t WHERE NOT active = true
+----
+Count t
+└── not
+    └── active = true
+
+plan
+SELECT count(*) FROM t WHERE amount > 5 AND NOT country = 'GB'
+----
+Count t
+└── minus
+    ├── amount > 5
+    └── country = 'GB'
+
+plan
+SELECT count(*) FROM t WHERE NOT country = 'GB' AND NOT country = 'FR'
+----
+Count t
+└── not
+    └── union
+        ├── country = 'GB'
+        └── country = 'FR'
+
+plan
+SELECT count(*) FROM t WHERE (amount > 5 AND active = true) AND country = 'GB'
+----
+Count t
+└── intersect
+    ├── amount > 5
+    ├── active = true
+    └── country = 'GB'
+
+plan
+SELECT count(*) FROM t WHERE amount > 5 AND (active = true OR country = 'GB')
+----
+Count t
+└── intersect
+    ├── amount > 5
+    └── union
+        ├── active = true
+        └── country = 'GB'
+
+plan
+SELECT count(*) FROM t WHERE country = 'GB' AND active = true AND amount >= 500
+----
+Count t
+└── intersect
+    ├── country = 'GB'
+    ├── active = true
+    └── amount >= 500
+
+# `IN` is a union of equalities; `NOT IN` negates the whole of it.
+plan
+SELECT count(*) FROM t WHERE country IN ('GB')
+----
+Count t
+└── country = 'GB'
+
+plan
+SELECT count(*) FROM t WHERE country IN ('GB', 'FR')
+----
+Count t
+└── union
+    ├── country = 'GB'
+    └── country = 'FR'
+
+plan
+SELECT count(*) FROM t WHERE country IN ('GB', 'FR', 'US')
+----
+Count t
+└── union
+    ├── country = 'GB'
+    ├── country = 'FR'
+    └── country = 'US'
+
+plan
+SELECT count(*) FROM t WHERE country NOT IN ('GB', 'FR')
+----
+Count t
+└── not
+    └── union
+        ├── country = 'GB'
+        └── country = 'FR'
+
+plan
+SELECT count(*) FROM t WHERE amount IN (1, 2, 3)
+----
+Count t
+└── union
+    ├── amount = 1
+    ├── amount = 2
+    └── amount = 3
+
+# `BETWEEN` is two bounds, and `NOT BETWEEN` is their negation rather than two negations.
+plan
+SELECT count(*) FROM t WHERE amount BETWEEN 5 AND 9
+----
+Count t
+└── intersect
+    ├── amount >= 5
+    └── amount <= 9
+
+plan
+SELECT count(*) FROM t WHERE amount NOT BETWEEN 5 AND 9
+----
+Count t
+└── not
+    └── intersect
+        ├── amount >= 5
+        └── amount <= 9
+
+plan
+SELECT count(*) FROM t WHERE price BETWEEN 1.00 AND 2.00
+----
+Count t
+└── intersect
+    ├── price >= 100
+    └── price <= 200
+
+plan
+SELECT count(*) FROM t WHERE balance BETWEEN -5 AND 5
+----
+Count t
+└── intersect
+    ├── balance >= -5 [signed]
+    └── balance <= 5 [signed]
+
+# `PREWHERE` selects exactly the same set: there is no row here to avoid reading, so it folds
+# into `WHERE` rather than becoming a second stage.
+plan
+SELECT count(*) FROM t PREWHERE amount > 5
+----
+Count t
+└── amount > 5
+
+plan
+SELECT count(*) FROM t PREWHERE amount > 5 WHERE active = true
+----
+Count t
+└── intersect
+    ├── amount > 5
+    └── active = true
+
+# `WITH <constant> AS <name>` binds a value. A `WITH` whose body is a select is a real CTE, and
+# is refused - see refusals.test.
+plan
+WITH 500 AS threshold SELECT count(*) FROM t WHERE amount >= threshold
+----
+Count t
+└── amount >= 500
+
+plan
+WITH 'GB' AS home SELECT count(*) FROM t WHERE country = home
+----
+Count t
+└── country = 'GB'
+
+# A predicate under every aggregate, not only under a count.
+plan
+SELECT sum(amount) FROM t WHERE country = 'GB'
+----
+Sum t.amount
+└── country = 'GB'
+
+plan
+SELECT avg(amount) FROM t WHERE amount > 10000
+----
+Sum t.amount
+└── amount > 10000
+Count t
+└── amount > 10000
+
+plan
+SELECT count(DISTINCT country) FROM t WHERE amount >= 500
+----
+Distinct t.country
+└── amount >= 500

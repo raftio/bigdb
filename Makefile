@@ -33,7 +33,7 @@ LOADER  := $(BIGI) --addr $(ADDR)
 
 .DEFAULT_GOAL := help
 .PHONY: help build install uninstall serve start stop restart status logs shell sql cli load demo clean-data \
-	test lint docs check cov e2e e2e-cluster
+	test lint docs check cov e2e e2e-cluster rewrite
 
 help:
 	@echo 'big, locally. Server on $(ADDR), database at $(DATA).'
@@ -62,6 +62,7 @@ help:
 	@echo '  make cov          line coverage per crate (needs cargo-llvm-cov)'
 	@echo '  make e2e          the four binaries, run as processes'
 	@echo '  make e2e-cluster  two real daemons and a failover; slow, run deliberately'
+	@echo '  make rewrite      regenerate the SQL test corpora, then read the diff'
 	@echo
 	@echo 'Variables: PROFILE=debug|release ADDR=host:port DATA=path LOG=level FLAGS="--durability none"'
 
@@ -194,6 +195,17 @@ WORKSPACE := --workspace --exclude big-bench
 
 test:
 	$(CARGO) test $(WORKSPACE)
+
+# The data-driven SQL corpora, regenerated from what the code now does - see docs/sql-testing.md.
+#
+# Deliberately not part of any gate, and it fails on purpose when it changes anything: a rewrite
+# is the cheap way to add a hundred cases and the cheap way to accept a hundred regressions, and
+# the only thing between the two is reading the diff.
+rewrite:
+	BIG_REWRITE=1 $(CARGO) test -p big-sql --test testdata || true
+	BIG_REWRITE=1 $(CARGO) test -p big-cluster --test logic || true
+	@echo
+	@echo 'Read `git diff` on the .test files, then `make test`.'
 
 # fmt first: a formatting failure is one command to fix and would otherwise hide behind clippy
 # output nobody reads to the bottom of. `-D warnings` matches CI's RUSTFLAGS, so a warning is a

@@ -200,7 +200,7 @@ fn select_distinct_is_the_grouping_it_is_defined_as() {
         translate("SELECT DISTINCT category FROM t").unwrap().answer.shape,
         Shape::Groups {
             keys: vec![0],
-            cells: vec![Cell { column: "category".to_string(), of: Of::Key }],
+            cells: vec![Cell::plain("category".to_string(), Of::Key)],
             having: None,
             order: None,
             cut: Cut::default(),
@@ -236,11 +236,8 @@ fn having_filters_groups_without_changing_the_plan() {
         Shape::Groups {
             keys: vec![0],
             cells: vec![
-                Cell { column: "category".to_string(), of: Of::Key },
-                Cell {
-                    column: "count".to_string(),
-                    of: Of::Group { plan: 0, absent: Absent::Zero }
-                },
+                Cell::plain("category".to_string(), Of::Key),
+                Cell::plain("count".to_string(), Of::Group { plan: 0, absent: Absent::Zero }),
             ],
             having: Some(Having {
                 of: Of::Group { plan: 0, absent: Absent::Zero },
@@ -276,11 +273,8 @@ fn a_limit_under_having_waits_until_after_the_filter() {
         Shape::Groups {
             keys: vec![0],
             cells: vec![
-                Cell { column: "category".to_string(), of: Of::Key },
-                Cell {
-                    column: "count".to_string(),
-                    of: Of::Group { plan: 0, absent: Absent::Zero }
-                },
+                Cell::plain("category".to_string(), Of::Key),
+                Cell::plain("count".to_string(), Of::Group { plan: 0, absent: Absent::Zero }),
             ],
             having: Some(Having {
                 of: Of::Group { plan: 0, absent: Absent::Zero },
@@ -347,7 +341,7 @@ fn grouping_with_an_aggregate_of_another_column() {
         translate("SELECT category FROM t GROUP BY category").unwrap().answer.shape,
         Shape::Groups {
             keys: vec![0],
-            cells: vec![Cell { column: "category".to_string(), of: Of::Key }],
+            cells: vec![Cell::plain("category".to_string(), Of::Key)],
             having: None,
             order: None,
             cut: Cut::default(),

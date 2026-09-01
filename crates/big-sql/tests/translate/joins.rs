@@ -34,11 +34,15 @@ fn a_join_is_two_groupings_and_a_shape() {
     assert_eq!(
         s.answer.shape,
         Shape::Join {
-            keys: (0, 1),
-            cells: vec![Cell {
-                column: "count".to_string(),
-                of: Of::Paired { left: 0, right: 1, how: Pairing::Product },
-            }],
+            axes: 1,
+            sides: vec![
+                JoinSide { keyed: Keying::By { plan: 0, axis: 0 }, required: true },
+                JoinSide { keyed: Keying::By { plan: 1, axis: 0 }, required: true },
+            ],
+            cells: vec![Cell::plain(
+                "count".to_string(),
+                Of::Paired { plan: 0, side: 0, how: Pairing::Product }
+            )],
             per_key: false,
             having: None,
             order: None,
@@ -81,9 +85,9 @@ fn an_aggregate_over_a_join_is_paired_against_the_other_sides_count() {
     // `sum` on the left is scaled by the right's count; `min` on the left only asks whether the
     // right holds the key; `max` on the right is scaled by the left's count - which is the
     // extreme's rule the other way round.
-    assert_eq!(cells[0].of, Of::Paired { left: 2, right: 1, how: Pairing::Product });
-    assert_eq!(cells[1].of, Of::Paired { left: 3, right: 1, how: Pairing::Least });
-    assert_eq!(cells[2].of, Of::Paired { left: 4, right: 0, how: Pairing::Greatest });
+    assert_eq!(cells[0].of, Of::Paired { plan: 2, side: 0, how: Pairing::Product });
+    assert_eq!(cells[1].of, Of::Paired { plan: 3, side: 0, how: Pairing::Least });
+    assert_eq!(cells[2].of, Of::Paired { plan: 4, side: 1, how: Pairing::Greatest });
 }
 
 /// `GROUP BY` over a join is the join key, which is the only column both sides agree about.
@@ -104,7 +108,7 @@ fn a_join_groups_by_its_key_and_nothing_else() {
     assert_eq!(
         *order,
         Some(GroupOrder {
-            by: OrderBy::Value { of: Of::Paired { left: 0, right: 1, how: Pairing::Product } },
+            by: OrderBy::Value { of: Of::Paired { plan: 0, side: 0, how: Pairing::Product } },
             desc: true,
         })
     );

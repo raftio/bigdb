@@ -143,7 +143,7 @@ fn main() {
 fn question(sql: &str) -> big_sql::lower::Statement {
     match big_sql::translate(sql).unwrap() {
         big_sql::Sql::Query(s) => s,
-        big_sql::Sql::Ddl(_) => panic!("`{sql}` is a schema change, not a question"),
+        other => panic!("`{sql}` is not a question: {other:?}"),
     }
 }
 

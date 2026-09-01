@@ -18,7 +18,10 @@
 //! coordinator holds when it applies the shape, so that is what a test holds. Everything here
 //! used to be reachable only through a socket.
 
-use big_api::{Answer, Cell, Container, Format, Group, Matches, Of, Pair, RowSet, Shape, Value};
+use big_api::{
+    Answer, Cell, Container, Format, Group, Matches, Of, Pair, RowSet, Selected, Shape, Units,
+    Value,
+};
 
 /// A statement's answer, in the default format and with no searches.
 pub fn answer(shape: Shape) -> Answer {
@@ -32,7 +35,7 @@ pub fn answer_with_probes(shape: Shape, calls: usize) -> Answer {
 
 /// One named column reading one thing.
 pub fn cell(column: &str, of: Of) -> Cell {
-    Cell { column: column.to_string(), of }
+    Cell::plain(column, of)
 }
 
 /// One group: a row id, the key it was interned from, and its number.
@@ -59,4 +62,14 @@ pub fn matching(records: &[u16]) -> Matches {
     let mut m = Matches::new();
     m.insert(0, rows);
     m
+}
+
+/// One projected column whose field stores whole numbers, which is every field but a decimal.
+pub fn plain_column(column: &str) -> Selected {
+    Selected { column: column.to_string(), units: Units::PLAIN }
+}
+
+/// One projected column out of a decimal field of `scale` digits.
+pub fn scaled_column(column: &str, scale: u8) -> Selected {
+    Selected { column: column.to_string(), units: Units::Digits(scale) }
 }

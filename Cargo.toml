@@ -10,6 +10,7 @@ members = [
     "crates/big-db",
     "crates/big-plan",
     "crates/big-sql",
+    "crates/big-testfile",
     "crates/big-exec",
     "crates/big-api",
     "crates/big-cli",

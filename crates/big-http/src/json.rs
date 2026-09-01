@@ -17,7 +17,7 @@
 //! The whole output surface is four shapes, so a serialisation library would be a dependency
 //! carried for one file. Escaping is the part worth getting right, and it is one function.
 
-use big_api::{Answer, Datum, Format, ResultSet, TableInfo};
+use big_api::{Datum, Format, ResultSet, TableInfo};
 use big_cluster::{RangeVerdict, RepairReport, WriteOutcome};
 use big_db::RecordId;
 use big_exec::{Group, Value};
@@ -171,7 +171,7 @@ pub fn value_paged(v: &Value, page: Page) -> String {
     }
 }
 
-/// One SQL answer as a result set: the columns, then a row per line of it.
+/// A result set, spelled the way the statement's `FORMAT` asked for.
 ///
 /// **A different shape from [`value_paged`] on purpose.** The other query route answers
 /// `{"count": 41}` because that is what its language asked for - a count, a sum, a list of
@@ -179,19 +179,14 @@ pub fn value_paged(v: &Value, page: Page) -> String {
 /// rows even when the table is one cell wide. Two surfaces, two shapes, and neither pretending
 /// to be the other.
 ///
-/// `values` holds one answer per plan the statement made, in the order the shape names them.
-/// Assembling them into rows is the last thing that happens to an answer, and it happens here
-/// because here is after the merge - see `big_sql::Shape`.
-pub fn result_set(answer: &Answer, values: &[Value]) -> String {
-    write_rows(answer.format, &big_api::result_set(answer, values))
-}
-
-/// A result set, spelled the way the statement's `FORMAT` asked for.
-///
 /// Every format renders from the same [`ResultSet`], which is what a cell *is* rather than what
 /// one format spells it as. This used to build the JSON row first and take it apart again for
 /// the separated formats; the cells are typed now, so each format writes them once.
-fn write_rows(format: Format, set: &ResultSet) -> String {
+///
+/// The rows arrive already assembled: a statement's answers become rows in the coordinator,
+/// because only there is every owner's answer in - and because three of the four kinds of
+/// statement have no plans to assemble at all. See `big_cluster::Cluster::sql`.
+pub fn result_set(format: Format, set: &ResultSet) -> String {
     if format == Format::Json {
         let columns: Vec<String> = set.columns.iter().map(|c| string(c)).collect();
         let rows: Vec<String> = set.rows.iter().map(|r| json_row(r)).collect();
@@ -225,6 +220,9 @@ fn json_cell(d: &Datum) -> String {
     match d {
         Datum::Null => "null".to_string(),
         Datum::Int(v) => v.to_string(),
+        // A JSON number, not a string: `12.50` is what the value is, and quoting it would make
+        // every client parse a decimal out of text.
+        Datum::Dec { units, scale } => big_api::fixed(*units, *scale),
         Datum::Real(v) => real(*v),
         Datum::Text(s) => string(s),
         Datum::Keys(keys) => keys_cell(keys),
@@ -236,6 +234,7 @@ fn separated_cell(d: &Datum) -> String {
     match d {
         Datum::Null => "null".to_string(),
         Datum::Int(v) => v.to_string(),
+        Datum::Dec { units, scale } => big_api::fixed(*units, *scale),
         Datum::Real(v) => real(*v),
         Datum::Text(s) => bare(s),
         // A list has no separated spelling, so it keeps its JSON one. A client reading `topK`

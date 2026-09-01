@@ -1,0 +1,137 @@
+# `UNION ALL`: several answers, one after the other.
+#
+# Nothing here is a set operation over records. Each branch is a whole statement with its own
+# plans, and what makes them one answer is that the rows are written one after the other - so
+# there was no `Plan` variant to add, no merge arm and no wire change. Branches are lowered on
+# their own and rebased onto one flat call list, which is what the `#n` indices below show.
+#
+# A plain `UNION` is refused rather than answered as `ALL`, because it removes duplicate rows
+# and a row here is a rendered answer rather than a stored tuple - see refusals.test.
+
+plan
+SELECT count(*) FROM t UNION ALL SELECT count(*) FROM u
+----
+Count t
+└── all
+Count u
+└── all
+
+shape
+SELECT count(*) FROM t UNION ALL SELECT count(*) FROM u
+----
+Union
+├── Row
+│   └── count = #0
+└── Row
+    └── count = #1
+
+plan
+SELECT count(*) FROM t WHERE active = true UNION ALL SELECT count(*) FROM t WHERE active = false
+----
+Count t
+└── active = true
+Count t
+└── active = false
+
+shape
+SELECT count(*) FROM t WHERE active = true UNION ALL SELECT count(*) FROM t WHERE active = false
+----
+Union
+├── Row
+│   └── count = #0
+└── Row
+    └── count = #1
+
+# Three branches, to show the rebasing rather than assume it from two.
+plan
+SELECT count(*) FROM t UNION ALL SELECT sum(amount) FROM t UNION ALL SELECT max(amount) FROM t
+----
+Count t
+└── all
+Sum t.amount
+└── all
+Max t.amount
+└── all
+
+shape
+SELECT count(*) FROM t UNION ALL SELECT sum(amount) FROM t UNION ALL SELECT max(amount) FROM t
+----
+Union
+├── Row
+│   └── count = #0
+├── Row
+│   └── sum = #1
+└── Row
+    └── max = #2
+
+# A grouped branch beside an ungrouped one. This is the shape that turned up the latent bug:
+# `Groups` used to drive its group list from every answer the statement held, which was right
+# until a union put another branch's plans in the same list.
+plan
+SELECT category, count(*) FROM t GROUP BY category UNION ALL SELECT category, count(*) FROM u GROUP BY category
+----
+GroupBy t.category -> count
+└── all
+GroupBy u.category -> count
+└── all
+
+shape
+SELECT category, count(*) FROM t GROUP BY category UNION ALL SELECT category, count(*) FROM u GROUP BY category
+----
+Union
+├── Groups keys=[#0]
+│   ├── category = key
+│   └── count = group #0 else 0
+└── Groups keys=[#1]
+    ├── category = key
+    └── count = group #1 else 0
+
+# SQL names a union's columns after its first branch, whatever the others called theirs.
+shape
+SELECT count(*) AS n FROM t UNION ALL SELECT count(*) AS m FROM u
+----
+Union
+├── Row
+│   └── n = #0
+└── Row
+    └── m = #1
+
+## A join in a branch, which is the one path that rebases a join's own plan indices.
+#
+# A branch is lowered counting its plans from zero, so every branch after the first is moved
+# along the statement's flat list. A join names plans in two places - the sides that say which
+# keys are in it, and each cell's own - and a `side` is a position among those sides rather than
+# an index into the calls, so it must *not* move. An index left behind here is a wrong answer
+# with nothing in the result to show it, which is why this case exists.
+
+plan
+SELECT count(*) FROM t JOIN u ON t.category = u.category UNION ALL SELECT count(*) FROM t JOIN u ON t.country = u.country
+----
+Distinct t.category
+└── all
+Distinct u.category
+└── all
+Distinct t.country
+└── all
+Distinct u.country
+└── all
+
+shape
+SELECT count(*) FROM t JOIN u ON t.category = u.category UNION ALL SELECT count(*) FROM t JOIN u ON t.country = u.country
+----
+Union
+├── Join keys=(#0, #1)
+│   └── count = product(#0, #1)
+└── Join keys=(#2, #3)
+    └── count = product(#2, #3)
+
+# The same, where the second branch measures the second side: the cell's plan moves along with
+# the branch and its `side` stays where it is.
+shape
+SELECT count(*) FROM t a JOIN u b ON a.category = b.category UNION ALL SELECT max(d.amount) FROM t c JOIN u d ON c.category = d.category
+----
+Union
+├── Join keys=(#0, #1)
+│   └── count = product(#0, #1)
+└── Join keys=(#2, #3)
+    └── max = greatest(#4, #2)

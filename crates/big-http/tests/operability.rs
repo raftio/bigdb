@@ -252,6 +252,43 @@ fn a_token_that_does_not_reach_far_enough_is_a_403() {
     assert_eq!(send_with(addr, "POST", "/table/new", "", Some("secret")).status, 200);
 }
 
+/// **The role a `POST /sql` needs is the statement's, not the route's.**
+///
+/// The route is authorised as `read`, because most statements read. A statement that writes
+/// facts or changes the schema raises that floor, and this is the test that says which does
+/// which - it is also the reason `Sql` has a variant per kind rather than a flag somewhere.
+#[test]
+fn a_sql_statement_raises_the_role_the_route_asks_for() {
+    let (_dir, path) = token_file("ro read\nrw write\nsecret admin\n");
+    let addr = spawn(9, ServerConfig { auth: Auth::from_file(&path).unwrap(), ..config() });
+
+    // A schema change needs `admin`, the same power `POST /table/{t}` demands.
+    let r = send_with(addr, "POST", "/sql", "CREATE TABLE tx (n INT)", Some("rw"));
+    assert_eq!(r.status, 403, "{}", r.body);
+    assert!(r.body.contains("needs `admin`"), "{}", r.body);
+    assert_eq!(
+        send_with(addr, "POST", "/sql", "CREATE TABLE tx (n INT)", Some("secret")).status,
+        200
+    );
+
+    // An `INSERT` needs `write`, the same power `POST /table/{t}/import` demands - and no more
+    // than that, because it reaches nothing the import route does not.
+    let insert = "INSERT INTO tx (_record_id, n) VALUES (1, 5)";
+    let r = send_with(addr, "POST", "/sql", insert, Some("ro"));
+    assert_eq!(r.status, 403, "{}", r.body);
+    assert!(r.body.contains("needs `write`"), "{}", r.body);
+    assert_eq!(send_with(addr, "POST", "/sql", insert, Some("rw")).status, 200);
+
+    // A `SELECT` and a `DESCRIBE` both read, which the route's own floor already covers.
+    assert_eq!(send_with(addr, "POST", "/sql", "SELECT count(*) FROM tx", Some("ro")).status, 200);
+    assert_eq!(send_with(addr, "POST", "/sql", "DESCRIBE tx", Some("ro")).status, 200);
+    assert_eq!(send_with(addr, "POST", "/sql", "SHOW TABLES", Some("ro")).status, 200);
+    // A statement that does not translate is refused for what is wrong with it, and the refusal
+    // does not depend on the credential - a 400 rather than a 403.
+    let r = send_with(addr, "POST", "/sql", "DROP DATABASE d", Some("ro"));
+    assert_eq!(r.status, 400, "{}", r.body);
+}
+
 #[test]
 fn an_unknown_token_is_not_distinguishable_from_no_token() {
     let (_dir, path) = token_file("secret admin\n");

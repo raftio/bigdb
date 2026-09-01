@@ -99,7 +99,14 @@ Asks a running bigd. Every command below is exactly one of its routes; there is 
 mode and no --file, because a second query path is a path nobody tests. Start a daemon.
 
 Queries:
-  sql <statement>|-           one SELECT over one table, or CREATE TABLE
+  sql <statement>|-           one SELECT over one table, a write, or a schema change:
+                                INSERT INTO t (a, n) VALUES ('GB', 5)
+                                CREATE TABLE IF NOT EXISTS t (a TEXT, n INT)
+                                ALTER TABLE t ADD COLUMN b BIGINT, DROP COLUMN a
+                                DROP TABLE IF EXISTS t
+                                DESCRIBE t | SHOW TABLES | SHOW CREATE TABLE t
+                              An INSERT needs a write token; a schema change an
+                              admin one. Volume goes through `import`, not here.
   query <table> <call>|-      one PQL call
   records <table>             every record id, in order
       --after <id>              resume after this id

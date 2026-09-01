@@ -21,6 +21,9 @@
 mod common;
 
 mod clauses;
+mod introspect;
 mod joins;
 mod refusals;
+mod schema;
 mod shapes;
+mod writes;

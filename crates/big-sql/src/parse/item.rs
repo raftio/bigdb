@@ -31,6 +31,11 @@ impl Parser<'_> {
             Proj::Star
         } else if self.word_is("DISTINCT") {
             return Err(self.refuse(Refused::MultiDistinct));
+        } else if self.word_is("CASE") {
+            // Before the name is read, because `CASE` is a keyword rather than a column and
+            // reading it as one dies at `WHEN` with "expected FROM" - a syntax error about
+            // perfectly good SQL, which is the failure this crate exists to avoid.
+            return Err(self.refuse(Refused::Case));
         } else {
             let name = self.name("a column or an aggregate")?;
             // A qualified name is a column of a named table, never a function: `a.count(*)`
@@ -44,10 +49,13 @@ impl Parser<'_> {
                     from_aggregate = a.filter;
                     a.proj
                 }
-                // A bare name followed by `(` is a function this dialect does not have, and
-                // followed by an operator is arithmetic it does not evaluate.
+                // A bare name followed by `(` is a function this dialect does not have. Which
+                // refusal it earns depends on what was asked for: an aggregate with no fold
+                // behind it, a conversion between representations that do not convert, and a
+                // choice per record all have their own sentence, and a client that wrote one of
+                // them needs the reason rather than "no expressions here".
                 None if self.peek() == Some(&Tok::LParen) => {
-                    return Err(self.refuse(Refused::Expression))
+                    return Err(self.refuse_at(unsupported_call(&name.column), at))
                 }
                 // An operator or a `*` after a bare column is arithmetic, which this dialect
                 // does not evaluate. Caught here so it is refused as what it is rather than as
@@ -271,4 +279,38 @@ impl Which {
             return None;
         })
     }
+}
+
+/// Which refusal a function call in the select list earns.
+///
+/// **Named lists rather than "anything unknown is an expression".** Somebody who wrote
+/// `stddevPop(amount)` asked a real question, and what they need is why bit planes cannot
+/// answer it - not a sentence about there being no expression evaluator, which is true and
+/// unhelpful. A name on none of these lists falls through to [`Refused::Aggregate`], whose
+/// message names the aggregates that do exist, and that is the right sentence for `foo(x)` too.
+fn unsupported_call(name: &str) -> Refused {
+    /// Conversions between representations that do not convert.
+    const CASTS: [&str; 9] = [
+        "cast",
+        "convert",
+        "toInt64",
+        "toUInt64",
+        "toInt32",
+        "toUInt32",
+        "toString",
+        "toDate",
+        "toDateTime",
+    ];
+    /// Choosing between two values per record.
+    const CHOICES: [&str; 5] = ["if", "multiIf", "coalesce", "nullIf", "ifNull"];
+
+    if CASTS.iter().any(|c| name.eq_ignore_ascii_case(c)) {
+        return Refused::Cast;
+    }
+    if CHOICES.iter().any(|c| name.eq_ignore_ascii_case(c)) {
+        return Refused::Case;
+    }
+    // `argMin`, `stddevPop`, `corr`, `any` - and `foo`, which gets the same sentence because
+    // the list of aggregates that exist is what a caller needs either way.
+    Refused::Aggregate
 }

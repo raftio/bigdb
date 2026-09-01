@@ -76,7 +76,7 @@ pub use config::{ClusterConfig, ClusterFile, ConfigError, Node, ShardRange};
 pub use error::{ClusterError, Result};
 pub use wire::{Assignment, Ddl, FactValue, OwnedFact};
 
-use big_api::{Answer, Api, KeyAssignment, PagerMut, Plan, QueryOptions, RecordId, RowId, Value};
+use big_api::{Api, KeyAssignment, PagerMut, Plan, QueryOptions, RecordId, RowId, Value};
 use client::{ClientError, Repeatable};
 use controller::{Controller, Leases};
 use merge::Merge;
@@ -115,6 +115,8 @@ pub mod path {
     pub const DELETE: &str = "/internal/delete";
     pub const RECORDS: &str = "/internal/records";
     pub const INTERN: &str = "/internal/intern";
+    pub const ALLOCATE: &str = "/internal/allocate";
+    pub const NEXT_RECORD: &str = "/internal/next-record";
     pub const DDL: &str = "/internal/ddl";
     pub const DIGEST: &str = "/internal/digest";
     pub const RAFT: &str = "/internal/raft";
@@ -146,6 +148,16 @@ pub struct Cluster<P: PagerMut> {
     /// that is slow, refusing, or running a different build used to need a real server on a
     /// real port to exercise. See [`client::Peers`].
     peers: Arc<dyn Peers>,
+    /// The record ids this node has handed out and not yet seen land, per table.
+    ///
+    /// **Only the schema leader ever reads or writes this**, which is what makes one number in
+    /// memory enough. An allocation takes the greater of the highest id anywhere and this
+    /// floor: the first term keeps it above ids written explicitly or through the import route,
+    /// and the second keeps two allocations that have not yet been committed from meeting.
+    ///
+    /// Not persisted, and does not need to be. A leader that restarts re-derives the first term
+    /// from the data itself, and the floor only ever has to outlive the writes it is ahead of.
+    allocated: std::sync::Mutex<std::collections::BTreeMap<String, RecordId>>,
     /// The agreement, when there is anything to agree about.
     ///
     /// `None` when no range has a copy: a range of one cannot fail over to anything, so
@@ -214,7 +226,14 @@ impl<P: PagerMut + Sync> Cluster<P> {
         let controller = config
             .is_replicated()
             .then(|| Controller::start(&config, Arc::clone(&peers), store, timing, leases));
-        Self { config, api, peers, controller, counters: counters::Counters::new() }
+        Self {
+            config,
+            api,
+            peers,
+            controller,
+            counters: counters::Counters::new(),
+            allocated: Default::default(),
+        }
     }
 
     /// What an operator can see about this node's place in the cluster.
