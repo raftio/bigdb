@@ -55,7 +55,7 @@ fn schema() -> Vec<TableInfo> {
 /// One row per field, and the two numbers that are absent rather than zero.
 #[test]
 fn describing_a_table_is_one_row_per_field() {
-    let set = introspect::describe(&schema(), "tx").unwrap();
+    let set = introspect::describe(&schema(), &[], "tx").unwrap();
     assert_eq!(set.columns, ["name", "kind", "bit_depth", "scale", "granularity"]);
     assert_eq!(set.rows.len(), 4);
     assert_eq!(
@@ -75,21 +75,28 @@ fn describing_a_table_is_one_row_per_field() {
 
     // A table with no fields is a real thing here, and describes as no rows rather than an
     // error - `POST /table/{t}` creates exactly that.
-    assert!(introspect::describe(&schema(), "empty").unwrap().rows.is_empty());
-    assert_eq!(introspect::describe(&schema(), "nope").unwrap_err().code(), "unknown_table");
-    assert_eq!(introspect::show_create(&schema(), "nope").unwrap_err().code(), "unknown_table");
+    assert!(introspect::describe(&schema(), &[], "empty").unwrap().rows.is_empty());
+    assert_eq!(introspect::describe(&schema(), &[], "nope").unwrap_err().code(), "unknown_table");
+    assert_eq!(
+        introspect::show_create(&schema(), &[], "nope", false).unwrap_err().code(),
+        "unknown_table"
+    );
 }
 
 /// The listing, and the statement that recreates one table.
 #[test]
 fn the_catalog_lists_itself_and_writes_itself_back_out() {
-    let set = introspect::show_tables(&schema(), None);
-    assert_eq!(set.columns, ["name", "engine", "fields"]);
-    assert_eq!(set.rows[0][0], Datum::Text("tx".to_string()));
-    assert_eq!(set.rows[0][2], Datum::Int(4));
-    assert_eq!(set.rows[1][2], Datum::Int(0));
+    let set = introspect::show_tables(&schema(), &[], None);
+    // `type` says `BASE TABLE` or `VIEW`, which is what a JDBC driver asks for. Tables and
+    // views share one namespace, so they share one sorted listing - `empty` sorts before `tx`.
+    assert_eq!(set.columns, ["name", "type", "engine", "fields"]);
+    assert_eq!(set.rows[0][0], Datum::Text("empty".to_string()));
+    assert_eq!(set.rows[0][1], Datum::Text("BASE TABLE".to_string()));
+    assert_eq!(set.rows[0][3], Datum::Int(0));
+    assert_eq!(set.rows[1][0], Datum::Text("tx".to_string()));
+    assert_eq!(set.rows[1][3], Datum::Int(4));
 
-    let set = introspect::show_create(&schema(), "tx").unwrap();
+    let set = introspect::show_create(&schema(), &[], "tx", false).unwrap();
     assert_eq!(set.columns, ["statement"]);
     let Datum::Text(statement) = &set.rows[0][0] else { panic!("a statement is text") };
     // The native spelling of each kind, because that is the field that exists - `TEXT` and
@@ -105,7 +112,7 @@ fn the_catalog_lists_itself_and_writes_itself_back_out() {
     }
     // A table with no fields renders without a column list, which is the statement that
     // creates it.
-    let set = introspect::show_create(&schema(), "empty").unwrap();
+    let set = introspect::show_create(&schema(), &[], "empty", false).unwrap();
     let Datum::Text(statement) = &set.rows[0][0] else { panic!("a statement is text") };
     assert!(!statement.contains('('), "{statement}");
 }

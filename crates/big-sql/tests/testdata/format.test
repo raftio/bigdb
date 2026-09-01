@@ -70,7 +70,15 @@ Groups keys=[#0] format=tsv
 shape
 SELECT * FROM t LIMIT 10 FORMAT CSV
 ----
-Records column=_record_id limit=10 format=csv
+Table format=csv
+├── amount
+├── price scale=2
+├── balance
+├── category
+├── country
+├── device
+├── visit
+└── active
 
 # The plan is the same whichever way the answer is written.
 plan

@@ -205,6 +205,19 @@ fn every_schema_change_survives() {
         },
         wire::Ddl::DropTable { table: "sales.orders".to_string() },
         wire::Ddl::DropField { table: "sales.orders".to_string(), field: "amount".to_string() },
+        // A view carries a whole statement, which is the longest string on this wire and the
+        // only one holding quotes, spaces and a `*`. Qualified for the same reason a table is:
+        // the database it is created in is also the database its body resolves in.
+        wire::Ddl::CreateView {
+            view: "big".to_string(),
+            text: "SELECT amount, country AS cc FROM tx WHERE country = 'GB'".to_string(),
+        },
+        wire::Ddl::CreateView {
+            view: "sales.big".to_string(),
+            text: "SELECT amount FROM orders WHERE amount >= 500".to_string(),
+        },
+        wire::Ddl::DropView { view: "big".to_string() },
+        wire::Ddl::DropView { view: "sales.big".to_string() },
     ];
     for case in cases {
         assert_eq!(wire::Ddl::decode(&case.encode()).unwrap(), case);

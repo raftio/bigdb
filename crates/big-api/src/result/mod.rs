@@ -187,7 +187,7 @@ fn rows_of(shape: &Shape, values: &[Value], probes_at: usize) -> Vec<Row> {
             .map(|p| {
                 p.values
                     .iter()
-                    .zip(columns)
+                    .zip(columns.named())
                     .map(|(v, c)| Datum::projected(v, c.units.digits()))
                     .collect()
             })

@@ -34,10 +34,12 @@ pub mod fact;
 pub mod introspect;
 pub mod result;
 pub mod schema;
+pub mod views;
 
 pub use error::{ApiError, Result};
 pub use result::{fixed, one_cell, result_set, Datum, ResultSet, Row};
 pub use schema::{FieldInfo, TableInfo};
+pub use views::ViewInfo;
 
 // Everything below appears in a signature on this page, and a type a caller cannot name is a
 // type they cannot hold: `query` returns a `Value`, so a function that wraps `query` has no way
@@ -60,9 +62,9 @@ pub use big_plan::{Plan, Rows};
 // The SQL surface's two public shapes. `Shape` appears in the return type of `Api::sql`, so a
 // caller that renders an answer has to be able to name it.
 pub use big_sql::{
-    Absent, Answer, Ask, Cell, Cut, Format, GroupOrder, Having, JoinSide, Keying, Of, OrderBy,
-    Pairing, Probe as SqlProbe, Refused, Selected, Shape, Statement as SqlStatement, Threshold,
-    Units,
+    Absent, Answer, Ask, Cell, Columns, Cut, Format, GroupOrder, Having, JoinSide, Keying, Of,
+    OrderBy, Pairing, Probe as SqlProbe, Refused, Selected, Shape, Statement as SqlStatement,
+    Threshold, Units,
 };
 pub use big_sql::{
     Alter as SqlAlter, Column as SqlColumn, ColumnKind as SqlColumnKind, Ddl as SqlDdl,
@@ -561,6 +563,67 @@ impl<P: PagerMut + Sync> Api<P> {
         introspect::show_databases(&self.schema())
     }
 
+    /// Stores a `SELECT` under a name. **`Ok(false)` means nothing changed** - the name already
+    /// held this exact statement.
+    ///
+    /// Changed rather than created, because a replace changes what every statement reading
+    /// through the view means, and answering `0` for that would report the most consequential
+    /// form of this statement as a no-op.
+    ///
+    /// **The body is validated before it is stored.** Its shape was decided by the parser at
+    /// `CREATE VIEW`; what this adds is the half that needs a catalog - the table or view it
+    /// reads has to exist. A view over nothing is a statement that parses and cannot be read,
+    /// and finding that out at `CREATE` is the difference between a typo and a trap. It is also
+    /// what makes a cycle unrepresentable, since a view can only name what is already there.
+    pub fn create_view(&self, name: &str, body: &str, or_replace: bool) -> Result<bool> {
+        let base = {
+            let mut parsed = big_sql::parse(body)?;
+            // **In the view's own database, not the request's.** A view created as `sales.big`
+            // over a bare `orders` names `sales.orders`, and that is the table that has to
+            // exist - the same rule `views::body_of` applies when the view is later read. A
+            // check against the wrong database would refuse a legal view, or worse, accept one
+            // because a table of that name happened to exist somewhere else.
+            big_sql::qualify(&mut parsed, big_db::TableRef::parse(name).database);
+            let big_sql::Parsed::Query(q) = &parsed else {
+                return Err(ApiError::Sql(big_sql::SqlError::Refused {
+                    what: big_sql::Refused::ViewBody,
+                    at: 0,
+                }));
+            };
+            // One branch, one source: the parser refused a `UNION` and a `JOIN` already.
+            q.branches[0].from.qualified()
+        };
+        let catalog = self.db.catalog();
+        if catalog.lookup(&base).is_none() && catalog.lookup_saved_query(&base).is_none() {
+            return Err(ApiError::Db(big_db::DbError::UnknownTable(base)));
+        }
+        let unchanged = catalog.lookup_saved_query(name).is_some_and(|q| q.text == body);
+        drop(catalog);
+        self.db.create_view(name, body, or_replace)?;
+        Ok(!unchanged)
+    }
+
+    /// Forgets a view. `Ok(false)` means there was no such view.
+    pub fn drop_view(&self, name: &str) -> Result<bool> {
+        Ok(self.db.drop_view(name)?)
+    }
+
+    /// Every view this node holds, with the statement each carries.
+    pub fn views(&self) -> Vec<ViewInfo> {
+        let catalog = self.db.catalog();
+        catalog
+            .saved_queries()
+            .map(|q| ViewInfo {
+                database: catalog
+                    .database_name(q.database)
+                    .unwrap_or(big_sql::DEFAULT_DATABASE)
+                    .to_string(),
+                name: q.name.clone(),
+                text: q.text.clone(),
+            })
+            .collect()
+    }
+
     /// Removes a table, its fields, its row keys and the pages behind them.
     ///
     /// `Ok(false)` means there was no such table.
@@ -650,7 +713,10 @@ impl<P: PagerMut + Sync> Api<P> {
         text: &str,
         database: &str,
     ) -> Result<(Vec<Plan>, Vec<SqlProbe>, Answer)> {
-        match big_sql::translate_in(text, database)? {
+        // Through `Api::translate_in` and not `big_sql`'s, so a statement reading a view is
+        // expanded here too. The un-clustered path and the coordinator's have to answer the
+        // same question, and going straight to `big-sql` is how they would stop doing that.
+        match self.translate_in(text, database)? {
             big_sql::Sql::Query(s) => self.plan_statement(s),
             // The three statements that are not questions have no plan to resolve: a schema
             // change goes to the leader, an insert goes to the shard owners, and a listing is
@@ -665,22 +731,28 @@ impl<P: PagerMut + Sync> Api<P> {
         }
     }
 
-    /// `DESCRIBE t`: this node's fields for one table, as rows.
+    /// `DESCRIBE t`: this node's fields for one table, as rows - or, for a view, the columns it
+    /// exposes.
     ///
-    /// Over the snapshot rather than the catalog directly, which is what makes the three
-    /// listings pure functions - and testable with neither a pager nor a socket.
+    /// Over the snapshot rather than the catalog directly, which is what makes the listings
+    /// pure functions - and testable with neither a pager nor a socket.
     pub fn describe(&self, table: &str) -> Result<ResultSet> {
-        introspect::describe(&self.schema(), table)
+        introspect::describe(&self.schema(), &self.views(), table)
     }
 
-    /// `SHOW TABLES`: every table this node holds.
+    /// `SHOW TABLES`: every table and view this node holds.
     pub fn show_tables(&self) -> ResultSet {
-        introspect::show_tables(&self.schema(), None)
+        introspect::show_tables(&self.schema(), &self.views(), None)
     }
 
-    /// `SHOW CREATE TABLE t`: the statement that would recreate one table.
+    /// `SHOW VIEWS`: every view this node holds, with the statement each carries.
+    pub fn show_views(&self) -> ResultSet {
+        introspect::show_views(&self.views(), None)
+    }
+
+    /// `SHOW CREATE [TABLE | VIEW] t`: the statement that would recreate one object.
     pub fn show_create(&self, table: &str) -> Result<ResultSet> {
-        introspect::show_create(&self.schema(), table)
+        introspect::show_create(&self.schema(), &self.views(), table, false)
     }
 
     /// Parses and translates a statement without resolving it against the schema.
@@ -688,14 +760,23 @@ impl<P: PagerMut + Sync> Api<P> {
     /// The door a coordinator uses, because what to *do* with a statement depends on which kind
     /// it is: a query is planned here and fanned out, a schema change goes to the leader. Doing
     /// it in one place means neither caller decides that by looking at the text.
+    /// **Three steps rather than one call, because the middle one needs a catalog.** `big-sql`
+    /// parses `FROM v` as an ordinary source and never learns what a view is - that is what
+    /// keeps it schema-free. Substituting the statement a view holds happens here, on the parse
+    /// tree, between filling in the request's database and lowering. See [`crate::views`].
     pub fn translate_in(&self, text: &str, database: &str) -> Result<big_sql::Sql> {
-        Ok(big_sql::translate_in(text, database)?)
+        let mut parsed = big_sql::parse(text)?;
+        // Qualified first: an expansion looks a source up by `(database, name)`, and a name
+        // still carrying `None` would be looked up in the wrong one.
+        big_sql::qualify(&mut parsed, database);
+        views::expand(&mut parsed, &self.db.catalog())?;
+        Ok(big_sql::finish(parsed)?)
     }
 
     /// The same, against the default database. See [`Api::translate_in`] for the request-scoped
     /// form, which is what an edge with a `?database=` uses.
     pub fn translate(&self, text: &str) -> Result<big_sql::Sql> {
-        Ok(big_sql::translate(text)?)
+        self.translate_in(text, big_sql::DEFAULT_DATABASE)
     }
 
     /// Resolves an already-translated query. See [`Api::plan_sql`].

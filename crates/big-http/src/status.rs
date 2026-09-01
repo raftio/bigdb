@@ -143,7 +143,9 @@ fn db(e: &DbError) -> u16 {
         // The table is what a URI names, so a missing one is a missing resource. A database
         // names one the same way and answers the same, which is also what makes the two
         // distinguishable to a client: same status, different code.
-        DbError::UnknownTable(_) | DbError::UnknownDatabase(_) => 404,
+        // A view is a name a `FROM` resolves, so a missing one is a missing resource for the
+        // same reason a missing table is - and distinguishable by its code, not its status.
+        DbError::UnknownTable(_) | DbError::UnknownDatabase(_) | DbError::UnknownView(_) => 404,
         // A field is named in a body far more often than in a path - `/import` and `/query`
         // both do - so the error-derived answer is `422`. The two routes that *do* put a
         // field in the URI (`POST` and `DELETE` on `/table/{t}/field/{f}`) answer `404`
@@ -166,13 +168,21 @@ fn db(e: &DbError) -> u16 {
         // A `DROP DATABASE` that would have worked while the database was empty. Same shape as
         // the three above: the request is well formed, and what has to change is the state -
         // either drop the tables, or say `CASCADE` and mean it.
-        | DbError::DatabaseNotEmpty { .. } => 409,
+        | DbError::DatabaseNotEmpty { .. }
+        // Two more of the same shape: the statement was well formed and would have worked a
+        // moment earlier, so what has to change is the state - or the caller says
+        // `OR REPLACE` and means it.
+        | DbError::ViewRedefined(_)
+        | DbError::ViewNameTaken(_) => 409,
 
         DbError::WrongFieldKind { .. }
         | DbError::NameTooLong { .. }
         // Both are a name the caller typed that no name is allowed to be, which is the same
         // class as a name too long: the request has to change, not the state.
         | DbError::NameSeparator(_)
+        // A body past the ceiling a catalog record can hold. The same class as a name too
+        // long, and the same fix: the request has to change.
+        | DbError::ViewTooLong { .. }
         | DbError::DropDefaultDatabase
         // A name the caller typed and no engine has. `400`, like every other malformed value
         // in a statement.

@@ -56,9 +56,9 @@ fn every_answer_shape_comes_back_as_columns_and_rows() {
     let (_, body) = send(addr, "POST", "/sql", "SELECT count(DISTINCT country) FROM tx");
     assert_eq!(body, r#"{"columns":["count"],"rows":[[2]]}"#);
 
-    // `SELECT *` is record ids, under a column that says so.
+    // `SELECT *` is every column the table declares, in declaration order.
     let (_, body) = send(addr, "POST", "/sql", "SELECT * FROM tx WHERE country = 'GB'");
-    assert_eq!(body, r#"{"columns":["_record_id"],"rows":[[1],[3]]}"#);
+    assert_eq!(body, r#"{"columns":["amount","country"],"rows":[[100,"GB"],[500,"GB"]]}"#);
 }
 
 /// A ranking is cut by the plan, and `LIMIT` on an unranked grouping cuts the shape.
@@ -73,8 +73,9 @@ fn limit_applies_where_the_statement_put_it() {
     );
     assert_eq!(body, r#"{"columns":["country","n"],"rows":[["GB",2]]}"#);
 
+    // A `LIMIT` on `SELECT *` is the plan's cut, because the columns are read per record.
     let (_, body) = send(addr, "POST", "/sql", "SELECT * FROM tx LIMIT 2");
-    assert_eq!(body, r#"{"columns":["_record_id"],"rows":[[1],[2]]}"#);
+    assert_eq!(body, r#"{"columns":["amount","country"],"rows":[[100,"GB"],[900,"US"]]}"#);
 }
 
 /// Nothing matched is `null`, not zero: a minimum over an empty set is absent, and a result set
@@ -91,7 +92,7 @@ fn an_aggregate_over_nothing_answers_null() {
 /// there is `422` because the body is well formed and describes something absent.
 #[test]
 fn a_refusal_and_a_schema_mistake_get_different_statuses() {
-    let addr = stocked(6);
+    let addr = stocked(5);
 
     // A join on a keyed column is answered, so the refusal here is the pairing that has no
     // key, which is what a comma between tables is.
@@ -99,10 +100,6 @@ fn a_refusal_and_a_schema_mistake_get_different_statuses() {
     assert_eq!(status, 400);
     assert!(body.contains(r#""code":"sql_no_joins""#), "{body}");
     assert!(body.contains("comma between tables"), "{body}");
-
-    let (status, body) = send(addr, "POST", "/sql", "SELECT amount FROM tx");
-    assert_eq!(status, 400);
-    assert!(body.contains(r#""code":"sql_projection_unsupported""#), "{body}");
 
     let (status, body) = send(addr, "POST", "/sql", "DELETE FROM tx");
     assert_eq!(status, 400);
@@ -585,12 +582,12 @@ fn a_filtered_group_that_matched_nothing_is_zero_for_a_count_and_absent_for_a_su
 /// became part of the statement.
 ///
 /// A projection reconstructs a value per record per column out of the bit planes it is stored
-/// in, so the number of records **is** what it costs. That is why the `LIMIT` is required and
-/// why it lives in the plan rather than in the shape: a cut applied to the answer would be a
-/// cut applied after paying for it.
+/// in, so the number of records **is** what it costs. That is why the `LIMIT` lives in the plan
+/// rather than in the shape: a cut applied to the answer would be a cut applied after paying
+/// for it. Leaving the `LIMIT` out is a full scan, which is the caller having asked for one.
 #[test]
-fn stored_values_can_be_selected_under_a_limit() {
-    let addr = stocked(6);
+fn stored_values_can_be_selected_with_or_without_a_limit() {
+    let addr = stocked(7);
 
     // Records 1, 2, 3 hold 100, 900, 500, and come back in record order.
     let (status, body) = send(addr, "POST", "/sql", "SELECT amount FROM tx LIMIT 10");
@@ -614,11 +611,15 @@ fn stored_values_can_be_selected_under_a_limit() {
     assert_eq!(status, 200, "{body}");
     assert_eq!(body, r#"{"columns":["country"],"rows":[["GB"],["US"],["GB"]]}"#);
 
-    // Without a limit there is no bound on what it costs, so the statement is refused.
+    // No limit is every match, at the same price per record - the same three rows the explicit
+    // `LIMIT 10` above asked for, because there are only three.
     let (status, body) = send(addr, "POST", "/sql", "SELECT amount FROM tx");
-    assert_eq!(status, 400, "{body}");
-    assert!(body.contains(r#""code":"sql_projection_unsupported""#), "{body}");
-    assert!(body.contains("LIMIT"), "{body}");
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body, r#"{"columns":["amount"],"rows":[[100],[900],[500]]}"#);
+
+    // And the `WHERE` still decides which records are paid for.
+    let (_, body) = send(addr, "POST", "/sql", "SELECT amount FROM tx WHERE country = 'GB'");
+    assert_eq!(body, r#"{"columns":["amount"],"rows":[[100],[500]]}"#);
 
     // And a value beside a number about the whole set is two answers of different heights.
     let (status, _) = send(addr, "POST", "/sql", "SELECT amount, count(*) FROM tx LIMIT 10");
@@ -1059,9 +1060,11 @@ fn rows_written_by_a_statement_are_read_back_by_one() {
     assert_eq!(body, r#"{"columns":["count"],"rows":[[1]]}"#);
     let (_, body) = send(addr, "POST", "/sql", "SELECT sum(amount) FROM tx");
     assert_eq!(body, r#"{"columns":["sum"],"rows":[[1000]]}"#);
-    // The ids the statement named are the records that exist, because the id *is* the record.
+    // The records the statement named are the ones that exist, and `SELECT *` reads their
+    // columns back. The ids themselves are the record listing's answer - see
+    // `a_record_id_is_allocated_when_the_statement_does_not_name_one`.
     let (_, body) = send(addr, "POST", "/sql", "SELECT * FROM tx");
-    assert_eq!(body, r#"{"columns":["_record_id"],"rows":[[1],[2]]}"#);
+    assert_eq!(body, r#"{"columns":["amount","country"],"rows":[[100,"GB"],[900,"US"]]}"#);
     // Writing the same id again writes about the same record, exactly as two import lines do.
     assert_eq!(
         send(addr, "POST", "/sql", "INSERT INTO tx (_record_id, amount) VALUES (1, 700)").0,
@@ -1242,12 +1245,12 @@ fn the_catalog_answers_in_sql_what_the_schema_route_answers_in_json() {
     let (_, body) = send(addr, "POST", "/sql", "SHOW TABLES");
     assert_eq!(
         body,
-        r#"{"columns":["name","engine","fields"],"rows":[["t","bitmap+columnar",3]]}"#
+        r#"{"columns":["name","type","engine","fields"],"rows":[["t","BASE TABLE","bitmap+columnar",3]]}"#
     );
 
     // `FORMAT` is the same clause a `SELECT` takes, and means the same thing.
     let (_, body) = send(addr, "POST", "/sql", "SHOW TABLES FORMAT TSV");
-    assert_eq!(body, "t\tbitmap+columnar\t3\n");
+    assert_eq!(body, "t\tBASE TABLE\tbitmap+columnar\t3\n");
 
     let (status, body) = send(addr, "POST", "/sql", "DESCRIBE nope");
     assert_eq!(status, 404, "{body}");
@@ -1299,21 +1302,21 @@ fn a_record_id_is_allocated_when_the_statement_does_not_name_one() {
         send(addr, "POST", "/sql", "INSERT INTO t (n, country) VALUES (10, 'GB'), (20, 'US')");
     assert_eq!(status, 200, "{body}");
     assert_eq!(body, r#"{"columns":["inserted"],"rows":[[2]]}"#);
-    let (_, body) = send(addr, "POST", "/sql", "SELECT * FROM t");
-    assert_eq!(body, r#"{"columns":["_record_id"],"rows":[[0],[1]]}"#);
+    let (_, body) = send(addr, "GET", "/table/t/records", "");
+    assert_eq!(body, r#"{"records":[0,1],"next":null}"#);
 
     // The next statement carries on above them rather than starting again.
     assert_eq!(send(addr, "POST", "/sql", "INSERT INTO t (n) VALUES (30)").0, 200);
-    let (_, body) = send(addr, "POST", "/sql", "SELECT * FROM t");
-    assert_eq!(body, r#"{"columns":["_record_id"],"rows":[[0],[1],[2]]}"#);
+    let (_, body) = send(addr, "GET", "/table/t/records", "");
+    assert_eq!(body, r#"{"records":[0,1,2],"next":null}"#);
 
     // **Above an id written by hand, too.** Allocation is one past the highest that exists, not
     // a counter of its own - so a statement that names an id cannot be overwritten by one that
     // does not, whichever order they arrive in.
     assert_eq!(send(addr, "POST", "/sql", "INSERT INTO t (_record_id, n) VALUES (100, 40)").0, 200);
     assert_eq!(send(addr, "POST", "/sql", "INSERT INTO t (n) VALUES (50)").0, 200);
-    let (_, body) = send(addr, "POST", "/sql", "SELECT * FROM t");
-    assert_eq!(body, r#"{"columns":["_record_id"],"rows":[[0],[1],[2],[100],[101]]}"#);
+    let (_, body) = send(addr, "GET", "/table/t/records", "");
+    assert_eq!(body, r#"{"records":[0,1,2,100,101],"next":null}"#);
 
     // Each row is its own record: the values went where the ids say they did.
     let (_, body) = send(addr, "POST", "/sql", "SELECT count(*) FROM t WHERE country = 'GB'");

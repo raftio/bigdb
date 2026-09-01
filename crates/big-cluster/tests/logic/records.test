@@ -11,43 +11,43 @@ INSERT INTO tx (_record_id, amount, price, country, active) VALUES
   (3, 500, 3.00, 'GB', true),
   (4, 700, 7.75, 'FR', true)
 
-# `SELECT *` answers with the identity of each match and nothing else. This engine stores facts
-# as bits at `(row, record)` and has no row of values to hand back, so a column visibly called
-# by the record's own name is worth more than a table of values reconstructed at a point read
-# apiece.
+# `SELECT *` is every column the table declares, in the order the column list declared them.
+# The statement is written before anything knows the table, so both halves of the answer are
+# filled in against the schema: the plan reads the columns and the header names them, out of one
+# expansion so they cannot disagree.
 query
 SELECT * FROM tx
 ----
-_record_id
-1
-2
-3
-4
+amount  price  country  active
+100     1.50   GB       1
+900     12.25  US       0
+500     3.00   GB       1
+700     7.75   FR       1
 
 query
 SELECT * FROM tx WHERE country = 'GB'
 ----
-_record_id
-1
-3
+amount  price  country  active
+100     1.50   GB       1
+500     3.00   GB       1
 
 query
 SELECT * FROM tx WHERE active = true AND amount >= 500
 ----
-_record_id
-3
-4
+amount  price  country  active
+500     3.00   GB       1
+700     7.75   FR       1
 
 query
 SELECT * FROM tx LIMIT 2
 ----
-_record_id
-1
-2
+amount  price  country  active
+100     1.50   GB       1
+900     12.25  US       0
 
-# A projection does read values back, and carries a mandatory limit for it: a record's value in
-# a bit-sliced field is not stored anywhere as a number, so reconstructing it is one bit per
-# plane per record per column.
+# Reading values back is what it costs: a record's value in a bit-sliced field is not stored
+# anywhere as a number, so reconstructing it is one bit per plane per record per column. A
+# `LIMIT` bounds that, and without one the statement asks for every match.
 query
 SELECT amount FROM tx LIMIT 10
 ----
@@ -104,15 +104,17 @@ amount
 700
 NULL
 
+# A record that holds no value in a column is still a row of the answer: `SELECT *` is every
+# match, and an absent fact reads as nothing rather than dropping the record.
 query
 SELECT * FROM tx
 ----
-_record_id
-1
-2
-3
-4
-5
+amount  price  country  active
+100     1.50   GB       1
+900     12.25  US       0
+500     3.00   GB       1
+700     7.75   FR       1
+NULL    NULL   DE       NULL
 
 # The formats, which change the bytes and nothing about the answer. What this corpus checks is
 # the answer, so every one of them prints the same cells - the bytes are `big-http`'s to check,
@@ -138,5 +140,5 @@ US       1
 query
 SHOW TABLES FORMAT TSV
 ----
-name  engine           fields
-tx    bitmap+columnar  4
+name  type        engine           fields
+tx    BASE TABLE  bitmap+columnar  4

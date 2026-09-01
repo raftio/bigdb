@@ -19,14 +19,17 @@
 //!            | [WITH literal AS ident (',' literal AS ident)*] select
 //! create    := CREATE TABLE [IF NOT EXISTS] ident
 //!              ['(' column (',' column)* ')'] [ENGINE '=' engine]
+//!            | CREATE [OR REPLACE] VIEW [IF NOT EXISTS] ident AS body
+//! body      := SELECT bare-item (',' bare-item)* FROM source [WHERE cond]
+//! bare-item := ident [AS ident]   -- a view is a filter and a projection; see `check_view_body`
 //! alter     := ALTER TABLE ident change (',' change)*
 //! change    := ADD [COLUMN] column | DROP [COLUMN] ident
-//! drop      := DROP TABLE [IF EXISTS] ident
+//! drop      := DROP TABLE [IF EXISTS] ident | DROP VIEW [IF EXISTS] ident
 //! column    := ident type      -- see `Parser::column_type` for the type names
 //! insert    := INSERT [INTO] ident '(' ident (',' ident)* ')' VALUES tuple (',' tuple)*
 //! tuple     := '(' literal (',' literal)* ')'
 //! show      := (DESCRIBE | DESC) [TABLE] ident | SHOW COLUMNS FROM ident
-//!            | SHOW TABLES | SHOW CREATE [TABLE] ident       [FORMAT ident]
+//!            | SHOW TABLES | SHOW VIEWS | SHOW CREATE [TABLE | VIEW] ident   [FORMAT ident]
 //! select    := SELECT list FROM source [JOIN source ON name '=' name]
 //!              [PREWHERE cond] [WHERE cond] [GROUP BY name] [HAVING having]
 //!              [ORDER BY order] [LIMIT n [WITH TIES]] [OFFSET n] [FORMAT ident]
@@ -85,7 +88,14 @@ pub enum Parsed {
 /// Parses one statement, refusing anything this engine does not answer.
 pub fn parse(input: &str) -> Result<Parsed> {
     let tokens = lex(input)?;
-    let mut p = Parser { t: &tokens, i: 0, end: input.len(), depth: 0, bound: Default::default() };
+    let mut p = Parser {
+        t: &tokens,
+        i: 0,
+        src: input,
+        end: input.len(),
+        depth: 0,
+        bound: Default::default(),
+    };
 
     // The leading keyword decides which of three things happened, and only one of them is a
     // syntax error. A `DELETE` is a statement this surface refuses; a `foo` is not a statement.
@@ -155,6 +165,13 @@ pub fn parse(input: &str) -> Result<Parsed> {
 struct Parser<'a> {
     t: &'a [Token],
     i: usize,
+    /// The statement as it was written.
+    ///
+    /// Held for exactly one clause: a `CREATE VIEW` stores its body as **text**, and the text is
+    /// this sliced from the token after `AS` to the end. Every `Token` already carries its byte
+    /// offset, so the slice costs nothing to find - and re-serialising the parsed body instead
+    /// would mean a `SELECT` renderer, which is a second dialect to keep in step with this one.
+    src: &'a str,
     /// Byte length of the input, which is where "end of statement" points.
     end: usize,
     depth: usize,

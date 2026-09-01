@@ -49,12 +49,29 @@ impl Parser<'_> {
             }
             return Ok(crate::ddl::Ddl::CreateDatabase { name, if_not_exists });
         }
+        // `OR REPLACE` comes before the object word, which is where every dialect puts it.
+        let or_replace = if self.word_is("OR") {
+            self.i += 1;
+            self.expect_word("REPLACE", "REPLACE after OR")?;
+            true
+        } else {
+            false
+        };
+        if self.word_is("VIEW") {
+            self.i += 1;
+            return self.create_view(or_replace);
+        }
         if !self.word_is("TABLE") {
-            // Every other `CREATE` is refused by name, and the one that has its own sentence
-            // says it: nothing here stores a statement.
-            if self.word_is("VIEW") || self.word_is("MATERIALIZED") {
-                return Err(self.refuse(Refused::View));
+            // A materialised view is the one other `CREATE` with a sentence of its own: what it
+            // asks for is a table plus a write path, not a name for a statement.
+            if self.word_is("MATERIALIZED") {
+                return Err(self.refuse(Refused::MaterializedView));
             }
+            return Err(self.refuse(Refused::Write));
+        }
+        if or_replace {
+            // `CREATE OR REPLACE TABLE` would drop and recreate, which is `DROP TABLE` wearing a
+            // gentler word. It is refused where every other unbuilt write is.
             return Err(self.refuse(Refused::Write));
         }
         self.i += 1;
@@ -80,6 +97,87 @@ impl Parser<'_> {
             return Err(self.syntax("the end of the statement"));
         }
         Ok(crate::ddl::Ddl::CreateTable { database, table, engine, columns, if_not_exists })
+    }
+
+    /// `CREATE [OR REPLACE] VIEW [IF NOT EXISTS] <name> AS <select>`, with `VIEW` consumed.
+    ///
+    /// The body is **parsed to validate it and then thrown away**: what is stored is the source
+    /// slice. Parsing here is what makes a malformed or unsupported body fail at `CREATE` rather
+    /// than at the first read, which is the whole difference between a view that was never
+    /// created and one that is a trap for whoever reads it next.
+    fn create_view(&mut self, or_replace: bool) -> Result<crate::ddl::Ddl> {
+        let if_not_exists = self.if_exists(true)?;
+        // Both at once is two opposite answers to one situation - replace what is there, or
+        // leave what is there - so it is a syntax error rather than a precedence rule nobody
+        // would remember.
+        if or_replace && if_not_exists {
+            return Err(self.syntax("only one of OR REPLACE and IF NOT EXISTS"));
+        }
+        let (database, name) = self.table_ref("a view name")?;
+        self.expect_word("AS", "AS before the view's SELECT")?;
+        // Where the body starts, in the original text. Taken before anything is consumed, so it
+        // points at the `SELECT` and not past it.
+        let from = self.at();
+        if !self.word_is("SELECT") {
+            return Err(self.syntax("SELECT after AS"));
+        }
+        self.i += 1;
+        let select = self.select()?;
+        self.check_view_body(&select)?;
+        if self.peek().is_some() {
+            // A `UNION` lands here, and so does anything else after the body. Both are the same
+            // answer: a view is one `SELECT`.
+            return Err(self.refuse(Refused::ViewBody));
+        }
+        let body = self.src[from..].trim().to_string();
+        Ok(crate::ddl::Ddl::CreateView { database, name, body, or_replace, if_not_exists })
+    }
+
+    /// Refuses a view body that is not a filter and a projection over one table.
+    ///
+    /// Every clause here is refused for one reason, stated once: **a view is inlined into the
+    /// statement that reads it.** The base table replaces the view's name, the two `WHERE`s are
+    /// ANDed, and the reader's columns are renamed through this select list. A clause that
+    /// cannot survive that substitution is a clause whose answer would have to exist before the
+    /// outer statement ran - which is a materialised view, and a different feature.
+    fn check_view_body(&self, select: &crate::ast::Select) -> Result<()> {
+        use crate::ast::Proj;
+        // Ordered so the first thing wrong is the thing reported, outermost clause first.
+        let bad = !select.joins.is_empty()
+            || !select.group_by.is_empty()
+            || select.having.is_some()
+            || select.order_by.is_some()
+            || select.limit.is_some()
+            || select.offset.is_some()
+            || select.format != crate::shape::Format::default()
+            || select.items.is_empty()
+            || select.items.iter().any(|item| {
+                // A per-entry `FILTER` narrows one aggregate, and there are no aggregates here.
+                item.filter.is_some()
+                    // `*` is every column the table has *at the time it is read*, and a view is
+                    // stored as text and re-planned at every read - so a body written with one
+                    // would silently start exposing a column added to the table years later. A
+                    // view names what it exposes.
+                    || !matches!(&item.proj, Proj::Column(name) if name.qualifier.is_none())
+            });
+        if bad {
+            return Err(self.refuse_at(Refused::ViewBody, self.view_body_at(select)));
+        }
+        Ok(())
+    }
+
+    /// Byte offset to point a [`Refused::ViewBody`] at: the offending select-list entry when it
+    /// is one, and the start of the body otherwise.
+    fn view_body_at(&self, select: &crate::ast::Select) -> usize {
+        use crate::ast::Proj;
+        select
+            .items
+            .iter()
+            .find(|item| {
+                item.filter.is_some()
+                    || !matches!(&item.proj, Proj::Column(name) if name.qualifier.is_none())
+            })
+            .map_or_else(|| self.at(), |item| item.at)
     }
 
     /// `IF [NOT] EXISTS`, or nothing.

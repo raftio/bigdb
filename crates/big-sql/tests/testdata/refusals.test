@@ -147,18 +147,6 @@ SELECT count(*) FROM t WHERE amount = NULL
 ----
 sql_no_nulls
 
-## A projection reads values back at a point read per record per column, so it needs a limit.
-
-error
-SELECT amount FROM t
-----
-sql_projection_unsupported
-
-error
-SELECT amount, price FROM t
-----
-sql_projection_unsupported
-
 error
 SELECT *, count(*) FROM t
 ----
@@ -308,20 +296,32 @@ SELECT count(*) FROM sales.orders.extra
 ----
 sql_ambiguous_column
 
-error
-CREATE VIEW v AS SELECT count(*) FROM t
-----
-sql_no_views
+## A plain view is answered now - see `view.test`. What is still refused is the materialised
+## half, which is not a name for a statement but a table plus a promise to keep it current.
 
 error
 CREATE MATERIALIZED VIEW v AS SELECT count(*) FROM t
 ----
-sql_no_views
+sql_no_materialized_views
 
 error
-DROP VIEW v
+DROP MATERIALIZED VIEW v
 ----
-sql_no_views
+sql_no_materialized_views
+
+error
+ALTER MATERIALIZED VIEW v REFRESH
+----
+sql_no_materialized_views
+
+## `ALTER VIEW` is not among them either, and gets the ordinary write refusal: a view carries a
+## name and a statement, and `CREATE OR REPLACE VIEW` says the statement - so there is nothing
+## left for an `ALTER` to reach.
+
+error
+ALTER VIEW v AS SELECT a FROM t
+----
+sql_read_only
 
 error
 CREATE INDEX i ON t (a)

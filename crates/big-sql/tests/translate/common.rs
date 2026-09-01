@@ -70,6 +70,20 @@ impl Schema for Stub {
             _ => return None,
         })
     }
+
+    /// The order a column list would have declared them in, which is the order `SELECT *`
+    /// answers in. Written out rather than derived from the match above, because that match is
+    /// a lookup and this is an ordering - and the corpus asserts the ordering.
+    fn fields(&self, table: &str) -> Vec<String> {
+        if !self.has_table(table) {
+            return Vec::new();
+        }
+        ["amount", "price", "balance", "category", "country", "device", "visit", "active"]
+            .iter()
+            .filter(|f| self.field_class(table, f).is_some())
+            .map(|f| (*f).to_string())
+            .collect()
+    }
 }
 
 /// A cell whose number comes out of a field, which is what carries that field's scale out to

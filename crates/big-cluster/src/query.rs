@@ -91,6 +91,14 @@ impl<P: PagerMut + Sync> Cluster<P> {
             big_api::SqlDdl::DropTable { database, table, if_exists } => {
                 ("dropped", self.sql_drop_table(&qualified(database, table), *if_exists)?)
             }
+            big_api::SqlDdl::CreateView { database, name, body, or_replace, if_not_exists } => (
+                "view",
+                self.create_view(&qualified(database, name), body, *or_replace, *if_not_exists)?
+                    .into(),
+            ),
+            big_api::SqlDdl::DropView { database, name, if_exists } => {
+                ("dropped", self.sql_drop_view(&qualified(database, name), *if_exists)?)
+            }
         };
         Ok((big_api::one_cell(column, big_api::Datum::Int(changed.into())), Format::default()))
     }
@@ -144,6 +152,20 @@ impl<P: PagerMut + Sync> Cluster<P> {
             return Err(local(big_db::DbError::UnknownTable(table.to_string())));
         }
         self.drop_table(table).map(u64::from)
+    }
+
+    /// `DROP VIEW`, answering with how many it dropped.
+    ///
+    /// `IF EXISTS` is answered here and answered first, the way `DROP TABLE`'s is: a view that
+    /// is not there is a request already satisfied.
+    fn sql_drop_view(&self, view: &str, if_exists: bool) -> Result<u64> {
+        if !self.api.views().iter().any(|v| v.qualified() == view) {
+            if if_exists {
+                return Ok(0);
+            }
+            return Err(local(big_db::DbError::UnknownView(view.to_string())));
+        }
+        self.drop_view(view).map(u64::from)
     }
 
     /// `CREATE DATABASE`, answering with how many it created - one, or nothing when it was
@@ -386,16 +408,28 @@ impl<P: PagerMut + Sync> Cluster<P> {
     /// `DESCRIBE` and `SHOW`, answered out of this node's catalog - which is every node's.
     fn sql_show(&self, show: &big_api::SqlShow) -> Result<(ResultSet, Format)> {
         let schema = self.schema();
+        // This node's own views, for the same reason the schema is this node's own: a listing
+        // is read out of the catalog every node holds, and a schema change reached all of them
+        // before it was answered.
+        let views = self.api.views();
         let set = match &show.what {
             big_api::SqlShown::Columns { database, table } => {
-                big_api::introspect::describe(&schema, &qualified(database, table))
+                big_api::introspect::describe(&schema, &views, &qualified(database, table))
             }
             big_api::SqlShown::Tables { database } => {
-                Ok(big_api::introspect::show_tables(&schema, database.as_deref()))
+                Ok(big_api::introspect::show_tables(&schema, &views, database.as_deref()))
+            }
+            big_api::SqlShown::Views { database } => {
+                Ok(big_api::introspect::show_views(&views, database.as_deref()))
             }
             big_api::SqlShown::Databases => Ok(big_api::introspect::show_databases(&schema)),
-            big_api::SqlShown::Create { database, table } => {
-                big_api::introspect::show_create(&schema, &qualified(database, table))
+            big_api::SqlShown::Create { database, table, view } => {
+                big_api::introspect::show_create(
+                    &schema,
+                    &views,
+                    &qualified(database, table),
+                    *view,
+                )
             }
         };
         Ok((set.map_err(ClusterError::Local)?, show.format))

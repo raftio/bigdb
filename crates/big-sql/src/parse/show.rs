@@ -53,6 +53,14 @@ impl Parser<'_> {
             };
             return Ok(Shown::Tables { database });
         }
+        if self.eat_word("VIEWS") {
+            let database = if self.eat_word("FROM") || self.eat_word("IN") {
+                Some(self.bare_ident("a database name")?)
+            } else {
+                None
+            };
+            return Ok(Shown::Views { database });
+        }
         if self.eat_word("DATABASES") || self.eat_word("SCHEMAS") || self.eat_word("DATASETS") {
             return Ok(Shown::Databases);
         }
@@ -62,13 +70,19 @@ impl Parser<'_> {
             return Ok(Shown::Columns { database, table });
         }
         if self.eat_word("CREATE") {
-            self.eat_word("TABLE");
-            let (database, table) = self.table_ref("a table name")?;
-            return Ok(Shown::Create { database, table });
+            // Neither word is required. `SHOW CREATE x` looks the name up as either, which is
+            // what somebody exploring means by it; naming the kind is how they say that a table
+            // under that name would be the wrong answer.
+            let view = self.eat_word("VIEW");
+            if !view {
+                self.eat_word("TABLE");
+            }
+            let (database, table) = self.table_ref("a table or view name")?;
+            return Ok(Shown::Create { database, table, view });
         }
         // `SHOW INDEX`, `SHOW GRANTS`, `SHOW PROCESSLIST`: each is a surface of its own, and
         // none of them is one this statement can grow by accident.
-        Err(self.syntax("TABLES, DATABASES, COLUMNS FROM a table, or CREATE TABLE"))
+        Err(self.syntax("TABLES, VIEWS, DATABASES, COLUMNS FROM a table, or CREATE TABLE"))
     }
 
     /// The trailing `FORMAT <name>`, or the default.

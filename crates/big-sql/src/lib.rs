@@ -65,14 +65,14 @@ pub mod shape;
 pub mod show;
 
 pub use ast::{Query, Select};
-pub use ddl::{Alter, Column, ColumnKind, Ddl};
+pub use ddl::{Alter, Column, ColumnKind, Ddl, MAX_VIEW_DEPTH};
 pub use error::{Refused, Result, SqlError};
 pub use insert::{Insert, MAX_INSERT_ROWS, RECORD_COLUMN};
-pub use lower::{lower, Ask, Probe, Statement, MAX_CALLS, MAX_PROJECTION};
+pub use lower::{lower, Ask, Probe, Statement, MAX_CALLS};
 pub use parse::{parse, Parsed};
 pub use shape::{
-    Absent, Answer, Cell, Cut, Format, GroupOrder, Having, JoinSide, Keying, Of, OrderBy, Pairing,
-    Selected, Shape, Threshold, Units,
+    Absent, Answer, Cell, Columns, Cut, Format, GroupOrder, Having, JoinSide, Keying, Of, OrderBy,
+    Pairing, Selected, Shape, Threshold, Units,
 };
 pub use show::{Show, Shown};
 
@@ -131,26 +131,49 @@ pub fn translate(text: &str) -> Result<Sql> {
 /// the common case still carries the bare name somebody wrote.
 pub fn translate_in(text: &str, database: &str) -> Result<Sql> {
     let mut parsed = parse(text)?;
-    // A request against the default database is left exactly as written. Not an optimisation:
-    // an unqualified name already resolves in the default database, so filling it in would
-    // change every name in the common case to say what it already meant.
-    if database != DEFAULT_DATABASE {
-        match &mut parsed {
-            Parsed::Query(q) => {
-                for select in &mut q.branches {
-                    select.from.database.get_or_insert_with(|| database.to_string());
-                    for join in &mut select.joins {
-                        join.source.database.get_or_insert_with(|| database.to_string());
-                    }
+    qualify(&mut parsed, database);
+    finish(parsed)
+}
+
+/// Fills in the database every name in a parse tree did not carry.
+///
+/// Public because the step after it is not always [`finish`]. A caller holding a catalog expands
+/// views between the two - a view is a name that is not a table, which only a catalog knows -
+/// and it has to run against names that are already qualified, or a view in `sales` and a table
+/// in `sales` would be looked up under different databases.
+///
+/// A request against the default database is left exactly as written. Not an optimisation: an
+/// unqualified name already resolves in the default database, so filling it in would change
+/// every name in the common case to say what it already meant.
+///
+/// A name the statement qualified itself is untouched: `sales.orders` in a request against `ops`
+/// means `sales`.
+pub fn qualify(parsed: &mut Parsed, database: &str) {
+    if database == DEFAULT_DATABASE {
+        return;
+    }
+    match parsed {
+        Parsed::Query(q) => {
+            for select in &mut q.branches {
+                select.from.database.get_or_insert_with(|| database.to_string());
+                for join in &mut select.joins {
+                    join.source.database.get_or_insert_with(|| database.to_string());
                 }
             }
-            Parsed::Insert(i) => {
-                i.database.get_or_insert_with(|| database.to_string());
-            }
-            Parsed::Show(s) => s.what.fill_database(database),
-            Parsed::Ddl(d) => d.fill_database(database),
         }
+        Parsed::Insert(i) => {
+            i.database.get_or_insert_with(|| database.to_string());
+        }
+        Parsed::Show(s) => s.what.fill_database(database),
+        Parsed::Ddl(d) => d.fill_database(database),
     }
+}
+
+/// Lowers a parse tree whose names are already whatever they are going to be.
+///
+/// The half of [`translate_in`] after [`qualify`], split out so a caller that has to do
+/// something in between - expanding a view - runs the same lowering rather than its own.
+pub fn finish(parsed: Parsed) -> Result<Sql> {
     Ok(match parsed {
         Parsed::Query(q) => Sql::Query(lower(&q)?),
         Parsed::Insert(i) => Sql::Insert(i),

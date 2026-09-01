@@ -32,9 +32,18 @@ fn describing_a_table_has_four_spellings_and_one_meaning() {
         assert_eq!(show(sql).what, columns, "{sql}");
     }
     assert_eq!(show("SHOW TABLES").what, Shown::Tables { database: None });
-    let create = Shown::Create { database: None, table: "events".to_string() };
+    assert_eq!(show("SHOW VIEWS").what, Shown::Views { database: None });
+    let create = Shown::Create { database: None, table: "events".to_string(), view: false };
     assert_eq!(show("SHOW CREATE TABLE events").what, create);
+    // Neither word is required, and a bare `SHOW CREATE` looks the name up as either - which is
+    // the same question, so it is the same `Shown`.
     assert_eq!(show("SHOW CREATE events").what, create);
+    // `VIEW` is not decoration: it says a table under that name is the wrong object rather than
+    // the answer, which the layer holding a catalog is what acts on.
+    assert_eq!(
+        show("SHOW CREATE VIEW events").what,
+        Shown::Create { database: None, table: "events".to_string(), view: true }
+    );
 }
 
 /// `FORMAT` is about the bytes and nothing else, which is why it is the same clause a `SELECT`

@@ -163,7 +163,8 @@ fn combine(plan: &Plan, node: &str, a: Value, b: Value) -> Result<Value> {
         // Each owner was asked for the whole page, because the first `limit` records overall
         // can all live on one node. The merge is what makes that page the right one: the two
         // lists interleave by record id and the cut happens once, here, after every owner has
-        // contributed.
+        // contributed. A plan with no limit has no cut to make - every owner's whole answer is
+        // the answer.
         (Plan::Project { limit, .. }, Value::Table(x), Value::Table(y)) => {
             Value::Table(big_exec::merge_projected(x, y, *limit))
         }

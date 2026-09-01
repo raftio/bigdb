@@ -41,10 +41,23 @@ pub mod kind {
     /// it carries a zero in the word that now names its database - which is
     /// `big_db::catalog::DEFAULT_DATABASE`, the database such a table has always been in.
     pub const DATABASE: u8 = 7;
+    /// A `SELECT` kept under a name - what SQL calls a view, and what this layer calls a saved
+    /// query because [`VIEW`] is already taken and means a bitmap partition by time quantum.
+    ///
+    /// The header: id, database and name, laid out exactly as a table record is. The statement
+    /// itself does not fit in a record and follows in [`SAVED_QUERY_TEXT`] chunks.
+    pub const SAVED_QUERY: u8 = 8;
+    /// One 104-byte slice of a saved query's statement, under the same id as its header.
+    ///
+    /// **The first payload in this format that spans records.** A record is a fixed width, and
+    /// a `SELECT` is not, so the text is cut into chunks and reassembled on load. A chunk
+    /// boundary falls wherever it falls, including mid-character, which is why the bytes are
+    /// joined before they are validated as UTF-8 rather than one record at a time.
+    pub const SAVED_QUERY_TEXT: u8 = 9;
 }
 
 /// Every kind, so adding one without checking it against the others is not possible.
-pub const ALL_KINDS: [u8; 7] = [
+pub const ALL_KINDS: [u8; 9] = [
     kind::TABLE,
     kind::FIELD,
     kind::VIEW,
@@ -52,6 +65,8 @@ pub const ALL_KINDS: [u8; 7] = [
     kind::FRAGMENT,
     kind::SEQ,
     kind::DATABASE,
+    kind::SAVED_QUERY,
+    kind::SAVED_QUERY_TEXT,
 ];
 
 // Distinctness, checked at compile time. Two crates allocate out of this space and cannot see

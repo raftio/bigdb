@@ -104,7 +104,14 @@ use std::time::{Duration, Instant};
 /// `sales.orders` in its own single namespace. That is the same class of failure as a
 /// misaligned byte and worse to find: both nodes would report success, and the tables would be
 /// in different places. The schema exchange carries the database for the same reason.
-pub const WIRE_VERSION: u32 = 3;
+///
+/// `4` since a view is a schema object: `Ddl` gained two tags and the schema exchange gained a
+/// section. A `3` node handed a `CreateView` answers `BadTag` - a clean refusal rather than a
+/// misread, because a tag it has never seen is the one thing this encoding checks first. The
+/// bump is still made: the exchange's new section is a shape change, and a mixed-version
+/// cluster where half the nodes silently lack a view is a cluster answering two different
+/// questions depending on which node a client reaches.
+pub const WIRE_VERSION: u32 = 4;
 
 /// The header carrying [`WIRE_VERSION`].
 pub const WIRE_HEADER: &str = "x-big-wire";

@@ -104,7 +104,9 @@ fn shape_kids(shape: &Shape) -> Vec<Line<'_>> {
     match shape {
         Shape::Row { cells } => cells.iter().map(|c| Line::Text(cell(c, &[]))).collect(),
         Shape::Records { .. } => Vec::new(),
-        Shape::Table { columns } => columns.iter().map(|c| Line::Text(selected(c))).collect(),
+        Shape::Table { columns } => {
+            columns.named().iter().map(|c| Line::Text(selected(c))).collect()
+        }
         Shape::Union { branches } => branches.iter().map(Line::Shape).collect(),
         // A join's sides are named by position in its own keys, so its cells are the only ones
         // that need them to print. The other two pass nothing, which is what they hold.
@@ -302,6 +304,26 @@ pub fn ddl(ddl: &Ddl) -> String {
                 if *if_exists { " if_exists" } else { "" }
             )
         }
+        Ddl::CreateView { database, name, body, or_replace, if_not_exists } => {
+            let mut out = format!(
+                "CreateView {}{}{}",
+                qualified(database, name),
+                if *or_replace { " or_replace" } else { "" },
+                if *if_not_exists { " if_not_exists" } else { "" },
+            );
+            // The body on its own line, as stored. A corpus case then shows the exact string
+            // that goes to disk and comes back to be re-parsed, which is the thing worth
+            // pinning: a change to how the slice is taken shows up here as a diff.
+            write_lines(&mut out, &[Line::Text(body.clone())], "");
+            out
+        }
+        Ddl::DropView { database, name, if_exists } => {
+            format!(
+                "DropView {}{}",
+                qualified(database, name),
+                if *if_exists { " if_exists" } else { "" }
+            )
+        }
     }
 }
 
@@ -362,8 +384,14 @@ pub fn show(show: &Show) -> String {
             Some(d) => format!("Tables {d}"),
             None => "Tables".to_string(),
         },
+        Shown::Views { database } => match database {
+            Some(d) => format!("Views {d}"),
+            None => "Views".to_string(),
+        },
         Shown::Databases => "Databases".to_string(),
-        Shown::Create { database, table } => format!("Create {}", qualified(database, table)),
+        Shown::Create { database, table, view } => {
+            format!("Create {}{}", qualified(database, table), if *view { " view" } else { "" })
+        }
     };
     match show.format {
         f if f == Format::default() => what,

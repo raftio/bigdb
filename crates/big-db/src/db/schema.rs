@@ -75,7 +75,10 @@ impl<P: PagerMut> Db<P> {
         let mut w = self.write();
         let Some(id) = w.catalog.database(name) else { return Ok(false) };
 
-        let held = w.catalog.table_count(id);
+        // A view counts as something held, for the reason `Catalog::drop_database` states: a
+        // `DROP DATABASE` that was `RESTRICT` about tables and `CASCADE` about views would be
+        // two rules wearing one word.
+        let held = w.catalog.table_count(id) + w.catalog.saved_query_count(id);
         if held > 0 && !cascade {
             return Err(DbError::DatabaseNotEmpty { database: name.to_string(), tables: held });
         }
@@ -87,7 +90,51 @@ impl<P: PagerMut> Db<P> {
             let Some(keys) = w.catalog.drop_table(id, table) else { continue };
             w.discard(&keys)?;
         }
+        let views: Vec<String> = w.catalog.saved_queries_in(id).map(|q| q.name.clone()).collect();
+        for view in &views {
+            // No `discard`: a view owns no pages. It is the one drop here with nothing to free.
+            w.catalog.drop_saved_query(id, view);
+        }
         let dropped = w.catalog.drop_database(name).is_some();
+        w.commit()?;
+        Ok(dropped)
+    }
+
+    /// Stores a `SELECT` under a name - what SQL calls `CREATE VIEW`.
+    ///
+    /// **This layer does not read the statement.** What a body may contain is a question about
+    /// the dialect and it is answered where the dialect lives, in `big-sql`'s parser; whether
+    /// the table it names exists is a question the caller has already asked. Here it is a
+    /// string, checked only for length and for a name a table already holds.
+    ///
+    /// `replace` is `CREATE OR REPLACE`. Without it a name already holding a *different*
+    /// statement is [`DbError::ViewRedefined`]; an identical one is idempotent either way.
+    pub fn create_view<'a>(
+        &self,
+        name: impl Into<TableRef<'a>>,
+        text: &str,
+        replace: bool,
+    ) -> Result<QueryId> {
+        let name = name.into();
+        let mut w = self.write();
+        // The database has to exist first, for the reason `create_table_with` states.
+        let database = w.catalog.database_of(name)?;
+        let id = w.catalog.intern_saved_query(database, name.table, text, replace)?;
+        w.commit()?;
+        Ok(id)
+    }
+
+    /// Forgets a view. `Ok(false)` means there was no such view.
+    ///
+    /// The one drop in this module that frees nothing: a view owns no fragments, so there are
+    /// no keys to hand to [`DbWrite::discard`] and no pages to return to the freelist. What it
+    /// costs is the records the statement was written in, which the next commit reclaims like
+    /// any other catalog change.
+    pub fn drop_view<'a>(&self, name: impl Into<TableRef<'a>>) -> Result<bool> {
+        let name = name.into();
+        let mut w = self.write();
+        let database = w.catalog.database_of(name)?;
+        let dropped = w.catalog.drop_saved_query(database, name.table);
         w.commit()?;
         Ok(dropped)
     }

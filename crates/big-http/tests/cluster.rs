@@ -281,10 +281,11 @@ fn sql_is_answered_across_nodes_and_merged() {
         r#"{"columns":["count"],"rows":[[3]]}"#
     );
 
-    // Record ids come back from both owners, in order.
+    // `SELECT *` reads every column back on each owner, and the rows interleave by record id
+    // when the two answers are merged - record 1 lives on one node and `WIDTH + 1` on the other.
     assert_eq!(
         ok(b, "POST", "/sql", "SELECT * FROM tx WHERE country = 'GB'"),
-        format!("{{\"columns\":[\"_record_id\"],\"rows\":[[1],[{}]]}}", WIDTH + 1)
+        r#"{"columns":["amount","country"],"rows":[[100,"GB"],[300,"GB"]]}"#
     );
 }
 

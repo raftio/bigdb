@@ -15,7 +15,7 @@
 //! What a statement lowers to: the calls, and the shape that reads their answers.
 
 use super::common::*;
-use big_sql::{Selected, Units};
+use big_sql::{Columns, Selected, Units};
 
 /// The six questions the analytical benchmark asks, in both languages.
 ///
@@ -60,10 +60,12 @@ fn the_aggregates_and_their_shapes() {
         translate("SELECT count(DISTINCT category) FROM t").unwrap().answer.shape,
         Shape::Row { cells: vec![Cell::plain("count".to_string(), Of::Groups { plan: 0 })] }
     );
+    // `SELECT *` is unexpanded here: translation sees no schema, and only a schema knows what
+    // the star came to. The limit rides along for the fall back to a record listing, which is
+    // what a table with nothing readable resolves to.
     assert_eq!(
         translate("SELECT * FROM t WHERE active = true LIMIT 10").unwrap().answer.shape,
-        // The record's own name, underscored so that `id` stays free for a field.
-        Shape::Records { column: big_sql::RECORD_COLUMN.to_string(), limit: Some(10) }
+        Shape::Table { columns: Columns::All { table: "t".to_string(), limit: Some(10) } }
     );
     assert_eq!(
         translate("SELECT category, count(*) FROM t GROUP BY category").unwrap().answer.shape,
@@ -131,7 +133,7 @@ fn a_projection_carries_its_cut_in_the_plan() {
     assert_eq!(
         translate("SELECT amount AS a, price FROM t LIMIT 5").unwrap().answer.shape,
         Shape::Table {
-            columns: vec![
+            columns: Columns::Named(vec![
                 Selected {
                     column: "a".to_string(),
                     units: Units::Written { table: "t".to_string(), field: "amount".to_string() },
@@ -140,7 +142,7 @@ fn a_projection_carries_its_cut_in_the_plan() {
                     column: "price".to_string(),
                     units: Units::Written { table: "t".to_string(), field: "price".to_string() },
                 },
-            ],
+            ]),
         }
     );
     // The two spellings of the cut must not both apply: the shape has no limit of its own.

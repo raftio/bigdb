@@ -42,6 +42,9 @@ impl Schema for Fake {
     fn field_class(&self, table: &str, field: &str) -> Option<FieldClass> {
         self.0.iter().find(|((t, f), _)| *t == table && *f == field).map(|(_, c)| *c)
     }
+    fn fields(&self, table: &str) -> Vec<String> {
+        self.0.keys().filter(|(t, _)| *t == table).map(|(_, f)| (*f).to_string()).collect()
+    }
 }
 
 fn planned(text: &str) -> Result<Plan> {

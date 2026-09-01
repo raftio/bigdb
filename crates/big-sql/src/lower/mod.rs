@@ -38,14 +38,6 @@ use big_plan::ast::{Call, Expr};
 /// denial of service; `avg` costs two, which is the case worth knowing about.
 pub const MAX_CALLS: usize = 16;
 
-/// How many records one projection may read.
-///
-/// **A bound on the point reads, not a taste in page sizes.** A projection reconstructs a value
-/// per record per column, and the number of records is the whole of what it costs. Ten thousand
-/// is a page a client can hold and a cost a node can absorb; past that the answer wants a
-/// cursor, which is what `GET /table/{t}/records` is for.
-pub const MAX_PROJECTION: usize = 10_000;
-
 mod cond;
 mod grouped;
 mod join;

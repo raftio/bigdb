@@ -33,13 +33,23 @@
 //! lands in the closed set [`ColumnKind`] so that the layer applying it matches exhaustively
 //! rather than re-parsing a string.
 
+/// How deep a view may be nested inside another before the expansion is refused.
+///
+/// **A bound on the statement a `FROM` becomes, not a taste in schemas.** A view is expanded by
+/// substitution, so a view over a view over a view is one statement with three filters ANDed
+/// together and three rounds of column renaming. Eight is past anything a schema arrives at on
+/// purpose and short of anything that makes an expansion expensive.
+///
+/// A cycle cannot be built - `CREATE VIEW` requires what it names to exist already - so this is
+/// the belt to that braces, and it also bounds the recursion for a file some other tool wrote.
+pub const MAX_VIEW_DEPTH: usize = 8;
+
 /// A schema change written in SQL.
 ///
-/// Three variants, and each was a decision of its own rather than a family filled in: a table
-/// is created, its fields are added and dropped, or the table goes. Everything else `CREATE`
-/// and `ALTER` can say in SQL is still refused by name - a database, a view, an index, a
-/// column's type - because a surface that grew them by accident would be a surface nobody
-/// chose.
+/// Each variant was a decision of its own rather than a family filled in: a database, a table,
+/// its fields, a view. Everything else `CREATE` and `ALTER` can say in SQL is still refused by
+/// name - an index, a materialised view, a column's type - because a surface that grew them by
+/// accident would be a surface nobody chose.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Ddl {
     /// `CREATE DATABASE [IF NOT EXISTS] <name>`, also spelled `SCHEMA` and `DATASET`.
@@ -117,6 +127,51 @@ pub enum Ddl {
         /// nothing dropped rather than with an error.
         if_exists: bool,
     },
+    /// `CREATE [OR REPLACE] VIEW [IF NOT EXISTS] <name> AS <select>`.
+    ///
+    /// # What a body may be, and why it is that little
+    ///
+    /// A filter and a projection over one table, and nothing else. A view here is **inlined**
+    /// into the statement that reads it - the base table replaces the view's name, the two
+    /// `WHERE`s are ANDed, and the outer statement's columns are renamed through the body's
+    /// select list. There is no subquery below this crate to nest one in, so a body that groups
+    /// or aggregates has nothing to become: its answer would have to exist before the outer
+    /// statement ran, which is the materialised half.
+    ///
+    /// The parser enforces that ([`crate::Refused::ViewBody`]), so it costs no schema and every
+    /// case is reachable by the corpus.
+    CreateView {
+        /// `sales` in `sales.v`. `None` means the request's default database.
+        database: Option<String>,
+        name: String,
+        /// The `SELECT`, sliced from the statement exactly as it was written.
+        ///
+        /// **Text, not the parsed body.** It is re-parsed at every read, which is what keeps one
+        /// place deciding what a name means - and it is what `SHOW CREATE VIEW` answers with.
+        /// Storing the tree would also mean writing a `SELECT` renderer, which is a second
+        /// dialect to keep in step with the parser.
+        body: String,
+        /// `OR REPLACE`: a name already holding a different statement is overwritten rather than
+        /// refused.
+        or_replace: bool,
+        /// `IF NOT EXISTS`: a name already holding a statement is left exactly as it is.
+        ///
+        /// Not the same as `OR REPLACE` and not a spelling of it - they are opposite answers to
+        /// the same situation. Writing both is refused where they are parsed.
+        if_not_exists: bool,
+    },
+    /// `DROP VIEW [IF EXISTS] <name>`.
+    ///
+    /// Cheap in a way `DROP TABLE` is not: a view owns no pages, so this forgets a name and a
+    /// string and frees nothing. It is still `admin`, because what it breaks is every statement
+    /// that was reading through it.
+    DropView {
+        /// `sales` in `sales.v`. `None` means the request's default database.
+        database: Option<String>,
+        name: String,
+        /// `IF EXISTS`: a view that is not there is a request already satisfied.
+        if_exists: bool,
+    },
 }
 
 impl Ddl {
@@ -129,7 +184,12 @@ impl Ddl {
         match self {
             Self::CreateTable { database: d, .. }
             | Self::AlterTable { database: d, .. }
-            | Self::DropTable { database: d, .. } => {
+            | Self::DropTable { database: d, .. }
+            // A view is *in* a database the way a table is, so it takes the request's. What its
+            // body resolves in is a different question with a different answer - the view's own
+            // database, applied where the body is parsed rather than here.
+            | Self::CreateView { database: d, .. }
+            | Self::DropView { database: d, .. } => {
                 d.get_or_insert_with(|| database.to_string());
             }
             Self::CreateDatabase { .. } | Self::DropDatabase { .. } => {}

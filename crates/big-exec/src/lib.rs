@@ -194,6 +194,13 @@ impl Schema for CatalogSchema<'_> {
         self.0.lookup(table).is_some_and(|t| t.engine.has_columns())
     }
 
+    /// In field-id order, which is the order the fields were declared in - so `SELECT *` on a
+    /// table built by a column list answers in the order that list was written.
+    fn fields(&self, table: &str) -> Vec<String> {
+        let Some(t) = self.0.lookup(table) else { return Vec::new() };
+        self.0.fields_of(t.id).map(|f| f.name.clone()).collect()
+    }
+
     /// Storage kinds collapse to the three classes a planner can tell apart. A decimal is an
     /// integer as far as `>` is concerned, and a mutex is a keyed field that happens to allow
     /// only one value at a time - a distinction the storage layer enforces on write, not one
@@ -316,13 +323,14 @@ pub fn execute<P: Pager + Sync>(db: &DbRead<'_, P>, plan: &Plan) -> Result<Value
 
         // The one arm that reads values back. Bounded by the plan's own limit rather than by a
         // shape applied afterwards: a projection's cost is a point read per record per column,
-        // so the cut has to happen before the reads, not after them.
+        // so the cut has to happen before the reads, not after them. No limit is a full scan,
+        // which is the caller having asked for one - see [`Plan::Project`].
         Plan::Project { rows, fields, limit, .. } => {
             let matched = eval(db, table, rows)?;
             let plans: Vec<ColumnPlan> =
                 fields.iter().map(|f| ColumnPlan::of(db, table, f)).collect();
             let mut out = Vec::new();
-            for record in matched.records_from(0).take(*limit) {
+            for record in matched.records_from(0).take(limit.unwrap_or(usize::MAX)) {
                 let mut values = Vec::with_capacity(fields.len());
                 for (field, how) in fields.iter().zip(&plans) {
                     values.push(how.read(db, table, field, record)?);
@@ -475,11 +483,19 @@ fn key_order(g: &Group) -> (bool, Option<&str>, RowId) {
 /// implementations of one ordering would be two answers depending on how many nodes were asked.
 /// A record lives on one node, so an id appearing twice is a duplicate rather than a row to
 /// combine, and the first of them is kept.
-pub fn merge_projected(mut a: Vec<Projected>, b: Vec<Projected>, limit: usize) -> Vec<Projected> {
+pub fn merge_projected(
+    mut a: Vec<Projected>,
+    b: Vec<Projected>,
+    limit: Option<usize>,
+) -> Vec<Projected> {
     a.extend(b);
     a.sort_by_key(|p| p.record);
     a.dedup_by_key(|p| p.record);
-    a.truncate(limit);
+    // Nothing to truncate to where the plan carried no cut: each node already read every match
+    // it owns, and the page is all of them.
+    if let Some(limit) = limit {
+        a.truncate(limit);
+    }
     a
 }
 

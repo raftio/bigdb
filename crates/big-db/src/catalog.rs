@@ -29,6 +29,15 @@ pub type TableId = u32;
 pub type FieldId = u32;
 pub type ViewId = u32;
 
+/// A saved query - what SQL calls a view.
+///
+/// **Not [`ViewId`], and the distance between those two names is deliberate.** A [`ViewId`] is a
+/// bitmap partition by time quantum, one component of a [`FragmentKey`], and it has meant that
+/// since before there was a SQL surface at all. A `QueryId` names a `SELECT` kept under a name.
+/// The two would sit one field apart in [`Catalog`] and share every prefix, so this layer does
+/// not use the word "view" for the SQL one anywhere - only `big-sql` and the wire do.
+pub type QueryId = u32;
+
 // The numbers themselves live in `big-page`, next to the record layout, because `big-keys`
 // writes into the same stream and neither crate can see the other's constants.
 pub const KIND_TABLE: u8 = kind::TABLE;
@@ -37,6 +46,8 @@ pub const KIND_VIEW: u8 = kind::VIEW;
 pub const KIND_FRAGMENT: u8 = kind::FRAGMENT;
 pub const KIND_SEQ: u8 = kind::SEQ;
 pub const KIND_DATABASE: u8 = kind::DATABASE;
+pub const KIND_SAVED_QUERY: u8 = kind::SAVED_QUERY;
+pub const KIND_SAVED_QUERY_TEXT: u8 = kind::SAVED_QUERY_TEXT;
 
 const NAME_AT: usize = 24;
 
@@ -46,6 +57,19 @@ const NAME_AT: usize = 24;
 /// same budget as `big_keys::MAX_KEY_LEN`. Truncating merges two different names into one and,
 /// when the cut lands inside a character, destroys the entry outright on the next reload.
 pub const MAX_NAME_LEN: usize = CATALOG_ENTRY_BYTES - NAME_AT;
+
+/// How much of a saved query's statement one record carries. The same 104 bytes a name gets,
+/// for the same reason: it is what is left of the record after the header words.
+const TEXT_CHUNK_BYTES: usize = CATALOG_ENTRY_BYTES - NAME_AT;
+
+/// Longest statement a saved query may hold, in bytes.
+///
+/// A ceiling rather than no limit, because the whole catalog is re-encoded whenever a commit
+/// dirties it (`DbWrite::commit`). Text is rewritten on schema commits and not on data ones -
+/// `set_catalog` compares before it dirties - but an unbounded body would still make one DDL
+/// commit arbitrarily expensive. 4 KiB is forty records, and it is a longer `SELECT` than this
+/// surface can express.
+pub const MAX_VIEW_BYTES: usize = 4096;
 
 /// The database a table is in when nobody said which, and the one every table written before
 /// databases existed is in.
@@ -214,6 +238,28 @@ pub struct FieldDef {
     pub granularity: Vec<Granularity>,
 }
 
+/// A `SELECT` kept under a name, in the database that name is unique within.
+///
+/// The statement is stored **as it was written** and re-parsed at every read, rather than stored
+/// as the calls it lowers to. Two reasons, and both are the same reason: `big-sql`'s output is
+/// the query language, re-planned at each read so exactly one place knows what a name means. A
+/// stored plan would freeze a resolution the schema can move under, and would leave
+/// `SHOW CREATE VIEW` with nothing to print.
+///
+/// This is the first catalog object whose payload does not fit in one record, which is what
+/// [`kind::SAVED_QUERY_TEXT`] exists for.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct SavedQuery {
+    pub id: QueryId,
+    /// The namespace [`SavedQuery::name`] is unique within - and, crucially, the database an
+    /// unqualified name **in the body** resolves in. A view created in `sales` over a bare
+    /// `orders` means `sales.orders` however the request that reads it was addressed.
+    pub database: DatabaseId,
+    pub name: String,
+    /// The `SELECT`, from the first token after `AS` to the end of the statement.
+    pub text: String,
+}
+
 /// Per fragment, because the same field legitimately has different depths in different shards.
 /// That is fragment independence working as intended, and it is why any protocol exchanging a
 /// partial BSI result has to carry the depth with it.
@@ -272,6 +318,12 @@ pub struct Catalog {
     field_ids: BTreeMap<TableId, BTreeMap<String, FieldId>>,
     views: BTreeMap<ViewId, String>,
     view_ids: BTreeMap<String, ViewId>,
+    /// SQL views. Named for what they hold rather than for what SQL calls them, because `views`
+    /// is the field directly above and means something else entirely - see [`QueryId`].
+    saved_queries: BTreeMap<QueryId, SavedQuery>,
+    /// Nested by database for the reason `table_ids` is: a lookup probes with `&str` and
+    /// allocates nothing.
+    saved_query_ids: BTreeMap<DatabaseId, BTreeMap<String, QueryId>>,
     fragments: BTreeMap<FragmentKey, FragmentMeta>,
     /// Id high-water marks, persisted rather than derived.
     ///
@@ -289,6 +341,7 @@ struct Sequences {
     database: DatabaseId,
     table: TableId,
     view: ViewId,
+    saved_query: QueryId,
     /// Per table, because field ids are scoped to their table.
     field: BTreeMap<TableId, FieldId>,
 }
@@ -299,6 +352,7 @@ impl Default for Sequences {
             database: FIRST_NAMED_DATABASE,
             table: 0,
             view: FIRST_NAMED_VIEW,
+            saved_query: 0,
             field: BTreeMap::new(),
         }
     }
@@ -310,6 +364,7 @@ mod seq_of {
     pub const VIEW: u8 = 1;
     pub const FIELD: u8 = 2;
     pub const DATABASE: u8 = 3;
+    pub const SAVED_QUERY: u8 = 4;
 }
 
 /// Panics rather than truncating if a name got this far over-long: every public entry point
@@ -439,6 +494,34 @@ impl Catalog {
         self.tables.get(&id)
     }
 
+    /// A saved query by database and name.
+    pub fn saved_query(&self, database: DatabaseId, name: &str) -> Option<&SavedQuery> {
+        self.saved_query_ids
+            .get(&database)
+            .and_then(|by_name| by_name.get(name))
+            .and_then(|id| self.saved_queries.get(id))
+    }
+
+    /// A saved query by its qualified string name, the way [`Catalog::lookup`] finds a table.
+    ///
+    /// The pair of them is how a name is classified: a name is a table, or a view, or neither.
+    /// Nothing prevents a caller asking both, and [`Catalog::intern_saved_query`] is what keeps
+    /// the answer from ever being "both".
+    pub fn lookup_saved_query(&self, name: &str) -> Option<&SavedQuery> {
+        let r = TableRef::parse(name);
+        self.saved_query(self.database(r.database)?, r.table)
+    }
+
+    /// Every saved query in one database, in id order - which is creation order.
+    pub fn saved_queries_in(&self, database: DatabaseId) -> impl Iterator<Item = &SavedQuery> {
+        self.saved_queries.values().filter(move |q| q.database == database)
+    }
+
+    /// Every saved query, for a listing that spans databases.
+    pub fn saved_queries(&self) -> impl Iterator<Item = &SavedQuery> {
+        self.saved_queries.values()
+    }
+
     /// Every table, by id. The only way to enumerate a schema without knowing a name first,
     /// which is what a tool inspecting a file has to do.
     pub fn tables(&self) -> impl Iterator<Item = &TableDef> {
@@ -519,12 +602,16 @@ impl Catalog {
             return None;
         }
         let id = *self.database_ids.get(name)?;
-        if self.tables_in(id).next().is_some() {
+        // A view counts toward emptiness. It owns no pages, so this one *could* be swallowed
+        // here - but then `DROP DATABASE` would be `RESTRICT` about tables and `CASCADE` about
+        // views, which is a rule nobody could hold in their head.
+        if self.tables_in(id).next().is_some() || self.saved_queries_in(id).next().is_some() {
             return None;
         }
         self.database_ids.remove(name);
         self.databases.remove(&id);
         self.table_ids.remove(&id);
+        self.saved_query_ids.remove(&id);
         Some(id)
     }
 
@@ -551,6 +638,11 @@ impl Catalog {
         engine: TableEngine,
     ) -> Result<TableId> {
         check_name(name)?;
+        // The other half of the rule `intern_saved_query` states: one namespace, so a `FROM`
+        // never has two things to choose between.
+        if self.saved_query(database, name).is_some() {
+            return Err(DbError::ViewNameTaken(name.to_string()));
+        }
         if let Some(id) = self.table_ids.get(&database).and_then(|by_name| by_name.get(name)) {
             let existing = self.tables[id].engine;
             return if existing == engine {
@@ -568,6 +660,80 @@ impl Catalog {
         self.tables.insert(id, TableDef { id, name: name.to_string(), engine, database });
         self.table_ids.entry(database).or_default().insert(name.to_string(), id);
         Ok(id)
+    }
+
+    /// Stores a `SELECT` under a name, replacing an existing one only when asked.
+    ///
+    /// **A view and a table may not share a name in one database.** Both are things a `FROM`
+    /// resolves, so a name that was both would resolve to whichever the lookup happened to try
+    /// first - and a `DROP TABLE` would then change what a statement naming neither of them
+    /// meant. Refused in both directions: this refuses a name a table holds, and
+    /// [`Catalog::intern_table_with`]'s caller refuses one a view holds.
+    ///
+    /// `replace` is `CREATE OR REPLACE VIEW`. Without it a second definition is
+    /// [`DbError::ViewRedefined`] rather than a silent overwrite, and *without* either the
+    /// caller wanting `IF NOT EXISTS` checks first - the same shape `intern_table_with` has.
+    pub fn intern_saved_query(
+        &mut self,
+        database: DatabaseId,
+        name: &str,
+        text: &str,
+        replace: bool,
+    ) -> Result<QueryId> {
+        check_name(name)?;
+        if text.len() > MAX_VIEW_BYTES {
+            return Err(DbError::ViewTooLong {
+                view: name.to_string(),
+                bytes: text.len(),
+                max: MAX_VIEW_BYTES,
+            });
+        }
+        if self.table(database, name).is_some() {
+            return Err(DbError::ViewNameTaken(name.to_string()));
+        }
+        if let Some(id) = self.saved_query_ids.get(&database).and_then(|m| m.get(name)).copied() {
+            let existing = &self.saved_queries[&id];
+            // An identical redefinition is idempotent for the reason an identical `CREATE TABLE`
+            // is: there is no second declaration for it to contradict.
+            if existing.text == text {
+                return Ok(id);
+            }
+            if !replace {
+                return Err(DbError::ViewRedefined(name.to_string()));
+            }
+            // Replacing keeps the id. Nothing below the catalog is keyed on it - a view owns no
+            // fragments - but a listing that renumbered on every redefinition would be noise.
+            self.saved_queries.insert(
+                id,
+                SavedQuery { id, database, name: name.to_string(), text: text.to_string() },
+            );
+            return Ok(id);
+        }
+        let id = self.seq.saved_query;
+        self.seq.saved_query += 1;
+        self.saved_queries.insert(
+            id,
+            SavedQuery { id, database, name: name.to_string(), text: text.to_string() },
+        );
+        self.saved_query_ids.entry(database).or_default().insert(name.to_string(), id);
+        Ok(id)
+    }
+
+    /// Forgets a saved query. `false` means there was no such view.
+    ///
+    /// The only drop in this file that returns no [`FragmentKey`]s, because a view owns no pages:
+    /// it is a name and a string, and forgetting it frees exactly the records it was written in.
+    pub fn drop_saved_query(&mut self, database: DatabaseId, name: &str) -> bool {
+        let Some(id) = self.saved_query_ids.get_mut(&database).and_then(|m| m.remove(name)) else {
+            return false;
+        };
+        self.saved_queries.remove(&id);
+        true
+    }
+
+    /// How many saved queries a database holds, which is what a `RESTRICT` refusal has to count.
+    pub fn saved_query_count(&self, database: DatabaseId) -> usize {
+        self.saved_queries_in(database).count()
     }
 
     pub fn intern_view(&mut self, name: &str) -> Result<ViewId> {
@@ -800,6 +966,30 @@ impl Catalog {
             put_name(&mut b, name);
             out.push(b);
         }
+        for q in self.saved_queries.values() {
+            // The header, laid out exactly as a table record is - id, database, name - plus the
+            // total text length, which is what lets the decoder tell a complete set of chunks
+            // from a torn one.
+            let mut b = vec![0u8; CATALOG_ENTRY_BYTES];
+            b[0] = KIND_SAVED_QUERY;
+            b[4..8].copy_from_slice(&q.id.to_le_bytes());
+            b[8..12].copy_from_slice(&q.database.to_le_bytes());
+            b[12..16].copy_from_slice(&(q.text.len() as u32).to_le_bytes());
+            put_name(&mut b, &q.name);
+            out.push(b);
+            // Then the statement, cut wherever 104 bytes falls - including mid-character. The
+            // decoder joins before it validates, which is the whole reason `put_name` is not
+            // used here.
+            for (i, chunk) in q.text.as_bytes().chunks(TEXT_CHUNK_BYTES).enumerate() {
+                let mut b = vec![0u8; CATALOG_ENTRY_BYTES];
+                b[0] = KIND_SAVED_QUERY_TEXT;
+                b[2..4].copy_from_slice(&(chunk.len() as u16).to_le_bytes());
+                b[4..8].copy_from_slice(&q.id.to_le_bytes());
+                b[8..12].copy_from_slice(&(i as u32).to_le_bytes());
+                b[NAME_AT..NAME_AT + chunk.len()].copy_from_slice(chunk);
+                out.push(b);
+            }
+        }
         for f in self.fields.values() {
             let mut b = vec![0u8; CATALOG_ENTRY_BYTES];
             b[0] = KIND_FIELD;
@@ -844,6 +1034,7 @@ impl Catalog {
             (seq_of::TABLE, 0, self.seq.table),
             (seq_of::VIEW, 0, self.seq.view),
             (seq_of::DATABASE, 0, self.seq.database),
+            (seq_of::SAVED_QUERY, 0, self.seq.saved_query),
         ];
         out.extend(self.seq.field.iter().map(|(t, n)| (seq_of::FIELD, *t, *n)));
         out
@@ -861,6 +1052,13 @@ impl Catalog {
     pub fn from_entries(entries: &[Vec<u8>]) -> crate::error::Result<Self> {
         let mut c = Self::new();
         c.keys = KeyStore::from_entries(entries);
+
+        // A saved query is the one object here assembled from several records, so its headers
+        // and its text are collected as the entries go past and joined once at the end. Keyed
+        // by `(id, chunk)` so a `BTreeMap` puts the pieces back in order whatever order they
+        // were written in.
+        let mut query_headers: BTreeMap<QueryId, (DatabaseId, String, usize)> = BTreeMap::new();
+        let mut query_text: BTreeMap<(QueryId, u32), Vec<u8>> = BTreeMap::new();
 
         for e in entries {
             if e.len() < CATALOG_ENTRY_BYTES {
@@ -902,6 +1100,17 @@ impl Catalog {
                     let (id, Some(name)) = (rd32(4), get_name(e)) else { continue };
                     c.view_ids.insert(name.clone(), id);
                     c.views.insert(id, name);
+                }
+                KIND_SAVED_QUERY => {
+                    let (id, Some(name)) = (rd32(4), get_name(e)) else { continue };
+                    query_headers.insert(id, (rd32(8), name, rd32(12) as usize));
+                }
+                KIND_SAVED_QUERY_TEXT => {
+                    let n = u16::from_le_bytes(e[2..4].try_into().unwrap()) as usize;
+                    if n > TEXT_CHUNK_BYTES {
+                        continue;
+                    }
+                    query_text.insert((rd32(4), rd32(8)), e[NAME_AT..NAME_AT + n].to_vec());
                 }
                 KIND_FIELD => {
                     let Some(name) = get_name(e) else { continue };
@@ -951,11 +1160,38 @@ impl Catalog {
                             *slot = (*slot).max(value);
                         }
                         seq_of::DATABASE => c.seq.database = c.seq.database.max(value),
+                        seq_of::SAVED_QUERY => c.seq.saved_query = c.seq.saved_query.max(value),
                         _ => {}
                     }
                 }
                 _ => {}
             }
+        }
+
+        // The saved queries, reassembled. Three ways a set can be wrong and all three end the
+        // same way - the view is skipped, per the policy this function's doc states, because a
+        // half-decoded `SELECT` is a statement nobody wrote.
+        for (id, (database, name, len)) in query_headers {
+            let mut bytes = Vec::with_capacity(len);
+            for ((_, _), chunk) in query_text.range((id, 0)..=(id, u32::MAX)) {
+                bytes.extend_from_slice(chunk);
+            }
+            // A chunk missing from the middle or lost off the end. The header's length is the
+            // only thing that can tell, which is why it is written.
+            if bytes.len() != len {
+                continue;
+            }
+            // Joined first, validated once: a chunk boundary falls mid-character often enough
+            // that validating per record would reject ordinary text.
+            let Ok(text) = String::from_utf8(bytes) else { continue };
+            // A name a table in the same database already holds. Not reachable through this
+            // crate's own writers, which refuse it in both directions, so this is about a file
+            // somebody else produced.
+            if c.table(database, &name).is_some() {
+                continue;
+            }
+            c.saved_query_ids.entry(database).or_default().insert(name.clone(), id);
+            c.saved_queries.insert(id, SavedQuery { id, database, name, text });
         }
 
         // A file written before `KIND_SEQ` existed carries no counters, so derive them the way
@@ -968,6 +1204,8 @@ impl Catalog {
             .seq
             .database
             .max(c.databases.keys().next_back().map_or(FIRST_NAMED_DATABASE, |m| m + 1));
+        c.seq.saved_query =
+            c.seq.saved_query.max(c.saved_queries.keys().next_back().map_or(0, |m| m + 1));
         for (table, field) in c.fields.keys() {
             let slot = c.seq.field.entry(*table).or_insert(0);
             *slot = (*slot).max(field + 1);

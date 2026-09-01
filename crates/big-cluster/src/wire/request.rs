@@ -524,11 +524,16 @@ impl KeysBody {
     }
 }
 
-/// The schema, as one node holds it.
+/// The schema, as one node holds it: its tables, then its views.
 ///
 /// Carried so that a repair can make a copy's schema match before it tries to make its bits
 /// match: a fragment cannot land on a node that has never heard of the field it belongs to.
-pub fn put_schema(out: &mut Vec<u8>, tables: &[big_api::TableInfo]) {
+///
+/// **Views are in the exchange even though they hold no bits**, because a repaired node that
+/// lacked one would refuse a statement its peers answer - and which node a client reached would
+/// decide whether the statement worked. That is the class of failure this whole layer exists to
+/// prevent. Appended after the tables, which is the shape change [`crate::WIRE_VERSION`] `4` is.
+pub fn put_schema(out: &mut Vec<u8>, tables: &[big_api::TableInfo], views: &[big_api::ViewInfo]) {
     put_count(out, tables.len());
     for table in tables {
         // Qualified, so a repair recreates the table in the database the sender had it in.
@@ -548,9 +553,17 @@ pub fn put_schema(out: &mut Vec<u8>, tables: &[big_api::TableInfo]) {
             }
         }
     }
+    put_count(out, views.len());
+    for view in views {
+        // Qualified for the reason a table is, and by the same helper: a repair has to recreate
+        // the view in the database the sender had it in, since that is also the database its
+        // body resolves in.
+        put_str(out, &view.qualified());
+        put_str(out, &view.text);
+    }
 }
 
-pub fn get_schema(bytes: &[u8]) -> Result<Vec<big_api::TableInfo>> {
+pub fn get_schema(bytes: &[u8]) -> Result<(Vec<big_api::TableInfo>, Vec<big_api::ViewInfo>)> {
     let mut r = Reader::new(bytes);
     let n = r.count()?;
     let mut tables = Vec::with_capacity(n);
@@ -586,8 +599,20 @@ pub fn get_schema(bytes: &[u8]) -> Result<Vec<big_api::TableInfo>> {
             fields,
         });
     }
+    let n = r.count()?;
+    let mut views = Vec::with_capacity(n);
+    for _ in 0..n {
+        let name = r.str()?;
+        let text = r.str()?;
+        let q = big_db::TableRef::parse(&name);
+        views.push(big_api::ViewInfo {
+            database: q.database.to_string(),
+            name: q.table.to_string(),
+            text,
+        });
+    }
     finished(&r)?;
-    Ok(tables)
+    Ok((tables, views))
 }
 
 /// `POST /internal/repaired`: this copy has caught up, so stop refusing to promote it.

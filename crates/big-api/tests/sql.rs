@@ -23,11 +23,6 @@
 use big_api::*;
 use big_db::catalog::FieldKind;
 
-/// The record's own column name, which `SELECT *` answers under.
-fn big_sql_record_column() -> String {
-    big_api::RECORD_COLUMN.to_string()
-}
-
 fn stocked() -> Api<big_pager::MemPager> {
     let api = Api::in_memory().unwrap();
     api.create_table("tx").unwrap();
@@ -133,9 +128,11 @@ fn the_shape_says_how_the_answer_becomes_columns() {
     let (_, shape) = one(&api, "SELECT country, count(*) FROM tx GROUP BY country");
     assert_eq!(shape.columns(), vec!["country", "count"]);
 
+    // `SELECT *` is every column the table declares, in declaration order, and the header is
+    // filled in against the schema - the statement was written before anything knew the table.
     let (value, shape) = one(&api, "SELECT * FROM tx WHERE active = true");
-    assert_eq!(shape, Shape::Records { column: big_sql_record_column(), limit: None });
-    assert_eq!(value.as_rows().unwrap().cardinality(), 4);
+    assert_eq!(shape.columns(), vec!["amount", "country", "active"]);
+    assert_eq!(value.as_table().unwrap().len(), 4);
 }
 
 /// A select list of several aggregates is several plans, and the shape says which cell reads
@@ -249,7 +246,8 @@ fn refusals_and_schema_errors_carry_their_codes_through_the_facade() {
     };
     // A join on a keyed column is answered; a cross join has no key to pair records on.
     assert_eq!(code("SELECT count(*) FROM tx, other"), "sql_no_joins");
-    assert_eq!(code("SELECT amount FROM tx"), "sql_projection_unsupported");
+    // A projection with no limit is a full scan rather than a refusal.
+    assert_eq!(code("SELECT amount FROM tx"), "accepted");
     // A write reaching `Api::sql` is refused because this is the un-clustered door: a write
     // goes to the shard owners, and an id it does not name is allocated by the schema leader.
     // `Cluster::sql` is the one that runs it - see `Api::plan_sql`.

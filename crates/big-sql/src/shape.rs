@@ -293,6 +293,44 @@ pub struct Cell {
     pub units: Units,
 }
 
+/// The columns of a projection, before and after a schema has named them.
+///
+/// Two variants for the reason [`Threshold`] has two: `SELECT *` cannot be turned into a list
+/// of columns where it is written, because nothing there knows the table. Making the unexpanded
+/// form its own variant is what turns "remember to call [`Shape::resolve`]" into something the
+/// type says.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Columns {
+    /// The select list, as written, in the order it wrote them.
+    Named(Vec<Selected>),
+    /// `SELECT *`: every column the table declares, filled in by [`Shape::resolve`].
+    ///
+    /// Expanded through [`big_plan::expanded_columns`], which is the same function the planner
+    /// expands the matching `Project` with - a header of four columns over a plan that read
+    /// three is an answer that is wrong rather than absent.
+    All {
+        table: String,
+        /// The statement's `LIMIT`, carried only for the fall back to [`Shape::Records`]: where
+        /// the expansion has columns the plan holds the cut, because a projection pays for
+        /// every record it reads and a cut applied here would be one applied afterwards.
+        limit: Option<usize>,
+    },
+}
+
+impl Columns {
+    /// The columns, once a schema has named them.
+    ///
+    /// Empty for an unexpanded `SELECT *`, which is reachable only through a shape built by
+    /// hand: [`Shape::resolve`] runs on the one path a statement takes, and it leaves no `All`
+    /// behind.
+    pub fn named(&self) -> &[Selected] {
+        match self {
+            Self::Named(columns) => columns,
+            Self::All { .. } => &[],
+        }
+    }
+}
+
 /// One column of a projection: the values of a field, read back per record.
 ///
 /// Not a [`Cell`], because a projected column names no plan - a projection is one plan whose
@@ -579,10 +617,15 @@ pub enum Shape {
     },
     /// Record ids, one per row.
     ///
-    /// The one shape that is not what SQL would give elsewhere, and it is deliberate: this
-    /// engine stores facts as bits at `(row, record)` and has no row of values to hand back, so
-    /// `SELECT *` answers with the identity of each match and nothing else. Better a column
-    /// visibly called `id` than a table of values reconstructed at a point read apiece.
+    /// The one shape that is not what SQL would give elsewhere, and what `SELECT *` falls back
+    /// to where there is nothing a projection could read - a table with no fields, or one whose
+    /// engine keeps no values and declares only keyed columns. This engine stores facts as bits
+    /// at `(row, record)`, so a record with no readable column still has an identity, and a
+    /// column visibly called by the record's own name is worth more than an empty header.
+    ///
+    /// It is also the only way a record id reaches a SQL answer at all: `_record_id` names a
+    /// record on the way in, for an `INSERT`, and is not a column a select list can ask for.
+    /// `GET /table/{t}/records` is the route that lists them.
     Records {
         /// The column name.
         column: String,
@@ -599,7 +642,7 @@ pub enum Shape {
     Table {
         /// The columns, in the order the select list wrote them, which is the order the cells
         /// come in.
-        columns: Vec<Selected>,
+        columns: Columns,
     },
     /// Several answers, one after the other.
     ///
@@ -718,7 +761,7 @@ impl Shape {
             Self::Union { branches } => branches.first().map(Shape::columns).unwrap_or_default(),
             Self::Pairs { cells, .. } => cells.iter().map(|c| c.column.as_str()).collect(),
             Self::Records { column, .. } => vec![column.as_str()],
-            Self::Table { columns } => columns.iter().map(|c| c.column.as_str()).collect(),
+            Self::Table { columns } => columns.named().iter().map(|c| c.column.as_str()).collect(),
             Self::Row { cells } | Self::Groups { cells, .. } | Self::Join { cells, .. } => {
                 cells.iter().map(|c| c.column.as_str()).collect()
             }
@@ -809,11 +852,44 @@ impl Shape {
                 order,
                 cut,
             },
-            Self::Table { columns } => Self::Table {
-                columns: columns
-                    .into_iter()
-                    .map(|c| Ok(Selected { units: resolve_units(schema, c.units)?, ..c }))
-                    .collect::<Result<Vec<_>, PlanError>>()?,
+            Self::Table { columns } => match columns {
+                Columns::Named(columns) => Self::Table {
+                    columns: Columns::Named(
+                        columns
+                            .into_iter()
+                            .map(|c| Ok(Selected { units: resolve_units(schema, c.units)?, ..c }))
+                            .collect::<Result<Vec<_>, PlanError>>()?,
+                    ),
+                },
+                // `SELECT *`. An empty expansion is a table with nothing a projection could
+                // read, and the planner turned the same call into a `Rows`; the header follows
+                // it back to record ids rather than naming no columns at all.
+                Columns::All { table, limit } => {
+                    let names = big_plan::expanded_columns(schema, &table);
+                    if names.is_empty() {
+                        return Ok(Self::Records {
+                            column: crate::RECORD_COLUMN.to_string(),
+                            limit,
+                        });
+                    }
+                    Self::Table {
+                        columns: Columns::Named(
+                            names
+                                .into_iter()
+                                .map(|field| {
+                                    let units = Units::Written {
+                                        table: table.clone(),
+                                        field: field.clone(),
+                                    };
+                                    Ok(Selected {
+                                        column: field,
+                                        units: resolve_units(schema, units)?,
+                                    })
+                                })
+                                .collect::<Result<Vec<_>, PlanError>>()?,
+                        ),
+                    }
+                }
             },
             Self::Union { branches } => Self::Union {
                 branches: branches

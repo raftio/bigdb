@@ -218,7 +218,10 @@ pub fn put_plan(out: &mut Vec<u8>, plan: &Plan) {
             for f in fields {
                 put_str(out, f);
             }
-            put_u64(out, *limit as u64);
+            // No limit travels as the largest count there is, which is what it means: read
+            // every match. The frame stays one fixed-width number either way, and a limit of
+            // `usize::MAX` and no limit ask the owner for exactly the same work.
+            put_u64(out, limit.map_or(u64::MAX, |n| n as u64));
         }
     }
 }
@@ -293,8 +296,12 @@ fn get_plan_at(r: &mut Reader<'_>, depth: usize) -> Result<Plan> {
                 fields.push(r.str()?);
             }
             // A limit that does not fit a `usize` is a page no answer could hold; saturating
-            // keeps a 32-bit target from wrapping it into a small one, as `TopN` does.
-            let limit = r.u64()?.try_into().unwrap_or(usize::MAX);
+            // keeps a 32-bit target from wrapping it into a small one, as `TopN` does. The
+            // sentinel `u64::MAX` is the full scan `put_plan` wrote.
+            let limit = match r.u64()? {
+                u64::MAX => None,
+                n => Some(n.try_into().unwrap_or(usize::MAX)),
+            };
             Plan::Project { table, rows, fields, limit }
         }
         tag => return Err(WireError::BadTag { what: "plan", tag }),
