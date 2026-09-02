@@ -459,10 +459,12 @@ impl Refused {
                  `POST /table/{t}/import`"
             }
             Self::InsertSize => {
-                "an `INSERT` carries at most 10000 rows, because the whole statement is lexed \
-                 and parsed into literals before the first fact is written - so the batch is \
-                 resident twice over before any of it lands. `POST /table/{t}/import` is the \
-                 route for volume: one fact per line, with no statement to hold"
+                "an `INSERT` carries a bounded number of rows, because the whole statement is \
+                 lexed and parsed into literals before the first fact is written - so the batch \
+                 is resident twice over before any of it lands. A request is bounded by its \
+                 bytes as well, and that is usually the one a statement meets first. \
+                 `POST /table/{t}/import` is the route for volume: one fact per line, with no \
+                 statement to hold"
             }
             Self::DeleteRows => {
                 "there is no row here to delete: a record is the bits set for it across every \

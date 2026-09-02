@@ -99,7 +99,21 @@ impl Insert {
 /// lexed into tokens and then parsed into literals before the first fact is written, so the
 /// rows are resident twice over; `POST /table/{t}/import` is the route for volume, and it holds
 /// one line at a time.
-pub const MAX_INSERT_ROWS: usize = 10_000;
+///
+/// **It is not the bound that usually bites, and it is not meant to be.** `big_http::MAX_BODY`
+/// caps a request at 8 MiB, checked against `Content-Length` before a byte is read, so the text
+/// this parser is handed is already bounded - and 8 MiB of the smallest rows there are,
+/// `(1),(2),(3)...`, is about seven hundred thousand of them. This sits above that on purpose:
+/// a count of rows says nothing about what they cost, since ten thousand rows of one small
+/// integer and ten thousand rows of eighty columns are the same number and nothing like the
+/// same memory. What it is for is the pathological narrow statement, where the byte cap alone
+/// still admits a great many rows.
+///
+/// The number matters, so here it is measured: seven hundred thousand of those smallest rows
+/// took one server from 3.4 MB resident to 239 MB, an amplification of about thirty-eight times
+/// over the text. `MAX_BODY` bounds that per request *in flight*, so the worker pool multiplies
+/// it - which is the sum an operator lowering either number is actually doing.
+pub const MAX_INSERT_ROWS: usize = 1_000_000;
 
 /// The column that names the record id.
 ///

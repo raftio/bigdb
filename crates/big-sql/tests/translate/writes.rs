@@ -131,11 +131,24 @@ fn the_writes_an_insert_does_not_make() {
 }
 
 /// A statement is bounded by what it holds in memory, twice over.
+///
+/// Sized from the constant rather than from a number written here, so that moving the ceiling
+/// moves the test with it. The statement built is large - that is the point of the ceiling -
+/// which is why this is the one test in the file that costs anything to run.
 #[test]
-fn an_insert_carries_at_most_ten_thousand_rows() {
+fn an_insert_is_refused_past_the_row_ceiling() {
     let rows = |n: usize| {
-        let values = (1..=n).map(|i| format!("({i})")).collect::<Vec<_>>().join(", ");
-        format!("INSERT INTO tx (_record_id) VALUES {values}")
+        let mut out = String::with_capacity(n * 10 + 40);
+        out.push_str("INSERT INTO tx (_record_id) VALUES ");
+        for i in 1..=n {
+            if i > 1 {
+                out.push(',');
+            }
+            out.push('(');
+            out.push_str(&i.to_string());
+            out.push(')');
+        }
+        out
     };
     assert_eq!(insert(&rows(big_sql::MAX_INSERT_ROWS)).rows.len(), big_sql::MAX_INSERT_ROWS);
     assert_eq!(code(&rows(big_sql::MAX_INSERT_ROWS + 1)), "sql_insert_too_large");
