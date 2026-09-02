@@ -29,7 +29,7 @@
 //!
 //! A field kind is the other case. `TEXT` is not a name to pass on - there is no field kind
 //! spelled `TEXT` anywhere below - so a column list is only meaningful if this crate decides
-//! what a type name means. That decision is a dialect, it is made in [`crate::parse`], and it
+//! what a type name means. That decision is a dialect, it is made in [`mod@crate::parse`], and it
 //! lands in the closed set [`ColumnKind`] so that the layer applying it matches exhaustively
 //! rather than re-parsing a string.
 
@@ -253,7 +253,7 @@ pub struct Column {
 /// a type name in a column list can mean. Emitting an enum makes the layer that applies it
 /// match exhaustively, so a kind added here cannot be quietly dropped there.
 ///
-/// The mapping from SQL type names onto these is [`crate::parse`]'s, and it is the one place in
+/// The mapping from SQL type names onto these is [`mod@crate::parse`]'s, and it is the one place in
 /// this crate that decides what a word means rather than passing it on: `TEXT` is a `Set`
 /// because a keyed field is what a string lands in, and `BIGINT` is 64 bits because that is
 /// what `BIGINT` has always been.

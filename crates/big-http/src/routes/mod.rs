@@ -38,7 +38,7 @@
 //! which is why it needs a directory on the command line before it will do anything. It is
 //! also the only one that answers for this node alone while looking like a client route: a
 //! cluster is backed up one node at a time, and the copies are not one snapshot. See
-//! [`backup`](self::backup).
+//! `backup`.
 //!
 //! **`/sql` is the one addition, and it does not hang off a table.** Every other query route is
 //! asked *of* an index and takes the table from the path; a `SELECT` names its own in `FROM`,
@@ -53,7 +53,7 @@
 //!
 //! \* `CREATE TABLE` over `/sql` needs `admin`. The role check runs before any body is decoded,
 //! so a route's role is a *floor*: the statement raises it once it has been classified, which is
-//! what stops a read-only token creating tables. See [`query::sql`].
+//! what stops a read-only token creating tables. See `query::sql`.
 //!
 //! Six more routes exist for the fan-out itself and are not part of that surface:
 //!

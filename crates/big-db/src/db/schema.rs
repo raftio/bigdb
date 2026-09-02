@@ -127,7 +127,7 @@ impl<P: PagerMut> Db<P> {
     /// Forgets a view. `Ok(false)` means there was no such view.
     ///
     /// The one drop in this module that frees nothing: a view owns no fragments, so there are
-    /// no keys to hand to [`DbWrite::discard`] and no pages to return to the freelist. What it
+    /// no keys to hand to `DbWrite::discard` and no pages to return to the freelist. What it
     /// costs is the records the statement was written in, which the next commit reclaims like
     /// any other catalog change.
     pub fn drop_view<'a>(&self, name: impl Into<TableRef<'a>>) -> Result<bool> {
@@ -250,7 +250,7 @@ impl<P: PagerMut> Db<P> {
     /// The standard view is untouched, so questions that carry no time still see every record.
     /// That is the honest shape of this operation and worth stating: it drops the *index by
     /// day*, not the records. A query with a `BETWEEN` stops finding them; a `count(*)` does
-    /// not change. Deleting records is [`crate::db::DbWrite::delete_records`].
+    /// not change. Deleting records is `DbWrite::delete_records`.
     pub fn drop_days_before<'a>(
         &self,
         table: impl Into<TableRef<'a>>,

@@ -515,7 +515,7 @@ pub enum Of {
     ///
     /// Not a plan, and deliberately not a clock read here either - the moment travels from the
     /// parser so that every `now()` in one statement, and every node answering it, means the
-    /// same instant. See [`crate::Proj::Now`].
+    /// same instant. See [`crate::ast::Proj::Now`].
     Now {
         /// Seconds since the Unix epoch.
         unix_seconds: i64,
@@ -545,16 +545,16 @@ pub enum Of {
     /// One side's per-key number, made one with every other side's, over a join.
     ///
     /// The cell names only the plan carrying the number; the sides it is scaled against are
-    /// [`Shape::Join::keys`], which is what says how many tables the join has. A cell cannot
+    /// `Shape::Join`'s `keys`, which is what says how many tables the join has. A cell cannot
     /// carry them itself and stay [`Copy`], and would be saying twice what the shape already
     /// says once.
     Paired {
         /// The plan whose per-key number this cell is about.
         plan: usize,
-        /// Which of [`Shape::Join::keys`] that plan belongs to.
+        /// Which of `Shape::Join`'s `keys` that plan belongs to.
         ///
         /// **An index into the join's keys, not into the statement's calls** - which is why
-        /// [`Of::rebase`] moves `plan` along and leaves this alone, and why [`Of::plans`] does
+        /// `Of::rebase` moves `plan` along and leaves this alone, and why [`Of::plans`] does
         /// not report it.
         side: usize,
         /// How this side's number and the others' become one.
@@ -584,7 +584,7 @@ pub enum Of {
     /// `(Σ_s top_s) / (Σ_s bottom_s)` and only the second is the average.
     ///
     /// Flat rather than two nested [`Of`]s because a cell has to stay [`Copy`]. Both plans move
-    /// under [`Of::rebase`]; `side` is a position among the join's sides and does not.
+    /// under `Of::rebase`; `side` is a position among the join's sides and does not.
     PairedRatio {
         /// The plan holding this side's total.
         top: usize,
@@ -705,7 +705,7 @@ impl Of {
     /// shape may look at has to come from the shape rather than from the length of the list.
     ///
     /// A join's other sides are not here: [`Of::Paired`] names them by position in
-    /// [`Shape::Join::keys`] and [`Of::SharedKeys`] names them not at all, so a caller after
+    /// `Shape::Join`'s `keys` and [`Of::SharedKeys`] names them not at all, so a caller after
     /// every plan a *shape* reads wants [`Shape::plans`] rather than this.
     pub fn plans(self) -> Vec<usize> {
         match self {

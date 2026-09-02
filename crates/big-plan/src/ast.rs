@@ -41,7 +41,7 @@ pub enum Literal {
     /// Its own variant for the reason [`Literal::Sint`] is, and it exists at all because floats
     /// do. A decimal field is unsigned, so this used to be refused in the lexer; a float field
     /// holds negative numbers perfectly well, and a lexer cannot see which kind of field a
-    /// value is headed for. So the shape is read here and the refusal moved to [`crate::plan`],
+    /// value is headed for. So the shape is read here and the refusal moved to [`mod@crate::plan`],
     /// where the field is known - which is where it always belonged.
     ///
     /// Still integers, so [`Literal`] keeps its `Eq`. Nothing in this crate holds an `f64`.

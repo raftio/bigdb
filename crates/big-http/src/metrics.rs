@@ -351,7 +351,7 @@ fn io_counter(out: &mut String, name: &str, backend: &str, help: &str, value: u6
 
 /// The row-key dictionary, which is the one thing here that grows with cardinality.
 ///
-/// Separate from [`render_pager`] because it does not come from the pager: the dictionary is
+/// Separate from `render_pager` because it does not come from the pager: the dictionary is
 /// catalog state held in memory, and the file it was loaded from says nothing about what it
 /// costs to hold. It is exported at all because it is the only unbounded allocation in a
 /// process whose whole read path is otherwise a borrow out of a mapping - a database with a

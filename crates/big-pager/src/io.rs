@@ -14,7 +14,7 @@
 
 //! What the storage backend actually did to the disk, counted by the backend itself.
 //!
-//! # Why this is not [`crate::counting::CountingPager`]
+//! # Why this is not `CountingPager`
 //!
 //! That decorator counts *calls into the trait*, which is the right measurement for a test: it
 //! is the same number on every machine, so it can be asserted. It is the wrong measurement for

@@ -80,7 +80,7 @@ pub const MAX_VIEW_BYTES: usize = 4096;
 /// migration - the same argument [`TableEngine`]'s zero byte carries, one field over.
 ///
 /// Never handed out by [`Catalog::intern_database`], which allocates from
-/// [`FIRST_NAMED_DATABASE`], and never dropped: a table has to be in some database, and this is
+/// `FIRST_NAMED_DATABASE`, and never dropped: a table has to be in some database, and this is
 /// the one that is always there to be in.
 pub const DEFAULT_DATABASE: DatabaseId = 0;
 
@@ -174,7 +174,7 @@ impl<'a> TableRef<'a> {
     /// path and another in the planner. So the qualified name *is* the string form, [`Display`]
     /// writes it, and this reads it back.
     ///
-    /// Unambiguous because [`check_name`] refuses a `.` in a name, so the first one can only be
+    /// Unambiguous because `check_name` refuses a `.` in a name, so the first one can only be
     /// the separator.
     ///
     /// [`Display`]: core::fmt::Display

@@ -465,7 +465,7 @@ fn fold_edits(mut buf: Vec<(RecordId, ColEdit)>) -> Vec<(RecordId, ColEdit)> {
 /// A field resolved to what the setters need, so a caller writing many facts at one field pays
 /// for the catalog walk once instead of once per fact.
 ///
-/// **The saving is the clone, more than the lookup.** [`resolve`] hands back an owned
+/// **The saving is the clone, more than the lookup.** `resolve` hands back an owned
 /// [`FieldDef`], which owns a name and a granularity list — so every setter call allocated twice
 /// to learn something that cannot change inside one transaction. A field's id, kind and declared
 /// width are fixed once it exists, and a replay does no DDL; the zone map and the bit depth that
