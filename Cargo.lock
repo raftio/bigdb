@@ -709,6 +709,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "big-message-redis"
+version = "0.1.0"
+dependencies = [
+ "big-embed",
+ "big-http",
+ "big-message",
+]
+
+[[package]]
 name = "big-page"
 version = "0.1.0"
 dependencies = [

@@ -185,7 +185,9 @@ needs - which means a feature request for the client is a feature request for th
 **`contrib/` is where the property that was lost is kept.** `contrib/big-message` is a producer
 for a program that makes events as it runs, and its `[dependencies]` section is empty - so
 `cargo tree -p big-message --edges normal` prints one line, and the thing `big-cli` used to
-prove is proved again by a build rather than by a paragraph. It is not a second client surface:
+prove is proved again by a build rather than by a paragraph. `contrib/big-message-redis` is a
+sink for a Redis stream and depends on exactly that one crate, which keeps the property one
+step further out. It is not a second client surface:
 it reaches the server through `POST /sql` and nothing else, and it holds no vocabulary the
 server does not.
 
