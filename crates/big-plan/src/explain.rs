@@ -156,6 +156,13 @@ fn rows_head(rows: &Rows) -> String {
             format!("{field} {} {} [float]", cmp(*op), f64::from_bits(*bits))
         }
         Rows::Key { field, value } => format!("{field} = '{value}'"),
+        // The call is named rather than the operator spelled, so that the folded one is visible:
+        // `LIKE` and `ILIKE` select different sets and a printer that showed them alike would
+        // hide which of the two ran.
+        Rows::KeyLike { field, pattern, fold } => {
+            let call = if *fold { "ILIKE" } else { "LIKE" };
+            format!("{field} {call} '{pattern}'")
+        }
         Rows::KeyBetween { field, value, from, to } => {
             format!("{field} = '{value}' in [{}, {}]", bound(from), bound(to))
         }

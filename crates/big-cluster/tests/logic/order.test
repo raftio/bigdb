@@ -1,0 +1,221 @@
+# `ORDER BY` over a projection, end to end.
+#
+# **This is the clause whose cost is the point.** A grouping's ordering can ride in the plan -
+# `TopN` ranks and cuts in one pass, because the number it ranks by is the plan's own answer. A
+# projection's rows are values reconstructed a record at a time, in record order, and nothing
+# below the coordinator holds them. So the sort happens after every value has been read, and the
+# `LIMIT` has to come with it: a sort has to see every row before it knows which three survive.
+#
+# What that means in practice, said plainly: `SELECT c FROM t ORDER BY c LIMIT 3` reads every
+# matching record where the same statement without the `ORDER BY` reads three. What bounds it is
+# the record ceiling every other unbounded read answers to.
+#
+# `rowsort` is deliberately **not** used in this file. The order is the thing being tested.
+
+statement
+CREATE TABLE o (name SET, amount UINT(32), price DECIMAL(10, 2), d DATE)
+
+statement
+INSERT INTO o (_record_id, name, amount, price, d) VALUES
+  (1, 'delta', 300, 3.50, '2024-03-01'),
+  (2, 'alpha', 100, 12.50, '2024-01-15'),
+  (3, 'charlie', 200, 1.05, '2023-11-30'),
+  (4, 'bravo', 400, 100.00, '2024-02-29')
+
+# ---------------------------------------------------------------------------------------------
+# The orders themselves
+# ---------------------------------------------------------------------------------------------
+
+query
+SELECT amount FROM o ORDER BY amount
+----
+amount
+100
+200
+300
+400
+
+query
+SELECT amount FROM o ORDER BY amount DESC
+----
+amount
+400
+300
+200
+100
+
+# A keyed column orders by its bytes, which is how a key is ordered everywhere else here.
+query
+SELECT name FROM o ORDER BY name
+----
+name
+alpha
+bravo
+charlie
+delta
+
+# **A decimal orders by its value, not by the integer it is stored as.** All four are stored as
+# integers of scale two - 350, 1250, 105, 10000 - and so happen to order the same way; what this
+# pins is that 1.05 comes below 3.50 rather than above it, which a comparison on the digits
+# alone would get wrong the moment the scales differed.
+query
+SELECT price FROM o ORDER BY price
+----
+price
+1.05
+3.50
+12.50
+100.00
+
+# A date orders as a moment, which is the count it is stored as.
+query
+SELECT d FROM o ORDER BY d
+----
+d
+2023-11-30
+2024-01-15
+2024-02-29
+2024-03-01
+
+# ---------------------------------------------------------------------------------------------
+# The cut, which is what the ordering moves
+# ---------------------------------------------------------------------------------------------
+
+# **The case the whole phase is about.** Without the sort the plan would read three records and
+# answer those three; with it the plan reads every record and the cut happens after the ordering
+# - so this is the three largest rather than the first three read.
+query
+SELECT amount FROM o ORDER BY amount DESC LIMIT 3
+----
+amount
+400
+300
+200
+
+query
+SELECT amount FROM o ORDER BY amount LIMIT 1
+----
+amount
+100
+
+# A `WHERE` narrows what is read, and the sort is over what survived it.
+query
+SELECT amount FROM o WHERE amount > 150 ORDER BY amount
+----
+amount
+200
+300
+400
+
+# ---------------------------------------------------------------------------------------------
+# Several columns, aliases, and expressions
+# ---------------------------------------------------------------------------------------------
+
+# The ordering names one column and the answer carries the others alongside it.
+query
+SELECT name, amount FROM o ORDER BY amount DESC
+----
+name     amount
+bravo    400
+delta    300
+charlie  200
+alpha    100
+
+# An `ORDER BY` may name the alias, which is the output name and therefore the one the answer
+# actually has.
+query
+SELECT amount AS n FROM o ORDER BY n DESC LIMIT 2
+----
+n
+400
+300
+
+# An expression is a projection too, and the sort is over the computed value - not over the
+# column underneath it.
+query
+SELECT amount * -1 AS neg FROM o ORDER BY neg
+----
+neg
+-400
+-300
+-200
+-100
+
+# ---------------------------------------------------------------------------------------------
+# Absent values sort last, in both directions
+# ---------------------------------------------------------------------------------------------
+
+statement
+CREATE TABLE sparse (label SET, amount UINT(32))
+
+statement
+INSERT INTO sparse (_record_id, label, amount) VALUES (1, 'a', 5)
+
+statement
+INSERT INTO sparse (_record_id, label) VALUES (2, 'b')
+
+statement
+INSERT INTO sparse (_record_id, label, amount) VALUES (3, 'c', 1)
+
+# A record holding no value in the column is not a small value. Burying it at the end is what a
+# reader of `ORDER BY amount DESC LIMIT 10` means, and the standard leaves the choice to the
+# implementation - so it is written down here rather than left to be discovered.
+query
+SELECT label, amount FROM sparse ORDER BY amount
+----
+label  amount
+c      1
+a      5
+b      NULL
+
+# The reversal applies to the values and leaves the absent row where it was, which is the half
+# that a naive `.reverse()` on the whole comparison would get wrong.
+query
+SELECT label, amount FROM sparse ORDER BY amount DESC
+----
+label  amount
+a      5
+c      1
+b      NULL
+
+# ---------------------------------------------------------------------------------------------
+# `SELECT *`, whose columns are not known until a schema expands them
+# ---------------------------------------------------------------------------------------------
+
+query
+SELECT * FROM o ORDER BY amount DESC LIMIT 2
+----
+name   amount  price   d
+bravo  400     100.00  2024-02-29
+delta  300     3.50    2024-03-01
+
+# A name the table does not have is caught where the expansion happens, which is the first place
+# it can be told from a column `*` would have produced.
+error
+SELECT * FROM o ORDER BY nosuch
+----
+error: unknown_field
+
+# ---------------------------------------------------------------------------------------------
+# What is refused
+# ---------------------------------------------------------------------------------------------
+
+# A column the projection does not read: sorting by it would mean a second point read per record
+# purely to order by, which is a cost the statement did not ask for.
+error
+SELECT name FROM o ORDER BY amount
+----
+error: sql_unsupported_order
+
+# A projection carries values per record and no number about the set, so there is nothing here
+# for an aggregate to name.
+error
+SELECT amount FROM o ORDER BY count(*)
+----
+error: sql_unsupported_order
+
+# One row of numbers has nothing to sort.
+error
+SELECT count(*) FROM o ORDER BY count(*)
+----
+error: sql_unsupported_order

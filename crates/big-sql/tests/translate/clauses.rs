@@ -449,3 +449,58 @@ fn two_totals_are_comparable_only_in_the_same_units() {
     let constant = "SELECT category, sum(price) FROM t GROUP BY category HAVING sum(price) > 10.00";
     assert!(translate(constant).unwrap().answer.shape.resolve(&Stub).is_ok());
 }
+
+/// A temporal call over a column holding no moment, and a boundary finer than the column keeps.
+///
+/// Here rather than in the corpus for the reason the test above is: deciding either needs a
+/// schema, and the corpus has none - what a case there can show is the shape going through
+/// unresolved, which does not say *why*. The sentence is the whole point of the check, so it is
+/// pinned where the resolver's answer is available.
+#[test]
+fn a_scalar_is_checked_against_the_kind_of_column_it_reads() {
+    // `day` counts whole days, and an hour says nothing about one: rounding to it would hand
+    // back the same date wearing a precision the column never had.
+    let e = translate("SELECT date_trunc('hour', day) FROM t")
+        .unwrap()
+        .answer
+        .shape
+        .resolve(&Stub)
+        .unwrap_err();
+    assert_eq!(e.code(), "bad_rounding");
+    let said = e.to_string();
+    assert!(said.contains("day or coarser"), "{said}");
+
+    // The same boundary over a column of seconds is fine, because there is a time of day in it
+    // to round.
+    assert!(translate("SELECT date_trunc('hour', seen) FROM t")
+        .unwrap()
+        .answer
+        .shape
+        .resolve(&Stub)
+        .is_ok());
+
+    // A moment asked of a keyed column, which holds strings.
+    let e = translate("SELECT toDate(country) FROM t")
+        .unwrap()
+        .answer
+        .shape
+        .resolve(&Stub)
+        .unwrap_err();
+    assert_eq!(e.code(), "bad_rounding");
+    assert!(e.to_string().contains("DATE or DATETIME"), "{e}");
+
+    // Arithmetic over that same keyed column is *not* refused here: what `upper(amount)` or
+    // `country / 2` answers is a null, which is what every engine does with them, and deciding
+    // it needs the value rather than the kind. Only the calls whose meaning depends on the
+    // column's kind are checked against it.
+    assert!(translate("SELECT country / 2 FROM t").unwrap().answer.shape.resolve(&Stub).is_ok());
+
+    // An expression over an aggregate is checked the same way, through `Cell::apply`.
+    let e = translate("SELECT date_trunc('hour', max(day)) FROM t")
+        .unwrap()
+        .answer
+        .shape
+        .resolve(&Stub)
+        .unwrap_err();
+    assert_eq!(e.code(), "bad_rounding");
+}

@@ -258,22 +258,39 @@ fn remap_item(item: &mut Item, exposed: &Exposed) -> Result<()> {
                 item.alias = Some(wrote);
             }
         }
-        // The rest name a column but are not named *by* it - `sum(x)` comes back as `sum`
+        // An expression already carries its own output name - the entry as the reader wrote it,
+        // in the view's names - so only the column underneath is substituted. `written` is left
+        // exactly as typed, which is what keeps the table's name for a column out of the header.
+        Proj::Scalar { inner, .. } => remap_leaf(inner, exposed)?,
+        other => remap_leaf(other, exposed)?,
+    }
+    if let Some(cond) = &mut item.filter {
+        remap_cond(cond, exposed)?;
+    }
+    Ok(())
+}
+
+/// The column an entry reads, substituted for the one the view exposes it as.
+///
+/// Split out of [`remap_item`] because an expression has to reach the same set of leaves
+/// through one more level, and two copies of this list is one copy plus the day a projection
+/// gains a kind that only one of them learns about.
+fn remap_leaf(proj: &mut Proj, exposed: &Exposed) -> Result<()> {
+    match proj {
+        // These name a column but are not named *by* it - `sum(x)` comes back as `sum`
         // whichever column it measured - so there is no header to preserve.
         Proj::CountDistinct(name)
         | Proj::Agg { field: name, .. }
         | Proj::Avg(name)
         | Proj::Quantile { field: name, .. }
         | Proj::TopKeys { field: name, .. }
-        // A rounded column names a column and is not named by it: `toDate(seen)` comes back as
-        // `toDate` whatever the view calls the column underneath.
-        | Proj::TimeOf { field: name, .. } => exposed.rename(name)?,
+        | Proj::Column(name) => exposed.rename(name)?,
         // `count(*)` names no column, so a view exposing none of them still answers it; and
         // `now()` names nothing at all, so a view with no columns exposed still answers that.
         Proj::Star | Proj::Count | Proj::Now { .. } => {}
-    }
-    if let Some(cond) = &mut item.filter {
-        remap_cond(cond, exposed)?;
+        // The parser builds no expression whose leaf is another expression: an item holds one
+        // tree, and its leaf is what that tree is about.
+        Proj::Scalar { .. } => unreachable!("an expression's leaf is never an expression"),
     }
     Ok(())
 }
@@ -332,9 +349,10 @@ fn remap_cond(cond: &mut Cond, exposed: &Exposed) -> Result<()> {
             remap_cond(b, exposed)
         }
         Cond::Not(a) => remap_cond(a, exposed),
-        Cond::Cmp { field, .. } | Cond::In { field, .. } | Cond::Between { field, .. } => {
-            exposed.rename(field)
-        }
+        Cond::Cmp { field, .. }
+        | Cond::In { field, .. }
+        | Cond::Between { field, .. }
+        | Cond::Like { field, .. } => exposed.rename(field),
     }
 }
 
@@ -353,7 +371,10 @@ fn qualify_cond(cond: Cond, label: &str) -> Cond {
                 walk(b, label);
             }
             Cond::Not(a) => walk(a, label),
-            Cond::Cmp { field, .. } | Cond::In { field, .. } | Cond::Between { field, .. } => {
+            Cond::Cmp { field, .. }
+            | Cond::In { field, .. }
+            | Cond::Between { field, .. }
+            | Cond::Like { field, .. } => {
                 field.qualifier.get_or_insert_with(|| label.to_string());
             }
         }

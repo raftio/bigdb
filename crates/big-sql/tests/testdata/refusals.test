@@ -125,8 +125,21 @@ SELECT count(*) FROM t ORDER BY count(*) DESC
 ----
 sql_unsupported_order
 
+## A projection **can** be ordered now - see `order.test` - and it costs what it costs: the sort
+## has to see every row, so the plan reads them all and the `LIMIT` moves out of it. What is
+## still refused is an ordering the answer holds nothing to sort by.
+
+## An aggregate beside a projection: the answer carries values per record and no number about
+## the set for one of these to name.
 error
-SELECT * FROM t ORDER BY amount
+SELECT amount FROM t ORDER BY count(*)
+----
+sql_unsupported_order
+
+## A column the projection does not read. Sorting by it would mean a second point read per
+## record purely to order by, which is a cost the statement did not ask for.
+error
+SELECT country FROM t ORDER BY amount
 ----
 sql_unsupported_order
 
@@ -216,10 +229,42 @@ TRUNCATE TABLE t
 ----
 sql_read_only
 
+## `INSERT ... SELECT` reads a **projection** - that form is answered, see `insert.test`. What
+## is refused is every other shape of answer, because a count or a grouping is a number *about*
+## a set of records rather than records to copy.
+
 error
-INSERT INTO t (amount) SELECT amount FROM u
+INSERT INTO t (amount) SELECT count(*) FROM u
 ----
 sql_unsupported
+
+error
+INSERT INTO t (country) SELECT country FROM u GROUP BY country
+----
+sql_unsupported
+
+## `SELECT *` answers with record ids, because a record has no row of values to read out.
+
+error
+INSERT INTO t (amount) SELECT * FROM u
+----
+sql_unsupported
+
+## The record ids are allocated, so the column list may not name one: `SELECT _record_id` is
+## not a projection this engine has.
+
+error
+INSERT INTO t (_record_id, amount) SELECT _record_id, amount FROM u
+----
+sql_unsupported
+
+## Reading and writing one table in a single statement has no snapshot under it: the records
+## being written are visible to the read that is still running.
+
+error
+INSERT INTO t (amount) SELECT amount FROM t
+----
+sql_insert_self_read
 
 ## An `INSERT` whose tuples do not match its column list.
 
@@ -535,46 +580,59 @@ CREATE TABLE t (a SIGNED(65))
 ----
 sql_bit_depth
 
-## Expressions, which have nowhere to run: a record is a set of bits, and there is no row for
-## `amount * 2` to be evaluated against.
+## Expressions **are** answered now - see `scalar.test`. What is left here is the boundary:
+## an expression is over one column, and a conversion that would have to invent a value is
+## still a conversion this engine cannot do.
+
+## Two columns in one cell is two plans, and a projection reads one field per column.
 
 error
-SELECT amount * 2 FROM t
+SELECT concat(country, tier) FROM t
 ----
 sql_unsupported
 
+## An expression over no column at all is a constant, which needs no table to be true.
+
 error
-SELECT cast(amount AS BIGINT) FROM t
+SELECT 1 + 1 FROM t
 ----
 sql_unsupported
 
-error
-SELECT toString(amount) FROM t
-----
-sql_unsupported
+## Widening a day count to an instant has to invent a time of day, and midnight is a guess
+## rather than an answer.
 
 error
 SELECT toDateTime(visit) FROM t
 ----
 sql_unsupported
 
+## The simple form of a case is the searched one with the comparison factored out, and there is
+## one spelling of it.
+
 error
-SELECT CASE WHEN amount > 5 THEN 1 ELSE 0 END FROM t
+SELECT CASE amount WHEN 5 THEN 1 ELSE 0 END FROM t
+----
+sql_unsupported
+
+## A scalar in a `WHERE` runs before there is anything to run it on - unchanged by the select
+## list gaining an evaluator.
+
+error
+SELECT count(*) FROM t WHERE round(amount, 2) > 5
+----
+sql_scalar_in_filter
+
+## `LIKE` and `ILIKE` are answered - a keyed column interns each string once, so a pattern is a
+## walk of that dictionary and a union of what matched. What is still refused is every other
+## string comparison, because none of them is a set operation this index can do.
+
+error
+SELECT count(*) FROM t WHERE country SIMILAR TO 'G%'
 ----
 sql_unsupported
 
 error
-SELECT multiIf(amount > 5, 1, 0) FROM t
-----
-sql_unsupported
-
-error
-SELECT coalesce(amount, 0) FROM t
-----
-sql_unsupported
-
-error
-SELECT count(*) FROM t WHERE country LIKE 'G%'
+SELECT count(*) FROM t WHERE country GLOB 'G*'
 ----
 sql_unsupported
 

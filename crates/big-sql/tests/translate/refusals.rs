@@ -82,7 +82,10 @@ fn every_refusal_names_itself() {
     assert_eq!(code("SELECT * FROM t HAVING count(*) > 5"), "sql_unsupported");
     assert_eq!(code("SELECT row_number() OVER () FROM t"), "sql_unsupported");
     assert_eq!(code("SELECT count(*) FROM t LIMIT 1 OFFSET 5"), "sql_unsupported");
-    assert_eq!(code("SELECT amount * 2 FROM t"), "sql_unsupported");
+    // Arithmetic is answered now; what is refused is an expression that is not about one
+    // column - two of them in a cell, or none at all.
+    assert_eq!(code("SELECT concat(country, category) FROM t"), "sql_unsupported");
+    assert_eq!(code("SELECT 1 + 1 FROM t"), "sql_unsupported");
     // One column and two are both answered; three would be a pass over the third per pair of
     // the first two.
     assert_eq!(code("SELECT DISTINCT category, country, active FROM t"), "sql_unsupported");
@@ -107,7 +110,11 @@ fn every_refusal_names_itself() {
     // server to allocate one.
     assert_eq!(code("INSERT INTO t VALUES (1, 2)"), "sql_insert_shape");
     assert_eq!(code("INSERT INTO t (_record_id, amount) VALUES ('seven', 2)"), "sql_insert_shape");
-    assert_eq!(code("INSERT INTO t (amount) SELECT amount FROM u"), "sql_unsupported");
+    // A projection is answered; every other shape of answer is not, and one table on both
+    // sides has no snapshot under it.
+    assert_eq!(code("INSERT INTO t (amount) SELECT count(*) FROM u"), "sql_unsupported");
+    assert_eq!(code("INSERT INTO t (amount) SELECT * FROM u"), "sql_unsupported");
+    assert_eq!(code("INSERT INTO t (amount) SELECT amount FROM t"), "sql_insert_self_read");
     // `id` is what a record is called, so a *field* of that name is one no `INSERT` could ever
     // fill - refused where it is declared rather than where it silently answers nothing.
     assert_eq!(code("CREATE TABLE t (_record_id UINT(32), a SET)"), "sql_id_column");
@@ -135,16 +142,18 @@ fn every_refusal_names_itself() {
     // `ALTER VIEW` gets the ordinary write refusal instead: `CREATE OR REPLACE VIEW` already
     // says the whole statement, so there is no change to a view left to name.
     assert_eq!(code("ALTER VIEW v AS SELECT a FROM t"), "sql_read_only");
-    // The three shapes of computation this dialect has no evaluator for, each named by what it
-    // asked for rather than by the evaluator that is missing.
-    assert_eq!(code("SELECT CASE WHEN amount > 5 THEN 1 ELSE 0 END FROM t"), "sql_unsupported");
-    assert_eq!(code("SELECT multiIf(amount > 5, 1, 0) FROM t"), "sql_unsupported");
-    assert_eq!(code("SELECT cast(amount AS BIGINT) FROM t"), "sql_unsupported");
-    assert_eq!(code("SELECT toString(amount) FROM t"), "sql_unsupported");
+    // The searched `CASE` and both `if` spellings are answered; the simple form is the one
+    // refused, because it is the same tree with the comparison factored out.
+    assert_eq!(code("SELECT CASE amount WHEN 5 THEN 1 ELSE 0 END FROM t"), "sql_unsupported");
+    // A conversion that would have to invent a value is still one this engine cannot make:
+    // widening a day count to an instant has to choose a time of day.
+    assert_eq!(code("SELECT toDateTime(visit) FROM t"), "sql_unsupported");
     assert_eq!(code("SELECT argMax(amount, price) FROM t"), "sql_unsupported");
     assert_eq!(code("SELECT stddevPop(amount) FROM t"), "sql_unsupported");
     assert_eq!(code("SELECT corr(amount, price) FROM t"), "sql_unsupported");
-    assert_eq!(code("SELECT count(*) FROM t WHERE country LIKE 'G%'"), "sql_unsupported");
+    // `LIKE` is answered now - a pattern over a keyed column is a union of the keys that match.
+    // Every other string comparison is still refused, because none of them is a set operation.
+    assert_eq!(code("SELECT count(*) FROM t WHERE country SIMILAR TO 'G%'"), "sql_unsupported");
     // Two aggregates are two plans, which is now answered. What is still refused is a select
     // list that is not one answer: a star beside an aggregate, or a bare column beside one.
     assert_eq!(code("SELECT *, count(*) FROM t"), "sql_unsupported");
@@ -165,7 +174,10 @@ fn every_refusal_names_itself() {
         code("SELECT category, count(*) FROM t GROUP BY category ORDER BY country"),
         "sql_unsupported_order"
     );
-    assert_eq!(code("SELECT * FROM t ORDER BY amount"), "sql_unsupported_order");
+    // A projection is ordered now, so what is refused over one is an ordering the answer holds
+    // nothing to sort by: a column it does not read, or a number about the set.
+    assert_eq!(code("SELECT country FROM t ORDER BY amount"), "sql_unsupported_order");
+    assert_eq!(code("SELECT amount FROM t ORDER BY count(*)"), "sql_unsupported_order");
     assert_eq!(code("SELECT count(*) FROM t ORDER BY count(*) DESC"), "sql_unsupported_order");
     // An offset into a record listing, which is paged with a cursor instead.
     assert_eq!(code("SELECT * FROM t LIMIT 10 OFFSET 5"), "sql_unsupported");
@@ -198,11 +210,25 @@ fn a_refusal_says_what_it_is_and_what_exists_instead() {
     assert!(what.why().contains("CROSS JOIN"), "{}", what.why());
     assert!(what.why().contains("NATURAL JOIN"), "{}", what.why());
 
-    // A projection with no `LIMIT` is a full scan rather than a refusal, so the clause that is
-    // still refused over one is `ORDER BY` - which would need every value materialised and
-    // sorted, and nothing here holds them.
-    let e = translate("SELECT amount FROM t ORDER BY amount").unwrap_err();
-    assert_eq!(e.code(), "sql_unsupported_order");
+    // A projection with no `LIMIT` is a full scan rather than a refusal, and one with an
+    // `ORDER BY` is answered - at the cost of the cut leaving the plan, which is the whole of
+    // what that clause changes here.
+    let ordered = translate("SELECT amount FROM t ORDER BY amount LIMIT 10").unwrap();
+    let Shape::Table { order, cut, .. } = &ordered.answer.shape else { panic!("a projection") };
+    assert_eq!(cut, &Some(10), "the limit moves into the shape");
+    assert!(order.is_some());
+    // And it is gone from the plan, which is what makes the sort correct rather than a sort of
+    // whichever ten records happened to be read first.
+    assert!(
+        !format!("{:?}", ordered.calls[0].call).contains("\"n\""),
+        "the plan kept a cut it cannot carry: {:?}",
+        ordered.calls[0].call
+    );
+
+    // Without an ordering the cut stays in the plan, where it bounds the point reads.
+    let cut_in_plan = translate("SELECT amount FROM t LIMIT 10").unwrap();
+    assert!(format!("{:?}", cut_in_plan.calls[0].call).contains("\"n\""));
+
     assert!(translate("SELECT amount FROM t").is_ok());
     assert!(translate("SELECT amount FROM t LIMIT 100").is_ok());
 }

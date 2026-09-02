@@ -35,6 +35,7 @@
 use crate::ast::ExplainMode;
 use crate::ddl::{Alter, Column, Ddl};
 use crate::insert::Insert;
+use crate::insert::Source as big_sql_source;
 use crate::lower::Probe;
 use crate::shape::{
     Absent, Answer, Cell, Cut, Format, GroupOrder, Having, JoinSide, Of, Operand, OrderBy, Pairing,
@@ -181,10 +182,23 @@ fn write_shape(out: &mut String, shape: &Shape, prefix: &str) {
 fn shape_head(shape: &Shape) -> String {
     match shape {
         Shape::Row { .. } => "Row".to_string(),
-        Shape::Records { column, limit } => {
-            format!("Records column={column}{}", opt(" limit=", limit.as_ref()))
-        }
-        Shape::Table { .. } => "Table".to_string(),
+        Shape::Records { column, limit, descending } => format!(
+            "Records column={column}{}{}",
+            opt(" limit=", limit.as_ref()),
+            if *descending { " order=desc" } else { "" }
+        ),
+        // The ordering is on the head line rather than among the columns, because it is about
+        // the rows rather than about any one of them - and because a lost `ORDER BY` is exactly
+        // what this printer may not hide.
+        Shape::Table { order, cut, .. } => match order {
+            None => "Table".to_string(),
+            Some(o) => format!(
+                "Table order={}{}{}",
+                o.column,
+                if o.desc { " desc" } else { "" },
+                opt(" limit=", cut.as_ref())
+            ),
+        },
         Shape::Union { .. } => "Union".to_string(),
         Shape::Pairs { keys, .. } => format!("Pairs keys={}", plans(keys)),
         // Printed as `keys=`, which is what these are: the plans whose keys make the rows.
@@ -211,7 +225,7 @@ fn shape_kids(shape: &Shape) -> Vec<Line<'_>> {
         // nothing to sort and nothing to page.
         Shape::Row { cells, having } => clauses(&[], cells, having, &None, &Cut::default()),
         Shape::Records { .. } => Vec::new(),
-        Shape::Table { columns } => {
+        Shape::Table { columns, .. } => {
             columns.named().iter().map(|c| Line::Text(selected(c))).collect()
         }
         Shape::Union { branches } => branches.iter().map(Line::Shape).collect(),
@@ -248,9 +262,18 @@ fn clauses<'a>(
     out
 }
 
-/// One column of an answer: its name, and the number that goes in it.
+/// One column of an answer: its name, the number that goes in it, and anything applied to that
+/// number on the way out.
+///
+/// The expression is printed for the reason [`selected`] gives below and it is the same reason:
+/// `round(avg(amount), 2)` and a bare `avg(amount)` name the same two plans, and a printer that
+/// showed them identically would let a lost expression through.
 fn cell(cell: &Cell, sides: &[JoinSide]) -> String {
-    format!("{} = {}{}", cell.column, of(cell.of, sides), units(&cell.units))
+    let applied = match &cell.apply {
+        Some(expr) => format!(" apply={}", expr.print()),
+        None => String::new(),
+    };
+    format!("{} = {}{}{}", cell.column, of(cell.of, sides), units(&cell.units), applied)
 }
 
 /// One column of a projection, which names no plan - the values are the plan's own answer.
@@ -261,8 +284,8 @@ fn cell(cell: &Cell, sides: &[JoinSide]) -> String {
 /// showed them identically would let a lost rounding through - which is the one thing this
 /// printer may not do.
 fn selected(selected: &Selected) -> String {
-    let applied = match selected.apply {
-        Some(op) => format!(" apply={}", op.name()),
+    let applied = match &selected.apply {
+        Some(expr) => format!(" apply={}", expr.print()),
         None => String::new(),
     };
     format!("{}{}{}", selected.column, units(&selected.units), applied)
@@ -512,11 +535,36 @@ pub fn insert(insert: &Insert) -> String {
             None => " id=allocated".to_string(),
         }
     );
-    let kids: Vec<Line> = insert
-        .rows
-        .iter()
-        .map(|row| Line::Text(row.iter().map(literal).collect::<Vec<_>>().join(", ")))
-        .collect();
+    // Where the values come from is the other half of what this statement is, and the two look
+    // nothing alike: literals are printed as they were written, and a query is printed as the
+    // plan and shape it resolves to - which is the same tree `EXPLAIN SELECT` would show, because
+    // it is the same statement.
+    let kids: Vec<Line> = match &insert.source {
+        big_sql_source::Values(rows) => rows
+            .iter()
+            .map(|row| Line::Text(row.iter().map(literal).collect::<Vec<_>>().join(", ")))
+            .collect(),
+        // The columns the query reads, and the table it reads them from.
+        //
+        // The *shape* rather than the plans, because this printer links no schema and a plan is
+        // a statement put against one - the same reason `Explained::Insert` takes no plans at
+        // all. What a reader needs from an explained `INSERT ... SELECT` is which columns feed
+        // which, and that is decided without a catalog.
+        big_sql_source::Select(select) => {
+            let query = crate::ast::Query { branches: vec![(**select).clone()] };
+            match crate::lower(&query) {
+                Ok(s) => vec![Line::Text(format!(
+                    "select {} from {}",
+                    s.answer.shape.columns().into_iter().collect::<Vec<_>>().join(", "),
+                    select.from.qualified()
+                ))],
+                // Unreachable through the parser, which accepts nothing here that would fail to
+                // lower - and an error line rather than a panic, because a printer may not be
+                // the thing that takes a node down.
+                Err(e) => vec![Line::Text(format!("error: {}", e.code()))],
+            }
+        }
+    };
     write_lines(&mut out, &kids, "");
     out
 }
@@ -546,7 +594,11 @@ pub fn show(show: &Show) -> String {
 
 /// A literal exactly as the statement wrote it, so that a decimal's written scale is visible -
 /// `1.50` and `1.5` are two different statements to a field of scale two.
-fn literal(literal: &Literal) -> String {
+///
+/// Shared with [`crate::Scalar::print`], which writes constants inside an expression and must
+/// write them the same way this does - two printers for one kind of value is one printer plus
+/// the day they disagree about `1.50`.
+pub(crate) fn literal(literal: &Literal) -> String {
     match literal {
         Literal::Int(n) => n.to_string(),
         Literal::Sint(n) => n.to_string(),

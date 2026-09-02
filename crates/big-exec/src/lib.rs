@@ -355,6 +355,14 @@ pub fn execute<P: Pager + Sync>(db: &DbRead<'_, P>, plan: &Plan) -> Result<Value
         // which is the caller having asked for one - see [`Plan::Project`].
         Plan::Project { rows, fields, limit, .. } => {
             let matched = eval(db, table, rows)?;
+            // An unbounded projection reads every matching record, so it answers to the same
+            // record ceiling every other unbounded read does - and the check costs nothing,
+            // because a `Matches` knows its cardinality without naming one of them. This is
+            // what bounds `SELECT c FROM t ORDER BY c`, whose cut cannot go into the plan: the
+            // sort has to see every row before it knows which ones survive.
+            if limit.is_none() {
+                db.check_records(matched.cardinality())?;
+            }
             let plans: Vec<ColumnPlan> =
                 fields.iter().map(|f| ColumnPlan::of(db, table, f)).collect();
             let mut out = Vec::new();
@@ -686,6 +694,9 @@ fn eval<P: Pager + Sync>(db: &DbRead<'_, P>, table: &str, rows: &Rows) -> Result
             db.matching_float(table, field, range_op(*op), f64::from_bits(*bits))?
         }
         Rows::Key { field, value } => db.matching_key(table, field, value)?,
+        Rows::KeyLike { field, pattern, fold } => {
+            db.matching_key_like(table, field, pattern, *fold)?
+        }
         Rows::KeyBetween { field, value, from, to } => {
             db.matching_key_between(table, field, value, *from, *to)?
         }

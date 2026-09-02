@@ -77,9 +77,11 @@ impl Parser<'_> {
 
     /// Whether the current token closes the term being parsed rather than continuing it.
     ///
-    /// What tells `WHERE active AND amount > 5` from `WHERE country LIKE 'G%'`: both are a
-    /// column followed by a word, and only the second is a comparison this engine has no set
-    /// operation for.
+    /// What tells `WHERE active AND amount > 5` from `WHERE country SIMILAR TO 'G%'`: both are
+    /// a column followed by a word, and only the second is a comparison this engine has no set
+    /// operation for. `LIKE` used to be the example here and is now answered - see
+    /// [`crate::ast::Cond::Like`] - which leaves the keyword list below doing the same job for
+    /// the ones that are not.
     fn ends_a_term(&self) -> bool {
         const ENDS: [&str; 8] =
             ["AND", "OR", "GROUP", "HAVING", "ORDER", "LIMIT", "OFFSET", "FORMAT"];
@@ -96,12 +98,19 @@ impl Parser<'_> {
         let at = self.at();
         let field = self.name("a column name")?;
         // A scalar call where a column belongs. Caught by name so it is refused as what it is -
-        // a rounding asked for before there is anything to round - rather than as a `(` where a
-        // comparison was expected, which is true and tells nobody anything. `now()` is not on
-        // this list: it is a value, and `Parser::literal` has already read it as one.
+        // a computation asked for before there is anything to compute it on - rather than as a
+        // `(` where a comparison was expected, which is true and tells nobody anything.
+        //
+        // **Every scalar function, not a hand-kept list.** The select list gained an expression
+        // evaluator and a `WHERE` did not, and the reason is unchanged: a condition chooses a
+        // set out of bitmaps before a single value has been read, so there is nothing for one of
+        // these to apply to. `now()` is not on this list - it is a value, and
+        // `Parser::literal` has already read it as one.
         if self.peek() == Some(&Tok::LParen)
             && field.qualifier.is_none()
-            && self.scalar_name(&field.column)
+            && !field.column.eq_ignore_ascii_case("now")
+            && (crate::scalar::Func::of(&field.column).is_some()
+                || field.column.eq_ignore_ascii_case("toStartOfInterval"))
         {
             return Err(self.refuse_at(Refused::ScalarFilter, at));
         }
@@ -109,9 +118,13 @@ impl Parser<'_> {
         if self.word_is("IS") {
             return Err(self.refuse(Refused::Null));
         }
-        // `NOT IN` and `NOT BETWEEN` negate the whole term, which is what `Not` already is.
-        let negated =
-            self.word_is("NOT") && (self.word_at_is(1, "IN") || self.word_at_is(1, "BETWEEN"));
+        // `NOT IN`, `NOT BETWEEN` and `NOT LIKE` negate the whole term, which is what `Not`
+        // already is.
+        let negated = self.word_is("NOT")
+            && (self.word_at_is(1, "IN")
+                || self.word_at_is(1, "BETWEEN")
+                || self.word_at_is(1, "LIKE")
+                || self.word_at_is(1, "ILIKE"));
         if negated {
             self.i += 1;
         }
@@ -127,6 +140,20 @@ impl Parser<'_> {
             }
             self.expect(&Tok::RParen, ") to close IN")?;
             Cond::In { field, values }
+        } else if self.word_is("LIKE") || self.word_is("ILIKE") {
+            // **The one string predicate a bitmap answers exactly.** A keyed column interns
+            // each distinct value once, so a pattern is a walk of that dictionary and a union
+            // of the bitmaps that matched - the column's cardinality, not its record count. See
+            // `big_plan::Rows::KeyLike`.
+            let fold = self.word_is("ILIKE");
+            self.i += 1;
+            let pattern = match self.literal("a quoted pattern after LIKE")? {
+                Literal::Str(p) => p,
+                // A number is not a pattern. Refused where it was written rather than compared
+                // against the digits it happens to have.
+                _ => return Err(self.syntax("a quoted pattern after LIKE")),
+            };
+            Cond::Like { field, pattern, fold }
         } else if self.eat_word("BETWEEN") {
             let low = self.literal("a lower bound")?;
             self.expect_word("AND", "AND between the two bounds")?;
@@ -139,8 +166,9 @@ impl Parser<'_> {
                     self.i += 1;
                     Cond::Cmp { field, op, value: self.literal("a value to compare against")? }
                 }
-                // A word here is `LIKE`, `SIMILAR`, `GLOB` or another comparison this engine
-                // has no set operation for. Refused as a predicate rather than as syntax.
+                // A word here is `SIMILAR TO`, `GLOB`, `MATCH` or another comparison this
+                // engine has no set operation for. Refused as a predicate rather than as
+                // syntax. `LIKE` and `ILIKE` are handled above, because a bitmap answers them.
                 //
                 // `AND`, `OR` and the clause keywords are the exception: they end the term
                 // rather than continue it, so a column standing alone in front of one is the

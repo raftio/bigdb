@@ -28,10 +28,13 @@
 
 mod group;
 mod num;
+mod scalar;
 
-use crate::{Answer, Shape, TimeOp, Units, Value};
+use crate::{Answer, Cell, Shape, Units, Value};
+use big_sql::Scalar;
 use group::{grouped, joined, paired};
 use num::{int_of, number, scalar_cell, Num};
+pub use scalar::eval;
 
 /// One row of a result set.
 pub type Row = Vec<Datum>;
@@ -80,12 +83,24 @@ pub enum Datum {
 
 impl Datum {
     /// One cell of a projected row, in the units its column is in.
-    fn projected(p: &big_exec::Projection, units: &Units, apply: Option<TimeOp>) -> Self {
+    ///
+    /// **The expression is applied last, to the finished cell.** Building the `Datum` first is
+    /// what lets the evaluator work on `12.50` rather than on the `1250` a decimal field
+    /// stores, and what lets `toDate` tell a day count from a second count without being told
+    /// which it was handed. See [`mod@scalar`].
+    fn projected(p: &big_exec::Projection, units: &Units, apply: Option<&Scalar>) -> Self {
+        let value = Self::read(p, units);
+        match apply {
+            None => value,
+            Some(expr) => scalar::eval(expr, &value),
+        }
+    }
+
+    /// The cell a projected value is before any expression has been applied to it.
+    fn read(p: &big_exec::Projection, units: &Units) -> Self {
         match p {
             big_exec::Projection::Absent => Self::Null,
-            big_exec::Projection::Int(v) => {
-                Self::num(Some(Num::Int(rounded(*v, units, apply))), units)
-            }
+            big_exec::Projection::Int(v) => Self::num(Some(Num::Int(*v)), units),
             // Already decoded, because undoing the float transform needed the field's width and
             // the executor was the last layer holding a catalog.
             big_exec::Projection::Real(v) => Self::Real(*v),
@@ -146,24 +161,91 @@ pub fn fixed(units: i128, scale: u8) -> String {
     format!("{sign}{}.{}", &digits[..point], &digits[point..])
 }
 
-/// A projected number with the rounding its column asked for already applied.
+/// Two cells in the order an `ORDER BY` puts them.
 ///
-/// **Applied here, on the way out, and nowhere else.** The plan read the column it was going to
-/// read anyway; a rounding is arithmetic on the number that came back, so it costs nothing and
-/// it happens in the same place a decimal has its point put back. That is also why it can only
-/// ever be a projection: a `WHERE` runs over bitmaps, before any of these numbers exist.
+/// **Absent sorts last, whichever direction was asked for**, which is why `desc` is an argument
+/// here rather than a `.reverse()` at the call site. Reversing the whole comparison would carry
+/// the absent rows to the front under `DESC`, and a row with no value in the column is not a
+/// large one any more than it is a small one. The standard leaves the choice to the
+/// implementation and engines disagree, so it is written down: burying them at the end is what
+/// a reader of `ORDER BY amount DESC LIMIT 10` means.
 ///
-/// The pair `(units, apply)` is unambiguous because [`Shape::resolve`] made it so - see
-/// `resolve_selected`. `units` is what the value is in *after* the rounding, so `ToDate` is the
-/// one case where the number arriving is in different units from the one leaving.
-fn rounded(v: i128, units: &Units, apply: Option<TimeOp>) -> i128 {
-    let Some(op) = apply else { return v };
-    let Ok(n) = i64::try_from(v) else { return v };
-    i128::from(match (op, units) {
-        (TimeOp::ToDate, _) => big_civil::to_days(n),
-        (TimeOp::Trunc(u), Units::Date) => big_civil::truncate_days(n, u),
-        (TimeOp::Trunc(u), _) => big_civil::truncate(n, u),
+/// Numbers compare as numbers across the kinds - a `Dec` against an `Int` meets at the scale,
+/// the same alignment the evaluator does - and text compares by bytes, which is how a key is
+/// ordered everywhere else in this engine. Two cells of kinds that do not compare keep the order
+/// they arrived in, because a projection column holds one kind and mixing them is not a shape
+/// this produces.
+fn order_cells(a: &Datum, b: &Datum, desc: bool) -> core::cmp::Ordering {
+    use core::cmp::Ordering;
+    // Decided before the direction is applied, and therefore unaffected by it.
+    match (a, b) {
+        (Datum::Null, Datum::Null) => return Ordering::Equal,
+        (Datum::Null, _) => return Ordering::Greater,
+        (_, Datum::Null) => return Ordering::Less,
+        _ => {}
+    }
+    let ord = match (a, b) {
+        (Datum::Text(x), Datum::Text(y)) => x.cmp(y),
+        (Datum::Keys(x), Datum::Keys(y)) => x.cmp(y),
+        _ => scalar::compare_numbers(a, b).unwrap_or(Ordering::Equal),
+    };
+    match desc {
+        true => ord.reverse(),
+        false => ord,
+    }
+}
+
+/// A cell as the literal that would have written it, for `INSERT ... SELECT`.
+///
+/// `Ok(None)` is a cell with no value - the source record held nothing in that field - and the
+/// caller writes no fact for it, which is what "no value" already means here. `Err` is a cell
+/// this language has no literal for at all.
+///
+/// **The one of those is a float**, and the reason is worth stating: a [`big_plan::Literal`] is
+/// exact by construction - an integer, or an integer and a scale - because every value on the
+/// write path has to mean the same thing it meant when it was typed. There is no spelling of an
+/// arbitrary `f64` in that set, and the nearest decimal is a *different number*. So a float
+/// column is refused by name rather than written as something close to what was read.
+///
+/// A date and a timestamp go back as the strings they render to, which is not a lossy step: it
+/// is the exact text an `INSERT` would have carried, read back by the same `to_count` the
+/// literal form uses.
+pub fn literal_of(cell: &Datum) -> Result<Option<big_plan::Literal>, &'static str> {
+    use big_plan::Literal;
+    Ok(match cell {
+        Datum::Null => None,
+        Datum::Int(v) => Some(match u64::try_from(*v) {
+            Ok(n) => Literal::Int(n),
+            Err(_) => Literal::Sint(i64::try_from(*v).map_err(|_| "a number this wide")?),
+        }),
+        Datum::Dec { units, scale } => Some(match u64::try_from(*units) {
+            Ok(n) => Literal::Dec { units: n, scale: *scale },
+            Err(_) => Literal::Sdec {
+                units: i64::try_from(*units).map_err(|_| "a number this wide")?,
+                scale: *scale,
+            },
+        }),
+        Datum::Date(days) => Some(Literal::Str(date_text(*days))),
+        Datum::Timestamp(secs) => Some(Literal::Str(timestamp_text(*secs))),
+        Datum::Text(s) => Some(Literal::Str(s.clone())),
+        Datum::Real(_) => return Err("a FLOAT or DOUBLE column"),
+        // A list of keys is what `topK` answers with, and a projection never produces one - so
+        // this is unreachable rather than a shape somebody can write.
+        Datum::Keys(_) => return Err("a list of keys"),
     })
+}
+
+/// A cell's number with the expression its entry asked for applied to it.
+///
+/// **One function for all four shapes.** A `Row`, a grouping, a pair grouping and a join each
+/// build their cells differently and each has to apply the expression the same way, so the
+/// alternative is four copies of two lines and the day one of them is forgotten - which would
+/// be an expression that silently does not run.
+pub(super) fn applied(cell: &Cell, value: Datum) -> Datum {
+    match &cell.apply {
+        None => value,
+        Some(expr) => scalar::eval(expr, &value),
+    }
 }
 
 /// A day count, written the way a date is written. UTC, like every date in this engine.
@@ -227,37 +309,63 @@ fn rows_of(shape: &Shape, values: &[Value], probes_at: usize) -> Vec<Row> {
             if !kept {
                 return Vec::new();
             }
-            vec![cells.iter().map(|c| scalar_cell(c, values, probes_at)).collect()]
+            vec![cells.iter().map(|c| applied(c, scalar_cell(c, values, probes_at))).collect()]
         }
 
-        Shape::Records { limit, .. } => match values.first().and_then(Value::as_rows) {
+        // Record ids, which already come in ascending order - so ascending costs nothing and
+        // descending is the same list read backwards. The cut is applied after the reversal,
+        // which is the only order that answers `ORDER BY _record_id DESC LIMIT 10` with the ten
+        // highest rather than the ten lowest read backwards.
+        Shape::Records { limit, descending, .. } => match values.first().and_then(Value::as_rows) {
             None => Vec::new(),
-            Some(m) => m
-                .records_from(0)
-                .take(limit.unwrap_or(usize::MAX))
-                .map(|r| vec![Datum::Int(i128::from(r))])
-                .collect(),
+            Some(m) => {
+                let ids: Box<dyn Iterator<Item = _>> = match descending {
+                    false => Box::new(m.records_from(0)),
+                    true => Box::new(m.records_from(0).collect::<Vec<_>>().into_iter().rev()),
+                };
+                ids.take(limit.unwrap_or(usize::MAX))
+                    .map(|r| vec![Datum::Int(i128::from(r))])
+                    .collect()
+            }
         },
 
         // Nothing to do but render: the plan carried the columns and the cut, because a
         // projection's cost is a point read per record per column and a cut applied here would
         // be one applied after paying for it.
-        Shape::Table { columns } => values
-            .first()
-            .and_then(Value::as_table)
-            .unwrap_or(&[])
-            .iter()
-            // Every shape a projected cell can be already has a `Datum`: the result set was
-            // built to carry keys and lists of keys because a grouping answers with them, and a
-            // projected keyed column is the same string arriving by a different route.
-            .map(|p| {
-                p.values
-                    .iter()
-                    .zip(columns.named())
-                    .map(|(v, c)| Datum::projected(v, &c.units, c.apply))
-                    .collect()
-            })
-            .collect(),
+        Shape::Table { columns, order, cut } => {
+            let mut out: Vec<Row> = values
+                .first()
+                .and_then(Value::as_table)
+                .unwrap_or(&[])
+                .iter()
+                // Every shape a projected cell can be already has a `Datum`: the result set was
+                // built to carry keys and lists of keys because a grouping answers with them, and a
+                // projected keyed column is the same string arriving by a different route.
+                .map(|p| {
+                    p.values
+                        .iter()
+                        .zip(columns.named())
+                        .map(|(v, c)| Datum::projected(v, &c.units, c.apply.as_ref()))
+                        .collect()
+                })
+                .collect();
+
+            // **Sorted here, after every value has been read, because there is nowhere else.**
+            // A projection's rows are values reconstructed a record at a time, in record order,
+            // and nothing below this holds them - so the plan cannot rank them and the cut
+            // cannot ride in it either. See `big_sql::RowOrder`, which states what that costs.
+            if let Some(o) = order {
+                if let Some(at) = columns.named().iter().position(|c| c.column == o.column) {
+                    // A stable sort, so rows that tie stay in record order - which is the only
+                    // tie-break available here and the one a reader can predict.
+                    out.sort_by(|a, b| order_cells(&a[at], &b[at], o.desc));
+                }
+            }
+            if let Some(n) = cut {
+                out.truncate(*n);
+            }
+            out
+        }
 
         Shape::Groups { keys, cells, having, order, cut } => {
             grouped(keys, cells, having.as_ref(), *order, *cut, values)

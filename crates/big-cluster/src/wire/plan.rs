@@ -62,6 +62,7 @@ mod rows_tag {
     pub const NOT: u8 = 8;
     pub const ALL: u8 = 9;
     pub const COMPARE_FLOAT: u8 = 10;
+    pub const KEY_LIKE: u8 = 11;
 }
 
 pub fn put_rows(out: &mut Vec<u8>, rows: &Rows) {
@@ -91,6 +92,12 @@ pub fn put_rows(out: &mut Vec<u8>, rows: &Rows) {
             put_u8(out, rows_tag::KEY);
             put_str(out, field);
             put_str(out, value);
+        }
+        Rows::KeyLike { field, pattern, fold } => {
+            put_u8(out, rows_tag::KEY_LIKE);
+            put_str(out, field);
+            put_str(out, pattern);
+            put_bool(out, *fold);
         }
         Rows::KeyBetween { field, value, from, to } => {
             put_u8(out, rows_tag::KEY_BETWEEN);
@@ -145,6 +152,7 @@ fn get_rows_at(r: &mut Reader<'_>, depth: usize) -> Result<Rows> {
             Rows::CompareFloat { field: r.str()?, op: get_cmp(r)?, bits: r.u64()? }
         }
         rows_tag::KEY => Rows::Key { field: r.str()?, value: r.str()? },
+        rows_tag::KEY_LIKE => Rows::KeyLike { field: r.str()?, pattern: r.str()?, fold: r.bool()? },
         rows_tag::KEY_BETWEEN => Rows::KeyBetween {
             field: r.str()?,
             value: r.str()?,

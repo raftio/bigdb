@@ -65,7 +65,11 @@ fn the_aggregates_and_their_shapes() {
     // what a table with nothing readable resolves to.
     assert_eq!(
         translate("SELECT * FROM t WHERE active = true LIMIT 10").unwrap().answer.shape,
-        Shape::Table { columns: Columns::All { table: "t".to_string(), limit: Some(10) } }
+        Shape::Table {
+            columns: Columns::All { table: "t".to_string(), limit: Some(10) },
+            order: None,
+            cut: None,
+        }
     );
     assert_eq!(
         translate("SELECT category, count(*) FROM t GROUP BY category").unwrap().answer.shape,
@@ -145,6 +149,8 @@ fn a_projection_carries_its_cut_in_the_plan() {
                     apply: None,
                 },
             ]),
+            order: None,
+            cut: None,
         }
     );
     // The two spellings of the cut must not both apply: the shape has no limit of its own.

@@ -95,3 +95,29 @@ INSERT INTO tx (id, country) VALUES (7, 'GB')
 ----
 Insert tx (id, country) id=allocated
 └── 7, 'GB'
+
+# `INSERT ... SELECT`: the values come out of another table rather than out of the statement.
+#
+# The printed source is the *shape* rather than a plan, because this printer links no schema -
+# what a reader needs is which columns feed which, and that is decided without a catalog.
+insert
+INSERT INTO tx (country) SELECT country FROM u
+----
+Insert tx (country) id=allocated
+└── select country from u
+
+# A `WHERE` and a `LIMIT` ride along: both belong to the projection, and both bound what is read
+# rather than what is written afterwards.
+insert
+INSERT INTO tx (country, amount) SELECT country, amount FROM u WHERE amount > 5 LIMIT 10
+----
+Insert tx (country, amount) id=allocated
+└── select country, amount from u
+
+# An expression over the column is a projection too - the plan reads the same column, and the
+# arithmetic happens where the value is written out.
+insert
+INSERT INTO tx (amount) SELECT amount * 2 FROM u
+----
+Insert tx (amount) id=allocated
+└── select amount * 2 from u

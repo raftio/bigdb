@@ -74,6 +74,24 @@ pub enum Rows {
         field: String,
         value: String,
     },
+    /// Every key of a field matching a `LIKE` pattern, unioned.
+    ///
+    /// **A set operation, not a scan.** A keyed field interns each distinct string once, so
+    /// this walks that dictionary and unions the bitmaps of the keys that match - the field's
+    /// cardinality, paid once, where a row engine pays the record count. Which is why it is a
+    /// `Rows` variant rather than a filter applied to something else's answer: it *is* a
+    /// bitmap, and everything that composes bitmaps composes it.
+    ///
+    /// Only a keyed field has a dictionary to walk. `big_db` refuses the rest by name rather
+    /// than answering an empty set, because an integer holds no strings and "nothing matched"
+    /// would be the wrong answer wearing a right one's clothes.
+    KeyLike {
+        field: String,
+        /// SQL's two wildcards: `%` for any run, `_` for one, `\` to escape either.
+        pattern: String,
+        /// `ILIKE`: fold both sides before comparing. The only difference between the two.
+        fold: bool,
+    },
     /// A key restricted to a window of time, answered from the views a time quantum field
     /// writes rather than by filtering everything it ever recorded.
     ///
@@ -595,6 +613,8 @@ impl<S: Schema> Ctx<'_, S> {
                 0 => Ok(Rows::All),
                 n => Err(PlanError::Arity { call: "All", want: "no arguments", got: n }),
             },
+            "Like" => self.like(call, false),
+            "ILike" => self.like(call, true),
             "Not" => Ok(Rows::Not(Box::new(self.one_rows_arg("Not", &call.args)?))),
             "Intersect" => Ok(Rows::Intersect(self.rows_args("Intersect", &call.args)?)),
             "Union" => Ok(Rows::Union(self.rows_args("Union", &call.args)?)),
@@ -670,6 +690,48 @@ impl<S: Schema> Ctx<'_, S> {
     ///
     /// This is where the parser's refusal to guess about `=` gets paid off: the schema says
     /// whether `country` is a key or an integer, and the same syntax resolves either way.
+    /// `Like(field='pattern')`, and `ILike` for the folded one.
+    ///
+    /// Written like a `Row` because it is one shape of the same question - which key does a
+    /// record hold - and reusing the spelling means somebody who can write `Row(country='GB')`
+    /// can write this without learning a second form.
+    ///
+    /// The field's class is checked here rather than left to the storage layer, so that a
+    /// pattern over an integer is refused where every other type mistake in this language is:
+    /// at plan time, with the sentence naming what the column actually holds.
+    fn like(&self, call: &Call, fold: bool) -> Result<Rows> {
+        let called = if fold { "ILike" } else { "Like" };
+        let (field, pattern) = match call.args.as_slice() {
+            [Expr::Named { name, value }] => match value.as_ref() {
+                Expr::Literal(Literal::Str(p)) => (name.clone(), p.clone()),
+                _ => return Err(PlanError::BadArgument { call: called, want: "a quoted pattern" }),
+            },
+            [Expr::Compare { field, op, value }] if op == "=" || op == "==" => match value {
+                Literal::Str(p) => (field.clone(), p.clone()),
+                _ => return Err(PlanError::BadArgument { call: called, want: "a quoted pattern" }),
+            },
+            other => {
+                return Err(PlanError::Arity {
+                    call: called,
+                    want: "one field and a quoted pattern",
+                    got: other.len(),
+                })
+            }
+        };
+
+        let class = self.class(&field)?;
+        match class {
+            FieldClass::Keyed(_) => Ok(Rows::KeyLike { field, pattern, fold }),
+            // The same refusal an operator mistake gets, and for the same reason: a pattern is
+            // an operator on strings, and this column holds none.
+            class => Err(PlanError::OperatorNotAllowed {
+                field,
+                op: called.to_string(),
+                class: class_name(class),
+            }),
+        }
+    }
+
     fn row(&self, call: &Call) -> Result<Rows> {
         // A time window is the only form with more than one argument, so it is recognised
         // before the shapes that insist on exactly one.

@@ -48,6 +48,16 @@ pub enum Tok {
     /// A comparison. Normalised: `==` arrives as `=` and `<>` as `!=`, so the lowering has one
     /// spelling of each to translate rather than two of some.
     Op(&'static str),
+    /// An arithmetic operator: `+`, `-`, `/` or `%`. Multiplication is [`Tok::Star`], which a
+    /// select list also uses for "every column" - which of the two it is, is the parser's to
+    /// say, and it can tell because only one of them can follow a value.
+    ///
+    /// **A `-` is a token here even when a number follows it.** It used to be folded into the
+    /// number, because a dialect with no arithmetic has no other reading of one; with
+    /// arithmetic there are two, and `amount-1` is the one a lexer cannot tell from `amount`
+    /// and `-1`. The sign is put back where the difference is visible - see
+    /// [`crate::parse::Parser::literal`], the one place a value is read.
+    Arith(&'static str),
     /// `(`
     LParen,
     /// `)`
@@ -143,7 +153,24 @@ pub fn lex(input: &str) -> Result<Vec<Token>> {
             }
             b'\'' => string(s, &mut i, b'\'').map(Tok::Str)?,
             b'"' => string(s, &mut i, b'"').map(Tok::Quoted)?,
-            b'-' | b'0'..=b'9' => number(s, &mut i)?,
+            // The `--` comment form was consumed above, so a `-` reaching here is the operator.
+            b'-' => {
+                i += 1;
+                Tok::Arith("-")
+            }
+            b'+' => {
+                i += 1;
+                Tok::Arith("+")
+            }
+            b'/' => {
+                i += 1;
+                Tok::Arith("/")
+            }
+            b'%' => {
+                i += 1;
+                Tok::Arith("%")
+            }
+            b'0'..=b'9' => number(s, &mut i)?,
             c if c.is_ascii_alphabetic() || c == b'_' => {
                 let start = i;
                 while i < s.len() && (s[i].is_ascii_alphanumeric() || s[i] == b'_') {
@@ -196,24 +223,14 @@ fn string(s: &[u8], i: &mut usize, quote: u8) -> Result<String> {
     }
 }
 
-/// An integer, a decimal, or either with a leading `-`.
+/// An integer or a decimal, unsigned.
 ///
-/// `-` is only ever a sign here: there is no arithmetic in this dialect, so a `-` that is not
-/// followed by a digit is not a token at all.
+/// **The sign is not read here.** A `-` is its own token now that this dialect has arithmetic,
+/// because `amount-1` and `amount, -1` are the same three bytes to a scanner and different
+/// statements to a reader. [`crate::parse::Parser::literal`] puts it back where a value is
+/// being read and the difference is decidable.
 fn number(s: &[u8], i: &mut usize) -> Result<Tok> {
     let at = *i;
-    let negative = s[*i] == b'-';
-    if negative {
-        *i += 1;
-        if !s.get(*i).is_some_and(u8::is_ascii_digit) {
-            return Err(SqlError::Syntax {
-                at,
-                found: "-".to_string(),
-                want: "a number after the sign",
-            });
-        }
-    }
-
     let start = *i;
     while s.get(*i).is_some_and(u8::is_ascii_digit) {
         *i += 1;
@@ -237,20 +254,34 @@ fn number(s: &[u8], i: &mut usize) -> Result<Tok> {
         String::from_utf8_lossy(&digits).parse().map_err(|_| SqlError::NumberTooLarge { at })?;
     let scale = u8::try_from(frac.len()).map_err(|_| SqlError::NumberTooLarge { at })?;
 
-    Ok(Tok::Num(match (negative, scale) {
-        // A negative fractional number used to be refused here, because a decimal field is
-        // unsigned and there was nowhere else for one to go. A float field holds one perfectly
-        // well, and a lexer cannot see which kind of field a value is headed for - so the shape
-        // is read and the refusal moved to `big_plan::to_units`, which knows the field.
-        (true, scale) if scale > 0 => {
-            let units = i64::try_from(units).map_err(|_| SqlError::NumberTooLarge { at })?;
-            Literal::Sdec { units: -units, scale }
-        }
-        (true, _) => {
-            let v = i64::try_from(units).map_err(|_| SqlError::NumberTooLarge { at })?;
+    Ok(Tok::Num(match scale {
+        0 => Literal::Int(units),
+        scale => Literal::Dec { units, scale },
+    }))
+}
+
+/// The same number with a `-` in front of it, which is how [`crate::parse::Parser::literal`]
+/// reads a sign that is now a token of its own.
+///
+/// A negative fractional number is not refused here: a decimal field is unsigned and a float
+/// field is not, and a parser cannot see which kind of field a value is headed for. The shape
+/// is read and the refusal left to `big_plan::to_units`, which knows the field.
+pub fn negate(n: &Literal, at: usize) -> Result<Literal> {
+    Ok(match n {
+        Literal::Int(units) => {
+            let v = i64::try_from(*units).map_err(|_| SqlError::NumberTooLarge { at })?;
             Literal::Sint(-v)
         }
-        (false, 0) => Literal::Int(units),
-        (false, scale) => Literal::Dec { units, scale },
-    }))
+        Literal::Dec { units, scale } => {
+            let units = i64::try_from(*units).map_err(|_| SqlError::NumberTooLarge { at })?;
+            Literal::Sdec { units: -units, scale: *scale }
+        }
+        // Already signed, which only a doubled sign produces - `- -1`. Negating again is the
+        // reading every language gives it.
+        Literal::Sint(v) => Literal::Sint(-v),
+        Literal::Sdec { units, scale } => Literal::Sdec { units: -units, scale: *scale },
+        _ => {
+            return Err(SqlError::Syntax { at, found: "-".into(), want: "a number after the sign" })
+        }
+    })
 }

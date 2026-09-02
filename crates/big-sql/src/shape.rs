@@ -30,7 +30,7 @@
 //! group is materialised at the coordinator before the cut. `TopN` still carries its own ranking
 //! when it can — see [`Shape::Groups`]'s `order`.
 
-use crate::ast::TimeOp;
+use crate::scalar::{Func, Scalar};
 use big_plan::{FieldClass, Literal, PlanError, Schema};
 
 /// A predicate on the numbers each group carries, applied to the merged answer.
@@ -326,6 +326,28 @@ pub enum OrderBy {
     },
 }
 
+/// `ORDER BY` over a projection's rows, applied after every value has been read.
+///
+/// **The one ordering that cannot go into the plan.** A grouping's can - `TopN` ranks and cuts
+/// in one pass - because the number it ranks by is the plan's own answer. A projection's rows
+/// are values reconstructed a record at a time, in record order, and nothing below this holds
+/// them; so the sort happens here, over the whole answer, and the `LIMIT` with it.
+///
+/// That is a real cost and it is stated rather than hidden: `SELECT c FROM t ORDER BY c LIMIT
+/// 10` reads every matching record where the same statement without the `ORDER BY` reads ten.
+/// What bounds it is the record ceiling every other unbounded read answers to - see
+/// `big_db::DbRead::check_records`.
+///
+/// The column is named rather than indexed because a name survives [`Shape::resolve`] expanding
+/// a `SELECT *`, and because an alias is what `ORDER BY` is allowed to name.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct RowOrder {
+    /// The output column to sort by, under the name the header gives it.
+    pub column: String,
+    /// `DESC` was written.
+    pub desc: bool,
+}
+
 /// `ORDER BY` over a list of groups, applied after the merge.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct GroupOrder {
@@ -411,6 +433,12 @@ pub struct Cell {
     /// What that number is measured in - see [`Units`]. `Digits(0)` for everything but a
     /// number that came out of a decimal field.
     pub units: Units,
+    /// An expression applied to the number on its way into the cell.
+    ///
+    /// The same field [`Selected`] carries and for the same reason: `round(avg(amount), 2)` is
+    /// the `avg` plan and a rounding, and the rounding happens here because this is the last
+    /// place - after the merge, where the quotient is finally whole.
+    pub apply: Option<Scalar>,
 }
 
 /// The columns of a projection, before and after a schema has named them.
@@ -463,13 +491,13 @@ pub struct Selected {
     pub column: String,
     /// What the values in it are measured in.
     pub units: Units,
-    /// A rounding applied to each value on the way out, from `toDate` or `date_trunc`.
+    /// An expression applied to each value on the way out.
     ///
     /// Here rather than in the plan because it changes nothing the plan does: the same column
-    /// is read, per record, at the same cost, and the rounding is arithmetic on the number that
+    /// is read, per record, at the same cost, and the expression is arithmetic on the value that
     /// comes back. That is the same place [`Units`] puts a decimal's point back, and for the
     /// same reason - it is the last step, and the only one that has to know.
-    pub apply: Option<TimeOp>,
+    pub apply: Option<Scalar>,
 }
 
 impl Cell {
@@ -479,7 +507,7 @@ impl Cell {
     /// The units of a cell that reads a field are the field's, and only the lowering knows
     /// which field that was - see [`Units::Written`].
     pub fn plain(column: impl Into<String>, of: Of) -> Self {
-        Self { column: column.into(), of, units: Units::PLAIN }
+        Self { column: column.into(), of, units: Units::PLAIN, apply: None }
     }
 }
 
@@ -784,18 +812,36 @@ pub enum Shape {
         column: String,
         /// `LIMIT`, applied after the merge.
         limit: Option<usize>,
+        /// `ORDER BY <the record id> DESC`, when one was written.
+        ///
+        /// Only a direction, because there is only one column and it is the record id. Ascending
+        /// is what the records already come in, so it costs nothing and is not represented.
+        descending: bool,
     },
     /// The stored values of some columns, one row per record.
     ///
     /// The shape a projection answers with, and the only one whose cells are values a record
-    /// holds rather than numbers about a set of them. There is nothing for a shape to do to it:
-    /// the plan carried the columns and the cut, because a projection's cost is a point read
-    /// per record per column and a cut applied afterwards would be a cut applied after paying
-    /// for it. The names are here so that the header can be written without the plan.
+    /// holds rather than numbers about a set of them. Usually there is nothing for a shape to
+    /// do to it: the plan carried the columns and the cut, because a projection's cost is a
+    /// point read per record per column and a cut applied afterwards would be a cut applied
+    /// after paying for it. The names are here so that the header can be written without the
+    /// plan.
+    ///
+    /// **An `ORDER BY` is the exception, and it moves the cut up here with it.** A sort has to
+    /// see every row before it knows which ten survive, so the plan cannot carry the limit and
+    /// the reads are not bounded by it. See [`RowOrder`].
     Table {
         /// The columns, in the order the select list wrote them, which is the order the cells
         /// come in.
         columns: Columns,
+        /// `ORDER BY`, applied after every value has been read. See [`RowOrder`].
+        order: Option<RowOrder>,
+        /// `LIMIT`, applied after the sort.
+        ///
+        /// **Only ever set beside an `order`.** Without one the cut belongs in the plan, where
+        /// it bounds the point reads rather than trimming what they already cost - which is why
+        /// `Columns::All` carries its own limit and this stays `None`.
+        cut: Option<usize>,
     },
     /// Several answers, one after the other.
     ///
@@ -929,7 +975,9 @@ impl Shape {
             Self::Union { branches } => branches.first().map(Shape::columns).unwrap_or_default(),
             Self::Pairs { cells, .. } => cells.iter().map(|c| c.column.as_str()).collect(),
             Self::Records { column, .. } => vec![column.as_str()],
-            Self::Table { columns } => columns.named().iter().map(|c| c.column.as_str()).collect(),
+            Self::Table { columns, .. } => {
+                columns.named().iter().map(|c| c.column.as_str()).collect()
+            }
             Self::Row { cells, .. } | Self::Groups { cells, .. } | Self::Join { cells, .. } => {
                 cells.iter().map(|c| c.column.as_str()).collect()
             }
@@ -996,7 +1044,16 @@ impl Shape {
         let all = |cells: Vec<Cell>| -> Result<Vec<Cell>, PlanError> {
             cells
                 .into_iter()
-                .map(|c| Ok(Cell { units: resolve_units(schema, c.units)?, ..c }))
+                .map(|c| {
+                    let units = resolve_units(schema, c.units)?;
+                    // The same check a projected column gets, for the same reason: an
+                    // expression over an aggregate is applied to the merged number, and whether
+                    // it means anything depends on the field that number came out of.
+                    if let Some(expr) = &c.apply {
+                        check_scalar(expr, &units)?;
+                    }
+                    Ok(Cell { units, ..c })
+                })
                 .collect()
         };
         Ok(match self {
@@ -1016,7 +1073,7 @@ impl Shape {
                 order,
                 cut,
             },
-            Self::Table { columns } => match columns {
+            Self::Table { columns, order, cut } => match columns {
                 Columns::Named(columns) => Self::Table {
                     columns: Columns::Named(
                         columns.into_iter().map(|c| resolve_selected(schema, c)).collect::<Result<
@@ -1025,6 +1082,8 @@ impl Shape {
                         >>(
                         )?,
                     ),
+                    order,
+                    cut,
                 },
                 // `SELECT *`. An empty expansion is a table with nothing a projection could
                 // read, and the planner turned the same call into a `Rows`; the header follows
@@ -1032,12 +1091,41 @@ impl Shape {
                 Columns::All { table, limit } => {
                     let names = big_plan::expanded_columns(schema, &table);
                     if names.is_empty() {
+                        // Nothing a projection could read, so the answer is record ids - and the
+                        // only ordering there is on the ids themselves, which is the order they
+                        // already come in. An `ORDER BY` naming anything else has no column to
+                        // name, and is refused here for the same reason a named projection's is
+                        // refused where its columns are known.
+                        let descending = match &order {
+                            None => false,
+                            Some(o) if o.column == crate::RECORD_COLUMN => o.desc,
+                            Some(o) => {
+                                return Err(PlanError::UnknownField {
+                                    table: table.clone(),
+                                    field: o.column.clone(),
+                                })
+                            }
+                        };
                         return Ok(Self::Records {
                             column: crate::RECORD_COLUMN.to_string(),
-                            limit,
+                            limit: cut.or(limit),
+                            descending,
                         });
                     }
+                    // **The check a `SELECT *` could not have at lowering time.** Which columns
+                    // `*` means is decided here, so this is the first place an `ORDER BY` over
+                    // one can be told from a name the table does not have.
+                    if let Some(o) = &order {
+                        if !names.contains(&o.column) {
+                            return Err(PlanError::UnknownField {
+                                table: table.clone(),
+                                field: o.column.clone(),
+                            });
+                        }
+                    }
                     Self::Table {
+                        order,
+                        cut,
                         columns: Columns::Named(
                             names
                                 .into_iter()
@@ -1096,6 +1184,7 @@ impl Shape {
                         other => other,
                     },
                     units: c.units,
+                    apply: c.apply,
                 })
                 .collect()
         };
@@ -1120,7 +1209,12 @@ impl Shape {
         let cells = |cells: Vec<Cell>| -> Vec<Cell> {
             cells
                 .into_iter()
-                .map(|c| Cell { column: c.column, of: c.of.rebase(by), units: c.units })
+                .map(|c| Cell {
+                    column: c.column,
+                    of: c.of.rebase(by),
+                    units: c.units,
+                    apply: c.apply,
+                })
                 .collect()
         };
         let having = |h: Option<Having>| h.map(|h| h.rebase(by));
@@ -1218,35 +1312,109 @@ impl Of {
 /// neither side could see alone.
 fn resolve_selected(schema: &impl Schema, c: Selected) -> Result<Selected, PlanError> {
     let units = resolve_units(schema, c.units.clone())?;
-    let Some(op) = c.apply else { return Ok(Selected { units, ..c }) };
+    if let Some(expr) = &c.apply {
+        check_scalar(expr, &units)?;
+    }
+    Ok(Selected { units, ..c })
+}
 
-    let bad = |why: &'static str| PlanError::BadRounding { call: op.name(), why };
-    // **The op is resolved as well as the units, and that is what makes rendering unambiguous.**
-    // A renderer sees the number and the units it came out in; it cannot see the column's kind.
-    // `toDate` over seconds has work to do and `toDate` over days has none, and the two would
-    // otherwise be the same pair of (op, units) at the far end. Turning the second into the
-    // identity truncation it is leaves exactly one reading of every combination that survives.
-    let (units, apply) =
-        match (op, &units) {
-            // The day an instant falls in: the column changes kind on the way out, and the cell has
-            // to say so or the answer would be rendered as the second count it was stored as.
-            (TimeOp::ToDate, Units::Seconds) => (Units::Date, TimeOp::ToDate),
-            // Already whole days, so there is nothing to do. `Trunc(Day)` over a day count is that
-            // nothing, written down.
-            (TimeOp::ToDate, Units::Date) => (Units::Date, TimeOp::Trunc(big_civil::Unit::Day)),
-            // A truncated timestamp is still a timestamp, at midnight or on the hour.
-            (TimeOp::Trunc(u), Units::Seconds) => (Units::Seconds, TimeOp::Trunc(u)),
-            (TimeOp::Trunc(u), Units::Date) if u.is_whole_days() => (Units::Date, TimeOp::Trunc(u)),
-            // Nothing below a day says anything about a column that counts whole days: it would
-            // hand back the same date wearing a precision the column never had.
-            (TimeOp::Trunc(_), Units::Date) => return Err(bad(
+/// Whether an expression means anything over a value of these units.
+///
+/// **The units are the input's and stay the input's.** An expression is evaluated on the
+/// [`Datum`](../../big_embed/result/enum.Datum.html) the column already became - a `Dec` that
+/// knows its own scale, a `Timestamp` that knows it is seconds - rather than on the stored
+/// integer, so there is no output unit for this to compute and nothing downstream that has to
+/// be told one. What is left is the half that is worth doing early: a temporal call over a
+/// column holding no moment is a mistake, and naming it here means naming it before anything
+/// runs rather than handing back a null from three layers down.
+///
+/// Only the temporal calls are checked, because they are the only ones whose meaning depends on
+/// the *kind* of column rather than on the value. `upper` of a number and `abs` of a key are
+/// answered by the evaluator with a null, which is what every engine does with them.
+fn check_scalar(expr: &Scalar, units: &Units) -> Result<(), PlanError> {
+    match expr {
+        Scalar::Value | Scalar::Literal(_) | Scalar::Now { .. } => Ok(()),
+        Scalar::Unary { arg, .. } => check_scalar(arg, units),
+        Scalar::Binary { left, right, .. } => {
+            check_scalar(left, units)?;
+            check_scalar(right, units)
+        }
+        Scalar::Case { arms, default } => {
+            for (when, then) in arms {
+                check_scalar(when, units)?;
+                check_scalar(then, units)?;
+            }
+            match default {
+                Some(d) => check_scalar(d, units),
+                None => Ok(()),
+            }
+        }
+        Scalar::Call { func, args } => {
+            for a in args {
+                check_scalar(a, units)?;
+            }
+            check_call(*func, args, units)
+        }
+    }
+}
+
+/// The temporal half of [`check_scalar`]: which calls need a moment, and which boundary a
+/// moment of these units can be rounded to.
+fn check_call(func: Func, args: &[Scalar], units: &Units) -> Result<(), PlanError> {
+    let temporal = matches!(units, Units::Date | Units::Seconds);
+    let bad =
+        |why: &'static str| Err(PlanError::BadRounding { call: func.name().to_string(), why });
+
+    // Whether the call reads the column itself, rather than a constant beside it. `date_diff`
+    // takes its unit first and its moments after, so a bare `date_diff('day', now(), now())` -
+    // legal arithmetic over two constants - must not be judged against the column's kind.
+    let reads_column = args.iter().any(|a| a.leaves() > 0);
+
+    match func {
+        Func::ToDate
+        | Func::DateTrunc
+        | Func::DateAdd
+        | Func::DateSub
+        | Func::DateDiff
+        | Func::FormatDateTime
+        | Func::ToYear
+        | Func::ToMonth
+        | Func::ToDayOfMonth
+        | Func::ToHour
+        | Func::ToMinute
+        | Func::ToSecond
+            if reads_column && !temporal =>
+        {
+            bad("a DATE or DATETIME column, and this column holds neither")
+        }
+        // Nothing below a day says anything about a column that counts whole days: it would
+        // hand back the same date wearing a precision the column never had.
+        Func::DateTrunc if matches!(units, Units::Date) => match unit_of(args) {
+            Some(u) if u.is_whole_days() => Ok(()),
+            Some(_) => bad(
                 "a boundary of a day or coarser: a DATE counts whole days, and nothing below a \
                  day says anything about one",
-            )),
-            // Every other kind: there is no moment here to round.
-            _ => return Err(bad("a DATE or DATETIME column, and this column holds neither")),
-        };
-    Ok(Selected { units, apply: Some(apply), ..c })
+            ),
+            None => Ok(()),
+        },
+        // The same rule, for the three that read a time of day out of a moment.
+        Func::ToHour | Func::ToMinute | Func::ToSecond if matches!(units, Units::Date) => {
+            bad("a DATETIME column: a DATE counts whole days and carries no time of day")
+        }
+        _ => Ok(()),
+    }
+}
+
+/// The calendar boundary a time call's first argument names, when it named one.
+///
+/// The spelling was already checked where it was parsed, so a name that does not parse here is
+/// one the parser let through - which is nothing today, and `None` rather than a panic if that
+/// ever stops being true.
+fn unit_of(args: &[Scalar]) -> Option<big_civil::Unit> {
+    match args.first() {
+        Some(Scalar::Literal(big_plan::Literal::Str(u))) => big_civil::Unit::parse(u),
+        _ => None,
+    }
 }
 
 fn resolve_units(schema: &impl Schema, u: Units) -> Result<Units, PlanError> {

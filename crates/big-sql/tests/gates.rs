@@ -139,6 +139,31 @@ fn every_refusal_is_reached_by_a_statement_in_the_corpus() {
     }
 }
 
+/// One statement's meaning, with the byte offsets taken out.
+///
+/// **The offsets shift and that is not a change to the statement.** Prefixing `EXPLAIN ` moves
+/// every byte in the text along by eight, so a parse tree that remembers where a clause was
+/// written differs from the same tree parsed bare - by arithmetic on the text rather than by
+/// anything about what it says. Most statements never show this, because lowering discards the
+/// offsets; the ones carrying an un-lowered `SELECT` - `INSERT ... SELECT` - do.
+///
+/// Blunt on purpose: this is a test, the alternative is a walk over every node of four trees,
+/// and what the claim needs is that nothing *but* a position differs.
+fn meaning(sql: &Sql) -> String {
+    let debug = format!("{sql:?}");
+    let mut out = String::with_capacity(debug.len());
+    let mut rest = debug.as_str();
+    while let Some(i) = rest.find("at: ") {
+        out.push_str(&rest[..i + 4]);
+        rest = &rest[i + 4..];
+        let digits = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+        out.push('_');
+        rest = &rest[digits..];
+    }
+    out.push_str(rest);
+    out
+}
+
 /// **`EXPLAIN X` is `X`, wrapped and otherwise untouched.**
 ///
 /// Held over the whole corpus rather than over a handful of statements, because that is the size
@@ -163,7 +188,11 @@ fn explain_wraps_every_statement_unchanged() {
         match (big_sql::translate(&sql), big_sql::translate(&format!("EXPLAIN {sql}"))) {
             (Ok(inner), Ok(Sql::Explain { mode, inner: wrapped })) => {
                 assert_eq!(mode, big_sql::ExplainMode::All, "{at}: bare EXPLAIN named a half");
-                assert_eq!(*wrapped, inner, "{at}: EXPLAIN changed the statement under it");
+                assert_eq!(
+                    meaning(&wrapped),
+                    meaning(&inner),
+                    "{at}: EXPLAIN changed the statement under it"
+                );
             }
             (Err(bare), Err(explained)) => {
                 assert_eq!(

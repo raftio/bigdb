@@ -268,7 +268,7 @@ impl Parser<'_> {
             Some(Tok::Quoted(w)) => format!("\"{w}\""),
             Some(Tok::Str(s)) => format!("'{s}'"),
             Some(Tok::Num(_)) => "a number".to_string(),
-            Some(Tok::Op(o)) => (*o).to_string(),
+            Some(Tok::Op(o)) | Some(Tok::Arith(o)) => (*o).to_string(),
             Some(Tok::LParen) => "(".to_string(),
             Some(Tok::RParen) => ")".to_string(),
             Some(Tok::Comma) => ",".to_string(),
@@ -521,6 +521,18 @@ impl Parser<'_> {
         if self.eat_word("FALSE") {
             return Ok(Literal::Bool(false));
         }
+        // A leading `-` is a token of its own since this dialect gained arithmetic - see
+        // [`crate::lex::Tok::Arith`] - so the sign is put back here, where what is being read is
+        // known to be a value. A `-` in front of anything but a number is a syntax error rather
+        // than a negation, which is what `negate` says.
+        if matches!(self.peek(), Some(Tok::Arith("-"))) {
+            let at = self.at();
+            self.i += 1;
+            let Some(Tok::Num(n)) = self.peek() else { return Err(self.syntax(want)) };
+            let n = crate::lex::negate(n, at)?;
+            self.i += 1;
+            return Ok(n);
+        }
         match self.peek() {
             Some(Tok::Num(n)) => {
                 let n = n.clone();
@@ -544,5 +556,6 @@ mod create;
 pub(crate) use create::decimal_bits;
 mod insert;
 mod item;
+mod scalar;
 mod select;
 mod show;

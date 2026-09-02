@@ -1,0 +1,200 @@
+# Arithmetic and function calls over the value a column already gave up.
+#
+# **The plan is the thing to watch in this file.** Every statement here plans exactly as the
+# bare column or the bare aggregate under it would - `Project t.(amount)`, `Sum(...)` - because
+# a scalar reads nothing its leaf did not read. What changes is the `apply=` on the shape, which
+# is the expression printed back with `_` where the value goes.
+#
+# The fields these statements use are declared in `testdata.rs`: `amount` is an integer, `price`
+# an integer of scale two, `country` a keyed set, `day` a count of days and `seen` a count of
+# seconds.
+
+## Arithmetic on a projection costs the plan nothing: the same column, read the same way.
+
+plan
+SELECT amount / 100 FROM t
+----
+Project t.(amount)
+└── all
+
+shape
+SELECT amount / 100 FROM t
+----
+Table
+└── amount / 100 apply=(_ / 100)
+
+# Precedence is the usual SQL table, and the printer brackets every binary node so that what
+# ran is readable rather than tidy.
+shape
+SELECT amount + 1 * 2 FROM t
+----
+Table
+└── amount + 1 * 2 apply=(_ + (1 * 2))
+
+# Left-associative, which is what keeps `a - b - c` from meaning `a - (b - c)`.
+shape
+SELECT amount - 1 - 2 FROM t
+----
+Table
+└── amount - 1 - 2 apply=((_ - 1) - 2)
+
+## The column name is the expression as written, which is what ClickHouse and Postgres both do.
+## An `AS` overrides it, and the expression still shows - that is the case the printer exists
+## for.
+
+shape
+SELECT amount * 2 AS doubled FROM t
+----
+Table
+└── doubled apply=(_ * 2)
+
+## A scalar over an aggregate is the aggregate's plan and a rounding after the merge. This is
+## the case that could not be written before: `avg` is a quotient of two plans, and the rounding
+## has to wait until both are whole.
+
+plan
+SELECT round(avg(amount), 2) FROM t
+----
+Sum t.amount
+└── all
+Count t
+└── all
+
+shape
+SELECT round(avg(amount), 2) FROM t
+----
+Row
+└── round(avg(amount), 2) = #0 / #1 apply=round(_, 2)
+
+## Strings. A keyed column is read back as the string it was interned from, so everything here
+## is applied to that string and none of it touches the index.
+
+shape
+SELECT upper(country) FROM t
+----
+Table
+└── upper(country) apply=upper(_)
+
+shape
+SELECT substring(country, 1, 2) FROM t
+----
+Table
+└── substring(country, 1, 2) apply=substring(_, 1, 2)
+
+# A constant beside the column is fine - it is the *column* count that has to be one.
+shape
+SELECT concat(country, '!') FROM t
+----
+Table
+└── concat(country, '!') apply=concat(_, '!')
+
+## Conversions. `toInt64` and `CAST(x AS BIGINT)` are the same question and parse into the same
+## call, which is why only one of them needs an evaluator - the two shapes below are identical
+## but for the name the column takes, which is the expression as each was written.
+
+shape
+SELECT toInt64(amount) AS n FROM t
+----
+Table
+└── n apply=toInt64(_)
+
+shape
+SELECT CAST(amount AS BIGINT) AS n FROM t
+----
+Table
+└── n apply=toInt64(_)
+
+shape
+SELECT toString(amount) FROM t
+----
+Table
+└── toString(amount) apply=toString(_)
+
+## Choice. `CASE WHEN`, `if` and `multiIf` are one tree under three spellings, which is what
+## these two identical shapes are claiming.
+
+shape
+SELECT CASE WHEN amount > 500 THEN 1 ELSE 0 END AS big FROM t
+----
+Table
+└── big apply=CASE WHEN (_ > 500) THEN 1 ELSE 0 END
+
+shape
+SELECT if(amount > 500, 1, 0) AS big FROM t
+----
+Table
+└── big apply=CASE WHEN (_ > 500) THEN 1 ELSE 0 END
+
+shape
+SELECT CASE WHEN amount > 500 THEN 'big' ELSE 'small' END FROM t
+----
+Table
+└── CASE WHEN amount > 500 THEN 'big' ELSE 'small' END apply=CASE WHEN (_ > 500) THEN 'big' ELSE 'small' END
+
+# An absent `ELSE` answers null, which is what SQL says - so there is nothing to print for it.
+shape
+SELECT CASE WHEN amount > 500 THEN 1 END FROM t
+----
+Table
+└── CASE WHEN amount > 500 THEN 1 END apply=CASE WHEN (_ > 500) THEN 1 END
+
+shape
+SELECT coalesce(amount, 0) FROM t
+----
+Table
+└── coalesce(amount, 0) apply=coalesce(_, 0)
+
+## Time. The units are the column's and stay the column's: an expression is evaluated on the
+## value the column already became, so there is no output unit for the shape to carry.
+
+shape
+SELECT toDate(seen) FROM t
+----
+Table
+└── toDate(seen) units=datetime apply=toDate(_)
+
+shape
+SELECT date_diff('day', seen, now()) FROM t
+----
+Table
+└── date_diff('day', seen, now()) units=datetime apply=date_diff('day', _, now())
+
+# `now()` reads no column, so it is a constant rather than a second leaf - which is what lets
+# the statement above name one column and a moment. A case for `now()` on its own belongs
+# nowhere in this corpus: what it prints is the wall clock, so it would pass today and fail
+# tomorrow.
+
+## What is refused, and why each one is not an engineering gap.
+
+## A boundary finer than the column, and a moment asked of a column holding none. Both are
+## caught where the expression meets the schema, so what a shape case can show is the shape
+## going through unresolved - the exact error is pinned in `tests/translate/clauses.rs`, which
+## can hold the resolver's answer rather than the printer's.
+
+shape
+SELECT date_trunc('hour', day) FROM t
+----
+Table
+└── date_trunc('hour', day) units=t.day (unresolved) apply=date_trunc('hour', _)
+
+shape
+SELECT toDate(country) FROM t
+----
+Table
+└── toDate(country) units=t.country (unresolved) apply=toDate(_)
+
+## A scalar on the grouped column would relabel rows without merging them: the grouping happened
+## over the stored key, so this would answer one row per instant, each printed as the same month.
+
+error
+SELECT date_trunc('month', seen), count(*) FROM t GROUP BY seen
+----
+sql_unsupported
+
+## An aggregate this engine has no fold for is still refused by name, and the sentence names the
+## ones that exist rather than saying there is no evaluator.
+
+error
+SELECT stddevPop(amount) FROM t
+----
+sql_unsupported

@@ -53,7 +53,11 @@ pub enum Refused {
     Order,
     /// `OFFSET` where the answer is not a list of groups.
     Offset,
-    /// Arithmetic or a function call in the select list.
+    /// An expression in the select list that names anything but exactly one column.
+    ///
+    /// Arithmetic and function calls **are** answered - see [`mod@crate::scalar`]. What is not
+    /// is an expression over two columns at once, or over none: a projection is one plan
+    /// reading one field per column, and there is no plan for either of those to be.
     Expression,
     /// `DISTINCT` over anything but one keyed column inside `count`.
     MultiDistinct,
@@ -68,8 +72,15 @@ pub enum Refused {
     InsertId,
     /// A field declared as `_record_id`, which is the name the record itself answers under.
     IdColumn,
-    /// `INSERT ... SELECT`, which would write an answer back as facts.
+    /// An `INSERT ... SELECT` whose query is not a projection.
+    ///
+    /// The form itself is answered - see [`crate::insert::Source::Select`]. What is refused is
+    /// every other shape of answer: a count is a number *about* a set of records rather than
+    /// records to copy, and `SELECT *` answers with ids because a record has no row of values
+    /// to read out.
     InsertSelect,
+    /// `INSERT INTO t ... SELECT ... FROM t`: one table on both sides of one statement.
+    InsertSelfRead,
     /// More rows in one `INSERT` than a statement may carry.
     InsertSize,
     /// `DELETE FROM`, which asks for a row this engine does not store.
@@ -98,7 +109,12 @@ pub enum Refused {
     ViewColumn,
     /// Views nested past [`crate::MAX_VIEW_DEPTH`]. Also raised in `big-embed`.
     ViewDepth,
-    /// `CASE WHEN`, `if`, `multiIf`, `coalesce` — choosing between two values per record.
+    /// `CASE <expr> WHEN <value> THEN ...`: the simple form of a case, which this dialect does
+    /// not read.
+    ///
+    /// The searched form - `CASE WHEN <condition> THEN ...` - is answered, and so are `if`,
+    /// `multiIf`, `coalesce`, `nullIf` and `ifNull`; all of them parse into one tree. What is
+    /// refused is the *second spelling* of that tree, not the ability to choose.
     Case,
     /// `CAST`, `toInt64`, `toString`: a conversion between representations that do not convert.
     Cast,
@@ -164,7 +180,7 @@ impl Refused {
     /// Kept honest by [`Refused::rank`] below, whose exhaustive match will not compile until a
     /// new variant is named - and by a test asserting that every rank appears here exactly once,
     /// which is what catches naming one and forgetting to add it.
-    pub const ALL: [Self; 48] = [
+    pub const ALL: [Self; 49] = [
         Self::Joins,
         Self::OuterJoin,
         Self::JoinOn,
@@ -184,6 +200,7 @@ impl Refused {
         Self::InsertId,
         Self::IdColumn,
         Self::InsertSelect,
+        Self::InsertSelfRead,
         Self::InsertSize,
         Self::DeleteRows,
         Self::SessionUse,
@@ -243,6 +260,7 @@ impl Refused {
             Self::InsertId => 16,
             Self::IdColumn => 17,
             Self::InsertSelect => 18,
+            Self::InsertSelfRead => 48,
             Self::InsertSize => 19,
             Self::DeleteRows => 20,
             Self::SessionUse => 21,
@@ -296,6 +314,9 @@ impl Refused {
             Self::InsertColumns | Self::InsertId => "sql_insert_shape",
             Self::IdColumn => "sql_id_column",
             Self::InsertSize => "sql_insert_too_large",
+            // Its own code rather than the shared one: what a client does about it is copy
+            // through a second table, which is nothing like what the other shapes need.
+            Self::InsertSelfRead => "sql_insert_self_read",
             Self::SessionUse => "sql_use_unsupported",
             Self::MaterializedView => "sql_no_materialized_views",
             Self::ViewBody => "sql_view_body",
@@ -403,8 +424,12 @@ impl Refused {
                  inserted under it, and a skip count does"
             }
             Self::Expression => {
-                "the select list takes a column or an aggregate of one, and nothing computed \
-                 from them: there is no expression evaluator here"
+                "an expression in the select list is computed over one column - the one the \
+                 projection reads, or the one the aggregate folds - and constants beside it: \
+                 `round(amount / 100, 2)` and `substring(country, 1, 2)` are answered, and so \
+                 is `date_diff('day', ts, now())`. Two columns in one cell is two plans, and a \
+                 projection reads one field per column; an expression over no column at all is \
+                 a constant, which needs no table to be true"
             }
             Self::MultiDistinct => {
                 "`DISTINCT` takes one keyed column - as `SELECT DISTINCT <column>`, which is \
@@ -452,11 +477,21 @@ impl Refused {
                  for a field of yours"
             }
             Self::InsertSelect => {
-                "`INSERT ... SELECT` would write an answer back as facts, and there is nothing \
-                 between the two: an answer here is counts and keys *about* a set of records \
-                 rather than records to copy, and `SELECT *` gives ids because a record has no \
-                 row of values to read out. Select what you want and write it back with \
+                "`INSERT ... SELECT` reads a **projection** - `SELECT <columns> FROM <table> \
+                 [WHERE ...] [LIMIT n]`, naming as many columns as the `INSERT` does. That is \
+                 the one shape that reads stored values back per record; a count or a grouping \
+                 is a number *about* a set of records rather than records to copy, and \
+                 `SELECT *` gives ids because a record has no row of values to read out. The \
+                 record ids are allocated, so the column list may not name `_record_id` either. \
+                 For anything else, select what you want and write it back with \
                  `POST /table/{t}/import`"
+            }
+            Self::InsertSelfRead => {
+                "an `INSERT ... SELECT` reads one table and writes another. Reading and writing \
+                 the same one in a single statement has no snapshot under it here: the records \
+                 being written are visible to the read that is still running, so the statement \
+                 would feed itself. Copy through a second table, or read it out and write it \
+                 back with `POST /table/{t}/import`"
             }
             Self::InsertSize => {
                 "an `INSERT` carries a bounded number of rows, because the whole statement is \
@@ -509,10 +544,11 @@ impl Refused {
                  depth is a bound on the statement this becomes rather than a taste in schemas"
             }
             Self::Case => {
-                "there is nothing here that chooses between two values per record, because \
-                 there are no values per record until something reads them back. A condition \
-                 selects a *set*, and `count(*) FILTER (WHERE ...)` - or `countIf(...)` - is \
-                 how one statement asks about several sets at once"
+                "a case here is written out in full - `CASE WHEN amount > 500 THEN 'big' ELSE \
+                 'small' END` - and `if(cond, a, b)`, `multiIf(...)`, `coalesce`, `nullIf` and \
+                 `ifNull` are answered too. The short form, `CASE amount WHEN 500 THEN ...`, is \
+                 the same statement with the comparison factored out, and there is one spelling \
+                 of it so that two trees cannot come to disagree about what they answer"
             }
             Self::Cast => {
                 "a value's type is its field's, decided when the field was created: a keyed \
