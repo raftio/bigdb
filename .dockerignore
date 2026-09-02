@@ -12,5 +12,9 @@ fuzz
 # `deploy/entrypoint.sh` is copied into the image, so the directory cannot be excluded whole.
 deploy/single
 deploy/cluster
+# Same shape one directory over: `examples/producer/Dockerfile` is read out of this context, so
+# what is excluded is the compose files rather than `examples` entire.
+examples/*/docker-compose.yml
+examples/*/run.sh
 Dockerfile
 .dockerignore
