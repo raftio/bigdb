@@ -19,10 +19,10 @@
 //! did not write: the peer is authenticated, not trusted, and a build on the other side of an
 //! upgrade is not hostile but is just as capable of sending something this one cannot read.
 
-use big_embed::{Plan, Rows, Value};
 use big_cluster::wire::{self, Assignment, FactValue, OwnedFact, WireError};
 use big_container::Container;
 use big_db::Matches;
+use big_embed::{Plan, Rows, Value};
 use big_engine::bitmap::RowSet;
 use big_exec::Group;
 use big_plan::CmpOp;
@@ -127,6 +127,12 @@ fn a_plan_survives_the_wire() {
                 from: Some(-1),
                 to: None,
             },
+            // A pattern travels as a pattern. The matching happens at the owner, against the
+            // dictionary it holds, so what crosses the wire is the question rather than the
+            // list of keys one node happened to have interned - which is the whole reason a
+            // plan travels and query text does not.
+            Rows::KeyLike { field: "country".to_string(), pattern: "G%".to_string(), fold: false },
+            Rows::KeyLike { field: "country".to_string(), pattern: "g_".to_string(), fold: true },
             Rows::Difference(
                 Box::new(Rows::All),
                 Box::new(Rows::Bool { field: "active".to_string(), value: true }),
@@ -174,7 +180,10 @@ fn every_schema_change_survives() {
             table: "tx".to_string(),
             engine: big_embed::TableEngine::BitmapColumnar,
         },
-        wire::Ddl::CreateTable { table: "tx".to_string(), engine: big_embed::TableEngine::Columnar },
+        wire::Ddl::CreateTable {
+            table: "tx".to_string(),
+            engine: big_embed::TableEngine::Columnar,
+        },
         wire::Ddl::CreateField {
             table: "tx".to_string(),
             field: "amount".to_string(),

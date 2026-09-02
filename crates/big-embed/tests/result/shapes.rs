@@ -98,7 +98,7 @@ fn a_group_with_no_interned_name_is_left_out_of_a_list_of_names() {
 
 #[test]
 fn records_answer_with_one_id_per_row() {
-    let shape = Shape::Records { column: "id".to_string(), limit: Some(2) };
+    let shape = Shape::Records { column: "id".to_string(), limit: Some(2), descending: false };
     let values = vec![Value::Rows(matching(&[1, 2, 5]))];
 
     let set = result_set(&answer(shape), &values);
@@ -111,6 +111,8 @@ fn records_answer_with_one_id_per_row() {
 fn a_projection_renders_the_values_the_plan_already_cut() {
     let shape = Shape::Table {
         columns: Columns::Named(vec![plain_column("amount"), plain_column("score")]),
+        order: None,
+        cut: None,
     };
     let values = vec![Value::Table(vec![
         Projected { record: 1, values: vec![Projection::Int(100), Projection::Absent] },
@@ -132,6 +134,8 @@ fn a_projection_renders_the_values_the_plan_already_cut() {
 fn a_decimal_column_is_rendered_with_the_point_its_field_keeps() {
     let shape = Shape::Table {
         columns: Columns::Named(vec![scaled_column("price", 2), plain_column("qty")]),
+        order: None,
+        cut: None,
     };
     let values = vec![Value::Table(vec![
         Projected { record: 1, values: vec![Projection::Int(1250), Projection::Int(3)] },
@@ -163,6 +167,7 @@ fn a_decimal_total_carries_the_scale_its_field_keeps() {
         column: column.to_string(),
         of,
         units: big_embed::Units::Digits(scale),
+        apply: None,
     };
     let shape = Shape::row(vec![
         scaled("sum", Of::Value { plan: 0 }, 2),

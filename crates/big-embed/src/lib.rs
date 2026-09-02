@@ -38,7 +38,9 @@ pub mod schema;
 pub mod views;
 
 pub use error::{ApiError, Result};
-pub use result::{date_text, fixed, one_cell, result_set, timestamp_text, Datum, ResultSet, Row};
+pub use result::{
+    date_text, fixed, literal_of, one_cell, result_set, timestamp_text, Datum, ResultSet, Row,
+};
 pub use schema::{FieldInfo, TableInfo};
 pub use views::ViewInfo;
 
@@ -62,15 +64,17 @@ pub use big_pager::{MemPager, Metrics, MmapPager, PagerMut, DEFAULT_MAPSIZE};
 pub use big_plan::{Plan, Rows};
 // The SQL surface's two public shapes. `Shape` appears in the return type of `Api::sql`, so a
 // caller that renders an answer has to be able to name it.
+pub use big_plan::Literal;
+pub use big_sql::lower;
 pub use big_sql::{
     Absent, Answer, Ask, Cell, Columns, Cut, Format, GroupOrder, Having, JoinSide, Keying, Of,
-    OrderBy, Pairing, Probe as SqlProbe, Refused, Selected, Shape, Statement as SqlStatement,
-    Threshold, TimeOp, Units,
+    OrderBy, Pairing, Probe as SqlProbe, Refused, Scalar, Selected, Shape,
+    Statement as SqlStatement, Threshold, Units,
 };
 pub use big_sql::{
     Alter as SqlAlter, Authority, Column as SqlColumn, ColumnKind as SqlColumnKind, Ddl as SqlDdl,
-    ExplainMode, Insert as SqlInsert, Show as SqlShow, Shown as SqlShown, Sql, SqlError,
-    RECORD_COLUMN,
+    ExplainMode, Insert as SqlInsert, Query as SqlQuery, Select as SqlSelect, Show as SqlShow,
+    Shown as SqlShown, Sql, SqlError, RECORD_COLUMN,
 };
 
 use big_db::{At, Db};

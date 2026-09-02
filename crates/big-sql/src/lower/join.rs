@@ -220,10 +220,11 @@ pub(super) fn joined(
         .map(|(i, units)| Cell {
             column: i.column(),
             units,
-            of: match i.proj {
+            of: match i.leaf() {
                 Proj::Column(_) => Of::Key,
                 _ => next.next().expect("one measure per aggregate, in select-list order"),
             },
+            apply: i.apply().cloned(),
         })
         .collect();
 
@@ -331,14 +332,11 @@ impl<'a> Sides<'a> {
             // pairing that never happened rather than a group with a zero in it.
             return Err(SqlError::Refused { what: Refused::JoinShape, at: item.at });
         }
-        Ok(match &item.proj {
+        Ok(match item.leaf() {
             Proj::Now { unix_seconds } => Of::Now { unix_seconds: *unix_seconds },
-            // A rounding is applied to values read back per record, and a grouped or joined
-            // answer holds none: what it carries per row is a key and the numbers folded under
-            // it. Refused rather than silently rounding something else.
-            Proj::TimeOf { .. } => {
-                return Err(SqlError::Refused { what: Refused::Shape, at: item.at })
-            }
+            // Seen through by `Item::leaf`, so a scalar never arrives here as itself: the
+            // expression rides on the item and is applied where the cell is written.
+            Proj::Scalar { .. } => unreachable!("leaf() sees through the expression"),
             // Every record on one side pairs with every record on every other, under each key.
             // Counted from the first side, which is as good as any: the product is over all of
             // them and the shape names them in `keys`.
@@ -533,9 +531,10 @@ fn touches(cond: &Cond, scope: &Scope<'_>, at: usize) -> Result<u32> {
     Ok(match cond {
         Cond::And(a, b) | Cond::Or(a, b) => touches(a, scope, at)? | touches(b, scope, at)?,
         Cond::Not(inner) => touches(inner, scope, at)?,
-        Cond::Cmp { field, .. } | Cond::In { field, .. } | Cond::Between { field, .. } => {
-            1 << scope.side(field, at)?
-        }
+        Cond::Cmp { field, .. }
+        | Cond::In { field, .. }
+        | Cond::Between { field, .. }
+        | Cond::Like { field, .. } => 1 << scope.side(field, at)?,
     })
 }
 

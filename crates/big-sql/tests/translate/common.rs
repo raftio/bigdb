@@ -99,6 +99,7 @@ pub fn measured(column: &str, of: big_sql::Of, table: &str, field: &str) -> big_
         column: column.to_string(),
         of,
         units: big_sql::Units::Written { table: table.to_string(), field: field.to_string() },
+        apply: None,
     }
 }
 

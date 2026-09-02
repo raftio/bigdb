@@ -513,6 +513,61 @@ impl<'db, P: Pager + Sync> DbRead<'db, P> {
         self.matching_row(table, field, row)
     }
 
+    /// Records whose key matches a `LIKE` pattern, unmaterialised and per shard.
+    ///
+    /// # Why this is cheap, and what it costs
+    ///
+    /// A keyed field stores each distinct string **once**, with a bitmap of the records holding
+    /// it. So a pattern match is: walk this field's keys, keep the ones that match, union their
+    /// bitmaps. The cost is the field's *cardinality* - the number of distinct values - and a
+    /// row engine would pay the number of *records* for the same question. On a country column
+    /// that is a couple of hundred comparisons against however many billion rows.
+    ///
+    /// The union is the same `or` an `IN` list builds, because that is what this is: `LIKE 'G%'`
+    /// is `IN (every key beginning with G)`, worked out here rather than typed out by the
+    /// client.
+    ///
+    /// A field that is not keyed is refused rather than answered empty. There is no dictionary
+    /// to walk for one - an integer is bit planes - and "no rows matched" would be a wrong
+    /// answer wearing a right one's clothes.
+    pub fn matching_key_like<'a>(
+        &self,
+        table: impl Into<TableRef<'a>>,
+        field: &str,
+        pattern: &str,
+        fold: bool,
+    ) -> Result<Matches> {
+        let table = table.into();
+        let (t, def) = resolve(&self.catalog, table, field)?;
+        if !def.kind.is_keyed() {
+            return Err(DbError::EngineCannotAnswer {
+                table: table.to_string(),
+                what: "a LIKE over a column that stores no keys",
+                engine: "bitmap",
+                instead: "LIKE walks the distinct strings a keyed column interned; a number is \
+                          bit planes and has none. Compare it with =, <, BETWEEN or IN, or \
+                          declare the column as TEXT if it holds text",
+            });
+        }
+
+        // Collected before any bitmap is read, because `matching_row` borrows the pager and the
+        // dictionary walk borrows the catalog - and because the count of matched keys is worth
+        // knowing before paying for their bitmaps.
+        let rows: Vec<RowId> = self
+            .catalog
+            .keys
+            .rows(t, def.id)
+            .filter(|(_, name)| crate::like::matches(pattern, name, fold))
+            .map(|(row, _)| row)
+            .collect();
+
+        let mut out = Matches::new();
+        for row in rows {
+            out = out.or(&self.matching_row(table, field, row)?);
+        }
+        Ok(out)
+    }
+
     /// Records whose boolean field holds `value`.
     pub fn matching_bool<'a>(
         &self,

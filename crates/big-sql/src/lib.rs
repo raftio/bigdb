@@ -59,15 +59,17 @@ pub mod lex;
 pub mod lower;
 pub mod parse;
 pub mod render;
+pub mod scalar;
 pub mod shape;
 pub mod show;
 
-pub use ast::{ExplainMode, Query, Select, TimeOp};
+pub use ast::{ExplainMode, Query, Select};
 pub use ddl::{Alter, Column, ColumnKind, Ddl, MAX_VIEW_DEPTH};
 pub use error::{Refused, Result, SqlError};
 pub use insert::{Insert, MAX_INSERT_ROWS, RECORD_COLUMN};
 pub use lower::{lower, Ask, Probe, Statement, MAX_CALLS};
 pub use parse::{parse, Parsed};
+pub use scalar::{BinOp, Func, Scalar, UnOp};
 pub use shape::{
     Absent, Answer, Cell, Columns, Cut, Format, GroupOrder, Having, JoinSide, Keying, Of, Operand,
     OrderBy, Pairing, Selected, Shape, Threshold, Units,

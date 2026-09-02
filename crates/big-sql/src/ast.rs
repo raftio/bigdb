@@ -209,6 +209,28 @@ pub struct Item {
 }
 
 impl Item {
+    /// What this entry *plans*, with any expression around it seen through.
+    ///
+    /// **Every site that decides a plan reads this rather than `proj`.** A scalar reads nothing
+    /// its leaf did not read, so `round(sum(amount), 2)` and `sum(amount)` plan identically -
+    /// and a lowering that matched on `proj` would have to repeat itself once per arm to say
+    /// so. The expression is picked up separately by [`Item::apply`], which is the only other
+    /// half there is.
+    pub fn leaf(&self) -> &Proj {
+        match &self.proj {
+            Proj::Scalar { inner, .. } => inner,
+            other => other,
+        }
+    }
+
+    /// The expression applied to this entry's number on the way out, if there is one.
+    pub fn apply(&self) -> Option<&crate::Scalar> {
+        match &self.proj {
+            Proj::Scalar { expr, .. } => Some(expr),
+            _ => None,
+        }
+    }
+
     /// The column name this entry produces.
     pub fn column(&self) -> String {
         match &self.alias {
@@ -218,13 +240,16 @@ impl Item {
                 // same number, and `id` is left free for a field of that name.
                 Proj::Star => crate::insert::RECORD_COLUMN.to_string(),
                 Proj::Column(c) => c.column.clone(),
+                // The expression as written, which is what ClickHouse and Postgres both name
+                // such a column. Sliced from the statement rather than printed back from the
+                // tree, so that there is no second dialect to keep in step with this one.
+                Proj::Scalar { written, .. } => written.clone(),
                 Proj::Count | Proj::CountDistinct(_) => "count".to_string(),
                 Proj::Agg { func, .. } => func.name().to_string(),
                 Proj::Avg(_) => "avg".to_string(),
                 Proj::TopKeys { .. } => "topK".to_string(),
                 Proj::Quantile { .. } => "quantile".to_string(),
                 Proj::Now { .. } => "now()".to_string(),
-                Proj::TimeOf { op, .. } => op.name(),
             },
         }
     }
@@ -248,18 +273,22 @@ pub enum Proj {
         /// Seconds since the Unix epoch.
         unix_seconds: i64,
     },
-    /// `toDate(<column>)` or `date_trunc('<unit>', <column>)`: a temporal column, rounded back
-    /// to a coarser boundary on the way out.
+    /// Arithmetic or a function call over the one number this entry is about.
     ///
-    /// **A projection, not a computation over records.** The plan still reads the column it
-    /// names; the rounding is applied to each value as the answer is written, which is the same
-    /// place a decimal has its point put back. That is why it costs nothing and why it cannot
-    /// appear in a `WHERE` - see `Refused::ScalarFilter`.
-    TimeOf {
-        /// Which rounding.
-        op: TimeOp,
-        /// The column it reads.
-        field: Name,
+    /// **The plan is `inner`'s, unchanged.** A scalar reads nothing the projection or the
+    /// aggregate underneath it did not already read - it is applied to the number on its way
+    /// into a cell, where a decimal has its point put back. So `round(avg(amount), 2)` is the
+    /// `avg` plan and a rounding, and `round(amount, 2)` is the projection and the same
+    /// rounding. See [`mod@crate::scalar`], which says at length why that is the only place an
+    /// expression can live in an engine with no rows.
+    Scalar {
+        /// What the leaf was: a column, an aggregate, a count. Planned exactly as it would be
+        /// on its own.
+        inner: Box<Proj>,
+        /// The expression, with [`crate::Scalar::Value`] standing for the leaf's number.
+        expr: crate::Scalar,
+        /// The entry as it was written, which is the column name when no `AS` was given.
+        written: String,
     },
     /// `count(*)`.
     Count,
@@ -303,30 +332,6 @@ pub enum Proj {
         /// The column ranked.
         field: Name,
     },
-}
-
-/// A rounding applied to a temporal value on the way out.
-///
-/// Both are the same shape - a moment in, a coarser moment out - which is why they are one type
-/// rather than two `Proj` entries. Neither reads anything the plan did not already read.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum TimeOp {
-    /// `toDate(ts)`: the day an instant falls in. A `DATETIME` becomes a `DATE`; a `DATE` is
-    /// already one and comes back unchanged.
-    ToDate,
-    /// `date_trunc(unit, ts)`: the start of the unit an instant falls in. The type does not
-    /// change - a truncated timestamp is still a timestamp, at midnight or on the hour.
-    Trunc(big_civil::Unit),
-}
-
-impl TimeOp {
-    /// The default column name, which is the call as it was written.
-    pub fn name(self) -> String {
-        match self {
-            Self::ToDate => "toDate".to_string(),
-            Self::Trunc(u) => format!("date_trunc('{}')", format!("{u:?}").to_lowercase()),
-        }
-    }
 }
 
 /// The three aggregates that are not a count.
@@ -523,6 +528,21 @@ pub enum Cond {
         /// At least one value; an empty list is a syntax error rather than an empty set,
         /// because SQL does not accept one either.
         values: Vec<Literal>,
+    },
+    /// `<column> LIKE '<pattern>'`, and `ILIKE` for the folded one. `NOT LIKE` is a
+    /// [`Cond::Not`] around one, exactly as `NOT IN` is.
+    ///
+    /// **A set operation like every other term here.** A keyed column interns each distinct
+    /// string once, so this is the union of the bitmaps whose key matches - which is why it
+    /// belongs beside `=` and `IN` rather than among the things a `WHERE` cannot do. See
+    /// [`big_plan::Rows::KeyLike`].
+    Like {
+        /// The column.
+        field: Name,
+        /// The pattern, exactly as written: `%` for any run, `_` for one, `\` to escape either.
+        pattern: String,
+        /// `ILIKE` was written.
+        fold: bool,
     },
     /// `<column> BETWEEN <low> AND <high>`, inclusive at both ends.
     Between {

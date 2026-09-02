@@ -83,6 +83,13 @@ They are on crates.io because a published crate cannot depend on an unpublished 
 Their shape is free to change in any release. Depending on one directly means pinning an exact
 version and reading the diff before every upgrade.
 
+**`contrib/`.** `big-message` and `big-message-redis`. These are written *against* `big-http`'s
+promise rather than being part of it: they are clients, and they hold no state a release could
+migrate. `big-message`'s `[dependencies]` section is empty and `big-message-redis` holds exactly
+that one entry, so "these cannot reach the engine" is checkable rather than asserted. They are
+`publish = false` and carry no promise of their own — what they depend on is the HTTP surface
+above, and that is the guarantee to read.
+
 **`big-embed`'s `unstable` feature.** It exposes `Api::db()`, which hands out the raw `Db` from a
 crate with no guarantee. Turning it on is an explicit opt-out of everything above.
 
@@ -120,8 +127,10 @@ big-http
 big-bin
 ```
 
-Three members are `publish = false` and are no part of the product: `big-bench`, which pulls in
-rival engines to measure against, and `big-e2e` and `big-testfile`, which exist only to test.
+Five members are `publish = false` and are no part of the product: `big-bench`, which pulls in
+rival engines to measure against, `big-e2e` and `big-testfile`, which exist only to test, and
+`contrib/big-message` and `contrib/big-message-redis`, which are clients written against the
+published HTTP surface.
 
 ### Checklist
 

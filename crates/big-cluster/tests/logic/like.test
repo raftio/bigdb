@@ -1,0 +1,195 @@
+# `LIKE` over a keyed column, end to end.
+#
+# **This is the one string predicate a bitmap answers exactly, and the reason is the dictionary.**
+# A keyed column interns each distinct value once and keeps a bitmap of the records holding it,
+# so a pattern is: walk the field's keys, keep the ones that match, union their bitmaps. The
+# cost is the number of *distinct values*, paid once - where a row engine pays the number of
+# records. On a country column that is a few hundred string comparisons against however many
+# rows there are.
+#
+# What that buys is composition: the answer is a bitmap like every other term, so `LIKE`
+# intersects with a range, unions with an `IN`, and negates - none of which needs a line of code
+# of its own. Half the cases below are about exactly that.
+
+statement
+CREATE TABLE p (name SET, tier MUTEX, amount UINT(32))
+
+statement
+INSERT INTO p (_record_id, name, tier, amount) VALUES
+  (1, 'alpha', 'gold', 100),
+  (2, 'alpine', 'gold', 200),
+  (3, 'beta', 'silver', 300),
+  (4, 'ALPHA', 'bronze', 400),
+  (5, 'a_b', 'gold', 500),
+  (6, '100%', 'silver', 600)
+
+# ---------------------------------------------------------------------------------------------
+# The two wildcards
+# ---------------------------------------------------------------------------------------------
+
+# `%` is any run, including an empty one - which is why `alpha` matches `alp%` and would match
+# `alpha%` too.
+query rowsort
+SELECT name FROM p WHERE name LIKE 'alp%'
+----
+name
+alpha
+alpine
+
+# A pattern with no wildcard is an equality, and it is case-sensitive: `ALPHA` is a different
+# key from `alpha`, interned separately, with its own bitmap.
+query
+SELECT count(*) FROM p WHERE name LIKE 'alpha'
+----
+count
+1
+
+# `_` is exactly one character. `a_b` is here to be matched by it and `alpha` is here to not be.
+query rowsort
+SELECT name FROM p WHERE name LIKE 'a_b'
+----
+name
+a_b
+
+# Leading `%`, which a prefix scan could not answer and a dictionary walk can.
+query rowsort
+SELECT name FROM p WHERE name LIKE '%a'
+----
+name
+alpha
+beta
+
+# `%` on both ends: the substring search everybody actually writes.
+query rowsort
+SELECT name FROM p WHERE name LIKE '%lp%'
+----
+name
+alpha
+alpine
+
+# ---------------------------------------------------------------------------------------------
+# Escaping, and the case a corpus exists for
+# ---------------------------------------------------------------------------------------------
+
+# `\%` is a literal per cent sign. Without the escape this pattern would match every row, so a
+# matcher that ignored the backslash would fail loudly here rather than quietly.
+query rowsort
+SELECT name FROM p WHERE name LIKE '100\%'
+----
+name
+100%
+
+# The same for `_`, whose unescaped form matches any single character.
+query rowsort
+SELECT name FROM p WHERE name LIKE 'a\_b'
+----
+name
+a_b
+
+# ---------------------------------------------------------------------------------------------
+# `ILIKE`, which differs in exactly one thing
+# ---------------------------------------------------------------------------------------------
+
+query rowsort
+SELECT name FROM p WHERE name ILIKE 'alpha'
+----
+name
+ALPHA
+alpha
+
+query rowsort
+SELECT name FROM p WHERE name ILIKE 'ALP%'
+----
+name
+ALPHA
+alpha
+alpine
+
+# ---------------------------------------------------------------------------------------------
+# Composition - the point of it being a bitmap
+# ---------------------------------------------------------------------------------------------
+
+# `NOT LIKE` negates the whole term, exactly as `NOT IN` does.
+query rowsort
+SELECT name FROM p WHERE name NOT LIKE 'alp%'
+----
+name
+100%
+ALPHA
+a_b
+beta
+
+# Intersected with a range: two bitmaps, one `AND`, and the pattern is not re-examined per
+# record.
+query rowsort
+SELECT name FROM p WHERE name LIKE 'alp%' AND amount >= 200
+----
+name
+alpine
+
+# Unioned with an equality on another column.
+query rowsort
+SELECT name FROM p WHERE name LIKE 'bet%' OR tier = 'bronze'
+----
+name
+ALPHA
+beta
+
+# Counting is the same plan with a popcount on the end, which is what makes this cheap.
+query
+SELECT count(*) FROM p WHERE name LIKE '%a%'
+----
+count
+4
+
+# Grouping over a pattern-filtered set: the filter is a bitmap, so the grouping intersects with
+# it exactly as it would with any other `WHERE`.
+#
+# One row out, and both halves of that are worth reading. `ALPHA` is not in it, because `LIKE`
+# is case-sensitive and `ALPHA` is a different key from `alpha`. And `silver` is *absent* rather
+# than zero: a group with no matching record is not a group, which is what `GROUP BY` means
+# everywhere and not something this engine decided.
+query rowsort
+SELECT tier, count(*) FROM p WHERE name LIKE 'a%' GROUP BY tier
+----
+tier  count
+gold  3
+
+# A `MUTEX` column has a dictionary too, so it takes a pattern like a `SET` does.
+query rowsort
+SELECT tier, count(*) FROM p WHERE tier LIKE '%old' GROUP BY tier
+----
+tier  count
+gold  3
+
+# A pattern nothing matches is an empty answer, not an error: asking for keys that were never
+# written is a legitimate question.
+query
+SELECT count(*) FROM p WHERE name LIKE 'zzz%'
+----
+count
+0
+
+# ---------------------------------------------------------------------------------------------
+# What is refused
+# ---------------------------------------------------------------------------------------------
+
+# A column that stores no keys has no dictionary to walk. Refused by name rather than answered
+# empty, because "nothing matched" would be the wrong answer wearing a right one's clothes.
+error
+SELECT count(*) FROM p WHERE amount LIKE '1%'
+----
+error: operator_not_allowed
+
+# A pattern is a quoted string. A bare number is a different question and is named as one.
+error
+SELECT count(*) FROM p WHERE name LIKE 100
+----
+error: parse_error
+
+# Every other string comparison is still refused: none of them is a set operation this index
+# can do, and `LIKE` is answered precisely because it is one.
+error
+SELECT count(*) FROM p WHERE name SIMILAR TO 'a%'
+----
+error: sql_unsupported

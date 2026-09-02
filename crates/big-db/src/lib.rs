@@ -34,6 +34,7 @@ pub mod copy;
 pub mod db;
 pub mod error;
 pub mod ingest;
+pub mod like;
 pub mod matches;
 
 pub use catalog::{

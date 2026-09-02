@@ -17,7 +17,7 @@
 //! Total: every shape the parser accepts has a set operation behind it, which is why nothing
 //! here returns a `Result`. Everything that does not was refused in the parser.
 
-use super::pql::{call, row, window};
+use super::pql::{call, like, row, window};
 use crate::ast::{Cond, Name};
 use big_plan::ast::Expr;
 use big_plan::Literal;
@@ -36,6 +36,10 @@ pub(super) fn rows(cond: &Cond) -> Expr {
             [one] => row(field, "=", one.clone()),
             many => call("Union", many.iter().map(|v| row(field, "=", v.clone())).collect()),
         },
+
+        // A pattern is the union of the keys that match it, worked out at the owner that holds
+        // the dictionary. Nothing to build here: the whole of it is one call.
+        Cond::Like { field, pattern, fold } => like(field, pattern, *fold),
 
         Cond::Between { field, low, high } => {
             call("Intersect", vec![row(field, ">=", low.clone()), row(field, "<=", high.clone())])

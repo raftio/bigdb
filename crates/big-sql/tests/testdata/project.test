@@ -230,7 +230,7 @@ shape
 SELECT toDate(seen) FROM t
 ----
 Table
-└── toDate units=date apply=toDate
+└── toDate(seen) units=datetime apply=toDate(_)
 
 # The units change with `toDate` and not with `date_trunc`: the day an instant falls in is a
 # date, and a truncated timestamp is still a timestamp, at midnight or on the hour.
@@ -238,14 +238,14 @@ shape
 SELECT date_trunc('month', seen) FROM t
 ----
 Table
-└── date_trunc('month') units=datetime apply=date_trunc('month')
+└── date_trunc('month', seen) units=datetime apply=date_trunc('month', _)
 
 # Over a column of whole days the rounding stays in days.
 shape
 SELECT date_trunc('quarter', day) FROM t
 ----
 Table
-└── date_trunc('quarter') units=date apply=date_trunc('quarter')
+└── date_trunc('quarter', day) units=date apply=date_trunc('quarter', _)
 
 # `toDate` of a date has nothing to do, and says so as the identity truncation it is - which is
 # what keeps every combination of (units, apply) readable one way at the far end.
@@ -253,7 +253,7 @@ shape
 SELECT toDate(day) FROM t
 ----
 Table
-└── toDate units=date apply=date_trunc('day')
+└── toDate(day) units=date apply=toDate(_)
 
 # An alias names the column and the rounding still shows, which is the case the printer exists
 # for: without `apply` this would be indistinguishable from a bare `SELECT seen AS seen`.
@@ -261,5 +261,5 @@ shape
 SELECT date_trunc('year', seen) AS seen, amount FROM t
 ----
 Table
-├── seen units=datetime apply=date_trunc('year')
+├── seen units=datetime apply=date_trunc('year', _)
 └── amount

@@ -218,14 +218,14 @@ fn lower_one(select: &Select) -> Result<Statement> {
     let mut stars = Vec::new();
     let mut columns = Vec::new();
     let mut aggregates = Vec::new();
+    // **Bucketed by the leaf, not by the entry.** The plan reads the column or folds the
+    // aggregate; an expression around it is applied where the answer is written and changes
+    // nothing about which bucket the entry belongs in. So `date_trunc('month', ts)` is a
+    // projection wearing a function, and `round(sum(x), 2)` is an aggregate wearing one.
     for item in &select.items {
-        match &item.proj {
+        match item.leaf() {
             Proj::Star => stars.push(item),
             Proj::Column(name) => columns.push((item, name.clone())),
-            // The plan reads the column; the rounding rides on the item and is applied where
-            // the answer is written. So this belongs with the projections and not with the
-            // aggregates - it is one of them wearing a function.
-            Proj::TimeOf { field, .. } => columns.push((item, field.clone())),
             _ => aggregates.push(item),
         }
     }

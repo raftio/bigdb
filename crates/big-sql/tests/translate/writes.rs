@@ -31,19 +31,19 @@ fn an_insert_is_its_columns_and_its_rows() {
     assert_eq!(i.table, "tx");
     assert_eq!(i.columns, ["_record_id", "country", "amount"]);
     assert_eq!(i.id_at, Some(0));
-    assert_eq!(i.rows.len(), 2);
-    assert_eq!(i.record(&i.rows[0]), Some(1));
-    assert_eq!(i.record(&i.rows[1]), Some(2));
+    assert_eq!(i.values().len(), 2);
+    assert_eq!(i.record(&i.values()[0]), Some(1));
+    assert_eq!(i.record(&i.values()[1]), Some(2));
     // Two rows of two fields each, which is what the statement costs in facts.
     assert_eq!(i.fact_count(), 4);
     assert_eq!(
-        i.facts(&i.rows[0]).collect::<Vec<_>>(),
+        i.facts(&i.values()[0]).collect::<Vec<_>>(),
         [("country", &Literal::Str("GB".to_string())), ("amount", &Literal::Int(100))]
     );
     // `INTO` is optional, as it is everywhere else it appears.
     assert_eq!(insert("INSERT tx (_record_id) VALUES (1)").table, "tx");
     // And `VALUE` is MySQL's spelling of the same word.
-    assert_eq!(insert("INSERT INTO tx (_record_id) VALUE (1)").rows.len(), 1);
+    assert_eq!(insert("INSERT INTO tx (_record_id) VALUE (1)").values().len(), 1);
 }
 
 /// The id is a column like any other, and may be written anywhere in the list.
@@ -51,10 +51,10 @@ fn an_insert_is_its_columns_and_its_rows() {
 fn the_record_id_is_found_wherever_it_was_written() {
     let i = insert("INSERT INTO tx (country, _record_id, amount) VALUES ('GB', 7, 100)");
     assert_eq!(i.id_at, Some(1));
-    assert_eq!(i.record(&i.rows[0]), Some(7));
+    assert_eq!(i.record(&i.values()[0]), Some(7));
     // Everything but the id is a field, whichever position the id took.
     assert_eq!(
-        i.facts(&i.rows[0]).map(|(name, _)| name).collect::<Vec<_>>(),
+        i.facts(&i.values()[0]).map(|(name, _)| name).collect::<Vec<_>>(),
         ["country", "amount"]
     );
     // Case is not significant here either, and a quoted name is the same column.
@@ -70,12 +70,12 @@ fn a_statement_without_an_id_asks_the_server_for_one() {
     assert_eq!(i.id_at, None);
     // `None` per row is the whole of the difference: nothing downstream searches the column
     // list to find out which of the two forms it was handed.
-    assert_eq!(i.record(&i.rows[0]), None);
+    assert_eq!(i.record(&i.values()[0]), None);
     assert_eq!(i.field_count(), 2);
     assert_eq!(i.fact_count(), 4);
     // Every column is a field when none of them is the id.
     assert_eq!(
-        i.facts(&i.rows[0]).map(|(name, _)| name).collect::<Vec<_>>(),
+        i.facts(&i.values()[0]).map(|(name, _)| name).collect::<Vec<_>>(),
         ["country", "amount"]
     );
     // And with an id there is one fewer field than there are columns.
@@ -97,7 +97,7 @@ fn every_literal_survives_translation_as_written() {
          VALUES (1, 100, -5, 12.50, 'GB', true)",
     );
     assert_eq!(
-        i.rows[0],
+        i.values()[0],
         [
             Literal::Int(1),
             Literal::Int(100),
@@ -131,13 +131,26 @@ fn the_writes_an_insert_does_not_make() {
 }
 
 /// A statement is bounded by what it holds in memory, twice over.
+///
+/// Sized from the constant rather than from a number written here, so that moving the ceiling
+/// moves the test with it. The statement built is large - that is the point of the ceiling -
+/// which is why this is the one test in the file that costs anything to run.
 #[test]
-fn an_insert_carries_at_most_ten_thousand_rows() {
+fn an_insert_is_refused_past_the_row_ceiling() {
     let rows = |n: usize| {
-        let values = (1..=n).map(|i| format!("({i})")).collect::<Vec<_>>().join(", ");
-        format!("INSERT INTO tx (_record_id) VALUES {values}")
+        let mut out = String::with_capacity(n * 10 + 40);
+        out.push_str("INSERT INTO tx (_record_id) VALUES ");
+        for i in 1..=n {
+            if i > 1 {
+                out.push(',');
+            }
+            out.push('(');
+            out.push_str(&i.to_string());
+            out.push(')');
+        }
+        out
     };
-    assert_eq!(insert(&rows(big_sql::MAX_INSERT_ROWS)).rows.len(), big_sql::MAX_INSERT_ROWS);
+    assert_eq!(insert(&rows(big_sql::MAX_INSERT_ROWS)).values().len(), big_sql::MAX_INSERT_ROWS);
     assert_eq!(code(&rows(big_sql::MAX_INSERT_ROWS + 1)), "sql_insert_too_large");
 }
 

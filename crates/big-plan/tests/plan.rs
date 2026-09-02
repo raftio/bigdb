@@ -333,3 +333,52 @@ fn an_aggregate_is_allowed_the_same_way_bare_and_grouped() {
     assert!(planned("Sum(All(), field=\"country\")").is_err());
     assert!(planned("GroupBy(All(), field=\"country\", aggregate=Sum(field=\"country\"))").is_err());
 }
+
+/// `Like` resolves to a set operation, and only over a column that has keys to match.
+///
+/// The refusal is the half worth pinning. A pattern is an operator on strings, so a field that
+/// stores no strings earns the same sentence a `>` over a keyed column would - named at plan
+/// time, against the schema, rather than answered as an empty set by a layer that found no
+/// dictionary to walk.
+#[test]
+fn a_pattern_is_a_set_operation_over_a_keyed_column() {
+    let Plan::Rows { rows: Rows::KeyLike { field, pattern, fold }, .. } =
+        planned(r#"Like(country="G%")"#).unwrap()
+    else {
+        panic!("expected a pattern")
+    };
+    assert_eq!((field.as_str(), pattern.as_str(), fold), ("country", "G%", false));
+
+    // `ILike` differs in exactly one bit, which is what the two calls are for.
+    let Plan::Rows { rows: Rows::KeyLike { fold, .. }, .. } =
+        planned(r#"ILike(country="g%")"#).unwrap()
+    else {
+        panic!("expected a pattern")
+    };
+    assert!(fold);
+
+    // An integer holds no strings, so there is nothing for a pattern to match against.
+    let e = planned(r#"Like(amount="5%")"#).unwrap_err();
+    assert_eq!(e.code(), "operator_not_allowed");
+    let said = e.to_string();
+    assert!(said.contains("amount") && said.contains("Like"), "{said}");
+
+    // A pattern is a quoted string. A bare number is a different question and is named as one
+    // rather than compared against the digits it happens to have.
+    assert!(planned("Like(country=5)").is_err());
+}
+
+/// A pattern composes with everything else, because it *is* a bitmap rather than a filter
+/// applied to one. This is the claim that makes it worth being a `Rows` variant.
+#[test]
+fn a_pattern_composes_with_the_other_set_operations() {
+    let p = planned(r#"Count(Intersect(Like(country="G%"), Row(amount > 10)))"#).unwrap();
+    let Plan::Count { rows: Rows::Intersect(parts), .. } = p else { panic!("expected a count") };
+    assert_eq!(parts.len(), 2);
+    assert!(matches!(parts[0], Rows::KeyLike { .. }));
+
+    // And under a negation, which is how `NOT LIKE` arrives.
+    let p = planned(r#"Count(Not(Like(country="G%")))"#).unwrap();
+    let Plan::Count { rows: Rows::Not(inner), .. } = p else { panic!("expected a count") };
+    assert!(matches!(*inner, Rows::KeyLike { .. }));
+}

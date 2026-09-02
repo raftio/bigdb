@@ -15,13 +15,20 @@
 //! One entry of the select list: a star, a column, or an aggregate with its `FILTER` and alias.
 
 use super::Parser;
-use crate::ast::{Agg, Cond, Item, Proj, TimeOp};
+use crate::ast::{Agg, Cond, Item, Proj};
 use crate::error::{Refused, Result};
 use crate::lex::Tok;
+use crate::scalar::Scalar;
 use big_plan::Literal;
 
 impl Parser<'_> {
     /// One select-list entry, and its alias.
+    ///
+    /// Everything but `*` goes through the expression parser, because a bare column and
+    /// `round(amount / 100, 2)` differ only in how much of the tree is the identity. What comes
+    /// back is the tree plus its leaves, and this decides whether the entry is answerable:
+    /// **exactly one leaf**, because a projection is one plan reading one field per column and
+    /// an aggregate is one plan producing one number. See [`crate::scalar::Scalar::leaves`].
     pub(super) fn item(&mut self) -> Result<Item> {
         let at = self.at();
         // Filled in when the aggregate carried an `-If`, which is the same clause as a trailing
@@ -31,46 +38,49 @@ impl Parser<'_> {
             Proj::Star
         } else if self.word_is("DISTINCT") {
             return Err(self.refuse(Refused::MultiDistinct));
-        } else if self.word_is("CASE") {
-            // Before the name is read, because `CASE` is a keyword rather than a column and
-            // reading it as one dies at `WHEN` with "expected FROM" - a syntax error about
-            // perfectly good SQL, which is the failure this crate exists to avoid.
-            return Err(self.refuse(Refused::Case));
         } else {
-            let name = self.name("a column or an aggregate")?;
-            // A qualified name is a column of a named table, never a function: `a.count(*)`
-            // is not a spelling of anything.
-            let agg = match name.qualifier {
-                Some(_) => None,
-                None => self.aggregate(&name.column)?,
-            };
-            match agg {
-                Some(a) => {
-                    from_aggregate = a.filter;
-                    a.proj
+            let parsed = self.expr()?;
+            let written = self.src[at..self.at().min(self.src.len())].trim().to_string();
+            // **Mentions of one column are one leaf.** `price * price` reads `price` once and
+            // squares the value it got, so it is a projection of one field like any other -
+            // what the rule is about is how many *columns* a cell would have to read, not how
+            // many times the expression writes one down. Collapsed here rather than in
+            // `Scalar::leaves`, which counts nodes and should go on counting nodes.
+            let mut leaves = parsed.leaves;
+            if leaves.windows(2).all(|w| w[0].proj == w[1].proj) {
+                // The filter comes off whichever mention carried one; two mentions of an
+                // aggregate cannot each carry a different `FILTER`, because the parser attaches
+                // one to the item rather than to a mention.
+                let filter = leaves.iter_mut().find_map(|l| l.filter.take());
+                leaves.truncate(1);
+                if let Some(first) = leaves.first_mut() {
+                    first.filter = filter;
                 }
-                // The scalar calls, tried before the refusal below. They are not aggregates -
-                // they fold nothing and read no more than the column already read - so they do
-                // not belong in `Which`, whose whole list is things that produce one number
-                // from many records.
-                None if self.peek() == Some(&Tok::LParen) && self.scalar_name(&name.column) => {
-                    self.scalar(&name.column)?
+            }
+            match leaves.len() {
+                1 => {
+                    let leaf = leaves.remove(0);
+                    from_aggregate = leaf.filter;
+                    match parsed.expr.is_identity() {
+                        // The column or the aggregate, untouched. Handed back as itself so that
+                        // nothing downstream has to see through an identity wrapper.
+                        true => leaf.proj,
+                        false => {
+                            Proj::Scalar { inner: Box::new(leaf.proj), expr: parsed.expr, written }
+                        }
+                    }
                 }
-                // A bare name followed by `(` is a function this dialect does not have. Which
-                // refusal it earns depends on what was asked for: an aggregate with no fold
-                // behind it, a conversion between representations that do not convert, and a
-                // choice per record all have their own sentence, and a client that wrote one of
-                // them needs the reason rather than "no expressions here".
-                None if self.peek() == Some(&Tok::LParen) => {
-                    return Err(self.refuse_at(unsupported_call(&name.column), at))
-                }
-                // An operator or a `*` after a bare column is arithmetic, which this dialect
-                // does not evaluate. Caught here so it is refused as what it is rather than as
-                // "expected FROM".
-                None if matches!(self.peek(), Some(Tok::Op(_)) | Some(Tok::Star)) => {
-                    return Err(self.refuse(Refused::Expression))
-                }
-                None => Proj::Column(name),
+                // `now()` alone is the one entry that names no column and is still an answer:
+                // it reads nothing, and every row carries the same instant.
+                0 => match parsed.expr {
+                    Scalar::Now { unix_seconds } => Proj::Now { unix_seconds },
+                    // A constant expression - `1 + 1` - has no column to be about, and a cell
+                    // of it would be a row count wearing a value.
+                    _ => return Err(self.refuse_at(Refused::Expression, at)),
+                },
+                // Two columns in one cell. A projection reads one field per column, so there is
+                // no plan this could be - see the module header on the one-leaf rule.
+                _ => return Err(self.refuse_at(Refused::Expression, at)),
             }
         };
 
@@ -101,65 +111,6 @@ impl Parser<'_> {
         let alias =
             if self.eat_word("AS") { Some(self.bare_ident("a name after AS")?) } else { None };
         Ok(Item { proj, filter, alias, at })
-    }
-
-    /// Whether a name is one of the scalar calls, which decides only whether [`Self::scalar`]
-    /// is asked. The refusal for everything else stays where it was.
-    pub(super) fn scalar_name(&self, name: &str) -> bool {
-        ["now", "toDate", "date_trunc", "toStartOfInterval"]
-            .iter()
-            .any(|c| name.eq_ignore_ascii_case(c))
-    }
-
-    /// `now()`, `toDate(<column>)`, `date_trunc('<unit>', <column>)`, with the name consumed and
-    /// the `(` still ahead.
-    ///
-    /// **These read no more than the plan already reads.** `toDate` and `date_trunc` round a
-    /// value the projection was going to return anyway, applied where a decimal has its point
-    /// put back; `now()` reads nothing at all. That is why they can exist in a surface with no
-    /// expression evaluator, and it is also the boundary: a scalar call in a `WHERE` would have
-    /// to be computed per record before the filter, and there is nothing here that could.
-    fn scalar(&mut self, name: &str) -> Result<Proj> {
-        // The name is already consumed - `item` reads it before it can tell a column from a
-        // call - so what is ahead is the bracket.
-        let at = self.at();
-        self.expect(&Tok::LParen, "( after the function name")?;
-
-        if name.eq_ignore_ascii_case("now") {
-            self.expect(&Tok::RParen, ") after now(")?;
-            return Ok(Proj::Now { unix_seconds: self.now });
-        }
-        if name.eq_ignore_ascii_case("toDate") {
-            let field = self.name("a column")?;
-            self.expect(&Tok::RParen, ") after the column")?;
-            return Ok(Proj::TimeOf { op: TimeOp::ToDate, field });
-        }
-
-        // `date_trunc(unit, column)` and ClickHouse's `toStartOfInterval(column, INTERVAL 1
-        // unit)` are the same question; only the first is read, and the second is refused by
-        // name below so that somebody who wrote it is told which spelling this dialect takes
-        // rather than that the function does not exist.
-        if !name.eq_ignore_ascii_case("date_trunc") {
-            return Err(self.refuse_at(Refused::Interval, at));
-        }
-        let unit = match self.peek() {
-            Some(Tok::Str(s)) => {
-                let s = s.clone();
-                self.i += 1;
-                s
-            }
-            // The unit is a quoted string, not a bare word: `date_trunc(month, ts)` reads as two
-            // columns everywhere else in this dialect, and accepting it here would make `month`
-            // sometimes a column and sometimes a keyword.
-            _ => return Err(self.syntax("a quoted unit, like 'month'")),
-        };
-        let Some(unit) = big_civil::Unit::parse(&unit) else {
-            return Err(self.refuse_at(Refused::TruncUnit, at));
-        };
-        self.expect(&Tok::Comma, ", after the unit")?;
-        let field = self.name("a column")?;
-        self.expect(&Tok::RParen, ") after the column")?;
-        Ok(Proj::TimeOf { op: TimeOp::Trunc(unit), field })
     }
 
     /// One parsed aggregate: what it measures, and the condition an `-If` narrowed it by.
@@ -354,7 +305,7 @@ impl Which {
 /// answer it - not a sentence about there being no expression evaluator, which is true and
 /// unhelpful. A name on none of these lists falls through to [`Refused::Aggregate`], whose
 /// message names the aggregates that do exist, and that is the right sentence for `foo(x)` too.
-fn unsupported_call(name: &str) -> Refused {
+pub(super) fn unsupported_call(name: &str) -> Refused {
     /// Conversions between representations that do not convert.
     ///
     /// `toDate` used to be here and is a scalar call now - it rounds a temporal column to the

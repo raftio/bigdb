@@ -1,0 +1,179 @@
+# `INSERT ... SELECT`, end to end.
+#
+# **The query runs whole before anything is written.** It goes through the same path a bare
+# `SELECT` takes - planned, fanned out, merged - so what feeds the write is the finished answer
+# rather than one node's share of it. Only then does a fact land. That ordering is the import
+# route's and it is here for the same reason: what fails must fail while nothing has been
+# written.
+#
+# The values become literals on the way across, because `fact::from_literal` is the one place a
+# value meets a field's kind. Which is what makes the decimal cases below worth reading: `price`
+# is stored as an integer with a scale, and a copy that moved the stored integer rather than the
+# value would be wrong by a factor of a hundred and look entirely plausible.
+
+statement
+CREATE TABLE src (country SET, amount UINT(32), price DECIMAL(10, 2), d DATE, ts DATETIME)
+
+statement
+CREATE TABLE dst (country SET, amount UINT(32), price DECIMAL(10, 2), d DATE, ts DATETIME)
+
+statement
+INSERT INTO src (_record_id, country, amount, price, d, ts) VALUES
+  (1, 'gb', 100, 12.50, '2024-01-31', '2024-01-15 10:30:00'),
+  (2, 'fr', 900, 4.05, '2024-02-29', '2023-12-31 23:59:59'),
+  (3, 'us', 500, 100.00, '2023-11-15', '2024-03-01 06:00:00')
+
+# ---------------------------------------------------------------------------------------------
+# The plain copy
+# ---------------------------------------------------------------------------------------------
+
+# The answer is the number of rows written, which is what `VALUES` answers too.
+statement
+INSERT INTO dst (country, amount) SELECT country, amount FROM src
+
+query rowsort
+SELECT country, amount FROM dst
+----
+country  amount
+fr       900
+gb       100
+us       500
+
+# The record ids were allocated, not copied: a record id is the address a fact is written to,
+# and `SELECT _record_id` is not a projection this engine has.
+query
+SELECT count(*) FROM dst
+----
+count
+3
+
+# ---------------------------------------------------------------------------------------------
+# A decimal, which is the case that would look plausible while being wrong
+# ---------------------------------------------------------------------------------------------
+
+statement
+CREATE TABLE money (price DECIMAL(10, 2))
+
+statement
+INSERT INTO money (price) SELECT price FROM src
+
+# 12.50 and not 1250, and not 0.125 either. The value crossed as the value.
+query rowsort
+SELECT price FROM money
+----
+price
+100.00
+12.50
+4.05
+
+# ---------------------------------------------------------------------------------------------
+# Dates, which cross as the text they render to
+# ---------------------------------------------------------------------------------------------
+
+statement
+CREATE TABLE times (d DATE, ts DATETIME)
+
+statement
+INSERT INTO times (d, ts) SELECT d, ts FROM src
+
+query rowsort
+SELECT d, ts FROM times
+----
+d           ts
+2023-11-15  2024-03-01 06:00:00
+2024-01-31  2024-01-15 10:30:00
+2024-02-29  2023-12-31 23:59:59
+
+# ---------------------------------------------------------------------------------------------
+# The clauses a projection carries
+# ---------------------------------------------------------------------------------------------
+
+statement
+CREATE TABLE big (country SET, amount UINT(32))
+
+# A `WHERE` bounds what is read, so it bounds what is written.
+statement
+INSERT INTO big (country, amount) SELECT country, amount FROM src WHERE amount >= 500
+
+query rowsort
+SELECT country, amount FROM big
+----
+country  amount
+fr       900
+us       500
+
+# An expression is a projection too: the plan reads the same column and the arithmetic happens
+# where the value is written out - so what lands is the computed number.
+statement
+CREATE TABLE doubled (amount UINT(32))
+
+statement
+INSERT INTO doubled (amount) SELECT amount * 2 FROM src
+
+query rowsort
+SELECT amount FROM doubled
+----
+amount
+1000
+1800
+200
+
+# A `LIMIT` bounds the read, which is the whole reason it belongs in the plan rather than after
+# it. Which three rows are unspecified, so this counts rather than naming them.
+statement
+CREATE TABLE two (amount UINT(32))
+
+statement
+INSERT INTO two (amount) SELECT amount FROM src LIMIT 2
+
+query
+SELECT count(*) FROM two
+----
+count
+2
+
+# ---------------------------------------------------------------------------------------------
+# What is refused
+# ---------------------------------------------------------------------------------------------
+
+# One table on both sides has no snapshot under it: the records being written are visible to the
+# read that is still running, so the statement would feed itself.
+error
+INSERT INTO src (country) SELECT country FROM src
+----
+error: sql_insert_self_read
+
+# A count is a number *about* a set of records rather than records to copy.
+error
+INSERT INTO dst (amount) SELECT count(*) FROM src
+----
+error: sql_unsupported
+
+# `SELECT *` answers with record ids, because a record has no row of values to read out.
+error
+INSERT INTO dst (amount) SELECT * FROM src
+----
+error: sql_unsupported
+
+# As many selected columns as the `INSERT` names, which is not a refusal but a statement that
+# does not say what it means.
+error
+INSERT INTO dst (country, amount) SELECT country FROM src
+----
+error: parse_error
+
+# A float has no exact literal spelling, and the nearest decimal is a different number - so the
+# column is named rather than written as something close to what was read.
+statement
+CREATE TABLE floaty (temp DOUBLE)
+
+statement
+INSERT INTO floaty (temp) VALUES (1.5)
+
+statement
+CREATE TABLE floaty2 (temp DOUBLE)
+
+error
+INSERT INTO floaty2 (temp) SELECT temp FROM floaty
+----
+error: engine_cannot_answer

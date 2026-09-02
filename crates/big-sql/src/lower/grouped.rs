@@ -132,9 +132,18 @@ fn refuse_what_a_grouping_cannot_hold(
             // grouped nor aggregated has no single value per group.
             return Err(SqlError::Refused { what: Refused::Shape, at: item.at });
         }
+        // **A scalar on the grouped column relabels rows without merging them.** The grouping
+        // happened over the stored key, so `date_trunc('month', ts)` beside `GROUP BY ts` would
+        // answer with one row per instant, every one of them printed as the same month - an
+        // answer that looks aggregated and is not. Refused rather than rendered, because a
+        // client cannot see the difference. Group by the rounded value instead, once there is a
+        // plan that can.
+        if item.apply().is_some() {
+            return Err(SqlError::Refused { what: Refused::Shape, at: item.at });
+        }
     }
     for item in aggregates {
-        match item.proj {
+        match item.leaf() {
             // A distinct count inside a grouping is a grouping over a composite key this index
             // never stored.
             Proj::CountDistinct(_) => {
@@ -165,16 +174,13 @@ fn measures_of(
     let mut measures: Vec<(Measure, Of)> = Vec::new();
     for item in aggregates {
         let rows = rows_of(rows, item);
-        let of = match &item.proj {
+        let of = match item.leaf() {
             // The same instant in every row, which is what it is: a constant needs no plan and
             // no group, so it costs a grouping nothing to carry.
             Proj::Now { unix_seconds } => Of::Now { unix_seconds: *unix_seconds },
-            // A rounding is applied to values read back per record, and a grouped or joined
-            // answer holds none: what it carries per row is a key and the numbers folded under
-            // it. Refused rather than silently rounding something else.
-            Proj::TimeOf { .. } => {
-                return Err(SqlError::Refused { what: Refused::Shape, at: item.at })
-            }
+            // Seen through by `Item::leaf`, so a scalar never arrives here as itself: the
+            // expression rides on the item and is applied where the cell is written.
+            Proj::Scalar { .. } => unreachable!("leaf() sees through the expression"),
             Proj::Count => {
                 Of::Group { plan: count_plan(calls, table, &rows, group)?, absent: Absent::Zero }
             }
@@ -236,11 +242,12 @@ fn cells_of(select: &Select, table: &str, measures: &[(Measure, Of)]) -> Vec<Cel
         .iter()
         .map(|i| Cell {
             column: i.column(),
-            of: match i.proj {
+            of: match i.leaf() {
                 Proj::Column(_) => Of::Key,
                 _ => next.next().expect("one measure per aggregate, in select-list order"),
             },
             units: units_of(table, &i.proj),
+            apply: i.apply().cloned(),
         })
         .collect()
 }

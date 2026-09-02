@@ -34,6 +34,13 @@ use big_plan::ast::Literal;
 /// A count is in records and a `topK` answers with keys, so neither has a field to be measured
 /// in. An average is a quotient of a sum in the field's units by a count, so it is in them too.
 pub(super) fn units_of(table: &str, proj: &Proj) -> Units {
+    // The units a scalar is handed are its leaf's; what it turns them into is decided in
+    // [`crate::Shape::resolve`], where the expression is walked against the schema. Same
+    // arrangement a rounded timestamp has always had, and for the same reason: only one of the
+    // two ends knows the field, and only the other knows the call.
+    if let Proj::Scalar { inner, .. } = proj {
+        return units_of(table, inner);
+    }
     // A moment, not a plain number. Without this the seconds it carries render as the count
     // they are, which is the same mistake a decimal read back unscaled makes.
     if let Proj::Now { .. } = proj {
@@ -51,6 +58,9 @@ pub(super) fn units_of(table: &str, proj: &Proj) -> Units {
 pub(super) fn field_measured(proj: &Proj) -> Option<&Name> {
     match proj {
         Proj::Agg { field, .. } | Proj::Avg(field) | Proj::Quantile { field, .. } => Some(field),
+        // The leaf's, because a scalar folds nothing: `round(sum(amount), 2)` is a sum of
+        // `amount` with a rounding on the way out, and the column it measures is still `amount`.
+        Proj::Scalar { inner, .. } => field_measured(inner),
         // A count is in records, a `topK` answers with keys, a key is not a number, and a star
         // is record ids.
         // `now()` measures nothing at all, and a rounded column is read back per record rather
@@ -60,8 +70,7 @@ pub(super) fn field_measured(proj: &Proj) -> Option<&Name> {
         | Proj::TopKeys { .. }
         | Proj::Star
         | Proj::Column(_)
-        | Proj::Now { .. }
-        | Proj::TimeOf { .. } => None,
+        | Proj::Now { .. } => None,
     }
 }
 

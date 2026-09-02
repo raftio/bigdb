@@ -313,7 +313,7 @@ impl<P: PagerMut + Sync> Cluster<P> {
         // exists to prevent.
         let statement = match sql {
             big_embed::Sql::Ddl(ddl) => return self.sql_ddl(&ddl),
-            big_embed::Sql::Insert(insert) => return self.sql_insert(&insert),
+            big_embed::Sql::Insert(insert) => return self.sql_insert(&insert, opts),
             big_embed::Sql::Show(show) => return self.sql_show(&show),
             // `EXPLAIN` reaches none of the three above and none of the fan-out below: what the
             // statement is has already been decided by the time it gets here, and writing it
@@ -434,7 +434,11 @@ impl<P: PagerMut + Sync> Cluster<P> {
     /// what fails must fail while nothing has been written. The run is contiguous and taken in
     /// the order the rows were written, so `VALUES (…), (…)` reads back in the order it was
     /// typed.
-    fn sql_insert(&self, insert: &big_embed::SqlInsert) -> Result<(ResultSet, Format)> {
+    fn sql_insert(
+        &self,
+        insert: &big_embed::SqlInsert,
+        opts: &QueryOptions,
+    ) -> Result<(ResultSet, Format)> {
         // The qualified name, which is what every route below takes and what an error should
         // say back: `orders` is not the table that was not found, `sales.orders` is.
         let name = qualified(&insert.database, &insert.table);
@@ -460,27 +464,55 @@ impl<P: PagerMut + Sync> Cluster<P> {
             fields.push(info);
         }
 
+        // **`INSERT ... SELECT` becomes rows of literals, and then it is the statement above.**
+        //
+        // The query is run first, whole, through the same path a bare `SELECT` takes - so it is
+        // planned, fanned out and merged exactly as it would have been on its own, and what
+        // comes back is the finished answer rather than one node's share of it. Only then is
+        // anything written. That ordering is what the import route follows too: what fails must
+        // fail while nothing has been written.
+        // Every cell as `Some(literal)` for the written form, and `None` where a source record
+        // held no value in that field - which is written as no fact, because that is what "no
+        // value" already means here.
+        let rows: Vec<Vec<Option<big_embed::Literal>>> = match insert.select() {
+            None => {
+                insert.values().iter().map(|row| row.iter().cloned().map(Some).collect()).collect()
+            }
+            Some(select) => self.read_source(select, &name, opts)?,
+        };
+
         // Asked for once for the whole statement rather than once per row: a round trip per
         // row would make a thousand-row insert a thousand round trips to one node.
         let allocated = match insert.id_at {
             Some(_) => 0,
-            None => self.allocate(&name, insert.rows.len() as u64)?,
+            None => self.allocate(&name, rows.len() as u64)?,
         };
 
-        let mut facts = Vec::with_capacity(insert.fact_count());
-        for (n, row) in insert.rows.iter().enumerate() {
-            let record = insert.record(row).unwrap_or(allocated + n as u64);
-            for (info, (_, value)) in fields.iter().zip(insert.facts(row)) {
-                facts.push(big_embed::fact::from_literal(&info.name, info, record, value).map_err(
-                    |e| {
-                        // The mapping is `fact`'s, not this function's: a value with more
-                        // digits than its field keeps is the planner's own refusal, and it
-                        // reads the same here as it does in a `WHERE`.
-                        ClusterError::Local(
-                            e.into_error(&info.name, &big_embed::fact::written(value)),
-                        )
-                    },
-                )?);
+        let mut facts = Vec::with_capacity(rows.len() * insert.field_count());
+        for (n, row) in rows.iter().enumerate() {
+            // The id column, when the statement wrote one, is a literal by construction - the
+            // parser refused anything else there - and the query form has none at all.
+            let record = match insert.id_at.and_then(|i| row.get(i)) {
+                Some(Some(big_embed::Literal::Int(id))) => *id,
+                _ => allocated + n as u64,
+            };
+            let values = row.iter().enumerate().filter(|(i, _)| Some(*i) != insert.id_at);
+            for (info, (_, value)) in fields.iter().zip(values) {
+                // No value is no fact. A record that held nothing in the source field holds
+                // nothing in the target one, which is the same statement rather than a zero.
+                let Some(value) = value else { continue };
+                facts.push(
+                    big_embed::fact::from_literal(&info.name, info, record, value).map_err(
+                        |e| {
+                            // The mapping is `fact`'s, not this function's: a value with more
+                            // digits than its field keeps is the planner's own refusal, and it
+                            // reads the same here as it does in a `WHERE`.
+                            ClusterError::Local(
+                                e.into_error(&info.name, &big_embed::fact::written(value)),
+                            )
+                        },
+                    )?,
+                );
             }
         }
 
@@ -494,9 +526,59 @@ impl<P: PagerMut + Sync> Cluster<P> {
         };
         let _ = outcome;
         Ok((
-            big_embed::one_cell("inserted", big_embed::Datum::Int(insert.rows.len() as i128)),
+            big_embed::one_cell("inserted", big_embed::Datum::Int(rows.len() as i128)),
             Format::default(),
         ))
+    }
+
+    /// The rows an `INSERT ... SELECT` writes, read out of the source table.
+    ///
+    /// The query goes through [`Self::run`] rather than through a private path, so that it is
+    /// planned, fanned out, merged and shaped exactly as the same `SELECT` written on its own -
+    /// which is what makes "insert what that query answers" a claim about one thing rather than
+    /// about two implementations that have to agree.
+    ///
+    /// The cells then become literals, because that is what the write path takes: `big_embed::
+    /// fact::from_literal` is the one place a value meets a field's kind, and routing this
+    /// through it is what keeps `12.50` the same 1250 units however it arrived. See
+    /// [`big_embed::literal_of`] for the one cell shape that has no literal spelling.
+    fn read_source(
+        &self,
+        select: &big_embed::SqlSelect,
+        target: &str,
+        opts: &QueryOptions,
+    ) -> Result<Vec<Vec<Option<big_embed::Literal>>>> {
+        let query = big_embed::SqlQuery { branches: vec![select.clone()] };
+        // Unreachable through the parser, which accepts nothing here that would fail to lower.
+        // Carried rather than asserted: a panic would take a node down over a statement a
+        // client wrote.
+        let statement = big_embed::lower(&query)
+            .map_err(|e| ClusterError::Local(big_embed::ApiError::Sql(e)))?;
+        let (set, _) = self.run(big_embed::Sql::Query(statement), opts)?;
+
+        let mut out = Vec::with_capacity(set.rows.len());
+        for row in &set.rows {
+            let mut literals = Vec::with_capacity(row.len());
+            for (cell, column) in row.iter().zip(&set.columns) {
+                // The column is named in `table` because that is the only field here that
+                // carries a `String`, and which column cannot be read is the whole of what the
+                // reader needs. `what` says which kind of value it was.
+                literals.push(big_embed::literal_of(cell).map_err(|what| {
+                    local(big_db::DbError::EngineCannotAnswer {
+                        table: format!("{target}`, column `{column}"),
+                        what,
+                        engine: "bitmap",
+                        instead: "a value on the write path travels as a literal, and a literal \
+                                  here is exact - an integer, or an integer and a scale. There \
+                                  is no exact spelling of a float, and the nearest decimal is a \
+                                  different number. Select the other columns, or read this one \
+                                  out and write it back with `POST /table/{t}/import`",
+                    })
+                })?);
+            }
+            out.push(literals);
+        }
+        Ok(out)
     }
 
     /// `DESCRIBE` and `SHOW`, answered out of this node's catalog - which is every node's.

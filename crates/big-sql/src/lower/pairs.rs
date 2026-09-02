@@ -113,12 +113,13 @@ pub(super) fn pairs(
         .iter()
         .map(|i| Cell {
             column: i.column(),
-            of: match &i.proj {
+            of: match i.leaf() {
                 Proj::Column(n) if n.column == left.column => Of::Key,
                 Proj::Column(_) => Of::RightKey,
                 _ => next.next().expect("one measure per aggregate, in select-list order"),
             },
             units: units_of(table, &i.proj),
+            apply: i.apply().cloned(),
         })
         .collect();
 

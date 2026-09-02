@@ -21,6 +21,11 @@ members = [
     "crates/big-e2e",
     # Not part of the engine: it pulls in rival engines to measure against.
     "bench",
+    # Not part of the engine either, and the other direction: these are written *against* the
+    # server's HTTP surface, the way somebody outside this repository would write them. Their
+    # `[dependencies]` sections are empty, which is what keeps that claim checkable.
+    "contrib/big-message",
+    "contrib/big-message-redis",
 ]
 # cargo-fuzz needs nightly; the engine itself stays on stable.
 exclude = ["fuzz"]
@@ -53,6 +58,8 @@ big-plan = { path = "crates/big-plan", version = "0.1.0" }
 big-sql = { path = "crates/big-sql", version = "0.1.0" }
 # No version: `publish = false`, so it can only ever be reached by path.
 big-testfile = { path = "crates/big-testfile" }
+big-message = { path = "contrib/big-message" }
+big-message-redis = { path = "contrib/big-message-redis" }
 
 [profile.release]
 opt-level = 3

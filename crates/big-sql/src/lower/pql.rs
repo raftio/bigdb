@@ -32,6 +32,22 @@ pub(super) fn row(field: &Name, op: &str, value: Literal) -> Expr {
     })
 }
 
+/// `Like(<field>='<pattern>')`, or `ILike` for the folded one.
+///
+/// Written as a `Compare` for the reason [`row`] gives: nothing is ambiguous on this path, so
+/// the resolved shape is produced directly rather than the `Named` the query language's own
+/// parser has to leave undecided.
+pub(super) fn like(field: &Name, pattern: &str, fold: bool) -> Expr {
+    Expr::Call(Call {
+        name: if fold { "ILike" } else { "Like" }.to_string(),
+        args: vec![Expr::Compare {
+            field: field.column.clone(),
+            op: "=".to_string(),
+            value: Literal::Str(pattern.to_string()),
+        }],
+    })
+}
+
 /// `Row(<field>="<key>", from=<seconds>, to=<seconds>)`, the window a time quantum field
 /// answers from its day views.
 ///

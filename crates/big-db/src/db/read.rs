@@ -175,7 +175,11 @@ impl<'db, P: Pager + Sync> DbRead<'db, P> {
     /// Checks a record count *before* materialising it. The cardinality of a `Matches` is
     /// known without naming a single record, so an answer too large to hold costs nothing to
     /// refuse.
-    pub(super) fn check_records(&self, n: u64) -> Result<()> {
+    ///
+    /// Public because the executor needs it too: a projection with no `LIMIT` reads every
+    /// matching record, and the one ceiling on that should be the one every other unbounded
+    /// read already answers to rather than a second number kept somewhere else.
+    pub fn check_records(&self, n: u64) -> Result<()> {
         if n > self.limits.max_records as u64 {
             return Err(DbError::QueryTooLarge {
                 limit: self.limits.max_records,

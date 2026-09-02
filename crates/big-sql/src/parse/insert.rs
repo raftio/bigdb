@@ -15,8 +15,9 @@
 //! `INSERT INTO t (...) VALUES (...)`.
 
 use super::Parser;
+use crate::ast::Proj;
 use crate::error::{Refused, Result};
-use crate::insert::{Insert, MAX_INSERT_ROWS, RECORD_COLUMN};
+use crate::insert::{Insert, Source, MAX_INSERT_ROWS, RECORD_COLUMN};
 use crate::lex::Tok;
 use big_plan::Literal;
 
@@ -31,10 +32,10 @@ impl Parser<'_> {
         self.eat_word("INTO");
         let (database, table) = self.table_ref("a table name")?;
 
-        // `INSERT INTO t SELECT ...` is a whole statement's worth of meaning, and answering it
-        // with "expected (" would be answering a question nobody asked.
+        // `INSERT INTO t SELECT ...` with no column list would be positional against a field
+        // order the statement does not carry, which is the same refusal `VALUES` earns.
         if self.word_is("SELECT") || self.word_is("WITH") {
-            return Err(self.refuse(Refused::InsertSelect));
+            return Err(self.refuse(Refused::InsertColumns));
         }
         if !self.eat(&Tok::LParen) {
             return Err(self.refuse(Refused::InsertColumns));
@@ -54,12 +55,18 @@ impl Parser<'_> {
         // statement rather than a malformed one - see [`Insert::id_at`].
         let id_at = columns.iter().position(|c| c.eq_ignore_ascii_case(RECORD_COLUMN));
 
+        // `SELECT` here reads the values out of the table instead of out of the statement.
+        if self.word_is("SELECT") {
+            let source = self.insert_select(&database, &table, columns.len(), id_at)?;
+            if self.peek().is_some() {
+                return Err(self.syntax("the end of the statement"));
+            }
+            return Ok(Insert { database, table, columns, id_at, source });
+        }
+
         // `VALUE` is MySQL's spelling of the same word and means the same thing.
         if !self.eat_word("VALUES") && !self.eat_word("VALUE") {
-            if self.word_is("SELECT") {
-                return Err(self.refuse(Refused::InsertSelect));
-            }
-            return Err(self.syntax("VALUES"));
+            return Err(self.syntax("VALUES or SELECT"));
         }
 
         let mut rows = Vec::new();
@@ -78,7 +85,68 @@ impl Parser<'_> {
         if self.peek().is_some() {
             return Err(self.syntax("the end of the statement"));
         }
-        Ok(Insert { database, table, columns, id_at, rows })
+        Ok(Insert { database, table, columns, id_at, source: Source::Values(rows) })
+    }
+
+    /// The `SELECT` an `INSERT` reads its values from, with `SELECT` still ahead.
+    ///
+    /// Three things are checked here and each is a different mistake:
+    ///
+    /// - **The shape has to be a projection.** Most answers on this surface are numbers *about*
+    ///   a set of records, and `SELECT *` answers with record ids because a record has no row of
+    ///   values to read out. A projection is the one shape that reads stored values back per
+    ///   record, so it is the one shape there is anything to write.
+    /// - **The source table cannot be the target.** Reading and writing one table in a single
+    ///   statement has no snapshot under it here: the records this writes would be visible to
+    ///   the read that is still running, and the statement would feed itself.
+    /// - **The widths have to match**, which is a syntax error rather than a refusal - nothing
+    ///   about the engine makes it impossible, the statement is simply not saying what it means.
+    fn insert_select(
+        &mut self,
+        database: &Option<String>,
+        table: &str,
+        columns: usize,
+        id_at: Option<usize>,
+    ) -> Result<Source> {
+        let at = self.at();
+        // `SELECT` is consumed here rather than by `select`, which starts at the list - the same
+        // way `CREATE VIEW` reads its body.
+        self.i += 1;
+        let select = self.select()?;
+
+        // A projection and nothing else. Ordered outermost clause first, so the first thing
+        // wrong is the thing reported.
+        let not_a_projection = !select.joins.is_empty()
+            || !select.group_by.is_empty()
+            || select.having.is_some()
+            || select.order_by.is_some()
+            || select.offset.is_some()
+            || select.items.is_empty()
+            || select
+                .items
+                .iter()
+                .any(|item| item.filter.is_some() || !matches!(item.leaf(), Proj::Column(_)));
+        if not_a_projection {
+            return Err(self.refuse_at(Refused::InsertSelect, at));
+        }
+
+        // The same table on both sides, whichever way each was qualified. Compared on the pair
+        // rather than the written text, so `INSERT INTO sales.t ... FROM t` under
+        // `?database=sales` is caught too.
+        if select.from.table == table && select.from.database == *database {
+            return Err(self.refuse_at(Refused::InsertSelfRead, at));
+        }
+
+        // An id column would have to be read out of the source, and `SELECT _record_id` is not
+        // a projection this engine has - a record id is the address a fact is written to rather
+        // than a value stored in one. So this form always allocates.
+        if id_at.is_some() {
+            return Err(self.refuse_at(Refused::InsertSelect, at));
+        }
+        if select.items.len() != columns {
+            return Err(self.syntax("as many selected columns as the INSERT names"));
+        }
+        Ok(Source::Select(Box::new(select)))
     }
 
     /// One `( <literal>, ... )`, as wide as the column list.

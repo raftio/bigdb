@@ -1,0 +1,271 @@
+# Expressions in the select list, end to end: written, read back, and computed on the way out.
+#
+# **What these cases are actually testing is that the plan did not change.** Every statement
+# here reads exactly the column or folds exactly the aggregate that the same statement without
+# the expression would; the arithmetic happens where a decimal has its point put back. So a case
+# that returns the right number over one shard and the wrong one over four would be an
+# expression that leaked into the merge - which is the failure this file exists to catch.
+#
+# `price` keeps two digits. That is the column to watch: an evaluator working on the stored
+# integer rather than on the value would answer a hundred times too much, and every case
+# involving it would still look plausible.
+
+statement
+CREATE TABLE s (amount INT, price DECIMAL(10, 2), country SET, d DATE, ts DATETIME)
+
+statement
+INSERT INTO s (_record_id, amount, price, country, d, ts) VALUES
+  (1, 250, 12.50, 'gb', '2024-01-31', '2024-01-15 10:30:00'),
+  (2, 1000, 4.05, 'france', '2024-02-29', '2023-12-31 23:59:59'),
+  (3, 75, 100.00, 'us', '2023-11-15', '2024-03-01 06:00:00')
+
+# ---------------------------------------------------------------------------------------------
+# Arithmetic
+# ---------------------------------------------------------------------------------------------
+
+# The plan is `Project s.(amount)` and nothing else - the division happens on the way out.
+#
+# **Watch the middle row.** 1000 / 100 comes out whole and the other two do not, and all three
+# are the same type: division leaves the exact world for every row or for none. Answering the
+# whole one as an integer would make this column `Real`, `Int`, `Real` - one column holding two
+# types, decided by the data, which a client would have to sniff cell by cell.
+query
+SELECT amount / 100 FROM s
+----
+amount / 100
+2.5
+10
+0.75
+
+# **The decimal case, which is the one worth reading.** `price` is stored as 1250, 405 and
+# 10000; an expression working on those numbers would answer 12.5, 4.05 and 100 for the first
+# column and be wrong by a factor of a hundred. The values below are the written ones.
+query
+SELECT price, price * 2, price + 0.5 FROM s
+----
+price   price * 2  price + 0.5
+12.50   25.00      13.00
+4.05    8.10       4.55
+100.00  200.00     100.50
+
+# Scales add under multiplication and align under addition, which is what keeps all of this
+# exact rather than routing a money value through a float.
+query
+SELECT price * price FROM s
+----
+price * price
+156.2500
+16.4025
+10000.0000
+
+# Precedence and associativity, over values chosen so that getting either wrong shows.
+query
+SELECT amount + 2 * 3 FROM s
+----
+amount + 2 * 3
+256
+1006
+81
+
+query
+SELECT amount - 10 - 5 FROM s
+----
+amount - 10 - 5
+235
+985
+60
+
+# A negative literal is still a literal, and `-` between two operands is still an operator. The
+# lexer cannot tell those apart, so this is the case that catches it getting the split wrong.
+query
+SELECT amount - -5 FROM s
+----
+amount - -5
+255
+1005
+80
+
+# Division by zero answers nothing rather than failing the statement, which is what every SQL
+# engine does with it - and `NULL` is what an absent value already is here.
+query
+SELECT amount / 7, amount / 0 FROM s
+----
+amount / 7          amount / 0
+35.714285714285715  NULL
+142.85714285714286  NULL
+10.714285714285714  NULL
+
+# ---------------------------------------------------------------------------------------------
+# An expression over an aggregate, which is applied after the merge
+# ---------------------------------------------------------------------------------------------
+
+# `avg` is a sum over a count and neither half is whole until every node has answered, so this
+# is the case that would go wrong if the rounding happened one layer down.
+query
+SELECT round(avg(amount), 2) FROM s
+----
+round(avg(amount), 2)
+441.67
+
+# The same over a decimal field: the total is 116.55 across three rows.
+query
+SELECT sum(price), round(avg(price), 2) FROM s
+----
+sum     round(avg(price), 2)
+116.55  38.85
+
+# ---------------------------------------------------------------------------------------------
+# Strings
+# ---------------------------------------------------------------------------------------------
+
+query
+SELECT country, upper(country), length(country) FROM s
+----
+country  upper(country)  length(country)
+gb       GB              2
+france   FRANCE          6
+us       US              2
+
+# One-based, as SQL says, and over characters rather than bytes.
+query
+SELECT substring(country, 1, 3), position(country, 'a') FROM s
+----
+substring(country, 1, 3)  position(country, 'a')
+gb                        0
+fra                       3
+us                        0
+
+# A constant beside the column is fine: it is the *column* count that has to be one.
+query
+SELECT concat(country, '-x') FROM s
+----
+concat(country, '-x')
+gb-x
+france-x
+us-x
+
+# ---------------------------------------------------------------------------------------------
+# Choice
+# ---------------------------------------------------------------------------------------------
+
+query
+SELECT CASE WHEN amount >= 250 THEN 'big' ELSE 'small' END FROM s
+----
+CASE WHEN amount >= 250 THEN 'big' ELSE 'small' END
+big
+big
+small
+
+# `if` is the same tree under another spelling, so it answers identically.
+query
+SELECT if(amount >= 250, 'big', 'small') FROM s
+----
+if(amount >= 250, 'big', 'small')
+big
+big
+small
+
+# An absent `ELSE` answers null rather than an empty string - a row that matched no arm has no
+# value, which is a different fact from having a blank one.
+query
+SELECT CASE WHEN amount > 500 THEN 'big' END FROM s
+----
+CASE WHEN amount > 500 THEN 'big' END
+NULL
+big
+NULL
+
+# ---------------------------------------------------------------------------------------------
+# Conversion
+# ---------------------------------------------------------------------------------------------
+
+# `toInt64` truncates towards zero, which is what a conversion does and not what `round` does.
+query
+SELECT toInt64(price), toString(amount) FROM s
+----
+toInt64(price)  toString(amount)
+12              250
+4               1000
+100             75
+
+# `CAST(x AS BIGINT)` is the same call under standard syntax, so the numbers are the same.
+query
+SELECT CAST(price AS BIGINT) FROM s
+----
+CAST(price AS BIGINT)
+12
+4
+100
+
+# ---------------------------------------------------------------------------------------------
+# Time
+# ---------------------------------------------------------------------------------------------
+
+# Adding a month to the 31st lands on the last day of the month it arrives in, rather than
+# sliding into the one after. The 2024-02-29 row is the leap day, which is the other half of
+# the same rule.
+query
+SELECT d, date_add('month', 1, d) FROM s
+----
+d           date_add('month', 1, d)
+2024-01-31  2024-02-29
+2024-02-29  2024-03-29
+2023-11-15  2023-12-15
+
+# A calendar difference is counted on the calendar: January to February is one month whatever
+# the number of days between them is.
+query
+SELECT date_diff('month', d, '2024-03-31') FROM s
+----
+date_diff('month', d, '2024-03-31')
+2
+1
+4
+
+query
+SELECT toYear(ts), toMonth(ts), toHour(ts) FROM s
+----
+toYear(ts)  toMonth(ts)  toHour(ts)
+2024        1            10
+2023        12           23
+2024        3            6
+
+query
+SELECT formatDateTime(ts, '%Y/%m/%d %H:%M') FROM s
+----
+formatDateTime(ts, '%Y/%m/%d %H:%M')
+2024/01/15 10:30
+2023/12/31 23:59
+2024/03/01 06:00
+
+# ---------------------------------------------------------------------------------------------
+# What is refused, over a real schema
+# ---------------------------------------------------------------------------------------------
+
+# A boundary finer than the column: `d` counts whole days, and an hour says nothing about one.
+# Refused here rather than answered with the same date wearing a precision it never had.
+error
+SELECT date_trunc('hour', d) FROM s
+----
+error: bad_rounding
+
+# A moment asked of a column holding strings.
+error
+SELECT toDate(country) FROM s
+----
+error: bad_rounding
+
+# Two columns in one cell is two plans, and a projection reads one field per column. Two
+# *mentions* of one column are fine - `price * price` above reads `price` once and squares the
+# value - so this case names two genuinely different fields.
+error
+SELECT concat(country, toString(amount)) FROM s
+----
+error: sql_unsupported
+
+# A scalar in a `WHERE` runs before there is anything to run it on - unchanged by the select
+# list gaining an evaluator.
+error
+SELECT count(*) FROM s WHERE round(price, 1) > 5
+----
+error: sql_scalar_in_filter

@@ -102,14 +102,19 @@ pub(super) fn grouped(
         .map(|row| {
             cells
                 .iter()
-                .map(|c| match c.of {
-                    // A row with no interned name is a `null`, not an empty string: it is a
-                    // group whose key this node has never been told, and the two are different
-                    // facts.
-                    Of::Key => find(&of_each, row)
-                        .and_then(|g| g.key.as_deref())
-                        .map_or(Datum::Null, Datum::text),
-                    of => Datum::num(number(of, values, Some(row)), &c.units),
+                .map(|c| {
+                    super::applied(
+                        c,
+                        match c.of {
+                            // A row with no interned name is a `null`, not an empty string: it is a
+                            // group whose key this node has never been told, and the two are different
+                            // facts.
+                            Of::Key => find(&of_each, row)
+                                .and_then(|g| g.key.as_deref())
+                                .map_or(Datum::Null, Datum::text),
+                            of => Datum::num(number(of, values, Some(row)), &c.units),
+                        },
+                    )
                 })
                 .collect()
         })
@@ -208,14 +213,19 @@ pub(super) fn paired(
                 of_each.iter().find_map(|ps| ps.iter().find(|p| (p.left.row, p.right.row) == row));
             cells
                 .iter()
-                .map(|c| match c.of {
-                    Of::Key => {
-                        found.and_then(|p| p.left.key.as_deref()).map_or(Datum::Null, Datum::text)
-                    }
-                    Of::RightKey => {
-                        found.and_then(|p| p.right.key.as_deref()).map_or(Datum::Null, Datum::text)
-                    }
-                    of => Datum::num(number(of, row), &c.units),
+                .map(|c| {
+                    super::applied(
+                        c,
+                        match c.of {
+                            Of::Key => found
+                                .and_then(|p| p.left.key.as_deref())
+                                .map_or(Datum::Null, Datum::text),
+                            Of::RightKey => found
+                                .and_then(|p| p.right.key.as_deref())
+                                .map_or(Datum::Null, Datum::text),
+                            of => Datum::num(number(of, row), &c.units),
+                        },
+                    )
                 })
                 .collect()
         })
@@ -261,7 +271,7 @@ pub(super) fn joined(
     if !per_key {
         return vec![cells
             .iter()
-            .map(|c| Datum::num(read.cell(c.of, &space, None), &c.units))
+            .map(|c| super::applied(c, Datum::num(read.cell(c.of, &space, None), &c.units)))
             .collect()];
     }
 
@@ -304,9 +314,14 @@ pub(super) fn joined(
         .map(|at| {
             cells
                 .iter()
-                .map(|c| match c.of {
-                    Of::Key => at.axis(0).map_or(Datum::Null, Datum::text),
-                    of => Datum::num(read.cell(of, &all, Some(at)), &c.units),
+                .map(|c| {
+                    super::applied(
+                        c,
+                        match c.of {
+                            Of::Key => at.axis(0).map_or(Datum::Null, Datum::text),
+                            of => Datum::num(read.cell(of, &all, Some(at)), &c.units),
+                        },
+                    )
                 })
                 .collect()
         })

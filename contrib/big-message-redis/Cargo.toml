@@ -1,0 +1,29 @@
+# A sink: messages out of a Redis stream and into a bigdb table.
+#
+# One dependency, and it is the producer beside this one. Everything else is `std`: RESP2 is five
+# type markers and a length prefix, which is less code than a client library's feature flags.
+# `[dependencies]` holding exactly one path entry is what keeps the claim in `big-message`'s own
+# manifest true one crate further out - the engine is not reachable from here either.
+[package]
+name = "big-message-redis"
+description = "Consume a Redis stream into a bigdb table, at-least-once, with the record ids left to the server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+big-message = { workspace = true }
+
+# The server, so the sink is tested against a real one rather than against a fixture that agrees
+# with it. Redis is not here: a scripted TCP peer plays that side, which is the honest thing to
+# do for a protocol this crate implements rather than links - see `tests/`.
+[dev-dependencies]
+big-embed = { workspace = true }
+big-http = { workspace = true }
+
+[[bin]]
+name = "big-redis-sink"
+path = "src/bin/big-redis-sink.rs"
