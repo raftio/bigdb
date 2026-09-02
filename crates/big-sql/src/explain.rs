@@ -206,7 +206,10 @@ enum Line<'a> {
 
 fn shape_kids(shape: &Shape) -> Vec<Line<'_>> {
     match shape {
-        Shape::Row { cells } => cells.iter().map(|c| Line::Text(cell(c, &[]))).collect(),
+        // Through `clauses` like the shapes that group, so an ungrouped `HAVING` prints in the
+        // same notation as a grouped one. It has no order and no cut to print: one row has
+        // nothing to sort and nothing to page.
+        Shape::Row { cells, having } => clauses(&[], cells, having, &None, &Cut::default()),
         Shape::Records { .. } => Vec::new(),
         Shape::Table { columns } => {
             columns.named().iter().map(|c| Line::Text(selected(c))).collect()

@@ -484,11 +484,6 @@ CREATE TABLE t (a UUID)
 ----
 sql_unknown_column_type
 
-error
-CREATE TABLE t (a DATE)
-----
-sql_unknown_column_type
-
 ## A decimal's scale and a field's depth, both decided while the statement is parsed.
 
 error
@@ -636,10 +631,22 @@ SELECT count(*) FROM (SELECT * FROM t)
 ----
 parse_error
 
-## `HAVING` without a grouping, and the offset a grouped answer cannot take.
+## A `HAVING` naming a number the answer does not hold, and the offset a grouped answer cannot
+## take. An ungrouped `HAVING` over an aggregate the select list *did* ask for is answered - see
+## `select.test` - but a projection and a record listing hold no aggregate for one to be about.
 
 error
-SELECT count(*) FROM t HAVING count(*) > 5
+SELECT count(*) FROM t HAVING sum(amount) > 5
+----
+sql_unsupported
+
+error
+SELECT amount FROM t HAVING count(*) > 5
+----
+sql_unsupported
+
+error
+SELECT * FROM t HAVING count(*) > 5
 ----
 sql_unsupported
 

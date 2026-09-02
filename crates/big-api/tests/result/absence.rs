@@ -109,7 +109,7 @@ fn an_ordering_puts_an_absent_number_last_in_both_directions() {
 
 #[test]
 fn an_average_over_no_records_is_null_rather_than_a_division_by_zero() {
-    let shape = Shape::Row { cells: vec![cell("avg(amount)", Of::Ratio { plan: 0, over: 1 })] };
+    let shape = Shape::row(vec![cell("avg(amount)", Of::Ratio { plan: 0, over: 1 })]);
 
     let set = result_set(&answer(shape), &[Value::Sum(0), Value::Count(0)]);
 

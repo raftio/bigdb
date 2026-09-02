@@ -38,9 +38,7 @@
 //!     panic!("a SELECT is a query")
 //! };
 //! assert_eq!(s.calls[0].table, "tx");
-//! assert_eq!(s.answer.shape, Shape::Row {
-//!     cells: vec![Cell::plain("count", Of::Value { plan: 0 })],
-//! });
+//! assert_eq!(s.answer.shape, Shape::row(vec![Cell::plain("count", Of::Value { plan: 0 })]));
 //! // The call is `Count(Row(amount >= 500))`, which is what a user would have written.
 //! assert_eq!(s.calls[0].call.name, "Count");
 //! ```

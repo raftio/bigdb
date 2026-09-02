@@ -49,16 +49,16 @@ fn the_aggregates_and_their_shapes() {
     // field keeps - see `Units`. `resolve` turns it into digits; translation never sees one.
     assert_eq!(
         translate("SELECT sum(amount) FROM t").unwrap().answer.shape,
-        Shape::Row { cells: vec![measured("sum", Of::Value { plan: 0 }, "t", "amount")] }
+        Shape::row(vec![measured("sum", Of::Value { plan: 0 }, "t", "amount")])
     );
     assert_eq!(
         translate("SELECT min(amount) AS lowest FROM t").unwrap().answer.shape,
-        Shape::Row { cells: vec![measured("lowest", Of::Value { plan: 0 }, "t", "amount")] }
+        Shape::row(vec![measured("lowest", Of::Value { plan: 0 }, "t", "amount")])
     );
     same("SELECT max(amount) FROM t", "Max(All(), field=amount)");
     assert_eq!(
         translate("SELECT count(DISTINCT category) FROM t").unwrap().answer.shape,
-        Shape::Row { cells: vec![Cell::plain("count".to_string(), Of::Groups { plan: 0 })] }
+        Shape::row(vec![Cell::plain("count".to_string(), Of::Groups { plan: 0 })])
     );
     // `SELECT *` is unexpanded here: translation sees no schema, and only a schema knows what
     // the star came to. The limit rides along for the fall back to a record listing, which is

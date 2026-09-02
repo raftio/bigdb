@@ -101,6 +101,15 @@ CreateTable t
 ├── b timequantum depth=32
 └── c timequantum depth=32
 
+# `DATE` is the fourth spelling of a time quantum, not a kind of its own: a date column is asked
+# to answer about days, and a time quantum field is the one that is viewed by day.
+ddl
+CREATE TABLE t (a DATE, b TIMESTAMP)
+----
+CreateTable t
+├── a timequantum depth=32
+└── b timequantum depth=32
+
 ddl
 CREATE TABLE t (a TEXT, b BIGINT, c BOOLEAN, d TIMESTAMP)
 ----

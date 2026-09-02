@@ -68,13 +68,18 @@ fn every_refusal_names_itself() {
         "sql_union"
     );
     assert_eq!(code("SELECT count(*) FROM t INTERSECT SELECT count(*) FROM t"), "sql_unsupported");
-    // `HAVING` on a count over a grouping is answered; the refusal is for the shapes that have
-    // no count to filter.
+    // A `HAVING` may only name a number the select list already asked for - that rule is what
+    // both of these are about, and it is the same rule whether or not there is a `GROUP BY`.
+    // A grouping that selected `sum(amount)` carries no count for a `HAVING count(*)` to read.
     assert_eq!(
         code("SELECT category, sum(amount) FROM t GROUP BY category HAVING count(*) > 5"),
         "sql_unsupported"
     );
-    assert_eq!(code("SELECT count(*) FROM t HAVING count(*) > 5"), "sql_unsupported");
+    // The ungrouped case, same rule: the answer holds a count and no sum.
+    assert_eq!(code("SELECT count(*) FROM t HAVING sum(amount) > 5"), "sql_unsupported");
+    // And the shapes that hold no aggregate at all for one to be about.
+    assert_eq!(code("SELECT amount FROM t HAVING count(*) > 5"), "sql_unsupported");
+    assert_eq!(code("SELECT * FROM t HAVING count(*) > 5"), "sql_unsupported");
     assert_eq!(code("SELECT row_number() OVER () FROM t"), "sql_unsupported");
     assert_eq!(code("SELECT count(*) FROM t LIMIT 1 OFFSET 5"), "sql_unsupported");
     assert_eq!(code("SELECT amount * 2 FROM t"), "sql_unsupported");

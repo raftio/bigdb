@@ -96,12 +96,16 @@ fn every_type_name_maps_onto_a_field_kind() {
             ("e".to_string(), "int", 64, None),
         ]
     );
+    // Four spellings of a time quantum, because a column asked to answer about days is the same
+    // column whichever of the four names it was declared under.
     assert_eq!(
-        columns("CREATE TABLE t (a BOOLEAN, b TIMESTAMP, c DATETIME)"),
+        columns("CREATE TABLE t (a BOOLEAN, b TIMESTAMP, c DATETIME, d DATE, e TIMEQUANTUM)"),
         [
             ("a".to_string(), "bool", 32, None),
             ("b".to_string(), "timequantum", 32, None),
             ("c".to_string(), "timequantum", 32, None),
+            ("d".to_string(), "timequantum", 32, None),
+            ("e".to_string(), "timequantum", 32, None),
         ]
     );
     // Case is not significant, here as everywhere else in this dialect.
@@ -164,11 +168,11 @@ fn a_bit_depth_is_one_to_sixty_four() {
 /// What the column list will not take, each refused where it is written.
 #[test]
 fn the_sql_a_column_list_does_not_answer() {
-    // A type this engine has nothing to store: no floats, no dates as values, no documents.
+    // A type this engine has nothing to store: no floats, no documents. `DATE` is *not* on this
+    // list - it is a time quantum, alongside `TIMESTAMP` and `DATETIME`, and is checked below.
     for sql in [
         "CREATE TABLE t (a FLOAT)",
         "CREATE TABLE t (a DOUBLE)",
-        "CREATE TABLE t (a DATE)",
         "CREATE TABLE t (a UUID)",
         "CREATE TABLE t (a JSON)",
         "CREATE TABLE t (a BLOB)",

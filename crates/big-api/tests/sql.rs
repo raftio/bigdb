@@ -119,10 +119,7 @@ fn the_shape_says_how_the_answer_becomes_columns() {
     let api = stocked();
     let (value, shape) = one(&api, "SELECT count(DISTINCT country) FROM tx");
     // The plan is a `Distinct`; the counting is the shape's job, after any merge.
-    assert_eq!(
-        shape,
-        Shape::Row { cells: vec![Cell::plain("count".to_string(), Of::Groups { plan: 0 })] }
-    );
+    assert_eq!(shape, Shape::row(vec![Cell::plain("count".to_string(), Of::Groups { plan: 0 })]));
     assert_eq!(value.as_groups().unwrap().len(), 3);
 
     let (_, shape) = one(&api, "SELECT country, count(*) FROM tx GROUP BY country");
@@ -150,15 +147,13 @@ fn several_aggregates_are_several_plans_over_the_same_records() {
     assert_eq!(plans.len(), 3);
     assert_eq!(
         answer.shape,
-        Shape::Row {
-            cells: vec![
-                Cell::plain("count".to_string(), Of::Value { plan: 0 }),
-                // Resolved, because a shape that reached here has met the schema: `amount`
-                // keeps no digits after the point, so its cells are plain.
-                Cell::plain("sum", Of::Value { plan: 1 }),
-                Cell::plain("max", Of::Value { plan: 2 }),
-            ]
-        }
+        Shape::row(vec![
+            Cell::plain("count".to_string(), Of::Value { plan: 0 }),
+            // Resolved, because a shape that reached here has met the schema: `amount`
+            // keeps no digits after the point, so its cells are plain.
+            Cell::plain("sum", Of::Value { plan: 1 }),
+            Cell::plain("max", Of::Value { plan: 2 }),
+        ])
     );
     // Each plan is what the aggregate alone would have produced.
     for (i, alone) in [
@@ -197,12 +192,10 @@ fn a_repeated_question_is_one_plan() {
     assert_eq!(plans.len(), 2, "a count and a sum, with the count shared");
     assert_eq!(
         answer.shape,
-        Shape::Row {
-            cells: vec![
-                Cell::plain("count".to_string(), Of::Value { plan: 0 }),
-                Cell::plain("avg", Of::Ratio { plan: 1, over: 0 }),
-            ]
-        }
+        Shape::row(vec![
+            Cell::plain("count".to_string(), Of::Value { plan: 0 }),
+            Cell::plain("avg", Of::Ratio { plan: 1, over: 0 }),
+        ])
     );
 }
 
@@ -281,7 +274,7 @@ fn a_statement_can_be_planned_without_being_run() {
     assert_eq!(plans[0].table(), "tx");
     assert_eq!(
         answer.shape,
-        Shape::Row { cells: vec![Cell::plain("count".to_string(), Of::Value { plan: 0 })] }
+        Shape::row(vec![Cell::plain("count".to_string(), Of::Value { plan: 0 })])
     );
     assert!(api.plan_sql("SELECT count(*) FROM nope").is_err());
 }
@@ -480,4 +473,43 @@ fn a_join_reaches_across_databases() {
         .unwrap();
     // One record on each side sharing one key, so the join is one pair.
     assert_eq!(values.len(), 2, "one grouped count per side");
+}
+
+/// A `HAVING` with no `GROUP BY` decides whether the one row exists, against a real database.
+///
+/// Written against the rendered rows rather than the plan's answer, because the plan is not
+/// where the decision happens: the count is the same number either way, and what the `HAVING`
+/// changes is whether it is handed back. A test on the value would pass with the clause
+/// ignored entirely.
+///
+/// The threshold is checked at the coordinator for a reason a single node cannot show: a total
+/// under it on one node can be over it once the others have contributed. `big-cluster`'s own
+/// tests hold that half; this one holds that the clause is applied at all, and in which
+/// direction.
+#[test]
+fn an_ungrouped_having_keeps_the_row_or_empties_the_answer() {
+    let api = stocked();
+    let rows = |sql: &str| {
+        let (values, answer) = api.sql(sql, &QueryOptions::default()).unwrap();
+        result_set(&answer, &values).rows
+    };
+
+    // Five records, so the same statement either answers with the count or with nothing.
+    assert_eq!(rows("SELECT count(*) FROM tx"), vec![vec![Datum::Int(5)]]);
+    assert_eq!(rows("SELECT count(*) FROM tx HAVING count(*) > 3"), vec![vec![Datum::Int(5)]]);
+    assert!(rows("SELECT count(*) FROM tx HAVING count(*) > 5").is_empty());
+    // The boundary, in both directions - an off-by-one here is the whole of what could be wrong.
+    assert_eq!(rows("SELECT count(*) FROM tx HAVING count(*) >= 5"), vec![vec![Datum::Int(5)]]);
+    assert!(rows("SELECT count(*) FROM tx HAVING count(*) < 5").is_empty());
+
+    // The `WHERE` runs first and the `HAVING` sees what it left: two records are `GB`.
+    let gb = "SELECT count(*) FROM tx WHERE country = 'GB'";
+    assert_eq!(rows(&format!("{gb} HAVING count(*) = 2")), vec![vec![Datum::Int(2)]]);
+    assert!(rows(&format!("{gb} HAVING count(*) = 5")).is_empty());
+
+    // An aggregate that reads a field, so the threshold goes through the same unit conversion a
+    // `WHERE` comparison does rather than being compared as written.
+    let total = "SELECT sum(amount) FROM tx";
+    assert_eq!(rows(&format!("{total} HAVING sum(amount) > 2000")), vec![vec![Datum::Int(2400)]]);
+    assert!(rows(&format!("{total} HAVING sum(amount) > 2400")).is_empty());
 }

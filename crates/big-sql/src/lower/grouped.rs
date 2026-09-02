@@ -14,12 +14,12 @@
 
 //! `GROUP BY` one keyed column, with the aggregates of it the select list asked for.
 
-use super::measure::{field_of, measure_of, names, units_of, Measure};
+use super::measure::{having_of, measure_of, names, units_of, Measure};
 use super::pql::{as_expr, call_of, field_arg, named};
 use super::{answer, count_plan, rows_of, Ask, Calls, Statement};
 use crate::ast::{Agg, HavingAgg, Item, Name, OrderKey, Proj, Select};
 use crate::error::{Refused, Result, SqlError};
-use crate::shape::{Absent, Cell, Cut, GroupOrder, Having, Of, OrderBy, Shape, Threshold};
+use crate::shape::{Absent, Cell, Cut, GroupOrder, Of, OrderBy, Shape};
 use big_plan::ast::{Expr, Literal};
 
 /// `GROUP BY` one keyed column, with the aggregates of it the select list asked for.
@@ -234,32 +234,6 @@ fn cells_of(select: &Select, table: &str, measures: &[(Measure, Of)]) -> Vec<Cel
             units: units_of(table, &i.proj),
         })
         .collect()
-}
-
-/// The `HAVING`, resolved against the numbers this answer actually holds.
-fn having_of(select: &Select, table: &str, measures: &[(Measure, Of)]) -> Result<Option<Having>> {
-    let Some(h) = &select.having else { return Ok(None) };
-    let of =
-        names(&h.agg, measures).ok_or(SqlError::Refused { what: Refused::Having, at: h.at })?;
-    // An average is fractional and this comparison is not. Rounding one into the other would
-    // answer a question next to the one that was asked.
-    if matches!(of, Of::Ratio { .. }) {
-        return Err(SqlError::Refused { what: Refused::Having, at: h.at });
-    }
-    let value = match field_of(&h.agg) {
-        // An aggregate's threshold is in the field's units, and only a schema knows what those
-        // are. `Shape::resolve` asks, with the planner's own conversion.
-        Some(field) => {
-            Threshold::Written { table: table.to_string(), field, value: h.value.clone() }
-        }
-        // A count is in records, which is a unit no field defines. Anything but a whole number
-        // of them is not a count, and is refused here rather than rounded into one.
-        None => match h.value {
-            Literal::Int(n) => Threshold::Units(i128::from(n)),
-            _ => return Err(SqlError::Refused { what: Refused::Having, at: h.at }),
-        },
-    };
-    Ok(Some(Having { of, op: h.op, value }))
 }
 
 /// Where an `ORDER BY` ends up: in the plan, in the shape, or nowhere.
