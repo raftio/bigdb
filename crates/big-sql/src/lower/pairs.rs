@@ -20,12 +20,12 @@
 //! column — and the number of those is what it costs, which is why [`MAX_LEFT`] travels in the
 //! plan rather than being applied to the answer.
 
-use super::measure::{field_of, measure_of, names, units_of, Measure};
+use super::measure::{field_of, having_tree, measure_of, names, units_of, Measure};
 use super::pql::{as_expr, call_of, field_arg, named};
 use super::{answer, rows_of, Calls, Statement};
 use crate::ast::{HavingAgg, Item, Name, OrderKey, Proj, Select};
 use crate::error::{Refused, Result, SqlError};
-use crate::shape::{Cell, Cut, GroupOrder, Having, Of, OrderBy, Shape, Threshold};
+use crate::shape::{Cell, Cut, GroupOrder, Of, OrderBy, Shape};
 use big_plan::ast::{Expr, Literal};
 
 /// How many values the outer column may hold.
@@ -125,18 +125,11 @@ pub(super) fn pairs(
     let having = match &select.having {
         None => None,
         Some(h) => {
-            let of = names(&h.agg, &measures)
-                .ok_or(SqlError::Refused { what: Refused::Having, at: h.at })?;
-            let value = match field_of(&h.agg) {
-                Some(field) => {
-                    Threshold::Written { table: table.to_string(), field, value: h.value.clone() }
-                }
-                None => match h.value {
-                    Literal::Int(n) => Threshold::Units(i128::from(n)),
-                    _ => return Err(SqlError::Refused { what: Refused::Having, at: h.at }),
-                },
+            let number = |a: &_, at: usize| {
+                names(a, &measures).ok_or(SqlError::Refused { what: Refused::Having, at })
             };
-            Some(Having { of, op: h.op, value })
+            let units = |a: &_, _at: usize| Ok(field_of(a).map(|f| (table.to_string(), f)));
+            Some(having_tree(h, &number, &units)?)
         }
     };
 

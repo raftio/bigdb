@@ -640,6 +640,14 @@ SELECT count(*) FROM t HAVING sum(amount) > 5
 ----
 sql_unsupported
 
+## A comparison between two constants says nothing about any group - it is true or false for
+## every one of them alike, and never what anybody meant.
+
+error
+SELECT category, count(*) FROM t GROUP BY category HAVING 1 > 2
+----
+sql_unsupported
+
 error
 SELECT amount FROM t HAVING count(*) > 5
 ----

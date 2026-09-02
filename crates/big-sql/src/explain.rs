@@ -37,7 +37,7 @@ use crate::ddl::{Alter, Column, Ddl};
 use crate::insert::Insert;
 use crate::lower::Probe;
 use crate::shape::{
-    Absent, Answer, Cell, Cut, Format, GroupOrder, Having, JoinSide, Of, OrderBy, Pairing,
+    Absent, Answer, Cell, Cut, Format, GroupOrder, Having, JoinSide, Of, Operand, OrderBy, Pairing,
     Selected, Shape, Threshold, Units,
 };
 use crate::show::{Show, Shown};
@@ -331,14 +331,37 @@ fn units(units: &Units) -> String {
     }
 }
 
+/// A `HAVING`, on one line.
+///
+/// **One line, brackets and all, rather than a subtree.** A `HAVING` is a handful of
+/// comparisons and reads as an expression; drawing it as a tree would spend four lines saying
+/// what `a > 5 and b < 3` says in one. It also keeps the guarantee this crate's printers all
+/// have to keep — that no line is ever blank — a property of the string rather than of a
+/// traversal, which matters because the corpus's `shape` directive calls
+/// [`crate::explain::answer`] directly and so does not pass through the filter in
+/// [`explained`].
+///
+/// **A single comparison prints exactly as it did before there was a tree**, which is what
+/// keeps every existing golden line byte for byte.
 fn having_of(having: &Having, sides: &[JoinSide]) -> String {
-    let value = match &having.value {
-        Threshold::Units(n) => n.to_string(),
-        Threshold::Written { table, field, value } => {
+    match having {
+        Having::And(a, b) => format!("{} and {}", having_of(a, sides), having_of(b, sides)),
+        Having::Or(a, b) => format!("({} or {})", having_of(a, sides), having_of(b, sides)),
+        Having::Not(a) => format!("not ({})", having_of(a, sides)),
+        Having::Cmp { left, op, right } => {
+            format!("{} {op} {}", operand_of(left, sides), operand_of(right, sides))
+        }
+    }
+}
+
+fn operand_of(operand: &Operand, sides: &[JoinSide]) -> String {
+    match operand {
+        Operand::Of { of: o, .. } => of(*o, sides),
+        Operand::Value(Threshold::Units(n)) => n.to_string(),
+        Operand::Value(Threshold::Written { table, field, value }) => {
             format!("{} as {table}.{field} (unresolved)", literal(value))
         }
-    };
-    format!("{} {} {value}", of(having.of, sides), having.op)
+    }
 }
 
 fn order_of(order: &GroupOrder, sides: &[JoinSide]) -> String {

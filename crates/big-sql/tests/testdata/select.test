@@ -302,3 +302,13 @@ SELECT sum(price) FROM t HAVING sum(price) > 100.00
 Row
 ├── sum = #0 scale=2
 └── having: #0 > 10000
+
+# The tree is the same tree without a `GROUP BY`: the whole filtered set is one group, so a
+# clause over several of its numbers means what it means over a grouping's.
+shape
+SELECT count(*), sum(amount) FROM t HAVING count(*) > 1000 AND sum(amount) > 500
+----
+Row
+├── count = #0
+├── sum = #1
+└── having: #0 > 1000 and #1 > 500

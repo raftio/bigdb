@@ -32,15 +32,15 @@
 //! `GROUP BY a, b, c` is already refused for.
 
 use super::cond::rows;
-use super::measure::{field_measured, measure_of, names, Measure};
+use super::measure::{field_measured, having_tree, measure_of, names, Measure};
 use super::pql::{as_expr, call, call_of, field_arg, named};
 use super::{answer, Calls, Statement, MAX_CALLS};
 use crate::ast::{Agg, Cond, HavingAgg, Item, Join, Name, OrderKey, Proj, Select, Source};
 use crate::error::{Refused, Result, SqlError};
 use crate::shape::{
-    Cell, Cut, GroupOrder, Having, JoinSide, Keying, Of, OrderBy, Pairing, Shape, Threshold, Units,
+    Cell, Cut, GroupOrder, Having, JoinSide, Keying, Of, OrderBy, Pairing, Shape, Units,
 };
-use big_plan::ast::{Call, Expr, Literal};
+use big_plan::ast::{Call, Expr};
 
 /// Which of a join's tables a column belongs to: a position in `FROM` order.
 ///
@@ -276,23 +276,22 @@ fn join_having(
     let Some(h) = &select.having else { return Ok(None) };
     if !per_key {
         // One row has no groups to keep or drop.
-        return Err(SqlError::Refused { what: Refused::Having, at: h.at });
+        return Err(SqlError::Refused { what: Refused::Having, at: h.at() });
     }
-    let of =
-        names(&h.agg, measures).ok_or(SqlError::Refused { what: Refused::Having, at: h.at })?;
-    // An average is fractional and this comparison is not. Rounding one into the other would
-    // answer a question next to the one that was asked - the same refusal a grouping gives.
-    if matches!(of, Of::PairedRatio { .. }) {
-        return Err(SqlError::Refused { what: Refused::Having, at: h.at });
-    }
-    let value = match having_field(&h.agg, scope, h.at)? {
-        Some((table, field)) => Threshold::Written { table, field, value: h.value.clone() },
-        None => match h.value {
-            Literal::Int(n) => Threshold::Units(i128::from(n)),
-            _ => return Err(SqlError::Refused { what: Refused::Having, at: h.at }),
-        },
+    let number = |a: &_, at: usize| {
+        let of = names(a, measures).ok_or(SqlError::Refused { what: Refused::Having, at })?;
+        // An average is fractional and this comparison is not. Rounding one into the other
+        // would answer a question next to the one that was asked - the same refusal a grouping
+        // gives, over the variant a join's average takes.
+        if matches!(of, Of::PairedRatio { .. }) {
+            return Err(SqlError::Refused { what: Refused::Having, at });
+        }
+        Ok(of)
     };
-    Ok(Some(Having { of, op: h.op, value }))
+    // A join has two tables, so which one a threshold is in the units of is a question about
+    // the qualifier rather than about the statement.
+    let units = |a: &_, at: usize| having_field(a, scope, at);
+    Ok(Some(having_tree(h, &number, &units)?))
 }
 
 /// The three things a join needs to know per side, in one value.

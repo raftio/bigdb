@@ -32,20 +32,49 @@
 
 use big_plan::{FieldClass, Literal, PlanError, Schema};
 
-/// A predicate on one of the numbers each group carries, applied to the merged answer.
+/// A predicate on the numbers each group carries, applied to the merged answer.
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub struct Having {
-    /// Which number is being compared, named the way a cell names one.
+pub enum Having {
+    /// `a AND b`
+    And(Box<Having>, Box<Having>),
+    /// `a OR b`
+    Or(Box<Having>, Box<Having>),
+    /// `NOT a`
+    Not(Box<Having>),
+    /// One comparison between two operands.
+    Cmp {
+        /// The left-hand side.
+        left: Operand,
+        /// One of `=`, `!=`, `<`, `<=`, `>`, `>=`.
+        op: &'static str,
+        /// The right-hand side.
+        right: Operand,
+    },
+}
+
+/// One side of a comparison in a [`Having`].
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Operand {
+    /// A number the answer carries, named the way a cell names one.
     ///
-    /// An [`Of`] rather than a plan index because a grouped answer can carry several numbers,
-    /// and because the one function that reads a number out of a merged answer should be the
-    /// one every clause uses. A `HAVING` on an [`Of::Ratio`] is refused before it gets here:
-    /// an average is fractional and this comparison is not.
-    pub of: Of,
-    /// One of `=`, `!=`, `<`, `<=`, `>`, `>=`.
-    pub op: &'static str,
-    /// The number to compare against.
-    pub value: Threshold,
+    /// An [`Of`] rather than a plan index because an answer can carry several numbers, and
+    /// because the one function that reads a number out of a merged answer should be the one
+    /// every clause uses.
+    Of {
+        /// Which number.
+        of: Of,
+        /// What it is measured in — the same [`Units`] the cell reading it carries.
+        ///
+        /// **Carried because two aggregates can be compared to each other**, and a comparison
+        /// between numbers in different units is not a comparison. A `sum` over a field of
+        /// scale two merges to 500 where the values were 5.00, so `sum(amount) > sum(price)`
+        /// over the stored numbers would answer 10 > 500 where it was asked 10 > 5 — with both
+        /// numbers valid and nothing in the result able to show it. Only a schema knows a
+        /// scale, so the check is [`Shape::resolve`]'s.
+        units: Units,
+    },
+    /// A number to compare against.
+    Value(Threshold),
 }
 
 /// A `HAVING` threshold, before and after it has met a schema.
@@ -76,29 +105,107 @@ pub enum Threshold {
 }
 
 impl Having {
-    /// Whether a group carrying `n` survives.
+    /// One number against one threshold, which is what every `HAVING` was before there was a
+    /// tree and what most of them still are.
     ///
-    /// `None` is a group with no number — a `min` or `max` over records that hold no value in
-    /// the field. It fails every comparison rather than defaulting to zero: absent is not the
-    /// same answer as zero, and this surface has no null for it to propagate through.
-    pub fn keeps(&self, n: Option<i128>) -> bool {
-        let Threshold::Units(want) = self.value else {
-            // Unreachable through `translate` + `resolve`, and a shape can also be built by
-            // hand. Dropping every group is the safe direction: it is visibly wrong, where
-            // keeping every group would look like a `HAVING` that simply matched a lot.
-            return false;
-        };
-        let Some(n) = n else { return false };
-        match self.op {
-            "=" => n == want,
-            "!=" => n != want,
-            "<" => n < want,
-            "<=" => n <= want,
-            ">" => n > want,
-            ">=" => n >= want,
-            // The lexer produces no other comparison, so this is unreachable rather than a
-            // silent "keep everything".
-            other => unreachable!("unexpected comparison in HAVING: {other}"),
+    /// The companion to [`Cell::plain`] and [`Shape::row`], for the same reason: a caller with
+    /// nothing to say about the tree should not have to build one.
+    pub fn cmp(of: Of, units: Units, op: &'static str, value: Threshold) -> Self {
+        Self::Cmp { left: Operand::Of { of, units }, op, right: Operand::Value(value) }
+    }
+
+    /// Whether a group survives, given a way to read the numbers it carries.
+    ///
+    /// `read` answers `None` for a number the group has none of — a `min` or `max` over records
+    /// that hold no value in the field, or a plan that said nothing about this group.
+    ///
+    /// **A comparison with an absent operand is false, not unknown.** Absent is not zero and it
+    /// is not a value, so nothing is true of it; and the boolean operators above are ordinary
+    /// two-valued ones rather than SQL's three-valued kind. That is a deliberate divergence and
+    /// the reason it is safe here is that this surface has no null to propagate: a bit is set
+    /// or it is not. Note what it means for `NOT`, which is the case three-valued logic exists
+    /// to argue about — `NOT (min(x) > 5)` **keeps** a group with no `x` at all, because the
+    /// comparison inside it is false rather than unknown.
+    pub fn holds(&self, read: &impl Fn(Of) -> Option<i128>) -> bool {
+        match self {
+            Self::And(a, b) => a.holds(read) && b.holds(read),
+            Self::Or(a, b) => a.holds(read) || b.holds(read),
+            Self::Not(a) => !a.holds(read),
+            Self::Cmp { left, op, right } => {
+                let (Some(l), Some(r)) = (left.value(read), right.value(read)) else {
+                    return false;
+                };
+                match *op {
+                    "=" => l == r,
+                    "!=" => l != r,
+                    "<" => l < r,
+                    "<=" => l <= r,
+                    ">" => l > r,
+                    ">=" => l >= r,
+                    // The lexer produces no other comparison, so this is unreachable rather
+                    // than a silent "keep everything".
+                    other => unreachable!("unexpected comparison in HAVING: {other}"),
+                }
+            }
+        }
+    }
+
+    /// The same clause against a branch's plans, moved by `by`. See [`Shape::rebase`].
+    pub fn rebase(self, by: usize) -> Self {
+        match self {
+            Self::And(a, b) => Self::And(Box::new(a.rebase(by)), Box::new(b.rebase(by))),
+            Self::Or(a, b) => Self::Or(Box::new(a.rebase(by)), Box::new(b.rebase(by))),
+            Self::Not(a) => Self::Not(Box::new(a.rebase(by))),
+            Self::Cmp { left, op, right } => {
+                Self::Cmp { left: left.rebase(by), op, right: right.rebase(by) }
+            }
+        }
+    }
+
+    /// Every number this clause reads, so a shape can say which plans it names.
+    pub fn plans(&self) -> Vec<usize> {
+        let mut out = Vec::new();
+        self.collect(&mut out);
+        out
+    }
+
+    fn collect(&self, out: &mut Vec<usize>) {
+        match self {
+            Self::And(a, b) | Self::Or(a, b) => {
+                a.collect(out);
+                b.collect(out);
+            }
+            Self::Not(a) => a.collect(out),
+            Self::Cmp { left, right, .. } => {
+                for side in [left, right] {
+                    if let Operand::Of { of, .. } = side {
+                        out.extend(of.plans());
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl Operand {
+    /// The same operand against a branch's plans, moved by `by`.
+    fn rebase(self, by: usize) -> Self {
+        match self {
+            Self::Of { of, units } => Self::Of { of: of.rebase(by), units },
+            Self::Value(t) => Self::Value(t),
+        }
+    }
+
+    /// The number this side stands for, or `None` when there is none.
+    fn value(&self, read: &impl Fn(Of) -> Option<i128>) -> Option<i128> {
+        match self {
+            Self::Of { of, .. } => read(*of),
+            // An unresolved threshold is unreachable through `translate` + `resolve`, and a
+            // shape can also be built by hand. Answering `None` drops the group, which is the
+            // safe direction: it is visibly wrong, where keeping every group would look like a
+            // `HAVING` that simply matched a lot.
+            Self::Value(Threshold::Written { .. }) => None,
+            Self::Value(Threshold::Units(n)) => Some(*n),
         }
     }
 }
@@ -846,11 +953,7 @@ impl Shape {
         let one = |h: Option<Having>| -> Result<Option<Having>, PlanError> {
             match h {
                 None => Ok(None),
-                Some(h) => Ok(Some(Having {
-                    of: h.of,
-                    op: h.op,
-                    value: resolve_threshold(schema, h.value)?,
-                })),
+                Some(h) => Ok(Some(resolve_having(schema, h)?)),
             }
         };
         let all = |cells: Vec<Cell>| -> Result<Vec<Cell>, PlanError> {
@@ -979,8 +1082,7 @@ impl Shape {
                 .map(|c| Cell { column: c.column, of: c.of.rebase(by), units: c.units })
                 .collect()
         };
-        let having =
-            |h: Option<Having>| h.map(|h| Having { of: h.of.rebase(by), op: h.op, value: h.value });
+        let having = |h: Option<Having>| h.map(|h| h.rebase(by));
         let order = |o: Option<GroupOrder>| {
             o.map(|o| GroupOrder {
                 by: match o.by {
@@ -1072,6 +1174,60 @@ fn resolve_units(schema: &impl Schema, u: Units) -> Result<Units, PlanError> {
     Ok(match class {
         FieldClass::Integer { scale } => Units::Digits(scale),
         _ => Units::PLAIN,
+    })
+}
+
+/// Puts every threshold in a `HAVING` against the schema, wherever in the tree it sits.
+///
+/// A walk rather than a single conversion, because a tree can hold several — and every one of
+/// them has to be converted, or a clause would compare a written `100.00` against a stored
+/// `10000` in one branch and correctly in another.
+fn resolve_having(schema: &impl Schema, h: Having) -> Result<Having, PlanError> {
+    let pair = |schema: &_, a: Box<Having>, b: Box<Having>| -> Result<_, PlanError> {
+        Ok((Box::new(resolve_having(schema, *a)?), Box::new(resolve_having(schema, *b)?)))
+    };
+    Ok(match h {
+        Having::And(a, b) => {
+            let (a, b) = pair(schema, a, b)?;
+            Having::And(a, b)
+        }
+        Having::Or(a, b) => {
+            let (a, b) = pair(schema, a, b)?;
+            Having::Or(a, b)
+        }
+        Having::Not(a) => Having::Not(Box::new(resolve_having(schema, *a)?)),
+        Having::Cmp { left, op, right } => {
+            // The field names, captured before resolution turns them into bare digits, so the
+            // refusal can say which two columns disagreed.
+            let name = |o: &Operand| match o {
+                Operand::Of { units: Units::Written { field, .. }, .. } => field.clone(),
+                _ => String::new(),
+            };
+            let (ln, rn) = (name(&left), name(&right));
+            let (left, right) = (resolve_operand(schema, left)?, resolve_operand(schema, right)?);
+            // **Two numbers are comparable only in the same units.** A threshold was converted
+            // into the units of the aggregate beside it, so a comparison against one always
+            // agrees; two aggregates were each converted into their own field's, and those can
+            // differ. Refused rather than compared, because comparing them is off by a factor
+            // of the scale with both numbers valid.
+            if let (Operand::Of { units: l, .. }, Operand::Of { units: r, .. }) = (&left, &right) {
+                if l.digits() != r.digits() {
+                    return Err(PlanError::OperatorNotAllowed {
+                        field: rn,
+                        op: format!("a comparison against a total of `{ln}`"),
+                        class: "a decimal of a different scale",
+                    });
+                }
+            }
+            Having::Cmp { left, op, right }
+        }
+    })
+}
+
+fn resolve_operand(schema: &impl Schema, o: Operand) -> Result<Operand, PlanError> {
+    Ok(match o {
+        Operand::Of { of, units } => Operand::Of { of, units: resolve_units(schema, units)? },
+        Operand::Value(t) => Operand::Value(resolve_threshold(schema, t)?),
     })
 }
 

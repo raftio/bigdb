@@ -162,14 +162,15 @@ fn having_reads_the_aggregate_the_answer_carries() {
     else {
         panic!("expected a grouped shape with a HAVING")
     };
-    assert_eq!(h.op, ">=");
+    let Having::Cmp { op, right, .. } = &h else { panic!("one comparison") };
+    assert_eq!(*op, ">=");
     assert_eq!(
-        h.value,
-        Threshold::Written {
+        *right,
+        Operand::Value(Threshold::Written {
             table: "t".to_string(),
             field: "amount".to_string(),
             value: Literal::Int(500),
-        }
+        })
     );
 
     // A `HAVING` naming any other number is refused: the answer holds one per group.
@@ -239,11 +240,12 @@ fn having_filters_groups_without_changing_the_plan() {
                 Cell::plain("category".to_string(), Of::Key),
                 Cell::plain("count".to_string(), Of::Group { plan: 0, absent: Absent::Zero }),
             ],
-            having: Some(Having {
-                of: Of::Group { plan: 0, absent: Absent::Zero },
-                op: ">=",
-                value: Threshold::Units(10),
-            }),
+            having: Some(Having::cmp(
+                Of::Group { plan: 0, absent: Absent::Zero },
+                Units::PLAIN,
+                ">=",
+                Threshold::Units(10),
+            )),
             order: None,
             cut: Cut::default(),
         }
@@ -276,11 +278,12 @@ fn a_limit_under_having_waits_until_after_the_filter() {
                 Cell::plain("category".to_string(), Of::Key),
                 Cell::plain("count".to_string(), Of::Group { plan: 0, absent: Absent::Zero }),
             ],
-            having: Some(Having {
-                of: Of::Group { plan: 0, absent: Absent::Zero },
-                op: ">",
-                value: Threshold::Units(5),
-            }),
+            having: Some(Having::cmp(
+                Of::Group { plan: 0, absent: Absent::Zero },
+                Units::PLAIN,
+                ">",
+                Threshold::Units(5),
+            )),
             order: None,
             cut: Cut { limit: Some(3), ..Cut::default() },
         }
@@ -295,38 +298,44 @@ fn a_limit_under_having_waits_until_after_the_filter() {
 /// Every comparison a `HAVING` accepts keeps the right groups.
 #[test]
 fn having_keeps_what_the_comparison_says() {
-    let h = |op: &'static str, value: i128| Having {
-        of: Of::Group { plan: 0, absent: Absent::Zero },
-        op,
-        value: Threshold::Units(value),
+    let h = |op: &'static str, value: i128| {
+        Having::cmp(
+            Of::Group { plan: 0, absent: Absent::Zero },
+            Units::PLAIN,
+            op,
+            Threshold::Units(value),
+        )
     };
-    let n = |v: i128| Some(v);
-    assert!(h(">", 5).keeps(n(6)) && !h(">", 5).keeps(n(5)));
-    assert!(h(">=", 5).keeps(n(5)) && !h(">=", 5).keeps(n(4)));
-    assert!(h("<", 5).keeps(n(4)) && !h("<", 5).keeps(n(5)));
-    assert!(h("<=", 5).keeps(n(5)) && !h("<=", 5).keeps(n(6)));
-    assert!(h("=", 5).keeps(n(5)) && !h("=", 5).keeps(n(4)));
-    assert!(h("!=", 5).keeps(n(4)) && !h("!=", 5).keeps(n(5)));
+    // The group carries `v`, whatever number the clause asks for.
+    let n = |v: i128| move |_: Of| Some(v);
+    let nothing = |_: Of| None;
+    assert!(h(">", 5).holds(&n(6)) && !h(">", 5).holds(&n(5)));
+    assert!(h(">=", 5).holds(&n(5)) && !h(">=", 5).holds(&n(4)));
+    assert!(h("<", 5).holds(&n(4)) && !h("<", 5).holds(&n(5)));
+    assert!(h("<=", 5).holds(&n(5)) && !h("<=", 5).holds(&n(6)));
+    assert!(h("=", 5).holds(&n(5)) && !h("=", 5).holds(&n(4)));
+    assert!(h("!=", 5).holds(&n(4)) && !h("!=", 5).holds(&n(5)));
 
     // A group with no number at all - a `min` over records that hold no value - fails every
     // comparison rather than being read as zero. `!= 5` is the one that would otherwise let it
     // through, which is why it is asserted next to the others rather than trusted.
     for op in [">", ">=", "<", "<=", "=", "!="] {
-        assert!(!h(op, 5).keeps(None), "`{op}` let a group with no value through");
+        assert!(!h(op, 5).holds(&nothing), "`{op}` let a group with no value through");
     }
 
     // A threshold that never met a schema drops every group. Visibly wrong beats a `HAVING`
     // that looks like it simply matched a lot.
-    let unresolved = Having {
-        of: Of::Group { plan: 0, absent: Absent::Zero },
-        op: ">",
-        value: Threshold::Written {
+    let unresolved = Having::cmp(
+        Of::Group { plan: 0, absent: Absent::Zero },
+        Units::PLAIN,
+        ">",
+        Threshold::Written {
             table: "t".to_string(),
             field: "amount".to_string(),
             value: Literal::Int(5),
         },
-    };
-    assert!(!unresolved.keeps(n(1_000_000)));
+    );
+    assert!(!unresolved.holds(&n(1_000_000)));
 }
 
 #[test]
@@ -401,4 +410,42 @@ fn a_window_over_a_column_with_no_time_views_is_refused() {
     let call = big_plan::parse("Count(Row(country=\"GB\", from=1, to=2))").unwrap();
     let err = big_plan::plan("t", &call, &Stub).unwrap_err();
     assert_eq!(err.code(), "operator_not_allowed");
+}
+
+/// Two totals can be compared to each other, and only when they are in the same units.
+///
+/// The clause is a tree over operands rather than one aggregate against one constant, so both
+/// sides may be numbers the answer holds. That makes a question possible that could not be
+/// written before - and it makes a wrong answer possible that could not happen before, because
+/// a total over a decimal field merges in the units that field stores.
+///
+/// `sum(amount) > sum(price)` over `amount` in whole units and `price` in hundredths would
+/// compare 10 against 500 where it was asked to compare 10 against 5.00: both numbers valid,
+/// and nothing in the result set able to show it. Only a schema knows a scale, so the refusal
+/// is `Shape::resolve`'s rather than the translation's - which is why this is here and not in
+/// the corpus, where no schema exists.
+#[test]
+fn two_totals_are_comparable_only_in_the_same_units() {
+    // Whole units on both sides: `amount` stores integers and `balance` is signed, and neither
+    // keeps digits after the point.
+    let same = "SELECT category, sum(amount), sum(balance) FROM t GROUP BY category \
+                HAVING sum(amount) > sum(balance)";
+    let shape = translate(same).unwrap().answer.shape;
+    assert!(shape.resolve(&Stub).is_ok(), "two whole-unit totals are comparable");
+
+    // `price` keeps two digits, so its total is a hundred times the number it stands for.
+    let mixed = "SELECT category, sum(amount), sum(price) FROM t GROUP BY category \
+                 HAVING sum(amount) > sum(price)";
+    let shape = translate(mixed).unwrap().answer.shape;
+    let e = shape.resolve(&Stub).unwrap_err();
+    assert_eq!(e.code(), "operator_not_allowed");
+    // The sentence names both columns, because which two disagreed is the whole of what the
+    // reader needs to know.
+    let said = e.to_string();
+    assert!(said.contains("amount") && said.contains("price"), "{said}");
+
+    // A total against a constant is unaffected: the constant was converted into that total's
+    // units on the way in, so the two sides agree by construction.
+    let constant = "SELECT category, sum(price) FROM t GROUP BY category HAVING sum(price) > 10.00";
+    assert!(translate(constant).unwrap().answer.shape.resolve(&Stub).is_ok());
 }

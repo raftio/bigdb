@@ -24,8 +24,8 @@
 
 pub use big_plan::{FieldClass, Keyed, Literal, Plan, Schema};
 pub use big_sql::{
-    Absent, Cell, Cut, GroupOrder, Having, JoinSide, Keying, Of, OrderBy, Pairing, Refused, Shape,
-    SqlError, Statement, Threshold,
+    Absent, Cell, Cut, GroupOrder, Having, JoinSide, Keying, Of, Operand, OrderBy, Pairing,
+    Refused, Shape, SqlError, Statement, Threshold, Units,
 };
 
 /// Translates a statement that is a query, which is every statement in this suite.

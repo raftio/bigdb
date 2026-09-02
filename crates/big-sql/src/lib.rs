@@ -69,8 +69,8 @@ pub use insert::{Insert, MAX_INSERT_ROWS, RECORD_COLUMN};
 pub use lower::{lower, Ask, Probe, Statement, MAX_CALLS};
 pub use parse::{parse, Parsed};
 pub use shape::{
-    Absent, Answer, Cell, Columns, Cut, Format, GroupOrder, Having, JoinSide, Keying, Of, OrderBy,
-    Pairing, Selected, Shape, Threshold, Units,
+    Absent, Answer, Cell, Columns, Cut, Format, GroupOrder, Having, JoinSide, Keying, Of, Operand,
+    OrderBy, Pairing, Selected, Shape, Threshold, Units,
 };
 pub use show::{Show, Shown};
 

@@ -21,7 +21,7 @@
 use crate::common::*;
 use big_api::{
     result_set, Absent, Cut, Datum, GroupOrder, Having, Of, OrderBy, ResultSet, Shape, Threshold,
-    Value,
+    Units, Value,
 };
 
 fn of() -> Of {
@@ -106,7 +106,7 @@ fn limit_zero_with_ties_keeps_nothing() {
 fn a_having_is_applied_before_the_limit_counts_anything() {
     // Three groups survive `> 2`. A limit of two applied first would have counted `e` towards
     // the two and answered with one row.
-    let having = Having { of: of(), op: ">", value: Threshold::Units(2) };
+    let having = Having::cmp(of(), Units::PLAIN, ">", Threshold::Units(2));
     let cut = Cut { offset: Some(2), limit: Some(2), ties: false };
 
     let set = result_set(&answer(shape(Some(having), Some(descending()), cut)), &values());
