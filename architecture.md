@@ -182,6 +182,22 @@ a terminal *is* the string the server chose. Every subcommand is exactly one rou
 `import` and `delete`, which are one *file*, cut into as many requests as the 8 MiB body cap
 needs - which means a feature request for the client is a feature request for the server.
 
+**`contrib/` is where the property that was lost is kept.** `contrib/big-message` is a producer
+for a program that makes events as it runs, and its `[dependencies]` section is empty - so
+`cargo tree -p big-message --edges normal` prints one line, and the thing `big-cli` used to
+prove is proved again by a build rather than by a paragraph. It is not a second client surface:
+it reaches the server through `POST /sql` and nothing else, and it holds no vocabulary the
+server does not.
+
+It also carries the one distinction worth reading before writing anything that ingests here.
+`bigctl import` is idempotent because **the caller chooses the record id**, so a chunk sent
+twice writes the same bits twice. `contrib/big-message` deliberately does not: a record id is
+the engine's own coordinate and it is absent from that crate's API, so its statements name no
+`_record_id` and the schema leader allocates. That buys a client that cannot leak an address,
+and it costs idempotency - at-least-once, with duplicates that nothing reports. Which of the two
+is right is a question about the caller's data, and having both means it can be answered rather
+than assumed.
+
 **Distribution is built, and the engine had decided most of it.** A record id names
 its shard by a shift, and the client picks the record id, so placement needs no agreement.
 `Matches` is a map from shard to row set whose `and`/`or` are shard-wise merges, so combining

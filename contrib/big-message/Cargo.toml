@@ -1,0 +1,26 @@
+# A producer: messages from a running program into a table, over the server's own HTTP surface.
+#
+# `[dependencies]` is empty and stays empty. This crate is written the way somebody outside this
+# repository would write it - it may know the wire and nothing else - and an empty section is the
+# only form of that claim a build can check. The engine appears under `[dev-dependencies]`, where
+# it binds a real server for the tests to talk to and does not reach what ships.
+[package]
+name = "big-message"
+description = "Stream messages into a bigdb table over HTTP, batched, with the record ids left to the server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+# Deliberately empty. See the note above.
+[dependencies]
+
+# The server, so a test can talk to one that is real rather than to a mock that agrees with
+# whatever this crate happens to send. `big-sql` is here for one test and one only: the ceilings
+# hardcoded in `batch.rs` are asserted against the server's own constants.
+[dev-dependencies]
+big-embed = { workspace = true }
+big-http = { workspace = true }
+big-sql = { workspace = true }
