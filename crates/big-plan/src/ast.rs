@@ -36,8 +36,38 @@ pub enum Literal {
         units: u64,
         scale: u8,
     },
+    /// `-12.50` as `units = -1250, scale = 2`.
+    ///
+    /// Its own variant for the reason [`Literal::Sint`] is, and it exists at all because floats
+    /// do. A decimal field is unsigned, so this used to be refused in the lexer; a float field
+    /// holds negative numbers perfectly well, and a lexer cannot see which kind of field a
+    /// value is headed for. So the shape is read here and the refusal moved to [`crate::plan`],
+    /// where the field is known - which is where it always belonged.
+    ///
+    /// Still integers, so [`Literal`] keeps its `Eq`. Nothing in this crate holds an `f64`.
+    Sdec {
+        units: i64,
+        scale: u8,
+    },
     Str(String),
     Bool(bool),
+}
+
+impl Literal {
+    /// The number this stands for, as the float a float field would store.
+    ///
+    /// `None` for a value that is not a number at all. The division is exact for every scale a
+    /// literal can carry, and it is the same division `f64::from_str` would have done - which is
+    /// why a written `3.14` and a parsed `3.14` are the same `f64`.
+    pub fn as_f64(&self) -> Option<f64> {
+        Some(match *self {
+            Self::Int(v) => v as f64,
+            Self::Sint(v) => v as f64,
+            Self::Dec { units, scale } => units as f64 / 10f64.powi(i32::from(scale)),
+            Self::Sdec { units, scale } => units as f64 / 10f64.powi(i32::from(scale)),
+            Self::Str(_) | Self::Bool(_) => return None,
+        })
+    }
 }
 
 /// `Name(arg, arg, ...)`, the only syntactic form the language has.

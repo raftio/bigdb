@@ -545,8 +545,25 @@ pub(super) fn parse_kind(s: &str) -> Option<FieldKind> {
         "mutex" => FieldKind::Mutex,
         "bool" => FieldKind::Bool,
         "timequantum" => FieldKind::TimeQuantum,
+        "float32" => FieldKind::Float32,
+        "float64" => FieldKind::Float64,
+        "date" => FieldKind::Date,
+        "datetime" => FieldKind::DateTime,
         _ => return None,
     })
+}
+
+/// How many planes a kind gets when the field route is not told.
+///
+/// **Not a constant 32.** A `float64` is the width its name says, and defaulting it to 32 would
+/// have made a field that silently rounded every value it was given - the same field spelled
+/// `FLOAT64` in a column list, and quietly a different one. A kind whose name carries a width
+/// answers with that width; everything else keeps the 32 it always had.
+pub(super) fn default_bit_depth(kind: FieldKind) -> u32 {
+    match kind {
+        FieldKind::Float64 | FieldKind::DateTime => 64,
+        _ => 32,
+    }
 }
 
 /// `?after=<id>&limit=<n>`, both optional.

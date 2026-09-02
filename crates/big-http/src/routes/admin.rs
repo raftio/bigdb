@@ -55,7 +55,8 @@ pub(super) fn create_field<P: PagerMut + Sync>(
         return Response::failure(
             400,
             "bad_parameter",
-            "kind must be int, decimal, set, mutex, bool or timequantum",
+            "kind must be int, signed, decimal, set, mutex, bool, timequantum, float32, \
+             float64, date or datetime",
         );
     };
     let bit_depth = match req.param("bit_depth").map(|v| v.parse::<u32>()) {
@@ -63,7 +64,7 @@ pub(super) fn create_field<P: PagerMut + Sync>(
         Some(Err(_)) => {
             return Response::failure(400, "bad_parameter", "bit_depth must be a number")
         }
-        None => 32,
+        None => super::default_bit_depth(kind),
     };
 
     let result = match kind {

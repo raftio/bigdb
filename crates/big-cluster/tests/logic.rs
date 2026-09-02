@@ -156,6 +156,10 @@ fn datum(d: &Datum) -> String {
         Datum::Int(v) => v.to_string(),
         Datum::Dec { units, scale } => big_api::fixed(*units, *scale),
         Datum::Real(v) => format!("{v}"),
+        // Spelled the way every output format spells them, so a corpus answer and a client's
+        // answer cannot come to disagree about what a date is.
+        Datum::Date(d) => big_api::date_text(*d),
+        Datum::Timestamp(t) => big_api::timestamp_text(*t),
         Datum::Text(s) => s.clone(),
         Datum::Keys(keys) => format!("[{}]", keys.join(", ")),
     }

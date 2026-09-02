@@ -10,6 +10,7 @@ readme = "readme.md"
 
 [dependencies]
 big-btree = { path = "../big-btree", version = "0.1.0" }
+big-civil = { path = "../big-civil", version = "0.1.0" }
 big-container = { path = "../big-container", version = "0.1.0" }
 big-page = { path = "../big-page", version = "0.1.0" }
 big-pager = { path = "../big-pager", version = "0.1.0" }

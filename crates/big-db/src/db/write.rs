@@ -898,10 +898,11 @@ impl<'db, P: PagerMut> DbWrite<'db, P> {
     pub fn set_int_at(&mut self, at: &At, record: RecordId, value: u64) -> Result<()> {
         let (t, def) = (at.table, &at.def);
         let field = def.name.as_str();
-        // `is_bsi` now covers the signed kind too, and this setter must not: the value it takes
-        // is already the stored value, so writing one to a signed field would store a number
-        // that reads back as something else entirely. `set_signed` is the way in.
-        expect_kind(def, field, |k| k.is_bsi() && !k.is_signed(), "int")?;
+        // `is_bsi` now covers the signed and float kinds too, and this setter must not: the
+        // value it takes is already the stored value, so writing one to a field with an
+        // encoding would store a number that reads back as something else entirely.
+        // `set_signed` and `set_float` are the ways in.
+        expect_kind(def, field, |k| k.is_bsi() && !k.is_signed() && !k.is_float(), "int")?;
 
         // A value wider than the field was declared for is refused, not truncated.
         let declared = if def.bit_depth == 0 { 64 } else { def.bit_depth };
@@ -955,6 +956,38 @@ impl<'db, P: PagerMut> DbWrite<'db, P> {
         // Everything below sees the *stored* value, which is what makes the zone map work
         // unchanged: the encoding is monotonic, so a window in stored space is the same window in
         // value space.
+        self.route(t, def, record, Fact::Value { value: stored, kind: def.kind })?;
+        self.mark_exists_at(t, record);
+        Ok(())
+    }
+
+    /// Writes a float value, encoded on the way in.
+    ///
+    /// Everything below this line sees an ordinary unsigned bit-sliced index, exactly as it does
+    /// for a signed field; the transform lives in [`crate::float`] and nowhere else. That is
+    /// what keeps the zone map, the range scan and `Bsi::extreme` working unchanged - the
+    /// encoding is monotonic, so a window in stored space is the same window in value space.
+    pub fn set_float<'a>(
+        &mut self,
+        table: impl Into<TableRef<'a>>,
+        field: &str,
+        record: RecordId,
+        value: f64,
+    ) -> Result<()> {
+        let table = table.into();
+        let at = self.at(table, field)?;
+        self.set_float_at(&at, record, value)
+    }
+
+    /// The same, at a field resolved once. See [`At`].
+    pub fn set_float_at(&mut self, at: &At, record: RecordId, value: f64) -> Result<()> {
+        let (t, def) = (at.table, &at.def);
+        expect_kind(def, &def.name, FieldKind::is_float, "float")?;
+
+        let declared = if def.bit_depth == 0 { 64 } else { def.bit_depth };
+        let stored = crate::float::encode(value, declared)
+            .ok_or(DbError::FloatValueOutOfRange { value, bit_depth: declared })?;
+
         self.route(t, def, record, Fact::Value { value: stored, kind: def.kind })?;
         self.mark_exists_at(t, record);
         Ok(())

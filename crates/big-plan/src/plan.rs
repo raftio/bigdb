@@ -21,7 +21,7 @@
 
 use crate::ast::{Call, Expr, Literal};
 use crate::error::{PlanError, Result};
-use crate::schema::{FieldClass, Keyed, Schema};
+use crate::schema::{FieldClass, Keyed, Schema, TimeUnit};
 
 /// Comparisons an integer field accepts. Deliberately the same set the storage layer already
 /// implements, so planning never promises something the executor has to emulate.
@@ -45,10 +45,30 @@ pub enum Rows {
     },
     /// The same, against a signed field. The bound stays an `i64` all the way down; the bias
     /// is applied in the storage layer, which is the only place that knows the field's depth.
+    ///
+    /// A date comparison is one of these. The stored value is a count from the Unix epoch, so
+    /// once `'2024-01-15'` has become a number there is nothing left for a temporal plan to say.
     CompareSigned {
         field: String,
         op: CmpOp,
         value: i64,
+    },
+    /// The same, against a float field.
+    ///
+    /// **The threshold travels as `f64::to_bits`, not as an `f64`.** Two reasons, and the second
+    /// is the load-bearing one: a plan is compared for equality all over the test corpus, and
+    /// `PartialEq` on a float is not reflexive, so an `f64` here would cost this enum its `Eq`
+    /// and cost it to everything holding one. The bits are the same number - `from_bits` is
+    /// exact and total - and the storage layer reads them back before it does anything with
+    /// them.
+    ///
+    /// Unrounded, because rounding it needs the field's width and the operator together; see
+    /// `big_db::float::encode_bound`.
+    CompareFloat {
+        field: String,
+        op: CmpOp,
+        /// `f64::to_bits` of the written threshold.
+        bits: u64,
     },
     Key {
         field: String,
@@ -268,18 +288,16 @@ impl<S: Schema> Ctx<'_, S> {
             }
         };
 
-        match self.class(&field)? {
-            // Both integer classes aggregate. Which one it is decides whether the answer comes
-            // back signed, and that is settled in the executor against the field rather than
-            // here against the call - a `Sum` is a `Sum` either way.
-            FieldClass::Integer { .. } | FieldClass::Signed => {}
-            other => {
-                return Err(PlanError::OperatorNotAllowed {
-                    field,
-                    op: name.to_string(),
-                    class: class_name(other),
-                })
-            }
+        // Which class it is decides whether the answer comes back signed or folded from values,
+        // and both are settled in the executor against the field rather than here against the
+        // call - a `Sum` is a `Sum` either way.
+        let class = self.class(&field)?;
+        if !aggregable(class, name) {
+            return Err(PlanError::OperatorNotAllowed {
+                field,
+                op: name.to_string(),
+                class: class_name(class),
+            });
         }
         let table = self.table.to_string();
         Ok(match name {
@@ -486,10 +504,14 @@ impl<S: Schema> Ctx<'_, S> {
         let stores_values = self.schema.stores_values(self.table);
         for field in &fields {
             match self.class(field)? {
-                // Both integer classes reconstruct from their bit planes. Which one it is
-                // decides whether the value comes back signed, and that is settled in the
-                // executor against the field, as it is for every aggregate.
-                FieldClass::Integer { .. } | FieldClass::Signed => {}
+                // Every bit-sliced class reconstructs from its planes. Which one it is decides
+                // what the stored number has to be turned back into - a sign undone, a float
+                // decoded, a count from the epoch read as a date - and all of that is settled
+                // below this line, against the field, as it is for every aggregate.
+                FieldClass::Integer { .. }
+                | FieldClass::Signed
+                | FieldClass::Float { .. }
+                | FieldClass::Temporal { .. } => {}
                 // A keyed or boolean column can be read back only where the values are stored.
                 // An index records which records hold a key and never which key a record
                 // holds, so on a table without segments there is no read to allow.
@@ -540,15 +562,13 @@ impl<S: Schema> Ctx<'_, S> {
                 return Err(PlanError::Arity { call: name, want: "field=<name>", got: other.len() })
             }
         };
-        match self.class(&field)? {
-            FieldClass::Integer { .. } => {}
-            other => {
-                return Err(PlanError::OperatorNotAllowed {
-                    field,
-                    op: name.to_string(),
-                    class: class_name(other),
-                })
-            }
+        let class = self.class(&field)?;
+        if !aggregable(class, name) {
+            return Err(PlanError::OperatorNotAllowed {
+                field,
+                op: name.to_string(),
+                class: class_name(class),
+            });
         }
         Ok(match name {
             "Min" => Plan::Min { table, rows: Rows::All, field },
@@ -680,7 +700,13 @@ impl<S: Schema> Ctx<'_, S> {
 
         let class = self.class(&field)?;
         match (class, &value) {
-            (FieldClass::Integer { scale }, Literal::Int(_) | Literal::Dec { .. }) => {
+            // `Sdec` is here only to reach `to_units`, which refuses it by name: a decimal field
+            // is unsigned, and the sentence that says so is more use than the operator refusal
+            // this would otherwise fall through to.
+            (
+                FieldClass::Integer { scale },
+                Literal::Int(_) | Literal::Dec { .. } | Literal::Sdec { .. },
+            ) => {
                 let cmp = int_op(&op).ok_or_else(|| PlanError::OperatorNotAllowed {
                     field: field.clone(),
                     op: op.clone(),
@@ -706,6 +732,38 @@ impl<S: Schema> Ctx<'_, S> {
                     _ => unreachable!("guarded by the match arm"),
                 };
                 Ok(Rows::CompareSigned { field, op: cmp, value })
+            }
+            // Every numeric literal is legal against a float, including the negative fractional
+            // one no other class takes. The threshold travels as written; the rounding it needs
+            // to become a bound the field can hold depends on the operator *and* the field's
+            // width, and the only layer that knows the width is the one that stores it.
+            (
+                FieldClass::Float { .. },
+                Literal::Int(_) | Literal::Sint(_) | Literal::Dec { .. } | Literal::Sdec { .. },
+            ) => {
+                let cmp = int_op(&op).ok_or_else(|| PlanError::OperatorNotAllowed {
+                    field: field.clone(),
+                    op: op.clone(),
+                    class: class_name(class),
+                })?;
+                let bits = value.as_f64().expect("guarded by the match arm").to_bits();
+                Ok(Rows::CompareFloat { field, op: cmp, bits })
+            }
+            // A date is compared against a written date, and comes out as the ordinary signed
+            // comparison it is: the stored value is a count from the epoch, so `Rows` needs no
+            // variant of its own and neither does anything below it.
+            (FieldClass::Temporal { unit }, Literal::Str(s)) => {
+                let cmp = int_op(&op).ok_or_else(|| PlanError::OperatorNotAllowed {
+                    field: field.clone(),
+                    op: op.clone(),
+                    class: class_name(class),
+                })?;
+                match unit.to_count(s) {
+                    Some(value) => Ok(Rows::CompareSigned { field, op: cmp, value }),
+                    None => {
+                        Err(PlanError::BadDate { field, written: s.clone(), want: unit.format() })
+                    }
+                }
             }
             (FieldClass::Keyed(_), Literal::Str(v)) if op == "=" || op == "==" => {
                 Ok(Rows::Key { field, value: v.clone() })
@@ -755,6 +813,11 @@ pub fn to_units(field: &str, value: &Literal, scale: u8) -> Result<u64> {
     let (units, written) = match value {
         Literal::Int(v) => (*v, 0u8),
         Literal::Dec { units, scale } => (*units, *scale),
+        // The refusal the lexer used to make, moved here now that a negative fractional number
+        // has somewhere else to go. This is the arm that knows the value was aimed at an
+        // unsigned bit-sliced field, which is the whole reason it cannot be stored: rounding it
+        // to an integer would answer a different question.
+        Literal::Sdec { .. } => return Err(PlanError::NegativeDecimal { at: 0 }),
         _ => return Err(PlanError::BadArgument { call: "Row", want: "a number" }),
     };
 
@@ -769,10 +832,32 @@ pub fn to_units(field: &str, value: &Literal, scale: u8) -> Result<u64> {
         .ok_or(PlanError::NumberTooLarge { at: 0 })
 }
 
+/// Whether an aggregate is meaningful over a field of this class.
+///
+/// **One function because there are two gates**, and they did not agree. `Sum(field="balance")`
+/// on its own was answered and the same call inside a `GroupBy` was refused, because the bare
+/// form's check listed `Signed` and the grouped one did not - a refusal nobody wrote on purpose,
+/// and one the executor never needed, since it routes a signed sum by the field either way.
+/// Written out here so the two cannot drift again.
+///
+/// `min` and `max` are questions about an ordering; `sum` is a question about addition. A date
+/// has the first and not the second, which is the whole of why it is listed separately.
+fn aggregable(class: FieldClass, name: &str) -> bool {
+    match class {
+        FieldClass::Integer { .. } | FieldClass::Signed | FieldClass::Float { .. } => true,
+        FieldClass::Temporal { .. } => name == "Min" || name == "Max",
+        FieldClass::Keyed(_) | FieldClass::Boolean => false,
+    }
+}
+
 fn class_name(c: FieldClass) -> &'static str {
     match c {
         FieldClass::Integer { .. } => "an integer field",
         FieldClass::Signed => "a signed integer field",
+        FieldClass::Float { bits: 32 } => "a single precision float field",
+        FieldClass::Float { .. } => "a float field",
+        FieldClass::Temporal { unit: TimeUnit::Days } => "a date field",
+        FieldClass::Temporal { unit: TimeUnit::Seconds } => "a timestamp field",
         FieldClass::Keyed(Keyed::Set) => "a keyed field",
         FieldClass::Keyed(Keyed::Mutex) => "a mutex field",
         FieldClass::Keyed(Keyed::Time) => "a time quantum field",

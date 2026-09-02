@@ -148,6 +148,13 @@ fn rows_head(rows: &Rows) -> String {
         Rows::CompareSigned { field, op, value } => {
             format!("{field} {} {value} [signed]", cmp(*op))
         }
+        // The threshold is printed as the number it stands for rather than as the bits it
+        // travelled as: a plan printed for a reader has to read back as what was written. The
+        // marker is there for the reason the signed one is - `rate > 5` and `count > 5` would
+        // otherwise print the same line from two different plans.
+        Rows::CompareFloat { field, op, bits } => {
+            format!("{field} {} {} [float]", cmp(*op), f64::from_bits(*bits))
+        }
         Rows::Key { field, value } => format!("{field} = '{value}'"),
         Rows::KeyBetween { field, value, from, to } => {
             format!("{field} = '{value}' in [{}, {}]", bound(from), bound(to))

@@ -43,6 +43,10 @@ pub fn kind_of(kind: SqlColumnKind) -> FieldKind {
         SqlColumnKind::Signed => FieldKind::SignedInt,
         SqlColumnKind::Decimal => FieldKind::Decimal,
         SqlColumnKind::TimeQuantum => FieldKind::TimeQuantum,
+        SqlColumnKind::Float32 => FieldKind::Float32,
+        SqlColumnKind::Float64 => FieldKind::Float64,
+        SqlColumnKind::Date => FieldKind::Date,
+        SqlColumnKind::DateTime => FieldKind::DateTime,
     }
 }
 
@@ -60,6 +64,10 @@ pub fn sql_kind_of(kind: FieldKind) -> SqlColumnKind {
         FieldKind::SignedInt => SqlColumnKind::Signed,
         FieldKind::Decimal => SqlColumnKind::Decimal,
         FieldKind::TimeQuantum => SqlColumnKind::TimeQuantum,
+        FieldKind::Float32 => SqlColumnKind::Float32,
+        FieldKind::Float64 => SqlColumnKind::Float64,
+        FieldKind::Date => SqlColumnKind::Date,
+        FieldKind::DateTime => SqlColumnKind::DateTime,
     }
 }
 

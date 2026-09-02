@@ -116,7 +116,7 @@ fn every_refusal_names_itself() {
     assert_eq!(code("DELETE FROM t WHERE amount > 5"), "sql_read_only");
     // A column list is answered now - see `schema` - so what is refused is a type name that
     // names nothing this engine stores, and the SQL that comes attached to one.
-    assert_eq!(code("CREATE TABLE t (a FLOAT)"), "sql_unknown_column_type");
+    assert_eq!(code("CREATE TABLE t (a BLOB)"), "sql_unknown_column_type");
     assert_eq!(code("CREATE TABLE t (a INT NOT NULL)"), "sql_no_constraints");
     assert_eq!(code("CREATE TABLE t (a DECIMAL)"), "sql_decimal_scale");
     assert_eq!(code("CREATE TABLE t (a UINT(0))"), "sql_bit_depth");
@@ -220,7 +220,8 @@ fn text_that_is_not_a_statement_is_a_parse_error_not_a_refusal() {
         code("SELECT count(*) FROM t WHERE amount > 99999999999999999999999"),
         "parse_error"
     );
-    assert_eq!(code("SELECT count(*) FROM t WHERE price > -12.50"), "parse_error");
+    // `-12.50` used to be here. It is a legal literal now - a float field holds one - so the
+    // refusal moved to where the field is known; see `big-plan`'s planning tests.
 }
 
 /// The stack bound, which is not a taste in conditions: a recursive descent that runs out of

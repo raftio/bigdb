@@ -47,6 +47,17 @@ pub enum ValueError {
     NeedsSeconds,
     /// A keyed field, given something that is not a string.
     NeedsKey,
+    /// A float field, given something that is not a number.
+    NeedsFloat,
+    /// A float field, given a number it cannot hold: a NaN, or a magnitude past the range of a
+    /// single-precision column. Refused rather than stored as an infinity, for the reason a
+    /// too-wide integer is refused rather than truncated.
+    FloatOutOfRange,
+    /// A date field, given a string that is not a date it can hold.
+    NeedsDate {
+        /// How a date for this field is written, e.g. `YYYY-MM-DD`.
+        want: &'static str,
+    },
     /// A decimal field, given more digits after the point than it stores.
     ///
     /// Carries both numbers because this is the planner's own refusal reached from the write
@@ -76,6 +87,13 @@ impl ValueError {
                 format!("`{field}` takes `key@seconds`, and `{value}` is not a number")
             }
             Self::NeedsKey => format!("`{field}` needs a key, got `{value}`"),
+            Self::NeedsFloat => format!("`{field}` needs a number, got `{value}`"),
+            Self::FloatOutOfRange => {
+                format!("`{field}` cannot hold `{value}`")
+            }
+            Self::NeedsDate { want } => {
+                format!("`{field}` takes a date written `{want}`, and `{value}` is not one")
+            }
             // The planner's sentence, because it is the planner's refusal - see `into_error`.
             Self::TooPrecise { written, scale } => {
                 PlanError::TooPrecise { field: field.to_string(), written, scale }.to_string()
@@ -130,6 +148,20 @@ pub fn from_text<'a>(
         FieldKind::Int | FieldKind::Decimal => match value.parse::<u64>() {
             Ok(v) => Fact::Int { field, record, value: v },
             Err(_) => return Err(ValueError::NeedsNumber),
+        },
+        // Written the way a float is written. An import line has no field to consult, so this
+        // is the one spelling, and it is the one `f64::from_str` reads.
+        FieldKind::Float32 | FieldKind::Float64 => match value.parse::<f64>() {
+            Ok(v) => float_fact(field, info, record, v)?,
+            Err(_) => return Err(ValueError::NeedsFloat),
+        },
+        // **A date is written as a date, not as a count.** An integer field takes the units it
+        // stores because that is what an import line has always sent, but a date has never been
+        // sendable at all, so there is no older spelling to keep faith with - and `2024-01-15`
+        // is what anyone writing one will send.
+        FieldKind::Date | FieldKind::DateTime => match date_unit(info.kind).to_count(value) {
+            Some(n) => Fact::Signed { field, record, value: n },
+            None => return Err(ValueError::NeedsDate { want: date_unit(info.kind).format() }),
         },
         FieldKind::Bool => match value {
             "true" => Fact::Bool { field, record, value: true },
@@ -189,6 +221,28 @@ pub fn from_literal<'a>(
         }
         (FieldKind::Decimal, _) => return Err(ValueError::NeedsNumber),
 
+        // Every numeric literal, including the negative fractional one only a float takes.
+        // `Literal::as_f64` is the same conversion the planner makes for a bound, so a value
+        // written into a float field and a value compared against one meet as the same number.
+        (
+            FieldKind::Float32 | FieldKind::Float64,
+            Literal::Int(_) | Literal::Sint(_) | Literal::Dec { .. } | Literal::Sdec { .. },
+        ) => {
+            let v = value.as_f64().expect("guarded by the match arm");
+            float_fact(field, info, record, v)?
+        }
+        (FieldKind::Float32 | FieldKind::Float64, _) => return Err(ValueError::NeedsFloat),
+
+        (FieldKind::Date | FieldKind::DateTime, Literal::Str(s)) => {
+            match date_unit(info.kind).to_count(s) {
+                Some(n) => Fact::Signed { field, record, value: n },
+                None => return Err(ValueError::NeedsDate { want: date_unit(info.kind).format() }),
+            }
+        }
+        (FieldKind::Date | FieldKind::DateTime, _) => {
+            return Err(ValueError::NeedsDate { want: date_unit(info.kind).format() })
+        }
+
         (FieldKind::Bool, Literal::Bool(v)) => Fact::Bool { field, record, value: *v },
         (FieldKind::Bool, _) => return Err(ValueError::NeedsBool),
 
@@ -203,6 +257,33 @@ pub fn from_literal<'a>(
     })
 }
 
+/// One float fact, refused rather than rounded to an infinity when the field cannot hold it.
+///
+/// Its own function because both spellings reach it - an import line and a SQL literal - and a
+/// value the field cannot hold has to be the same refusal either way.
+#[inline]
+fn float_fact<'a>(
+    field: &'a str,
+    info: &FieldInfo,
+    record: RecordId,
+    value: f64,
+) -> Result<Fact<'a>, ValueError> {
+    let declared = if info.bit_depth == 0 { 64 } else { info.bit_depth };
+    match big_db::float::encode(value, declared) {
+        Some(_) => Ok(Fact::Float { field, record, bits: value.to_bits() }),
+        None => Err(ValueError::FloatOutOfRange),
+    }
+}
+
+/// Which count a temporal field keeps. The kinds are two and the units are two, so this is a
+/// mapping rather than a decision.
+fn date_unit(kind: FieldKind) -> big_plan::TimeUnit {
+    match kind {
+        FieldKind::Date => big_plan::TimeUnit::Days,
+        _ => big_plan::TimeUnit::Seconds,
+    }
+}
+
 /// How a literal reads back in a message, which is the text a client wrote.
 pub fn written(value: &Literal) -> String {
     match value {
@@ -211,6 +292,7 @@ pub fn written(value: &Literal) -> String {
         // The same placing of the point a decimal cell is rendered with, so a value reads back
         // in an error message exactly as it would in an answer.
         Literal::Dec { units, scale } => crate::result::fixed(i128::from(*units), *scale),
+        Literal::Sdec { units, scale } => crate::result::fixed(i128::from(*units), *scale),
         Literal::Str(s) => s.clone(),
         Literal::Bool(b) => b.to_string(),
     }

@@ -84,7 +84,12 @@ pub fn digest<P: PagerMut + Sync>(api: &Api<P>) -> big_api::Result<u64> {
                 }
                 // A total rather than every value: a bit-sliced field has no cheap way to
                 // enumerate itself, and a sum changes whenever a record it covers does.
-                FieldKind::Int | FieldKind::Decimal | FieldKind::SignedInt => {
+                // A date is a count from the epoch, so it totals exactly like the integer it is.
+                FieldKind::Int
+                | FieldKind::Decimal
+                | FieldKind::SignedInt
+                | FieldKind::Date
+                | FieldKind::DateTime => {
                     let total = api.execute(
                         &Plan::Sum {
                             table: table.name.clone(),
@@ -97,6 +102,33 @@ pub fn digest<P: PagerMut + Sync>(api: &Api<P>) -> big_api::Result<u64> {
                         Value::Sum(n) => h.u128(n),
                         Value::SignedSum(n) => h.u128(n as u128),
                         _ => {}
+                    }
+                }
+                // **Deliberately not a sum.** A total over a float is folded from the values
+                // rather than counted off the bit planes, and floating point addition is not
+                // associative - two replicas holding byte-identical data can differ in the last
+                // bit purely from the order they read records in. Digesting that would report
+                // divergence on a healthy cluster, which is worse than not checking: it is a
+                // repair triggered against data that was never wrong.
+                //
+                // The extremes and the count are exact and order-independent, and between them
+                // they still change whenever a value covered by the field does.
+                FieldKind::Float32 | FieldKind::Float64 => {
+                    let (t, f) = (table.name.clone(), field.name.clone());
+                    let extremes = [
+                        Plan::Min { table: t.clone(), rows: Rows::All, field: f.clone() },
+                        Plan::Max { table: t, rows: Rows::All, field: f },
+                    ];
+                    for plan in extremes {
+                        let extreme = api.execute(&plan, &QueryOptions::default())?;
+                        // The stored value, not the float it decodes to: the encoding is
+                        // order-preserving, so the extreme of one is the extreme of the other,
+                        // and an integer digests without a rounding question.
+                        h.u128(match extreme {
+                            Value::Extreme(v) => u128::from(v.unwrap_or(0)),
+                            Value::SignedExtreme(v) => v.unwrap_or(0) as u128,
+                            _ => 0,
+                        });
                     }
                 }
                 // Two rows, and both of them matter: "false" and "absent" are different

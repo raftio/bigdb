@@ -513,3 +513,46 @@ fn an_ungrouped_having_keeps_the_row_or_empties_the_answer() {
     assert_eq!(rows(&format!("{total} HAVING sum(amount) > 2000")), vec![vec![Datum::Int(2400)]]);
     assert!(rows(&format!("{total} HAVING sum(amount) > 2400")).is_empty());
 }
+
+/// `now()`, whose value cannot live in a golden file.
+///
+/// The corpus can pin what `toDate` and `date_trunc` answer because their answers are functions
+/// of the rows. This one is a function of the clock, so what is asserted here is the part that
+/// is a property rather than a value: it is a moment, it is roughly the present, and every use
+/// of it in one statement is the *same* moment - which is the claim the whole design rests on,
+/// and the one a second clock read per call site would quietly break.
+#[test]
+fn now_is_one_instant_for_the_whole_statement() {
+    let api = Api::in_memory().unwrap();
+    api.create_table("e").unwrap();
+    api.create_field("e", "ts", FieldKind::DateTime, 64).unwrap();
+    api.import("e", &[Fact::Signed { field: "ts", record: 1, value: 1_700_000_000 }]).unwrap();
+
+    let rows = |sql: &str| {
+        let (values, answer) = api.sql(sql, &QueryOptions::default()).unwrap();
+        result_set(&answer, &values).rows
+    };
+
+    // A moment, rendered as one, and not the bare count of seconds it is stored as.
+    let got = rows("SELECT now(), now() FROM e");
+    let [row] = &got[..] else { panic!("expected one row") };
+    let [Datum::Timestamp(a), Datum::Timestamp(b)] = row[..] else {
+        panic!("expected two timestamps in one row, got {row:?}")
+    };
+    assert_eq!(a, b, "two `now()`s in one statement are two reads of one clock");
+
+    // Roughly the present: after this feature was written and not absurdly far ahead. A wide
+    // window on purpose - this is checking that a clock was read at all, not what it said.
+    assert!((1_760_000_000..4_000_000_000).contains(&a), "{a} is not a plausible now");
+
+    // The same instant reaches a `WHERE`, which is the other half of the claim: the value there
+    // comes from the parser rather than from a second read at the coordinator.
+    let before = rows("SELECT count(*) FROM e WHERE ts < now()");
+    let [row] = &before[..] else { panic!("expected one row") };
+    let [Datum::Int(n)] = row[..] else { panic!("expected one count, got {row:?}") };
+    assert_eq!(n, 1, "a record written in 2023 is before now");
+    let after = rows("SELECT count(*) FROM e WHERE ts > now()");
+    let [row] = &after[..] else { panic!("expected one row") };
+    let [Datum::Int(n)] = row[..] else { panic!("expected one count, got {row:?}") };
+    assert_eq!(n, 0);
+}

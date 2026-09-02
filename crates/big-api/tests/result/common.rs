@@ -66,10 +66,10 @@ pub fn matching(records: &[u16]) -> Matches {
 
 /// One projected column whose field stores whole numbers, which is every field but a decimal.
 pub fn plain_column(column: &str) -> Selected {
-    Selected { column: column.to_string(), units: Units::PLAIN }
+    Selected { column: column.to_string(), units: Units::PLAIN, apply: None }
 }
 
 /// One projected column out of a decimal field of `scale` digits.
 pub fn scaled_column(column: &str, scale: u8) -> Selected {
-    Selected { column: column.to_string(), units: Units::Digits(scale) }
+    Selected { column: column.to_string(), units: Units::Digits(scale), apply: None }
 }

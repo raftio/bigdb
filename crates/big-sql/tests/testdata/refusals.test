@@ -459,18 +459,27 @@ sql_unknown_column_type
 
 ## Types with no field kind behind them.
 
+## A width in brackets on a type whose name already carries one. `FLOAT(10, 2)` is the one
+## worth keeping a case for: it parses in every other dialect and means a fixed-point column
+## there, so reading it as a float would silently drop the digits it was asked to keep.
+
 error
-CREATE TABLE t (a FLOAT)
+CREATE TABLE t (a FLOAT(10, 2))
 ----
 sql_unknown_column_type
 
 error
-CREATE TABLE t (a DOUBLE)
+CREATE TABLE t (a DATETIME(3))
 ----
 sql_unknown_column_type
 
 error
 CREATE TABLE t (a JSON)
+----
+sql_unknown_column_type
+
+error
+CREATE TABLE t (a BLOB)
 ----
 sql_unknown_column_type
 
@@ -545,7 +554,7 @@ SELECT toString(amount) FROM t
 sql_unsupported
 
 error
-SELECT toDate(visit) FROM t
+SELECT toDateTime(visit) FROM t
 ----
 sql_unsupported
 
@@ -746,3 +755,24 @@ error
 SELECT count(*) FROM t WHERE ((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((amount > 1))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))
 ----
 query_too_deep
+
+## The scalar calls, and the two ways of asking for one that cannot be answered.
+
+## A boundary the calendar does not have. Refused at parse time, because the list of boundaries
+## is the dialect's rather than the schema's.
+error
+SELECT date_trunc('fortnight', seen) FROM tx
+----
+sql_bad_trunc_unit
+
+## A rounding in a `WHERE`. It reads a value per record, and a `WHERE` runs over bitmaps before
+## there are any values - so the refusal names the range to write instead.
+error
+SELECT count(*) FROM tx WHERE toDate(seen) = '2024-01-15'
+----
+sql_scalar_in_filter
+
+error
+SELECT count(*) FROM tx WHERE date_trunc('month', seen) = '2024-01-01'
+----
+sql_scalar_in_filter

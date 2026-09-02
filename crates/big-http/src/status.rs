@@ -110,7 +110,9 @@ fn plan(e: &PlanError) -> u16 {
         | PlanError::Arity { .. }
         | PlanError::BadArgument { .. }
         | PlanError::OperatorNotAllowed { .. }
-        | PlanError::TooPrecise { .. } => 400,
+        | PlanError::TooPrecise { .. }
+        | PlanError::BadDate { .. }
+        | PlanError::BadRounding { .. } => 400,
         // 400 rather than 413: the body is not too large - `MAX_BODY` let it through and would
         // let something ten times deeper through too. What is refused is its shape.
         PlanError::TooDeep { .. } => 400,
@@ -193,7 +195,7 @@ fn db(e: &DbError) -> u16 {
         DbError::EngineCannotAnswer { .. } => 422,
         // A value the field cannot hold is data the caller sent, and the request was otherwise
         // well formed - so `422` rather than `400`, the same answer a value too wide gets.
-        DbError::SignedValueOutOfRange { .. } => 422,
+        DbError::SignedValueOutOfRange { .. } | DbError::FloatValueOutOfRange { .. } => 422,
 
         // The file was written by a newer big than this one. `500` because nothing the client
         // can change will help, and it is redacted like every other 5xx: the fix is an

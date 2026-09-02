@@ -260,6 +260,20 @@ impl<'db, P: Pager + Sync> DbRead<'db, P> {
         Ok(self.get_int(table, field, record)?.map(|v| crate::signed::decode(v, declared)))
     }
 
+    /// A float field's value for one record, decoded on the way out.
+    pub fn get_float<'a>(
+        &self,
+        table: impl Into<TableRef<'a>>,
+        field: &str,
+        record: RecordId,
+    ) -> Result<Option<f64>> {
+        let table = table.into();
+        let (_, def) = resolve(&self.catalog, table, field)?;
+        expect_kind(&def, field, FieldKind::is_float, "float")?;
+        let declared = declared_depth(&def);
+        Ok(self.get_int(table, field, record)?.map(|v| crate::float::decode(v, declared)))
+    }
+
     pub fn get_int<'a>(
         &self,
         table: impl Into<TableRef<'a>>,

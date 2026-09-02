@@ -332,6 +332,13 @@ impl<'a> Sides<'a> {
             return Err(SqlError::Refused { what: Refused::JoinShape, at: item.at });
         }
         Ok(match &item.proj {
+            Proj::Now { unix_seconds } => Of::Now { unix_seconds: *unix_seconds },
+            // A rounding is applied to values read back per record, and a grouped or joined
+            // answer holds none: what it carries per row is a key and the numbers folded under
+            // it. Refused rather than silently rounding something else.
+            Proj::TimeOf { .. } => {
+                return Err(SqlError::Refused { what: Refused::Shape, at: item.at })
+            }
             // Every record on one side pairs with every record on every other, under each key.
             // Counted from the first side, which is as good as any: the product is over all of
             // them and the shape names them in `keys`.

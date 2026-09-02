@@ -264,9 +264,13 @@ fn remap_item(item: &mut Item, exposed: &Exposed) -> Result<()> {
         | Proj::Agg { field: name, .. }
         | Proj::Avg(name)
         | Proj::Quantile { field: name, .. }
-        | Proj::TopKeys { field: name, .. } => exposed.rename(name)?,
-        // `count(*)` names no column, so a view exposing none of them still answers it.
-        Proj::Star | Proj::Count => {}
+        | Proj::TopKeys { field: name, .. }
+        // A rounded column names a column and is not named by it: `toDate(seen)` comes back as
+        // `toDate` whatever the view calls the column underneath.
+        | Proj::TimeOf { field: name, .. } => exposed.rename(name)?,
+        // `count(*)` names no column, so a view exposing none of them still answers it; and
+        // `now()` names nothing at all, so a view with no columns exposed still answers that.
+        Proj::Star | Proj::Count | Proj::Now { .. } => {}
     }
     if let Some(cond) = &mut item.filter {
         remap_cond(cond, exposed)?;

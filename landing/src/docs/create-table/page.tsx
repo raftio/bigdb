@@ -103,7 +103,11 @@ const KINDS: Kind[] = [
   { id: "int", sql: "TINYINT, SMALLINT, INT, BIGINT", holds: "An unsigned integer, bit-sliced.", opts: "bit_depth (32), or UINT(bits)" },
   { id: "signed", sql: "SIGNED, INT SIGNED, BIGINT SIGNED", holds: "A signed integer, in the same planes under a bias.", opts: "bit_depth (32), or SIGNED(bits)" },
   { id: "decimal", sql: "DECIMAL(p, s), NUMERIC(p, s)", holds: "An integer compared as a value with digits after the point.", opts: "scale (required), bit_depth" },
-  { id: "timequantum", sql: "TIMEQUANTUM, TIMESTAMP, DATETIME", holds: "A key, plus a bitmap view per granularity, so a window reads only the days in it.", opts: "—" },
+  { id: "float32", sql: "FLOAT, REAL, FLOAT32", holds: "Single precision, in 32 planes under an order-preserving bit transform.", opts: "—" },
+  { id: "float64", sql: "DOUBLE, DOUBLE PRECISION, FLOAT64", holds: "Double precision, the same transform over 64 planes.", opts: "—" },
+  { id: "date", sql: "DATE", holds: "Days since 1970-01-01, signed, written '2024-01-15'.", opts: "—" },
+  { id: "datetime", sql: "DATETIME, TIMESTAMP", holds: "Seconds since 1970-01-01 UTC, written '2024-01-15 10:30:00'.", opts: "—" },
+  { id: "timequantum", sql: "TIMEQUANTUM", holds: "A key, plus a bitmap view per granularity, so a window reads only the days in it.", opts: "—" },
 ];
 
 type Rule = { title: string; body: React.ReactNode };

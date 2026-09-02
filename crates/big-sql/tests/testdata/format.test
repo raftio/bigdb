@@ -78,7 +78,10 @@ Table format=csv
 ├── country
 ├── device
 ├── visit
-└── active
+├── active
+├── rate
+├── day units=date
+└── seen units=datetime
 
 # The plan is the same whichever way the answer is written.
 plan

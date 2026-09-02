@@ -256,13 +256,41 @@ impl Parser<'_> {
             "BOOL" | "BOOLEAN" => {
                 Column { name, kind: Bool, bit_depth: KEYLESS_DEPTH, scale: None }
             }
-            // `DATE` joins the other three rather than getting a kind of its own: a time quantum
-            // field is keyed by a moment and viewed by day, which is what a date column is asked
-            // to answer about. Giving it a separate kind would mean a second routing for facts
-            // that are already routed - and a `DATE` that could not be windowed by day would be
-            // the one spelling of a time that does not do the thing times are here for.
-            "TIMEQUANTUM" | "TIMESTAMP" | "DATETIME" | "DATE" => {
+            // A time quantum is keyed by a moment and viewed by day, and it keeps its own
+            // spelling. `DATE` and `DATETIME` used to be spellings of it too, and stopped being
+            // when they got scalar kinds: a keyed field answers `f = 'k' AND f BETWEEN lo AND
+            // hi` and nothing else, so `WHERE d >= '2024-01-01'`, `ORDER BY d` and `max(d)` -
+            // which is most of what anyone writes a date column for - had no way to be asked.
+            // The two are different things and now have different names.
+            "TIMEQUANTUM" => {
                 Column { name, kind: TimeQuantum, bit_depth: KEYLESS_DEPTH, scale: None }
+            }
+            // A day count and a second count, both from 1970 and both signed, because dates
+            // before it are ordinary values. The depths are what those counts need: 32 planes of
+            // days is ±5.8 million years, and seconds want the full width.
+            //
+            // A bracket on any of these four is refused rather than read. `FLOAT(10, 2)` is a
+            // MySQL decimal wearing a float's name, and `DATETIME(3)` asks for a sub-second
+            // precision this does not keep; reading either would answer a question next to the
+            // one that was asked. The type that keeps those digits exactly is `DECIMAL`, and it
+            // is still here.
+            "DATE" | "DATETIME" | "TIMESTAMP" | "FLOAT" | "FLOAT32" | "REAL" | "DOUBLE"
+            | "FLOAT64" => {
+                if self.peek() == Some(&Tok::LParen) {
+                    return Err(self.refuse_at(Refused::ColumnType, at));
+                }
+                // `DOUBLE PRECISION` is the standard's spelling of the same type, read for the
+                // reason `INT UNSIGNED` is: it is a word that says what was already meant.
+                if word == "DOUBLE" {
+                    self.eat_word("PRECISION");
+                }
+                let (kind, bit_depth) = match word.as_str() {
+                    "DATE" => (Date, 32),
+                    "DATETIME" | "TIMESTAMP" => (DateTime, 64),
+                    "FLOAT" | "FLOAT32" | "REAL" => (Float32, 32),
+                    _ => (Float64, 64),
+                };
+                Column { name, kind, bit_depth, scale: None }
             }
             // A length on a key is a bound on nothing: keys are stored whole, and there is no
             // truncation or padding for a `VARCHAR(255)` to describe.

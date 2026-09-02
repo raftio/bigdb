@@ -30,6 +30,7 @@
 //! group is materialised at the coordinator before the cut. `TopN` still carries its own ranking
 //! when it can — see [`Shape::Groups`]'s `order`.
 
+use crate::ast::TimeOp;
 use big_plan::{FieldClass, Literal, PlanError, Schema};
 
 /// A predicate on the numbers each group carries, applied to the merged answer.
@@ -351,6 +352,16 @@ pub enum Units {
     /// Digits after the point. Zero for a count, for a key, and for a field that stores whole
     /// numbers - which is every field but a decimal.
     Digits(u8),
+    /// Days since the Unix epoch, out of a `DATE` field.
+    ///
+    /// Here rather than as a `Datum` the executor built, for the reason [`Self::Digits`] is: the
+    /// plan, the fan-out and the merge all work in the number the field stores, which is what
+    /// keeps them exact and comparable, and the reading is applied once at the end. A float
+    /// needs no variant because a float cell is already a float by the time it gets here - only
+    /// an integer is ambiguous about what it stands for.
+    Date,
+    /// Seconds since the Unix epoch, out of a `DATETIME` field.
+    Seconds,
     /// The field the number came out of, until a schema has said what that field keeps.
     ///
     /// `table` is carried rather than taken from the statement for the reason
@@ -374,7 +385,9 @@ impl Units {
     pub fn digits(&self) -> u8 {
         match self {
             Self::Digits(n) => *n,
-            Self::Written { .. } => 0,
+            // A count from the epoch is a whole number. There is no point to place in it, and
+            // the reading it needs is not one a scale can describe.
+            Self::Date | Self::Seconds | Self::Written { .. } => 0,
         }
     }
 
@@ -450,6 +463,13 @@ pub struct Selected {
     pub column: String,
     /// What the values in it are measured in.
     pub units: Units,
+    /// A rounding applied to each value on the way out, from `toDate` or `date_trunc`.
+    ///
+    /// Here rather than in the plan because it changes nothing the plan does: the same column
+    /// is read, per record, at the same cost, and the rounding is arithmetic on the number that
+    /// comes back. That is the same place [`Units`] puts a decimal's point back, and for the
+    /// same reason - it is the last step, and the only one that has to know.
+    pub apply: Option<TimeOp>,
 }
 
 impl Cell {
@@ -490,6 +510,15 @@ pub enum Of {
         plan: usize,
         /// The denominator's plan.
         over: usize,
+    },
+    /// `now()`: the instant the statement was read, the same in every row.
+    ///
+    /// Not a plan, and deliberately not a clock read here either - the moment travels from the
+    /// parser so that every `now()` in one statement, and every node answering it, means the
+    /// same instant. See [`crate::Proj::Now`].
+    Now {
+        /// Seconds since the Unix epoch.
+        unix_seconds: i64,
     },
     /// The group's key, or a pair's left half.
     Key,
@@ -680,7 +709,11 @@ impl Of {
     /// every plan a *shape* reads wants [`Shape::plans`] rather than this.
     pub fn plans(self) -> Vec<usize> {
         match self {
-            Self::Key | Self::RightKey | Self::Probe { .. } | Self::SharedKeys => Vec::new(),
+            Self::Key
+            | Self::RightKey
+            | Self::Probe { .. }
+            | Self::SharedKeys
+            | Self::Now { .. } => Vec::new(),
             Self::Value { plan }
             | Self::Groups { plan }
             | Self::Keys { plan }
@@ -701,7 +734,11 @@ impl Of {
             | Self::Paired { plan, .. }
             | Self::Ratio { plan, .. }
             | Self::PairedRatio { top: plan, .. } => Some(plan),
-            Self::Key | Self::RightKey | Self::Probe { .. } | Self::SharedKeys => None,
+            Self::Key
+            | Self::RightKey
+            | Self::Probe { .. }
+            | Self::SharedKeys
+            | Self::Now { .. } => None,
         }
     }
 }
@@ -982,10 +1019,11 @@ impl Shape {
             Self::Table { columns } => match columns {
                 Columns::Named(columns) => Self::Table {
                     columns: Columns::Named(
-                        columns
-                            .into_iter()
-                            .map(|c| Ok(Selected { units: resolve_units(schema, c.units)?, ..c }))
-                            .collect::<Result<Vec<_>, PlanError>>()?,
+                        columns.into_iter().map(|c| resolve_selected(schema, c)).collect::<Result<
+                            Vec<_>,
+                            PlanError,
+                        >>(
+                        )?,
                     ),
                 },
                 // `SELECT *`. An empty expansion is a table with nothing a projection could
@@ -1011,6 +1049,9 @@ impl Shape {
                                     Ok(Selected {
                                         column: field,
                                         units: resolve_units(schema, units)?,
+                                        // `SELECT *` names no function, so there is nothing to
+                                        // apply - a rounding only ever arrives written down.
+                                        apply: None,
                                     })
                                 })
                                 .collect::<Result<Vec<_>, PlanError>>()?,
@@ -1139,6 +1180,8 @@ impl Of {
             Self::Keys { plan } => Self::Keys { plan: plan + by },
             Self::Group { plan, absent } => Self::Group { plan: plan + by, absent },
             Self::Ratio { plan, over } => Self::Ratio { plan: plan + by, over: over + by },
+            // A constant points at no plan, so nothing moves.
+            Self::Now { unix_seconds } => Self::Now { unix_seconds },
             // `side` is a position in the join's own keys rather than in the statement's
             // calls, so it stays where it is while the plan it points past moves along.
             Self::Paired { plan, side, how } => Self::Paired { plan: plan + by, side, how },
@@ -1165,6 +1208,47 @@ impl Of {
 ///
 /// A field that is not a decimal keeps none, which is what every other class answers - and a
 /// field nobody has is the planner's error, the same one a condition on it would raise.
+/// One projected column against the schema: what it is measured in, and whether the rounding
+/// written over it means anything for a column of that kind.
+///
+/// **The check is here because this is where both halves are in reach.** A parser knows the
+/// function was written and not what it was written over; a storage layer knows the kind and
+/// never sees the statement. `date_trunc('hour', d)` on a column of whole days is the case worth
+/// having: it parses, it names a real column, and the only thing wrong with it is a combination
+/// neither side could see alone.
+fn resolve_selected(schema: &impl Schema, c: Selected) -> Result<Selected, PlanError> {
+    let units = resolve_units(schema, c.units.clone())?;
+    let Some(op) = c.apply else { return Ok(Selected { units, ..c }) };
+
+    let bad = |why: &'static str| PlanError::BadRounding { call: op.name(), why };
+    // **The op is resolved as well as the units, and that is what makes rendering unambiguous.**
+    // A renderer sees the number and the units it came out in; it cannot see the column's kind.
+    // `toDate` over seconds has work to do and `toDate` over days has none, and the two would
+    // otherwise be the same pair of (op, units) at the far end. Turning the second into the
+    // identity truncation it is leaves exactly one reading of every combination that survives.
+    let (units, apply) =
+        match (op, &units) {
+            // The day an instant falls in: the column changes kind on the way out, and the cell has
+            // to say so or the answer would be rendered as the second count it was stored as.
+            (TimeOp::ToDate, Units::Seconds) => (Units::Date, TimeOp::ToDate),
+            // Already whole days, so there is nothing to do. `Trunc(Day)` over a day count is that
+            // nothing, written down.
+            (TimeOp::ToDate, Units::Date) => (Units::Date, TimeOp::Trunc(big_civil::Unit::Day)),
+            // A truncated timestamp is still a timestamp, at midnight or on the hour.
+            (TimeOp::Trunc(u), Units::Seconds) => (Units::Seconds, TimeOp::Trunc(u)),
+            (TimeOp::Trunc(u), Units::Date) if u.is_whole_days() => (Units::Date, TimeOp::Trunc(u)),
+            // Nothing below a day says anything about a column that counts whole days: it would
+            // hand back the same date wearing a precision the column never had.
+            (TimeOp::Trunc(_), Units::Date) => return Err(bad(
+                "a boundary of a day or coarser: a DATE counts whole days, and nothing below a \
+                 day says anything about one",
+            )),
+            // Every other kind: there is no moment here to round.
+            _ => return Err(bad("a DATE or DATETIME column, and this column holds neither")),
+        };
+    Ok(Selected { units, apply: Some(apply), ..c })
+}
+
 fn resolve_units(schema: &impl Schema, u: Units) -> Result<Units, PlanError> {
     let Units::Written { table, field } = u else { return Ok(u) };
 
@@ -1173,6 +1257,10 @@ fn resolve_units(schema: &impl Schema, u: Units) -> Result<Units, PlanError> {
         .ok_or_else(|| PlanError::UnknownField { table: table.clone(), field: field.clone() })?;
     Ok(match class {
         FieldClass::Integer { scale } => Units::Digits(scale),
+        // A `max(seen)` merges as a count from the epoch and has to read back as the date it
+        // stands for, exactly as a `sum(price)` reads back with its point put in.
+        FieldClass::Temporal { unit: big_plan::TimeUnit::Days } => Units::Date,
+        FieldClass::Temporal { unit: big_plan::TimeUnit::Seconds } => Units::Seconds,
         _ => Units::PLAIN,
     })
 }
@@ -1244,15 +1332,30 @@ fn resolve_threshold(schema: &impl Schema, t: Threshold) -> Result<Threshold, Pl
         }
         (FieldClass::Signed, Literal::Int(n)) => Ok(Threshold::Units(i128::from(*n))),
         (FieldClass::Signed, Literal::Sint(n)) => Ok(Threshold::Units(i128::from(*n))),
+        // `HAVING max(seen) > '2024-01-01'`. The stored value is a count from the epoch and the
+        // comparison downstream is integral, so the only work is the conversion - the same one
+        // a `WHERE` on the same field does, through the same function.
+        (FieldClass::Temporal { unit }, Literal::Str(s)) => match unit.to_count(s) {
+            Some(n) => Ok(Threshold::Units(i128::from(n))),
+            None => Err(PlanError::BadDate { field, written: s.clone(), want: unit.format() }),
+        },
         // A `HAVING` on a keyed or boolean field never reaches here: only `sum`, `min` and
         // `max` carry a field, and the planner refuses all three on those classes before this
         // runs. The arm exists so a hand-built shape gets an error rather than a wrong answer.
+        //
+        // A float does reach here, and is refused. A `HAVING` compares in the units the field
+        // stores, and a threshold that is `i128` all the way down cannot hold one; `int_of`
+        // already answers `None` for a fractional number, which is how a `HAVING` on an `avg`
+        // has always been refused. Rounding either side into the other would answer a question
+        // next to the one that was asked, so this says so instead.
         (class, _) => Err(PlanError::OperatorNotAllowed {
             field,
             op: "HAVING".to_string(),
             class: match class {
                 FieldClass::Integer { .. } => "an integer field",
                 FieldClass::Signed => "a signed integer field",
+                FieldClass::Float { .. } => "a float field",
+                FieldClass::Temporal { .. } => "a date field",
                 FieldClass::Keyed(_) => "a keyed field",
                 FieldClass::Boolean => "a boolean field",
             },

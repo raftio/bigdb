@@ -109,7 +109,7 @@ pub(super) fn grouped(
                     Of::Key => find(&of_each, row)
                         .and_then(|g| g.key.as_deref())
                         .map_or(Datum::Null, Datum::text),
-                    of => Datum::num(number(of, values, Some(row)), c.units.digits()),
+                    of => Datum::num(number(of, values, Some(row)), &c.units),
                 })
                 .collect()
         })
@@ -215,7 +215,7 @@ pub(super) fn paired(
                     Of::RightKey => {
                         found.and_then(|p| p.right.key.as_deref()).map_or(Datum::Null, Datum::text)
                     }
-                    of => Datum::num(number(of, row), c.units.digits()),
+                    of => Datum::num(number(of, row), &c.units),
                 })
                 .collect()
         })
@@ -261,7 +261,7 @@ pub(super) fn joined(
     if !per_key {
         return vec![cells
             .iter()
-            .map(|c| Datum::num(read.cell(c.of, &space, None), c.units.digits()))
+            .map(|c| Datum::num(read.cell(c.of, &space, None), &c.units))
             .collect()];
     }
 
@@ -306,7 +306,7 @@ pub(super) fn joined(
                 .iter()
                 .map(|c| match c.of {
                     Of::Key => at.axis(0).map_or(Datum::Null, Datum::text),
-                    of => Datum::num(read.cell(of, &all, Some(at)), c.units.digits()),
+                    of => Datum::num(read.cell(of, &all, Some(at)), &c.units),
                 })
                 .collect()
         })

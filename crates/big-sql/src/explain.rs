@@ -254,8 +254,18 @@ fn cell(cell: &Cell, sides: &[JoinSide]) -> String {
 }
 
 /// One column of a projection, which names no plan - the values are the plan's own answer.
+///
+/// The rounding is printed even though the column name usually implies it, because the two are
+/// not the same thing and one of them is what actually runs: `date_trunc('month', ts) AS ts`
+/// and a bare `ts` produce a column of the same name in the same units, and a printer that
+/// showed them identically would let a lost rounding through - which is the one thing this
+/// printer may not do.
 fn selected(selected: &Selected) -> String {
-    format!("{}{}", selected.column, units(&selected.units))
+    let applied = match selected.apply {
+        Some(op) => format!(" apply={}", op.name()),
+        None => String::new(),
+    };
+    format!("{}{}{}", selected.column, units(&selected.units), applied)
 }
 
 /// Where a cell's number comes from, with plans named by the index the shape holds.
@@ -268,6 +278,9 @@ fn of(of: Of, sides: &[JoinSide]) -> String {
         Of::Value { plan } => format!("#{plan}"),
         Of::Groups { plan } => format!("groups(#{plan})"),
         Of::Ratio { plan, over } => format!("#{plan} / #{over}"),
+        // The instant itself, not the word: two statements parsed a second apart are two
+        // different questions, and a printer that hid that would print them the same.
+        Of::Now { unix_seconds } => format!("now '{}'", big_civil::format_datetime(unix_seconds)),
         Of::Key => "key".to_string(),
         Of::RightKey => "right key".to_string(),
         Of::Probe { probe } => format!("probe #{probe}"),
@@ -327,6 +340,8 @@ fn units(units: &Units) -> String {
     match units {
         Units::Digits(0) => String::new(),
         Units::Digits(n) => format!(" scale={n}"),
+        Units::Date => " units=date".to_string(),
+        Units::Seconds => " units=datetime".to_string(),
         Units::Written { table, field } => format!(" units={table}.{field} (unresolved)"),
     }
 }
@@ -543,6 +558,20 @@ fn literal(literal: &Literal) -> String {
                 whole.to_string()
             } else {
                 format!("{whole}.{frac}")
+            }
+        }
+        // The same placing of the point, with the sign put back in front of it. Written through
+        // the magnitude rather than through `units` directly so that `-0.5` keeps the zero it
+        // was written with, which formatting a negative number with a width would have eaten.
+        Literal::Sdec { units, scale } => {
+            let s = *scale as usize;
+            let text = format!("{:0>width$}", units.unsigned_abs(), width = s + 1);
+            let (whole, frac) = text.split_at(text.len() - s);
+            let sign = if *units < 0 { "-" } else { "" };
+            if s == 0 {
+                format!("{sign}{whole}")
+            } else {
+                format!("{sign}{whole}.{frac}")
             }
         }
         Literal::Str(s) => format!("'{s}'"),

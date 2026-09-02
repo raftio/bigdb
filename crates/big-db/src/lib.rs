@@ -49,6 +49,7 @@ pub use bulk::BulkLoad;
 pub use db::{FragmentAddr, COLUMN_VIEW, MUTEX_SHADOW_VIEW};
 pub use error::{DbError, Result};
 pub use matches::Matches;
+pub mod float;
 pub mod signed;
 // `day_view` names the boundary a retention drop actually used, which is the one thing a
 // caller passing an instant cannot work out for itself.

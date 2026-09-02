@@ -168,6 +168,17 @@ pub enum DbError {
         min: i64,
         max: i64,
     },
+    /// A float value a field cannot hold, refused for the same reason a signed one out of range
+    /// is: a number that reads back as a different number is worse than a write that failed.
+    ///
+    /// Two ways to earn it, and the message tells them apart. A NaN has no position in an order,
+    /// so there is nowhere in the bit planes to put it and no query it could correctly answer -
+    /// see `crate::float`. A finite value past a single-precision field's range would arrive as
+    /// an infinity, which is a different value from the one that was written.
+    FloatValueOutOfRange {
+        value: f64,
+        bit_depth: u32,
+    },
 }
 
 impl From<std::io::Error> for DbError {
@@ -312,6 +323,14 @@ impl core::fmt::Display for DbError {
             Self::SignedValueOutOfRange { value, min, max } => {
                 write!(f, "{value} is outside the field's range of {min}..={max}")
             }
+            Self::FloatValueOutOfRange { value, bit_depth } if value.is_nan() => write!(
+                f,
+                "a float field stores an ordering, and NaN has no place in one: it is not less                  than, equal to, or greater than any value the {bit_depth}-bit field holds"
+            ),
+            Self::FloatValueOutOfRange { value, bit_depth } => write!(
+                f,
+                "{value} is outside the range a {bit_depth}-bit float field can hold"
+            ),
             Self::UnknownFieldKind { table, field, kind } => write!(
                 f,
                 "field {field} of table {table} has kind {kind}, which this build does not know; \
@@ -358,7 +377,9 @@ impl DbError {
             Self::QueryCancelled => "query_cancelled",
             Self::EngineCannotAnswer { .. } => "engine_cannot_answer",
             Self::UnknownFieldKind { .. } => "unknown_field_kind",
-            Self::SignedValueOutOfRange { .. } => "value_out_of_range",
+            Self::SignedValueOutOfRange { .. } | Self::FloatValueOutOfRange { .. } => {
+                "value_out_of_range"
+            }
             Self::BulkLoadNotEmpty { .. } => "bulk_load_not_empty",
         }
     }

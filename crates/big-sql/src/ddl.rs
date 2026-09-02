@@ -266,6 +266,10 @@ pub enum ColumnKind {
     Signed,
     Decimal,
     TimeQuantum,
+    Float32,
+    Float64,
+    Date,
+    DateTime,
 }
 
 impl ColumnKind {
@@ -282,6 +286,10 @@ impl ColumnKind {
             Self::Signed => "signed",
             Self::Decimal => "decimal",
             Self::TimeQuantum => "timequantum",
+            Self::Float32 => "float32",
+            Self::Float64 => "float64",
+            Self::Date => "date",
+            Self::DateTime => "datetime",
         }
     }
 }

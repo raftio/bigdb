@@ -22,7 +22,7 @@
 //! the lowering emits a comparison - and the planner resolves both to the same thing, which is
 //! the level the claim is actually made at.
 
-pub use big_plan::{FieldClass, Keyed, Literal, Plan, Schema};
+pub use big_plan::{FieldClass, Keyed, Literal, Plan, Schema, TimeUnit};
 pub use big_sql::{
     Absent, Cell, Cut, GroupOrder, Having, JoinSide, Keying, Of, Operand, OrderBy, Pairing,
     Refused, Shape, SqlError, Statement, Threshold, Units,
@@ -67,6 +67,9 @@ impl Schema for Stub {
             // A time quantum field, so a window over one has somewhere to land.
             "visit" => FieldClass::Keyed(Keyed::Time),
             "active" => FieldClass::Boolean,
+            "rate" => FieldClass::Float { bits: 64 },
+            "day" => FieldClass::Temporal { unit: TimeUnit::Days },
+            "seen" => FieldClass::Temporal { unit: TimeUnit::Seconds },
             _ => return None,
         })
     }
@@ -78,11 +81,14 @@ impl Schema for Stub {
         if !self.has_table(table) {
             return Vec::new();
         }
-        ["amount", "price", "balance", "category", "country", "device", "visit", "active"]
-            .iter()
-            .filter(|f| self.field_class(table, f).is_some())
-            .map(|f| (*f).to_string())
-            .collect()
+        [
+            "amount", "price", "balance", "category", "country", "device", "visit", "active",
+            "rate", "day", "seen",
+        ]
+        .iter()
+        .filter(|f| self.field_class(table, f).is_some())
+        .map(|f| (*f).to_string())
+        .collect()
     }
 }
 
@@ -143,7 +149,7 @@ pub fn order_of(sql: &str) -> Option<GroupOrder> {
 /// The stable code a refused statement carries.
 ///
 /// Through the crate's own `translate` rather than the one above, because a refusal is the one
-/// thing both kinds of statement can be: `CREATE TABLE t (a FLOAT)` is refused as surely as a
+/// thing both kinds of statement can be: `CREATE TABLE t (a BLOB)` is refused as surely as a
 /// join is, and routing it through a helper that panics on a schema change would leave the
 /// column list untestable from here.
 pub fn code(sql: &str) -> &'static str {

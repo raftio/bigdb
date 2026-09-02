@@ -98,6 +98,18 @@ pub enum Parsed {
     },
 }
 
+/// The wall clock, in seconds since the epoch.
+///
+/// Saturating rather than panicking on a clock set before 1970: a machine whose clock is wrong
+/// should answer a query with a strange timestamp in it, not refuse to answer at all.
+fn now_seconds() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(d) => i64::try_from(d.as_secs()).unwrap_or(i64::MAX),
+        Err(e) => -i64::try_from(e.duration().as_secs()).unwrap_or(i64::MAX),
+    }
+}
+
 /// Parses one statement, refusing anything this engine does not answer.
 pub fn parse(input: &str) -> Result<Parsed> {
     let tokens = lex(input)?;
@@ -108,6 +120,7 @@ pub fn parse(input: &str) -> Result<Parsed> {
         end: input.len(),
         depth: 0,
         bound: Default::default(),
+        now: now_seconds(),
     };
     statement(&mut p, true)
 }
@@ -224,6 +237,14 @@ struct Parser<'a> {
     depth: usize,
     /// Constants a `WITH` clause bound, by the name it gave them.
     bound: std::collections::BTreeMap<String, Literal>,
+    /// The instant this statement was read, in seconds since the epoch.
+    ///
+    /// **Read once, here, and shared by every `now()` in the statement.** A clock read per call
+    /// site would let `SELECT now() FROM t WHERE ts < now()` compare against two different
+    /// moments, and one read per node would let two shards disagree about which records match a
+    /// window. Taking it where the statement is parsed makes it the coordinator's single
+    /// answer, which is the only one that is the same everywhere the statement goes.
+    now: i64,
 }
 
 impl Parser<'_> {
@@ -475,6 +496,19 @@ impl Parser<'_> {
                 self.i += 1;
                 return Ok(v);
             }
+        }
+        // `now()` is a value, so it belongs here rather than in each clause that takes one:
+        // this is the single door a written value comes through, and putting it here is what
+        // makes `WHERE ts < now()`, `VALUES (now())` and `WITH t AS now()` one feature rather
+        // than three. It becomes the text a date is written in, so everything downstream reads
+        // it through the same conversion a hand-written `'2024-01-15 10:30:00'` gets.
+        if self.word_is("now")
+            && matches!(self.t.get(self.i + 1).map(|t| &t.tok), Some(Tok::LParen))
+        {
+            self.i += 1;
+            self.expect(&Tok::LParen, "( after now")?;
+            self.expect(&Tok::RParen, ") after now(")?;
+            return Ok(Literal::Str(big_civil::format_datetime(self.now)));
         }
         // `NULL` is refused where a value would go rather than parsed into one, because the
         // whole point is that this engine has no value it could become.

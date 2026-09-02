@@ -89,6 +89,109 @@ impl<'db, P: Pager + Sync> DbRead<'db, P> {
         self.matching(table, field, op, crate::signed::encode_bound(k, declared))
     }
 
+    /// Records whose float value stands in `op` to `k`.
+    ///
+    /// The bound is rounded to what the field can hold before anything is read, and the
+    /// direction of that rounding depends on the operator - see `crate::float::encode_bound`.
+    /// A threshold that no stored value can equal decides the answer outright, exactly as an
+    /// out-of-range bound does for a signed field.
+    ///
+    /// Past the bound there is nothing float-specific left: the encoding is monotonic, so this
+    /// is the ordinary range scan, over the ordinary zone maps.
+    pub fn matching_float<'a>(
+        &self,
+        table: impl Into<TableRef<'a>>,
+        field: &str,
+        op: RangeOp,
+        k: f64,
+    ) -> Result<Matches> {
+        let table = table.into();
+        let (_, def) = resolve(&self.catalog, table, field)?;
+        expect_kind(&def, field, FieldKind::is_float, "float")?;
+        let declared = declared_depth(&def);
+
+        match crate::float::encode_bound(k, declared, op) {
+            crate::float::Bound::At(stored) => self.matching(table, field, op, stored),
+            // `true` means every record that holds a value, not every record in the table: a
+            // record with no value is not unequal to anything. The same distinction
+            // `matching_signed` draws for a bound off the end of the range.
+            crate::float::Bound::Always(true) => self.matching_row(table, field, EXISTS_ROW),
+            crate::float::Bound::Always(false) => Ok(Matches::new()),
+        }
+    }
+
+    /// Smallest value of a float field over a set of records.
+    ///
+    /// **No scan.** The encoding is order-preserving, so the smallest stored value is the
+    /// encoding of the smallest actual value, and `Bsi::extreme` narrows plane by plane exactly
+    /// as it does for any other bit-sliced field.
+    pub fn min_float_where<'a>(
+        &self,
+        table: impl Into<TableRef<'a>>,
+        field: &str,
+        rows: &Matches,
+    ) -> Result<Option<f64>> {
+        let table = table.into();
+        let declared = self.float_depth(table, field)?;
+        Ok(self.min_where(table, field, rows)?.map(|v| crate::float::decode(v, declared)))
+    }
+
+    /// Largest value of a float field over a set of records. See [`Self::min_float_where`].
+    pub fn max_float_where<'a>(
+        &self,
+        table: impl Into<TableRef<'a>>,
+        field: &str,
+        rows: &Matches,
+    ) -> Result<Option<f64>> {
+        let table = table.into();
+        let declared = self.float_depth(table, field)?;
+        Ok(self.max_where(table, field, rows)?.map(|v| crate::float::decode(v, declared)))
+    }
+
+    /// Total of a float field over a set of records.
+    ///
+    /// **The one aggregate that cannot use the bit planes.** `Bsi::sum` weights plane `i` by
+    /// `2^i` and counts the records that set it, which is a total only because the signed
+    /// encoding is affine: `sum(stored) = sum(value) + n * bias`, one correction for the whole
+    /// fold. The float encoding is order-preserving and nothing more, so the weighted count of
+    /// its planes is a number that stands for nothing, and there is no correction that would
+    /// make it one. Every value has to be read.
+    ///
+    /// So this is `O(records)` where a signed total is `O(planes)`, and that difference is the
+    /// price of the type rather than something to optimise away later. `min`, `max` and `count`
+    /// are unaffected: all three are decided by the ordering alone.
+    ///
+    /// Summed with Neumaier compensation so the total does not depend on the order records
+    /// happen to be laid out in. Across nodes the fold order is the coordinator's, and float
+    /// addition is not associative, so a distributed total is reproducible rather than exact -
+    /// which is why the replica digest does not hash one. See `big_cluster::digest`.
+    pub fn sum_float_where<'a>(
+        &self,
+        table: impl Into<TableRef<'a>>,
+        field: &str,
+        rows: &Matches,
+    ) -> Result<f64> {
+        let table = table.into();
+        let declared = self.float_depth(table, field)?;
+        let (mut sum, mut compensation) = (0f64, 0f64);
+        for record in rows.records_from(0) {
+            let Some(stored) = self.get_int(table, field, record)? else { continue };
+            let value = crate::float::decode(stored, declared);
+            let t = sum + value;
+            compensation +=
+                if sum.abs() >= value.abs() { (sum - t) + value } else { (value - t) + sum };
+            sum = t;
+        }
+        Ok(sum + compensation)
+    }
+
+    fn float_depth<'a>(&self, table: impl Into<TableRef<'a>>, field: &str) -> Result<u32> {
+        let table = table.into();
+        let (_, def) = resolve(&self.catalog, table, field)?;
+        expect_kind(&def, field, FieldKind::is_float, "float")?;
+        Ok(declared_depth(&def))
+    }
+
     /// Smallest value of a signed field over a set of records.
     pub fn min_signed_where<'a>(
         &self,

@@ -223,6 +223,8 @@ impl Item {
                 Proj::Avg(_) => "avg".to_string(),
                 Proj::TopKeys { .. } => "topK".to_string(),
                 Proj::Quantile { .. } => "quantile".to_string(),
+                Proj::Now { .. } => "now()".to_string(),
+                Proj::TimeOf { op, .. } => op.name(),
             },
         }
     }
@@ -236,6 +238,29 @@ pub enum Proj {
     Star,
     /// A bare column: the grouped column, or one of a projection's.
     Column(Name),
+    /// `now()` - the instant the statement was read.
+    ///
+    /// Carries the moment rather than a marker, because **one statement has one now**. Reading
+    /// the clock again at the coordinator would let `SELECT now() FROM t WHERE ts < now()`
+    /// compare against two different instants, and reading it per node would let two shards
+    /// disagree about which records match. It is taken once, where the statement is parsed.
+    Now {
+        /// Seconds since the Unix epoch.
+        unix_seconds: i64,
+    },
+    /// `toDate(<column>)` or `date_trunc('<unit>', <column>)`: a temporal column, rounded back
+    /// to a coarser boundary on the way out.
+    ///
+    /// **A projection, not a computation over records.** The plan still reads the column it
+    /// names; the rounding is applied to each value as the answer is written, which is the same
+    /// place a decimal has its point put back. That is why it costs nothing and why it cannot
+    /// appear in a `WHERE` - see `Refused::ScalarFilter`.
+    TimeOf {
+        /// Which rounding.
+        op: TimeOp,
+        /// The column it reads.
+        field: Name,
+    },
     /// `count(*)`.
     Count,
     /// `count(DISTINCT <column>)`.
@@ -278,6 +303,30 @@ pub enum Proj {
         /// The column ranked.
         field: Name,
     },
+}
+
+/// A rounding applied to a temporal value on the way out.
+///
+/// Both are the same shape - a moment in, a coarser moment out - which is why they are one type
+/// rather than two `Proj` entries. Neither reads anything the plan did not already read.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TimeOp {
+    /// `toDate(ts)`: the day an instant falls in. A `DATETIME` becomes a `DATE`; a `DATE` is
+    /// already one and comes back unchanged.
+    ToDate,
+    /// `date_trunc(unit, ts)`: the start of the unit an instant falls in. The type does not
+    /// change - a truncated timestamp is still a timestamp, at midnight or on the hour.
+    Trunc(big_civil::Unit),
+}
+
+impl TimeOp {
+    /// The default column name, which is the call as it was written.
+    pub fn name(self) -> String {
+        match self {
+            Self::ToDate => "toDate".to_string(),
+            Self::Trunc(u) => format!("date_trunc('{}')", format!("{u:?}").to_lowercase()),
+        }
+    }
 }
 
 /// The three aggregates that are not a count.
