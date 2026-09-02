@@ -64,6 +64,7 @@ mod error;
 mod http;
 mod json;
 mod producer;
+mod reader;
 mod sql;
 mod value;
 
@@ -73,4 +74,5 @@ pub use config::{
 };
 pub use error::Error;
 pub use producer::{Flushed, Producer};
+pub use reader::Reader;
 pub use value::Value;

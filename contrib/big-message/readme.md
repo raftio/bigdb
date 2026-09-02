@@ -5,11 +5,14 @@ Messages from a running program into a bigdb table.
 `bigctl import` loads a **file**. This loads a **stream**: a program producing events as it runs,
 with no file to point at and no record ids of its own.
 
+[`examples/producer/`](../../examples/producer/) runs all of this under `docker compose` in one
+command, if you would rather see it than read it.
+
 ```rust
 use big_message::{Config, Producer, Value};
 
 let mut producer = Producer::open(
-    "127.0.0.1:8080",
+    "127.0.0.1:7654",
     "tx",
     &["amount", "country"],
     None,
@@ -150,3 +153,24 @@ loop {
     }
 }
 ```
+
+## Reading back
+
+`Reader` answers one question, and it is the one a writer that cannot see record ids needs:
+
+```rust
+let mut reader = Reader::open("127.0.0.1:7654", None, &Config::default());
+let already: Vec<String> = reader.seen("tx", "msg_id", &["1700-0", "1700-1"])?;
+```
+
+Which of these keys the table already holds in that field. Only useful when the caller put the
+key there — a table with no such column has nothing to match on, because the record ids are the
+server's and are never handed out. `contrib/big-message-redis` uses it to make a restart write
+nothing it already wrote.
+
+It is one call rather than "send any statement": a caller writing its own SQL is a caller this
+crate cannot keep from disagreeing with what `Producer` writes, and the escaping — the one place
+here where a mistake is a security bug rather than a failure — would have had two callers.
+
+Retry here is the **opposite** of retry in `Producer`: a `SELECT` is idempotent, so it is sent
+again after a failure of any kind, including the one a flush must never repeat.
