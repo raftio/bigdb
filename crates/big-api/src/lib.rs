@@ -30,6 +30,7 @@
 #![deny(missing_docs)]
 
 pub mod error;
+pub mod explain;
 pub mod fact;
 pub mod introspect;
 pub mod result;
@@ -67,8 +68,9 @@ pub use big_sql::{
     Threshold, Units,
 };
 pub use big_sql::{
-    Alter as SqlAlter, Column as SqlColumn, ColumnKind as SqlColumnKind, Ddl as SqlDdl,
-    Insert as SqlInsert, Show as SqlShow, Shown as SqlShown, Sql, RECORD_COLUMN,
+    Alter as SqlAlter, Authority, Column as SqlColumn, ColumnKind as SqlColumnKind, Ddl as SqlDdl,
+    ExplainMode, Insert as SqlInsert, Show as SqlShow, Shown as SqlShown, Sql, SqlError,
+    RECORD_COLUMN,
 };
 
 use big_db::{At, Db};
@@ -728,6 +730,18 @@ impl<P: PagerMut + Sync> Api<P> {
                     at: 0,
                 }))
             }
+            // ...and an `EXPLAIN`, which is a statement *about* a statement: there is no plan
+            // for this to answer with, because the whole of what it asks for is that nothing
+            // runs. The surface that answers one is `Cluster::sql`, which builds rows.
+            //
+            // **Its own refusal, not the one above.** That one says this surface does not
+            // write, a sentence which is simply untrue of `EXPLAIN SELECT count(*) FROM t` -
+            // and a caller who reads it is told the wrong thing about a statement that is
+            // fine. What is refused here is the question, not the text.
+            big_sql::Sql::Explain { .. } => Err(ApiError::Sql(big_sql::SqlError::Refused {
+                what: big_sql::Refused::ExplainRows,
+                at: 0,
+            })),
         }
     }
 

@@ -1,0 +1,101 @@
+# `EXPLAIN`, which describes a statement and runs none of it.
+
+explain
+EXPLAIN SELECT count(*) FROM t WHERE amount >= 500
+----
+plan #0
+Count t
+└── amount >= 500
+shape
+Row
+└── count = #0
+
+explain
+EXPLAIN PLAN SELECT country, count(*) FROM t GROUP BY country
+----
+plan #0
+GroupBy t.country -> count
+└── all
+
+explain
+EXPLAIN SHAPE SELECT country, count(*) FROM t GROUP BY country
+----
+shape
+Groups keys=[#0]
+├── country = key
+└── count = group #0 else 0
+
+# A quantile makes no call at all, so an explanation that printed only plans would say nothing.
+explain
+EXPLAIN SELECT quantile(0.5)(amount) FROM t WHERE country = 'GB'
+----
+probe t.amount per_mille=500
+└── country = 'GB'
+shape
+Row
+└── quantile = probe #0
+
+explain
+EXPLAIN CREATE TABLE z (a UINT(32))
+----
+ddl
+CreateTable z
+└── a int depth=32
+
+explain
+EXPLAIN INSERT INTO t (country, amount) VALUES ('GB', 100)
+----
+insert
+Insert t (country, amount) id=allocated
+└── 'GB', 100
+
+explain
+EXPLAIN SHOW TABLES
+----
+show
+Tables
+
+# `PLAN` and `SHAPE` name halves only a query has.
+error
+EXPLAIN PLAN CREATE TABLE z (a UINT(32))
+----
+sql_explain_half
+
+error
+EXPLAIN SHAPE INSERT INTO t (amount) VALUES (1)
+----
+sql_explain_half
+
+# A description of a description. Not a statement in any dialect, so a syntax error rather than
+# a refusal - there is nothing that exists instead of it.
+error
+EXPLAIN EXPLAIN SELECT count(*) FROM t
+----
+parse_error
+
+error
+EXPLAIN
+----
+parse_error
+
+# The refusals are the inner statement's own: `EXPLAIN` did not write it, and describing a
+# statement this engine will not answer is not a thing to answer either.
+error
+EXPLAIN DELETE FROM t
+----
+sql_read_only
+
+error
+EXPLAIN SELECT * FROM t, u
+----
+sql_no_joins
+
+# `EXPLAIN` is not a reserved word: only the leading token position is special, so a table and a
+# column may still be called one.
+ddl
+CREATE TABLE explain (explain UINT(8), plan UINT(8), shape SET)
+----
+CreateTable explain
+├── explain int depth=8
+├── plan int depth=8
+└── shape set depth=32

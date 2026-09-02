@@ -32,14 +32,118 @@
 //! differently from one that pointed at the right one, which is the property that makes this
 //! usable as an expected answer.
 
+use crate::ast::ExplainMode;
 use crate::ddl::{Alter, Column, Ddl};
 use crate::insert::Insert;
+use crate::lower::Probe;
 use crate::shape::{
     Absent, Answer, Cell, Cut, Format, GroupOrder, Having, JoinSide, Of, OrderBy, Pairing,
     Selected, Shape, Threshold, Units,
 };
 use crate::show::{Show, Shown};
-use big_plan::Literal;
+use big_plan::{Literal, Plan};
+
+/// One search, with the records it walks already resolved.
+///
+/// A quantile is a search rather than a question, so it makes **no call**. `SELECT
+/// median(amount) FROM t` therefore resolves to zero plans and one of these, and an explanation
+/// that printed only plans would answer it with nothing at all. The row set is planned by the
+/// caller, which is the only side holding a schema.
+pub struct Probed<'a> {
+    /// What is being searched for.
+    pub probe: &'a Probe,
+    /// The records the search runs over, planned exactly as the search itself plans them.
+    pub rows: Plan,
+}
+
+/// What an `EXPLAIN` has to say, once the half that needs a schema has been resolved.
+///
+/// **The four kinds are named here rather than at the caller**, so that which printer a
+/// statement gets is the dialect's decision and not the coordinator's. What the caller supplies
+/// is only the part this crate cannot compute: a plan is a statement put against a schema, and
+/// this crate deliberately links none.
+pub enum Explained<'a> {
+    /// A query: the plans its calls resolve to, its searches, and the answer they build.
+    Query {
+        /// One per call, in the order the shape names them.
+        plans: &'a [Plan],
+        /// One per search, whose answers sit after the calls'.
+        probes: &'a [Probed<'a>],
+        /// The answer, already resolved against the schema.
+        answer: &'a Answer,
+    },
+    /// A schema change, which is already wholly in the parse tree.
+    Ddl(&'a Ddl),
+    /// A write, as the columns and literals it would turn into facts.
+    Insert(&'a Insert),
+    /// A question about the catalog.
+    Show(&'a Show),
+}
+
+/// A statement, written out instead of run. No trailing newline, and **no blank line anywhere**.
+///
+/// The blank line is a hard rule rather than a preference: the test corpora end an expected
+/// block at the first one, so a blank line here would truncate a case in the middle and read as
+/// a passing test of half an answer.
+///
+/// Each section is labelled with the word the corpus directive for that half already uses, so
+/// the two names cannot drift. A label is needed rather than merely helpful - `Row` and `Rows`
+/// are one character apart, and running the plan and shape sections together with nothing
+/// between them would make the seam ambiguous exactly where it matters.
+pub fn explained(mode: ExplainMode, what: &Explained<'_>) -> String {
+    let mut out: Vec<String> = Vec::new();
+    match what {
+        Explained::Query { plans, probes, answer } => {
+            if mode != ExplainMode::Shape {
+                // Numbered, because the shape names its plans by index and the two halves are
+                // only readable together if `#0` here is `#0` there.
+                for (i, plan) in plans.iter().enumerate() {
+                    out.push(format!("plan #{i}"));
+                    out.push(big_plan::explain(plan));
+                }
+                for Probed { probe, rows } in probes.iter() {
+                    // A search is not a plan, and printing it as one would hide what it costs:
+                    // it is the same `Count` asked with moving bounds until it converges. So it
+                    // gets its own head line, and the planned row set contributes only what sits
+                    // under it - the same convention the corpus `plan` directive follows.
+                    out.push(format!(
+                        "probe {}.{} per_mille={}",
+                        probe.table, probe.field, probe.per_mille
+                    ));
+                    let printed = big_plan::explain(rows);
+                    out.push(
+                        printed
+                            .split_once('\n')
+                            .map(|(_, rest)| rest.to_string())
+                            .unwrap_or_else(|| "└── all".to_string()),
+                    );
+                }
+            }
+            if mode != ExplainMode::Plan {
+                out.push("shape".to_string());
+                // `answer` rather than `shape`, so the line carries the `FORMAT` the statement
+                // arrived under when it is not the default - which is part of what was asked.
+                out.push(self::answer(answer));
+            }
+        }
+        // The three that need no schema, and therefore no plan: explaining one reads no catalog
+        // at all, which is what keeps an explained `CREATE` from being a way to ask whether a
+        // table exists. `mode` cannot be a half here - the parser refuses that.
+        Explained::Ddl(d) => {
+            out.push("ddl".to_string());
+            out.push(ddl(d));
+        }
+        Explained::Insert(i) => {
+            out.push("insert".to_string());
+            out.push(insert(i));
+        }
+        Explained::Show(s) => {
+            out.push("show".to_string());
+            out.push(show(s));
+        }
+    }
+    out.join("\n").lines().filter(|l| !l.trim().is_empty()).collect::<Vec<_>>().join("\n")
+}
 
 /// The answer a statement produces: its shape, and how it is written out.
 ///

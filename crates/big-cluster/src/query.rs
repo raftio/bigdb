@@ -40,19 +40,22 @@ impl<P: PagerMut + Sync> Cluster<P> {
         self.execute(&plan, opts)
     }
 
-    /// The same for one SQL statement, which is planned here and fanned out as a plan.
+    /// What this text is, resolved against the request but run nowhere.
     ///
-    /// **No fan-out code and no merge arm.** SQL reaches storage as the `Plan` the other
-    /// surface produces, so everything below this line has nothing to learn - which was the
-    /// condition the SQL surface was built under rather than a happy accident of it.
-    /// Which kind of statement this is, without planning or running it.
+    /// The edge needs the answer before it can decide what the request costs: `POST /sql` is
+    /// authorised as `read`, and a schema change written in SQL needs `admin` - see
+    /// [`big_api::Sql::authority`]. Exposed here rather than having the edge parse for itself,
+    /// so that what decides the role and what decides the action are one definition.
     ///
-    /// The edge needs the answer before it can decide what role the request needs: `POST /sql`
-    /// is authorised as `read`, and a schema change written in SQL needs `admin`. Exposed here
-    /// rather than having the edge parse for itself, so that what decides the role and what
-    /// decides the action are one definition.
-    pub fn classify(&self, text: &str) -> big_api::Result<big_api::Sql> {
-        self.api.translate(text)
+    /// **`opts` rather than nothing, and the statement rather than a verdict.** The edge used to
+    /// classify against the default database and then hand the *text* back for [`Cluster::sql`]
+    /// to translate a second time, against the request's database. Two translations of one
+    /// statement is two answers waiting to differ, and the one that decided the role was not the
+    /// one that ran. Now there is one translation: this returns the `Sql` the edge authorises,
+    /// and [`Cluster::run`] takes that same value. A statement cannot be authorised as one thing
+    /// and executed as another because there is only one of it.
+    pub fn classify(&self, text: &str, opts: &QueryOptions) -> Result<big_api::Sql> {
+        Ok(self.api.translate_in(text, opts.database())?)
     }
 
     /// A schema change written in SQL, applied the way every schema change is.
@@ -279,26 +282,43 @@ impl<P: PagerMut + Sync> Cluster<P> {
         }
     }
 
-    /// One SQL statement, run wherever it has to run, answered as rows.
+    /// One SQL statement, translated and then run wherever it has to run.
     ///
-    /// **A `ResultSet` rather than plans and a shape, because only one of the four kinds of
+    /// [`Cluster::classify`] then [`Cluster::run`], which is what a caller with no reason to
+    /// look at the statement in between wants. An edge that authorises the statement first
+    /// calls the two halves itself and passes the same value to both.
+    pub fn sql(&self, text: &str, opts: &QueryOptions) -> Result<(ResultSet, Format)> {
+        self.run(self.classify(text, opts)?, opts)
+    }
+
+    /// An already-classified statement, run wherever it has to run, answered as rows.
+    ///
+    /// **A `ResultSet` rather than plans and a shape, because only one of the five kinds of
     /// statement has either.** A query's rows come out of what the owners answered, applied to
     /// the shape `big-sql` decided; a schema change and an insert answer with a number they
-    /// already know; a listing is read straight out of this node's catalog. Assembling all four
-    /// here is what lets the edge write bytes without knowing which one it got - and it is
-    /// where the assembling belonged anyway, since a `Shape` is only right once every owner's
-    /// answer is in.
-    pub fn sql(&self, text: &str, opts: &QueryOptions) -> Result<(ResultSet, Format)> {
-        // Classified before anything is planned, because the four kinds go to different places:
-        // a query is planned here and fanned out to the owners, a schema change goes to the
-        // leader and then everywhere, an insert goes to the shards that own its records, and a
-        // listing goes nowhere at all. Deciding it here rather than inside `plan_sql` is what
-        // keeps a `CREATE TABLE` from being applied on whichever node the client happened to
-        // reach - which is the failure a schema leader exists to prevent.
-        let statement = match self.api.translate_in(text, opts.database())? {
+    /// already know; a listing is read straight out of this node's catalog; an explanation is
+    /// text. Assembling all five here is what lets the edge write bytes without knowing which
+    /// one it got - and it is where the assembling belonged anyway, since a `Shape` is only
+    /// right once every owner's answer is in.
+    ///
+    /// **Takes the statement, not the text.** The value handed in is the one the caller
+    /// authorised, so nothing between the check and the work can re-read the bytes and reach a
+    /// different conclusion about what they say.
+    pub fn run(&self, sql: big_api::Sql, opts: &QueryOptions) -> Result<(ResultSet, Format)> {
+        // The five kinds go to different places: a query is planned here and fanned out to the
+        // owners, a schema change goes to the leader and then everywhere, an insert goes to the
+        // shards that own its records, and a listing goes nowhere at all. Deciding it here
+        // rather than inside `plan_sql` is what keeps a `CREATE TABLE` from being applied on
+        // whichever node the client happened to reach - which is the failure a schema leader
+        // exists to prevent.
+        let statement = match sql {
             big_api::Sql::Ddl(ddl) => return self.sql_ddl(&ddl),
             big_api::Sql::Insert(insert) => return self.sql_insert(&insert),
             big_api::Sql::Show(show) => return self.sql_show(&show),
+            // `EXPLAIN` reaches none of the three above and none of the fan-out below: what the
+            // statement is has already been decided by the time it gets here, and writing it
+            // out is the whole of the work.
+            big_api::Sql::Explain { mode, inner } => return self.sql_explain(mode, *inner),
             big_api::Sql::Query(s) => s,
         };
         let (plans, probes, answer) = self.api.plan_statement(statement)?;
@@ -325,6 +345,80 @@ impl<P: PagerMut + Sync> Cluster<P> {
             )?);
         }
         Ok((big_api::result_set(&answer, &values), answer.format))
+    }
+
+    /// `EXPLAIN`: resolved as far as it would have to be to run, and then not run.
+    ///
+    /// **A query is planned and the other three are not**, which is not an optimisation - it is
+    /// what those statements are. A plan is a statement put against a schema, so
+    /// `EXPLAIN SELECT nope FROM tx` has to report the unknown field rather than draw a tree for
+    /// a statement that could never run. A schema change, a write and a listing are already
+    /// wholly in the parse tree, so explaining one reads no catalog at all - which is also what
+    /// keeps an explained `CREATE` from becoming a way to ask whether a table exists.
+    ///
+    /// Nothing past the planning happens on any path: no `execute`, no probe, no round trip.
+    fn sql_explain(
+        &self,
+        mode: big_api::ExplainMode,
+        inner: big_api::Sql,
+    ) -> Result<(ResultSet, Format)> {
+        // Planned here, because a plan needs the catalog and the catalog is this side's. What
+        // the plans then *say* is `big-sql`'s, which is why this function chooses no printer:
+        // it resolves, and hands over.
+        let (planned, format) = match inner {
+            big_api::Sql::Query(statement) => {
+                let (plans, probes, answer) = self.api.plan_statement(statement)?;
+                // A search's records are an ordinary call, resolved so the tree under it is the
+                // one the search would actually walk. Without this a statement that is only a
+                // quantile - which makes no call at all - would explain as nothing but a shape,
+                // hiding the `WHERE` that is the whole of its work.
+                let probed = probes
+                    .iter()
+                    .map(|p| {
+                        self.api
+                            .plan_call(&p.table, &p.rows)
+                            .map(|rows| big_api::explain::Probed { probe: p, rows })
+                            .map_err(ClusterError::Local)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let format = answer.format;
+                let set = big_api::explain::result_set(
+                    mode,
+                    &big_api::explain::Explained::Query {
+                        plans: &plans,
+                        probes: &probed,
+                        answer: &answer,
+                    },
+                );
+                (set, format)
+            }
+            // The three that need no schema, so nothing here is resolved for them at all.
+            big_api::Sql::Ddl(d) => (
+                big_api::explain::result_set(mode, &big_api::explain::Explained::Ddl(&d)),
+                Format::default(),
+            ),
+            big_api::Sql::Insert(i) => (
+                big_api::explain::result_set(mode, &big_api::explain::Explained::Insert(&i)),
+                Format::default(),
+            ),
+            big_api::Sql::Show(s) => (
+                big_api::explain::result_set(mode, &big_api::explain::Explained::Show(&s)),
+                s.format,
+            ),
+            // The parser refuses a second `EXPLAIN`, so nothing constructs this. Reported rather
+            // than asserted: a panic here would take a node down over a statement a client
+            // wrote, and an unreachable state is worth exactly one error path.
+            big_api::Sql::Explain { .. } => {
+                return Err(ClusterError::Local(big_api::ApiError::Sql(
+                    big_api::SqlError::Syntax {
+                        at: 0,
+                        found: "EXPLAIN".to_string(),
+                        want: "a statement to explain",
+                    },
+                )))
+            }
+        };
+        Ok((planned, format))
     }
 
     /// `INSERT`, which is `POST /table/{t}/import` with the facts written as a statement.

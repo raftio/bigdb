@@ -22,7 +22,7 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use big_sql::{Ddl, Refused, Sql};
+use big_sql::{Authority, Ddl, Refused, Sql};
 
 /// Every statement in the corpus, whatever directive it was written under.
 ///
@@ -93,7 +93,7 @@ fn every_refusal_is_reached_by_a_statement_in_the_corpus() {
     /// because it was the refusal a window earned before the planner had a field class that
     /// could tell a set from a time quantum, and the window it refused is now answered. This
     /// gate found that, and the variant is gone.
-    const EXCUSED: [(&str, &str); 3] = [
+    const EXCUSED: [(&str, &str); 4] = [
         ("sql_insert_too_large", "needs 10,001 tuples; covered in tests/translate/writes.rs"),
         // The two refusals a view is expanded into. `translate` holds no catalog - which is
         // what makes every test in this crate a parser test - so no statement here can reach a
@@ -101,6 +101,10 @@ fn every_refusal_is_reached_by_a_statement_in_the_corpus() {
         // and covered where the catalog is.
         ("sql_view_column", "needs a stored view; covered in big-api/tests/views.rs"),
         ("sql_view_depth", "needs a stored view; covered in big-api/tests/views.rs"),
+        // The refusal a surface raises about itself rather than about the text. `translate`
+        // accepts every `EXPLAIN` the dialect has - that is the whole point of the wrapper - so
+        // no statement here can reach the one refusal that is about which surface was asked.
+        ("sql_explain_rows", "raised in big-api::plan_sql_in; covered in big-api/tests/sql.rs"),
     ];
 
     let reached: BTreeSet<&str> = statements()
@@ -131,6 +135,109 @@ fn every_refusal_is_reached_by_a_statement_in_the_corpus() {
         assert!(
             !reached.contains(code),
             "`{code}` is excused as `{why}`, but the corpus now reaches it - delete the excuse"
+        );
+    }
+}
+
+/// **`EXPLAIN X` is `X`, wrapped and otherwise untouched.**
+///
+/// Held over the whole corpus rather than over a handful of statements, because that is the size
+/// of the claim: `EXPLAIN` was added in front of a parser with four entry points, and a clause it
+/// broke would have to be one nobody wrote a case for. It costs nothing to keep - the statements
+/// are already there, under whatever directive they were written for - and it covers the `WITH`
+/// bindings, `UNION ALL`, every join, every type name and every refusal at once.
+///
+/// The refusal half is the load-bearing one. A statement this dialect will not answer is refused
+/// under `EXPLAIN` with the *same code*: the refusal is about what was written, and `EXPLAIN` did
+/// not write it. That is what makes the wrapper safe to have added - it inherits the whole list
+/// rather than growing a second one that could disagree.
+#[test]
+fn explain_wraps_every_statement_unchanged() {
+    for (path, line, sql) in statements() {
+        // The corpus holds statements that are already an `EXPLAIN`; wrapping one again is the
+        // nesting the parser refuses, and `explain.test` covers that on purpose.
+        if sql.trim_start().get(..7).is_some_and(|w| w.eq_ignore_ascii_case("EXPLAIN")) {
+            continue;
+        }
+        let at = format!("{}:{line}", path.display());
+        match (big_sql::translate(&sql), big_sql::translate(&format!("EXPLAIN {sql}"))) {
+            (Ok(inner), Ok(Sql::Explain { mode, inner: wrapped })) => {
+                assert_eq!(mode, big_sql::ExplainMode::All, "{at}: bare EXPLAIN named a half");
+                assert_eq!(*wrapped, inner, "{at}: EXPLAIN changed the statement under it");
+            }
+            (Err(bare), Err(explained)) => {
+                assert_eq!(
+                    bare.code(),
+                    explained.code(),
+                    "{at}: refused differently under EXPLAIN"
+                );
+            }
+            (bare, explained) => {
+                panic!("{at}: explained differently\n  bare: {bare:?}\n  explained: {explained:?}")
+            }
+        }
+    }
+}
+
+/// **What a statement costs agrees with the keyword it opens with.**
+///
+/// Checked against the leading word *on purpose*, which is the one derivation
+/// [`Sql::authority`] refuses to use: it reads the parse tree, this reads the text, and a test
+/// that re-implemented the match it is checking would pass whatever that match said. Held over
+/// the corpus so a statement added to a file is a statement this covers.
+#[test]
+fn what_a_statement_costs_agrees_with_the_word_it_opens_with() {
+    for (path, line, sql) in statements() {
+        let Ok(parsed) = big_sql::translate(&sql) else { continue };
+        let mut words = sql.split_whitespace();
+        // `EXPLAIN` and the half it may name are skipped rather than judged: what an explanation
+        // costs is the *next* word's business, which is the claim the test below is about.
+        let mut word = words.next().unwrap_or_default().to_uppercase();
+        while matches!(word.as_str(), "EXPLAIN" | "PLAN" | "SHAPE") {
+            word = words.next().unwrap_or_default().to_uppercase();
+        }
+        let expected = match word.as_str() {
+            "CREATE" | "ALTER" | "DROP" => Authority::Admin,
+            "INSERT" => Authority::Write,
+            // `WITH` binds constants for a `SELECT`; the rest read what is already there.
+            "SELECT" | "WITH" | "DESCRIBE" | "DESC" | "SHOW" => Authority::Read,
+            other => panic!("{}:{line}: no expected authority for `{other}`", path.display()),
+        };
+        assert_eq!(
+            parsed.authority(),
+            expected,
+            "{}:{line}: `{word}` statement demands the wrong authority\n  {sql}",
+            path.display()
+        );
+    }
+}
+
+/// **`EXPLAIN X` costs exactly what `X` costs.**
+///
+/// The load-bearing half of [`Sql::authority`], and the reason it looks inside the wrapper: an
+/// explanation that read as a plain read would let a `read` token name a schema change, which is
+/// the class of statement its credential says it may not name. ClickHouse decides it the same
+/// way - its `EXPLAIN` checks the access the explained query would have needed.
+///
+/// Held over the whole corpus rather than over a handful of statements, so the rule covers every
+/// kind of statement anybody ever writes a case for, including ones added after this.
+#[test]
+fn explaining_a_statement_costs_what_the_statement_costs() {
+    for (path, line, sql) in statements() {
+        // Already an `EXPLAIN`; wrapping one again is the nesting the parser refuses.
+        if sql.trim_start().get(..7).is_some_and(|w| w.eq_ignore_ascii_case("EXPLAIN")) {
+            continue;
+        }
+        let (Ok(bare), Ok(explained)) =
+            (big_sql::translate(&sql), big_sql::translate(&format!("EXPLAIN {sql}")))
+        else {
+            continue;
+        };
+        assert_eq!(
+            explained.authority(),
+            bare.authority(),
+            "{}:{line}: EXPLAIN changed what the statement costs\n  {sql}",
+            path.display()
         );
     }
 }

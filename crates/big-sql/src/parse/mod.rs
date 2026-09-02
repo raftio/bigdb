@@ -15,8 +15,9 @@
 //! Tokens to [`Select`]. Recursive descent, with the refusals placed where the construct is.
 //!
 //! ```text
-//! statement := create | alter | drop | insert | show
+//! statement := explain | create | alter | drop | insert | show
 //!            | [WITH literal AS ident (',' literal AS ident)*] select
+//! explain   := EXPLAIN [PLAN | SHAPE] statement   -- the inner one is not an EXPLAIN
 //! create    := CREATE TABLE [IF NOT EXISTS] ident
 //!              ['(' column (',' column)* ')'] [ENGINE '=' engine]
 //!            | CREATE [OR REPLACE] VIEW [IF NOT EXISTS] ident AS body
@@ -57,7 +58,7 @@
 //! second tells a user their SQL is malformed when it is perfectly good SQL that this engine
 //! will not answer, and those call for entirely different reactions.
 
-use crate::ast::{Name, Query, Select};
+use crate::ast::{ExplainMode, Name, Query, Select};
 use crate::error::{Refused, Result, SqlError};
 use crate::insert::Insert;
 use crate::lex::{lex, Tok, Token};
@@ -83,6 +84,18 @@ pub enum Parsed {
     Insert(Insert),
     Show(Show),
     Ddl(crate::ddl::Ddl),
+    /// `EXPLAIN <statement>`: describe what the statement would do, and do none of it.
+    ///
+    /// **One variant that wraps every kind, rather than a flag on each.** A statement kind added
+    /// after this one is explainable the day it parses, with no arm here to remember - which is
+    /// the property a per-kind flag would not have. The box is what a recursive variant costs;
+    /// it is paid once per `EXPLAIN` and by nothing else.
+    Explain {
+        /// Which half was asked for. [`ExplainMode::All`] unless the statement named one.
+        mode: ExplainMode,
+        /// The statement being described, which is never itself an `EXPLAIN`.
+        inner: Box<Parsed>,
+    },
 }
 
 /// Parses one statement, refusing anything this engine does not answer.
@@ -96,12 +109,46 @@ pub fn parse(input: &str) -> Result<Parsed> {
         depth: 0,
         bound: Default::default(),
     };
+    statement(&mut p, true)
+}
 
-    // The leading keyword decides which of three things happened, and only one of them is a
+/// The leading keyword, and the statement it turned out to introduce.
+///
+/// Split out of [`parse`] for one caller: `EXPLAIN` wraps a statement, so the dispatch has to be
+/// able to run itself again. `explainable` is how it says the inner one may not be another
+/// `EXPLAIN` - a bool rather than a depth, because there is no reading of `EXPLAIN EXPLAIN` that
+/// means more than `EXPLAIN` does.
+fn statement(p: &mut Parser<'_>, explainable: bool) -> Result<Parsed> {
+    // The leading keyword decides which of four things happened, and only one of them is a
     // syntax error. A `DELETE` is a statement this surface refuses; a `foo` is not a statement.
     let Some(word) = p.word() else {
         return Err(SqlError::Syntax { at: p.at(), found: p.here(), want: "a SELECT statement" });
     };
+    // `EXPLAIN <statement>` answers with what the statement *would* do, having done none of it.
+    //
+    // Checked before every other keyword and nowhere else, which is what keeps `EXPLAIN` from
+    // becoming a reserved word: the lexer has no keyword list, so a table or a column may still
+    // be called `explain` - only this one token position is special.
+    if word.eq_ignore_ascii_case("EXPLAIN") {
+        // A syntax error rather than a refusal, which is the split this crate's errors are
+        // built on: a refusal says the text is a statement this engine will not answer, and
+        // `EXPLAIN EXPLAIN` is not a statement in any dialect - there is no engine it means
+        // something to. Nothing exists instead of it, so there is no sentence to write.
+        if !explainable {
+            return Err(p.syntax("a statement to explain"));
+        }
+        p.i += 1;
+        let mode = p.explain_mode();
+        let at = p.at();
+        let inner = statement(p, false)?;
+        // A half only a query has, named over a statement that has one printer. Refused here
+        // rather than ignored: a client that asked for the plans of a `CREATE TABLE` has a
+        // misunderstanding, and printing the schema change anyway would leave them with it.
+        if mode != ExplainMode::All && !matches!(inner, Parsed::Query(_)) {
+            return Err(p.refuse_at(Refused::ExplainHalf, at));
+        }
+        return Ok(Parsed::Explain { mode, inner: Box::new(inner) });
+    }
     // `WITH 500 AS threshold SELECT ...` binds a constant for the statement to use by name.
     // **Constants only.** A CTE whose body is a select is a subquery, which this engine has no
     // set operation behind - `bindings` refuses one at the bracket that opens it.
@@ -295,6 +342,20 @@ impl Parser<'_> {
     /// The word `n` tokens ahead, for the two-token keywords: `GROUP BY`, `NOT IN`, `IS NULL`.
     pub(super) fn word_at_is(&self, n: usize, kw: &str) -> bool {
         matches!(self.t.get(self.i + n).map(|t| &t.tok), Some(Tok::Word(w)) if w.eq_ignore_ascii_case(kw))
+    }
+
+    /// The half named right after `EXPLAIN`, if one was.
+    ///
+    /// Peeked in this one position and nowhere else, so `PLAN` and `SHAPE` stay ordinary words
+    /// everywhere a table or a column may be called either.
+    pub(super) fn explain_mode(&mut self) -> ExplainMode {
+        if self.eat_word("PLAN") {
+            ExplainMode::Plan
+        } else if self.eat_word("SHAPE") {
+            ExplainMode::Shape
+        } else {
+            ExplainMode::All
+        }
     }
 
     pub(super) fn eat_word(&mut self, kw: &str) -> bool {

@@ -259,6 +259,17 @@ fn refusals_and_schema_errors_carry_their_codes_through_the_facade() {
     assert_eq!(code("SELECT count(*) FROM nope"), "unknown_table");
     assert_eq!(code("SELECT count(*) FROM tx WHERE nope = 1"), "unknown_field");
     assert_eq!(code("SELECT sum(country) FROM tx"), "operator_not_allowed");
+    // **`EXPLAIN` gets its own refusal, and not the write one above.** This door resolves a
+    // statement to plans; an explanation has none, because the whole of what it asks for is
+    // that nothing runs. Telling the caller this surface is read-only would be telling them
+    // something untrue about a statement that reads - `Cluster::sql` answers it, as rows.
+    //
+    // `big-sql/tests/gates.rs` excuses `sql_explain_rows` from its corpus on the strength of
+    // this assertion, which is why it is here rather than left to the reader of the match.
+    assert_eq!(code("EXPLAIN SELECT count(*) FROM tx"), "sql_explain_rows");
+    assert_eq!(code("EXPLAIN CREATE TABLE never (a UINT(32))"), "sql_explain_rows");
+    // ...and having been refused, it is still not a statement that ran.
+    assert_eq!(code("SELECT count(*) FROM never"), "unknown_table");
 }
 
 /// Planning is pure, so a statement that will not resolve is refused without a read

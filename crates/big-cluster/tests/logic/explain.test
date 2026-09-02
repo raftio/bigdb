@@ -1,0 +1,100 @@
+# `EXPLAIN`, against a real database: the rows a client actually reads.
+#
+# The corpus in `big-sql` pins the text against a stub schema. This pins that the text survives
+# becoming a result set - one row per line, under one column - and that a view is read through
+# before anything is described. Nothing here runs: every case would answer differently if it did.
+
+statement
+CREATE TABLE tx (amount UINT(32), price DECIMAL(10, 2), country SET, active BOOL)
+
+statement
+INSERT INTO tx (_record_id, amount, price, country, active) VALUES
+  (1, 100, 1.50, 'GB', true),
+  (2, 900, 12.25, 'US', false),
+  (3, 500, 3.00, 'GB', true)
+
+query
+EXPLAIN SELECT count(*) FROM tx WHERE amount >= 500
+----
+explain
+plan #0
+Count tx
+└── amount >= 500
+shape
+Row
+└── count = #0
+
+query
+EXPLAIN PLAN SELECT country, count(*) FROM tx GROUP BY country
+----
+explain
+plan #0
+GroupBy tx.country -> count
+└── all
+
+# A quantile makes no call, so this is the whole of what it costs: a search over these records.
+query
+EXPLAIN SELECT quantile(0.5)(amount) FROM tx WHERE country = 'GB'
+----
+explain
+probe tx.amount per_mille=500
+└── country = 'GB'
+shape
+Row
+└── quantile = probe #0
+
+# A written threshold against a decimal is resolved into stored units before it is described, so
+# what is printed is the number the engine will actually compare.
+query
+EXPLAIN SELECT country, sum(price) FROM tx GROUP BY country HAVING sum(price) >= 4.00
+----
+explain
+plan #0
+GroupBy tx.country -> sum(price)
+└── all
+shape
+Groups keys=[#0]
+├── country = key
+├── sum = group #0 else 0 scale=2
+└── having: group #0 else 0 >= 400
+
+# Explaining a statement is not running it: the table below is never created.
+query
+EXPLAIN CREATE TABLE never (a UINT(32))
+----
+explain
+ddl
+CreateTable never
+└── a int depth=32
+
+query
+SHOW TABLES
+----
+name  type        engine           fields
+tx    BASE TABLE  bitmap+columnar  4
+
+# A view is a name for a statement, so an `EXPLAIN` that reads one describes what it stands for.
+statement
+CREATE VIEW gb AS SELECT amount, country FROM tx WHERE country = 'GB'
+
+query
+EXPLAIN SELECT count(*) FROM gb
+----
+explain
+plan #0
+Count tx
+└── country = 'GB'
+shape
+Row
+└── count = #0
+
+# Still resolved against the schema, so a field nobody has is reported rather than drawn.
+error
+EXPLAIN SELECT count(*) FROM tx WHERE nope = 1
+----
+error: unknown_field
+
+error
+EXPLAIN EXPLAIN SELECT count(*) FROM tx
+----
+error: parse_error

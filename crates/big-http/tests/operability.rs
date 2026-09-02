@@ -301,6 +301,48 @@ fn a_sql_statement_raises_the_role_the_route_asks_for() {
     assert_eq!(r.status, 400, "{}", r.body);
 }
 
+/// **An `EXPLAIN` costs what the statement under it costs, not what the keyword suggests.**
+///
+/// It runs nothing, so on the letter of it every `EXPLAIN` is a read. The role inherits anyway,
+/// because the alternative decides a power from a *wrapper keyword* rather than from what the
+/// statement is about - and that is the shape that goes wrong the first time an explained
+/// statement has to read something to say anything useful. This way round it fails closed, and
+/// the test that says so is here rather than left to the reader of the match.
+#[test]
+fn an_explain_needs_the_role_of_the_statement_it_describes() {
+    let (_dir, path) = token_file("ro read\nrw write\nsecret admin\n");
+    // Eight, which is how many requests this test makes.
+    let addr = spawn(8, ServerConfig { auth: Auth::from_file(&path).unwrap(), ..config() });
+    assert_eq!(
+        send_with(addr, "POST", "/sql", "CREATE TABLE tx (n INT)", Some("secret")).status,
+        200
+    );
+
+    // Explaining a `SELECT` reads, which the route's own floor already covers.
+    let r = send_with(addr, "POST", "/sql", "EXPLAIN SELECT count(*) FROM tx", Some("ro"));
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert!(r.body.starts_with(r#"{"columns":["explain"],"rows":[["plan #0"#), "{}", r.body);
+
+    // Explaining a write needs `write`, and a schema change `admin` - the same powers the
+    // statements themselves demand.
+    let insert = "EXPLAIN INSERT INTO tx (_record_id, n) VALUES (1, 5)";
+    let r = send_with(addr, "POST", "/sql", insert, Some("ro"));
+    assert_eq!(r.status, 403, "{}", r.body);
+    assert!(r.body.contains("needs `write`"), "{}", r.body);
+    assert_eq!(send_with(addr, "POST", "/sql", insert, Some("rw")).status, 200);
+
+    let ddl = "EXPLAIN CREATE TABLE never (a INT)";
+    let r = send_with(addr, "POST", "/sql", ddl, Some("rw"));
+    assert_eq!(r.status, 403, "{}", r.body);
+    assert!(r.body.contains("needs `admin`"), "{}", r.body);
+    assert_eq!(send_with(addr, "POST", "/sql", ddl, Some("secret")).status, 200);
+
+    // ...and having been explained by a token that may run it, the table is still not there.
+    // The role is the only thing `EXPLAIN` inherits; the doing is not.
+    let r = send_with(addr, "POST", "/sql", "SHOW TABLES", Some("ro"));
+    assert!(!r.body.contains("never"), "EXPLAIN created the table it described: {}", r.body);
+}
+
 #[test]
 fn an_unknown_token_is_not_distinguishable_from_no_token() {
     let (_dir, path) = token_file("secret admin\n");
