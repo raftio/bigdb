@@ -19,9 +19,9 @@
 //! that: the same aggregate over the same column is the same number, and anything else would
 //! have to be computed.
 
-use crate::ast::{Agg, HavingAgg, Item, Name, Proj, Select};
+use crate::ast::{self, Agg, HavingAgg, HavingOperand, Item, Name, Proj, Select};
 use crate::error::{Refused, Result, SqlError};
-use crate::shape::{Absent, Having, Of, Threshold, Units};
+use crate::shape::{Absent, Having, Of, Operand, Threshold, Units};
 use big_plan::ast::Literal;
 
 /// What the number one select-list entry produces is measured in.
@@ -109,39 +109,114 @@ pub(super) fn names(having: &HavingAgg, measures: &[(Measure, Of)]) -> Option<Of
     measures.iter().find(|(m, _)| *m == want).map(|(_, of)| *of)
 }
 
-/// The `HAVING`, resolved against the numbers this answer actually holds.
+/// A `HAVING` tree, resolved against the numbers this answer actually holds.
 ///
-/// Here rather than beside one caller because two shapes ask it: a grouping filters the row per
-/// group, and an ungrouped aggregate filters the single row it answers with. The question is the
-/// same one either way - does this answer hold the number the `HAVING` names, and is that number
-/// a whole one - so it is asked in one place.
+/// **One walk for every shape that has a `HAVING`.** Four of them do — a grouping, a pair
+/// grouping, a join and an ungrouped aggregate — and they differ in exactly two ways, which is
+/// why those two are the closures rather than four copies of the walk:
+///
+/// - `number` says which of this answer's numbers an aggregate is, and refuses the ones this
+///   shape cannot compare. A grouping's average is an [`Of::Ratio`] and a join's is an
+///   [`Of::PairedRatio`]; both are fractional where this comparison is not, and each shape
+///   knows which of them is its own.
+/// - `units` says which field a threshold beside that aggregate is written in the units of. A
+///   grouping reads it off the one table; a join has two and has to resolve the qualifier.
+///
+/// The units of a literal come from **the aggregate on the other side of the comparison**,
+/// which is the only thing they could come from: `sum(price) >= 10.00` is ten pounds because
+/// `price` is in pounds, and the same `10.00` beside a count would be ten records.
+pub(super) fn having_tree(
+    h: &ast::Having,
+    number: &impl Fn(&HavingAgg, usize) -> Result<Of>,
+    units: &impl Fn(&HavingAgg, usize) -> Result<Option<(String, String)>>,
+) -> Result<Having> {
+    Ok(match h {
+        ast::Having::And(a, b) => Having::And(
+            Box::new(having_tree(a, number, units)?),
+            Box::new(having_tree(b, number, units)?),
+        ),
+        ast::Having::Or(a, b) => Having::Or(
+            Box::new(having_tree(a, number, units)?),
+            Box::new(having_tree(b, number, units)?),
+        ),
+        ast::Having::Not(a) => Having::Not(Box::new(having_tree(a, number, units)?)),
+        ast::Having::Cmp { left, op, right, at } => {
+            // Both sides are read before either is turned into an operand, because a literal's
+            // units are the *other* side's.
+            let agg_of = |o: &HavingOperand| match o {
+                HavingOperand::Agg(a) => Some(a.clone()),
+                HavingOperand::Value(_) => None,
+            };
+            let (la, ra) = (agg_of(left), agg_of(right));
+            // Two constants compared to each other is a statement about nothing the answer
+            // holds - true or false for every group alike, and never what anybody meant.
+            if la.is_none() && ra.is_none() {
+                return Err(SqlError::Refused { what: Refused::Having, at: *at });
+            }
+            let side = |o: &HavingOperand, other: Option<&HavingAgg>| -> Result<Operand> {
+                Ok(match o {
+                    // The operand carries what it is measured in, for the same reason a cell
+                    // does: only a schema knows a scale, and a comparison between two of these
+                    // has to be told whether they are in the same one.
+                    HavingOperand::Agg(a) => Operand::Of {
+                        of: number(a, *at)?,
+                        units: match units(a, *at)? {
+                            Some((table, field)) => Units::Written { table, field },
+                            // A count is in records, which is a unit no field defines.
+                            None => Units::PLAIN,
+                        },
+                    },
+                    HavingOperand::Value(v) => Operand::Value(match other {
+                        // An aggregate's threshold is in the field's units, and only a schema
+                        // knows what those are. `Shape::resolve` asks, with the planner's own
+                        // conversion.
+                        Some(a) => match units(a, *at)? {
+                            Some((table, field)) => {
+                                Threshold::Written { table, field, value: v.clone() }
+                            }
+                            // A count is in records, which is a unit no field defines. Anything
+                            // but a whole number of them is not a count, and is refused here
+                            // rather than rounded into one.
+                            None => match v {
+                                Literal::Int(n) => Threshold::Units(i128::from(*n)),
+                                _ => {
+                                    return Err(SqlError::Refused {
+                                        what: Refused::Having,
+                                        at: *at,
+                                    })
+                                }
+                            },
+                        },
+                        // Unreachable: at least one side is an aggregate, checked above.
+                        None => return Err(SqlError::Refused { what: Refused::Having, at: *at }),
+                    }),
+                })
+            };
+            Having::Cmp { left: side(left, ra.as_ref())?, op, right: side(right, la.as_ref())? }
+        }
+    })
+}
+
+/// The `HAVING` of a shape whose numbers are named by [`names`] and measured on one table.
+///
+/// The grouped and ungrouped cases, which differ in nothing a `HAVING` can see.
 pub(super) fn having_of(
     select: &Select,
     table: &str,
     measures: &[(Measure, Of)],
 ) -> Result<Option<Having>> {
     let Some(h) = &select.having else { return Ok(None) };
-    let of =
-        names(&h.agg, measures).ok_or(SqlError::Refused { what: Refused::Having, at: h.at })?;
-    // An average is fractional and this comparison is not. Rounding one into the other would
-    // answer a question next to the one that was asked.
-    if matches!(of, Of::Ratio { .. }) {
-        return Err(SqlError::Refused { what: Refused::Having, at: h.at });
-    }
-    let value = match field_of(&h.agg) {
-        // An aggregate's threshold is in the field's units, and only a schema knows what those
-        // are. `Shape::resolve` asks, with the planner's own conversion.
-        Some(field) => {
-            Threshold::Written { table: table.to_string(), field, value: h.value.clone() }
+    let number = |a: &HavingAgg, at: usize| {
+        let of = names(a, measures).ok_or(SqlError::Refused { what: Refused::Having, at })?;
+        // An average is fractional and this comparison is not. Rounding one into the other
+        // would answer a question next to the one that was asked.
+        if matches!(of, Of::Ratio { .. }) {
+            return Err(SqlError::Refused { what: Refused::Having, at });
         }
-        // A count is in records, which is a unit no field defines. Anything but a whole number
-        // of them is not a count, and is refused here rather than rounded into one.
-        None => match h.value {
-            Literal::Int(n) => Threshold::Units(i128::from(n)),
-            _ => return Err(SqlError::Refused { what: Refused::Having, at: h.at }),
-        },
+        Ok(of)
     };
-    Ok(Some(Having { of, op: h.op, value }))
+    let units = |a: &HavingAgg, _at: usize| Ok(field_of(a).map(|f| (table.to_string(), f)));
+    Ok(Some(having_tree(h, &number, &units)?))
 }
 
 /// The column an aggregate's threshold is written in the units of, if any.

@@ -311,27 +311,91 @@ impl Agg {
     }
 }
 
-/// `HAVING <aggregate> <op> <value>`.
+/// A `HAVING` clause, as a tree of comparisons over the numbers a group carries.
 ///
-/// A predicate on the one number each group carries, and nothing else. It is not part of the
-/// plan: groups are filtered where `count(DISTINCT x)` is counted, at the coordinator after
-/// every node has contributed, because a group under the threshold on one node can be over it
-/// once the rest have been added. Filtering per node would answer a different question,
-/// quietly.
+/// A predicate on what each group holds, and not part of the plan: groups are filtered where
+/// `count(DISTINCT x)` is counted, at the coordinator after every node has contributed, because
+/// a group under the threshold on one node can be over it once the rest have been added.
+/// Filtering per node would answer a different question, quietly.
+///
+/// # Why this is a tree and [`Cond`] is a different one
+///
+/// The same shape, deliberately, so the two read alike — and two types rather than one because
+/// they select different things. A `Cond` names *columns* and becomes bitmap set operations
+/// before anything runs; this names *aggregates* and is evaluated per group on numbers that
+/// already exist. `WHERE` runs on the way in and `HAVING` on the way out, and giving them one
+/// type would invite a term to be moved between them, which changes the answer.
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub struct Having {
-    /// Which number is being compared. It has to be the one the select list asked for: a
-    /// grouped answer carries exactly one value per group, so a `HAVING` on any other
-    /// aggregate would filter on a number the answer does not hold.
-    pub agg: HavingAgg,
-    /// One of `=`, `!=`, `<`, `<=`, `>`, `>=`, normalised by the lexer.
-    pub op: &'static str,
-    /// The value to compare against, exactly as written. A threshold on a decimal field is
-    /// still in written units here; [`crate::Shape::resolve`] turns it into stored units with
-    /// the same conversion a `WHERE` comparison gets.
-    pub value: Literal,
-    /// Byte offset, for the refusal.
-    pub at: usize,
+pub enum Having {
+    /// `a AND b`
+    And(Box<Having>, Box<Having>),
+    /// `a OR b`
+    Or(Box<Having>, Box<Having>),
+    /// `NOT a`
+    Not(Box<Having>),
+    /// `<operand> <op> <operand>`
+    Cmp {
+        /// The left-hand side.
+        left: HavingOperand,
+        /// One of `=`, `!=`, `<`, `<=`, `>`, `>=`, normalised by the lexer.
+        op: &'static str,
+        /// The right-hand side. An operand rather than a literal, which is what lets
+        /// `HAVING sum(paid) > sum(due)` be written: both sides are numbers a group carries,
+        /// and nothing about the comparison cares which side an aggregate is on.
+        right: HavingOperand,
+        /// Byte offset, for the refusal.
+        at: usize,
+    },
+}
+
+impl Having {
+    /// Where this clause begins, for a refusal that has no more specific place to point.
+    pub fn at(&self) -> usize {
+        match self {
+            Self::And(a, _) | Self::Or(a, _) => a.at(),
+            Self::Not(a) => a.at(),
+            Self::Cmp { at, .. } => *at,
+        }
+    }
+
+    /// Every aggregate this clause names, in the order written.
+    ///
+    /// The list the lowering checks against what the answer carries — and, once a `HAVING` may
+    /// name an aggregate the select list did not ask for, the list of numbers that still have
+    /// to be computed.
+    pub fn aggregates(&self) -> Vec<&HavingAgg> {
+        let mut out = Vec::new();
+        self.walk(&mut out);
+        out
+    }
+
+    fn walk<'a>(&'a self, out: &mut Vec<&'a HavingAgg>) {
+        match self {
+            Self::And(a, b) | Self::Or(a, b) => {
+                a.walk(out);
+                b.walk(out);
+            }
+            Self::Not(a) => a.walk(out),
+            Self::Cmp { left, right, .. } => {
+                for side in [left, right] {
+                    if let HavingOperand::Agg(a) = side {
+                        out.push(a);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// One side of a `HAVING` comparison.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum HavingOperand {
+    /// A number the group carries.
+    Agg(HavingAgg),
+    /// A value to compare against, exactly as written. A threshold on a decimal field is still
+    /// in written units here; [`crate::Shape::resolve`] turns it into stored units with the
+    /// same conversion a `WHERE` comparison gets.
+    Value(Literal),
 }
 
 /// Which of a grouped answer's numbers a `HAVING` names.

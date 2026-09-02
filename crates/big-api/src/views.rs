@@ -42,7 +42,10 @@
 //! source-to-source rewrite between two things `big-sql` produced.
 
 use big_db::catalog::{Catalog, SavedQuery, TableRef};
-use big_sql::ast::{Cond, HavingAgg, Item, Name, Order, OrderKey, Proj, Query, Select, Source};
+use big_sql::ast::{
+    Cond, Having, HavingAgg, HavingOperand, Item, Name, Order, OrderKey, Proj, Query, Select,
+    Source,
+};
 use big_sql::{Parsed, Refused, SqlError};
 
 use crate::error::{ApiError, Result};
@@ -227,10 +230,7 @@ fn remap_select(select: &mut Select, exposed: &Exposed) -> Result<()> {
         exposed.rename(name)?;
     }
     if let Some(having) = &mut select.having {
-        match &mut having.agg {
-            HavingAgg::Agg { field, .. } | HavingAgg::Avg(field) => exposed.rename(field)?,
-            HavingAgg::Count => {}
-        }
+        remap_having(having, exposed)?;
     }
     if let Some(order) = &mut select.order_by {
         remap_order(order, exposed, &aliases)?;
@@ -272,6 +272,34 @@ fn remap_item(item: &mut Item, exposed: &Exposed) -> Result<()> {
         remap_cond(cond, exposed)?;
     }
     Ok(())
+}
+
+/// Puts every column a `HAVING` names through the view, wherever in the tree it sits.
+///
+/// A walk rather than one match, for the reason the clause is a tree at all: a column the view
+/// hides has to be refused in every branch, and a branch that skipped the substitution would
+/// read the base table's column through a view that exists to keep it out of sight.
+fn remap_having(having: &mut Having, exposed: &Exposed) -> Result<()> {
+    match having {
+        Having::And(a, b) | Having::Or(a, b) => {
+            remap_having(a, exposed)?;
+            remap_having(b, exposed)
+        }
+        Having::Not(a) => remap_having(a, exposed),
+        Having::Cmp { left, right, .. } => {
+            for side in [left, right] {
+                if let HavingOperand::Agg(agg) = side {
+                    match agg {
+                        HavingAgg::Agg { field, .. } | HavingAgg::Avg(field) => {
+                            exposed.rename(field)?
+                        }
+                        HavingAgg::Count => {}
+                    }
+                }
+            }
+            Ok(())
+        }
+    }
 }
 
 fn remap_order(order: &mut Order, exposed: &Exposed, aliases: &[String]) -> Result<()> {

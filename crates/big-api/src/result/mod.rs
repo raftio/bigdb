@@ -167,7 +167,7 @@ fn rows_of(shape: &Shape, values: &[Value], probes_at: usize) -> Vec<Row> {
         Shape::Row { cells, having } => {
             let kept = match having {
                 None => true,
-                Some(h) => h.keeps(int_of(number(h.of, values, None))),
+                Some(h) => h.holds(&|of| int_of(number(of, values, None))),
             };
             if !kept {
                 return Vec::new();

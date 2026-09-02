@@ -20,7 +20,9 @@
 
 use crate::common::*;
 use big_api::Value;
-use big_api::{result_set, Absent, Cut, Datum, GroupOrder, Having, Of, OrderBy, Shape, Threshold};
+use big_api::{
+    result_set, Absent, Cut, Datum, GroupOrder, Having, Of, OrderBy, Shape, Threshold, Units,
+};
 
 fn shape(having: Option<Having>, order: Option<GroupOrder>) -> Shape {
     Shape::Groups {
@@ -75,11 +77,12 @@ fn absent_is_zero_when_the_shape_says_so() {
 
 #[test]
 fn a_having_drops_an_absent_number_rather_than_treating_it_as_zero() {
-    let having = Having {
-        of: Of::Group { plan: 1, absent: Absent::Null },
-        op: ">=",
-        value: Threshold::Units(0),
-    };
+    let having = Having::cmp(
+        Of::Group { plan: 1, absent: Absent::Null },
+        Units::PLAIN,
+        ">=",
+        Threshold::Units(0),
+    );
 
     let set = result_set(&answer(shape(Some(having), None)), &values());
 

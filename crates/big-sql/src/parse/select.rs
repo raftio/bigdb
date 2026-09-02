@@ -15,7 +15,9 @@
 //! The statement's own clauses: `FROM`, `JOIN`, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`.
 
 use super::Parser;
-use crate::ast::{Cond, Having, HavingAgg, Join, Order, OrderKey, Proj, Select, Source};
+use crate::ast::{
+    Cond, Having, HavingAgg, HavingOperand, Join, Order, OrderKey, Proj, Select, Source,
+};
 use crate::error::{Refused, Result, SqlError};
 use crate::lex::Tok;
 use big_plan::Literal;
@@ -320,20 +322,91 @@ impl Parser<'_> {
         Ok(Order { key, desc, at })
     }
 
-    /// `HAVING <aggregate> <op> <value>`.
+    /// `HAVING <comparison> [AND|OR <comparison>]*`, with `NOT` and brackets.
     ///
-    /// One aggregate, one comparison, one value. **Which** aggregate is legal is not decided
-    /// here: a grouped answer carries exactly one number per group, and whether the one named
-    /// is the one the select list asked for is a question about the select list. The lowering
-    /// asks it. This one only refuses what is not an aggregate at all, so that
-    /// `HAVING country = 'GB'` is named as a `HAVING` this surface does not take rather than
-    /// as a syntax error somewhere after it.
+    /// **The same four-function chain [`Parser::cond`] is**, and deliberately so: two grammars
+    /// that read alike are two grammars a reader learns once. What differs is the leaf — a
+    /// `WHERE` term names a column and a `HAVING` term names an aggregate — and that difference
+    /// is the whole reason they are separate types. See [`Having`].
+    ///
+    /// **Which** aggregate is legal is not decided here: whether the number named is one the
+    /// answer carries is a question about the select list, and the lowering asks it. This only
+    /// refuses what is not an aggregate at all, so that `HAVING country = 'GB'` is named as a
+    /// `HAVING` this surface does not take rather than as a syntax error somewhere after it.
     pub(super) fn having(&mut self) -> Result<Having> {
+        self.enter()?;
+        let mut left = self.having_conj()?;
+        while self.eat_word("OR") {
+            left = Having::Or(Box::new(left), Box::new(self.having_conj()?));
+        }
+        self.leave();
+        Ok(left)
+    }
+
+    fn having_conj(&mut self) -> Result<Having> {
+        self.enter()?;
+        let mut left = self.having_neg()?;
+        while self.eat_word("AND") {
+            left = Having::And(Box::new(left), Box::new(self.having_neg()?));
+        }
+        self.leave();
+        Ok(left)
+    }
+
+    fn having_neg(&mut self) -> Result<Having> {
+        self.enter()?;
+        let out = if self.eat_word("NOT") {
+            Having::Not(Box::new(self.having_neg()?))
+        } else if self.peek() == Some(&Tok::LParen) {
+            // A `(` beginning a select is a subquery wherever it appears, and saying so here is
+            // what keeps it from dying as "expected an aggregate".
+            if self.word_at_is(1, "SELECT") {
+                return Err(self.refuse(Refused::Subquery));
+            }
+            self.i += 1;
+            let inner = self.having()?;
+            self.expect(&Tok::RParen, ") to close the HAVING")?;
+            inner
+        } else {
+            self.having_cmp()?
+        };
+        self.leave();
+        Ok(out)
+    }
+
+    /// One comparison: `<operand> <op> <operand>`.
+    ///
+    /// Both sides go through the same reader, which is what makes `HAVING sum(paid) > sum(due)`
+    /// fall out rather than needing a case of its own — a comparison does not care which side
+    /// an aggregate is on, and neither does the group it is evaluated against.
+    fn having_cmp(&mut self) -> Result<Having> {
         let at = self.at();
+        let left = self.having_operand(at)?;
+
+        let Some(Tok::Op(op)) = self.peek() else {
+            return Err(self.syntax("a comparison after the aggregate"));
+        };
+        let op = *op;
+        self.i += 1;
+
+        let right = self.having_operand(self.at())?;
+        Ok(Having::Cmp { left, op, right, at })
+    }
+
+    /// An aggregate, or a value to compare one against.
+    fn having_operand(&mut self, at: usize) -> Result<HavingOperand> {
+        // A literal is a value and nothing else - and any literal, not only a whole number: a
+        // threshold on a decimal field is written the way the field is written, and
+        // `Shape::resolve` converts it with the same code a `WHERE` comparison goes through.
+        if !matches!(self.peek(), Some(Tok::Word(_)) | Some(Tok::Quoted(_))) {
+            return Ok(HavingOperand::Value(
+                self.literal("a value to compare the aggregate against")?,
+            ));
+        }
         let Ok(name) = self.bare_ident("an aggregate") else {
             return Err(self.refuse_at(Refused::Having, at));
         };
-        let agg = match self.aggregate(&name)?.map(|a| (a.proj, a.filter.is_some())) {
+        Ok(HavingOperand::Agg(match self.aggregate(&name)?.map(|a| (a.proj, a.filter.is_some())) {
             // As in `ORDER BY`: a filtered aggregate is named by its alias, not by repeating
             // the condition that made it.
             Some((_, true)) => return Err(self.refuse_at(Refused::Having, at)),
@@ -343,19 +416,6 @@ impl Parser<'_> {
             // `count(DISTINCT x)` in a HAVING is a second grouping inside the first, and a
             // bare column is a predicate on a value no group holds.
             Some(_) | None => return Err(self.refuse_at(Refused::Having, at)),
-        };
-
-        let Some(Tok::Op(op)) = self.peek() else {
-            return Err(self.syntax("a comparison after the aggregate"));
-        };
-        let op = *op;
-        self.i += 1;
-
-        // Any literal, not only a whole number: a threshold on a decimal field is written the
-        // way the field is written, and `Shape::resolve` converts it with the same code a
-        // `WHERE` comparison goes through.
-        let value = self.literal("a value to compare the aggregate against")?;
-
-        Ok(Having { agg, op, value, at })
+        }))
     }
 }

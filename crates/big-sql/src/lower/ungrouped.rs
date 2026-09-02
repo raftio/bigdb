@@ -37,7 +37,7 @@ pub(super) fn ungrouped(
     // does so at the bottom of this function.
     if let Some(h) = &select.having {
         if !columns.is_empty() || !stars.is_empty() {
-            return Err(SqlError::Refused { what: Refused::Having, at: h.at });
+            return Err(SqlError::Refused { what: Refused::Having, at: h.at() });
         }
     }
 

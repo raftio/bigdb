@@ -296,3 +296,57 @@ SELECT category, min(amount) FILTER (WHERE active = true) FROM t GROUP BY catego
 Groups keys=[#0, #1]
 ├── category = key
 └── min = group #0 else null
+
+# A `HAVING` is a tree, not one comparison. `AND`, `OR`, `NOT` and brackets read as they do in a
+# `WHERE`, and for the same reason: two grammars that look alike are one grammar to learn. What
+# differs is the leaf - a `WHERE` term names a column and a `HAVING` term names an aggregate.
+shape
+SELECT category, count(*), sum(amount) FROM t GROUP BY category HAVING count(*) > 5 AND sum(amount) < 100
+----
+Groups keys=[#0, #1]
+├── category = key
+├── count = group #0 else 0
+├── sum = group #1 else 0
+└── having: group #0 else 0 > 5 and group #1 else 0 < 100
+
+shape
+SELECT category, count(*) FROM t GROUP BY category HAVING count(*) > 5 OR count(*) = 0
+----
+Groups keys=[#0]
+├── category = key
+├── count = group #0 else 0
+└── having: (group #0 else 0 > 5 or group #0 else 0 = 0)
+
+shape
+SELECT category, count(*) FROM t GROUP BY category HAVING NOT (count(*) > 5)
+----
+Groups keys=[#0]
+├── category = key
+├── count = group #0 else 0
+└── having: not (group #0 else 0 > 5)
+
+# Both sides are numbers the answer already holds, so neither has to be the constant. This is the
+# comparison a single-sided clause could not write at all.
+#
+# Both totals are in whole units here, which is what makes them comparable. Two totals in
+# *different* units are refused where the scales are known - see `tests/translate/clauses.rs`,
+# which is where a schema exists to know them.
+shape
+SELECT category, sum(amount), sum(balance) FROM t GROUP BY category HAVING sum(amount) > sum(balance)
+----
+Groups keys=[#0, #1]
+├── category = key
+├── sum = group #0 else 0
+├── sum = group #1 else 0
+└── having: group #0 else 0 > group #1 else 0
+
+# Brackets group, and the printer says which way they went - `or` is bracketed and `and` is not,
+# so a tree reads back as the tree it is.
+shape
+SELECT category, count(*), sum(amount) FROM t GROUP BY category HAVING count(*) > 5 AND (sum(amount) < 100 OR sum(amount) > 900)
+----
+Groups keys=[#0, #1]
+├── category = key
+├── count = group #0 else 0
+├── sum = group #1 else 0
+└── having: group #0 else 0 > 5 and (group #1 else 0 < 100 or group #1 else 0 > 900)

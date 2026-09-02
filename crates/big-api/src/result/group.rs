@@ -77,7 +77,7 @@ pub(super) fn grouped(
     let mut kept: Vec<RowId> = rows
         .into_iter()
         .filter(|row| match having {
-            Some(h) => h.keeps(int_of(number(h.of, values, Some(*row)))),
+            Some(h) => h.holds(&|of| int_of(number(of, values, Some(*row)))),
             None => true,
         })
         .collect();
@@ -170,7 +170,7 @@ pub(super) fn paired(
     let mut kept: Vec<(RowId, RowId)> = rows
         .into_iter()
         .filter(|row| match having {
-            Some(h) => h.keeps(int_of(number(h.of, *row))),
+            Some(h) => h.holds(&|of| int_of(number(of, *row))),
             None => true,
         })
         .collect();
@@ -269,7 +269,7 @@ pub(super) fn joined(
     // and the order the grouped shape applies them in.
     let all = space.clone();
     space.retain(|at| match having {
-        Some(h) => h.keeps(int_of(read.cell(h.of, &all, Some(*at)))),
+        Some(h) => h.holds(&|of| int_of(read.cell(of, &all, Some(*at)))),
         None => true,
     });
     if let Some(o) = order {
@@ -368,7 +368,7 @@ impl<'a> Reader<'a> {
             wanted.extend(c.of.plans());
         }
         if let Some(h) = having {
-            wanted.extend(h.of.plans());
+            wanted.extend(h.plans());
         }
         if let Some(GroupOrder { by: OrderBy::Value { of }, .. }) = order {
             wanted.extend(of.plans());
