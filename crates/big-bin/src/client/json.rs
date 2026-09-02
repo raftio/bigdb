@@ -12,11 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Reading the JSON `bigd` writes, and no other JSON.
+//! Reading the JSON `big serve` writes, and no other JSON.
 //!
 //! Two halves, and the split is deliberate. [`parse`] is an ordinary reader for the subset of
 //! JSON the server emits. [`Answer::read`] is the strict half: it matches the handful of shapes
-//! `bigd` actually produces and **errors on anything else**, rather than falling back to
+//! `big serve` actually produces and **errors on anything else**, rather than falling back to
 //! something plausible. There is exactly one producer for this reader, so a shape it does not
 //! recognise is a version skew or a proxy in the way, and both are worth being told about.
 //!
@@ -288,7 +288,7 @@ pub struct Failure {
 impl Failure {
     /// Reads an error body, falling back to the raw text when it is not one.
     ///
-    /// A 5xx from a reverse proxy is HTML, not `bigd`'s JSON, and printing it is more useful
+    /// A 5xx from a reverse proxy is HTML, not `big serve`'s JSON, and printing it is more useful
     /// than reporting that it could not be parsed.
     pub fn read(body: &str) -> Self {
         match parse(body) {
@@ -306,7 +306,7 @@ impl Failure {
 }
 
 impl Answer {
-    /// Recognises one of the shapes `bigd` writes, or says it does not.
+    /// Recognises one of the shapes `big serve` writes, or says it does not.
     pub fn read(body: &str) -> Result<Self, String> {
         let value = parse(body)?;
         let Value::Obj(fields) = &value else {
@@ -475,7 +475,7 @@ fn verify(v: &Value) -> Result<Answer, String> {
     }
     let notes = match v.get("agree") {
         Some(Value::Bool(false)) => {
-            vec!["the copies of at least one range disagree; see `bigc repair`".to_string()]
+            vec!["the copies of at least one range disagree; see `bigctl repair`".to_string()]
         }
         _ => Vec::new(),
     };

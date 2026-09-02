@@ -1,7 +1,11 @@
 #!/bin/sh
 # Stages the credentials somewhere their mode is real, drops privileges, and becomes the daemon.
 #
-# **Why this starts as root.** Two things are true at once: `bigd` refuses a token file that
+# **`serve` is added here, not in the image's CMD.** It is the one word that turns the argument
+# list every compose file already writes into the subcommand `big` now needs, and putting it in
+# one place means a compose file that predates the rename still starts.
+#
+# **Why this starts as root.** Two things are true at once: `big serve` refuses a token file that
 # anyone but its owner can read, and a bind-mounted file arrives with whatever ownership and
 # mode the *host* gave it - root-owned `600` on one machine, `0755` on Docker Desktop, uid 1000
 # somewhere else. Nothing the image can do makes those two agree. Reading the file as root and
@@ -38,6 +42,8 @@ stage /etc/big/secrets/peer.token /run/big/peer.token
 if [ "$me" = 0 ]; then
     # `setpriv` rather than `su`: no shell in between, no session, no signal indirection - the
     # daemon becomes PID 1's child directly and sees a stop signal as itself.
-    exec setpriv --reuid=big --regid=big --init-groups bigd "$@"
+    # The `big` in `--reuid=big` is the user; the `big` after `--init-groups` is the binary.
+    # They are spelled the same and are not the same thing.
+    exec setpriv --reuid=big --regid=big --init-groups big serve "$@"
 fi
-exec bigd "$@"
+exec big serve "$@"

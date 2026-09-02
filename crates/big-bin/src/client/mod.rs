@@ -12,21 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! `bigc` - one command, one route, no vocabulary of its own.
+//! `bigctl` - one command, one route, no vocabulary of its own.
 //!
-//! This crate links **nothing**. Not `big-api`, not `big-plan`, not `big-sql`. That is the
-//! design rather than an economy: a client that cannot link the engine cannot grow an offline
-//! query path, and cannot validate a statement it is about to send. Both would be a second
-//! surface that drifts from the first, and the second one always loses.
+//! **This module links the engine and must never use it.** It once could not: the client was
+//! its own package with an empty `[dependencies]` section, so "cannot grow an offline query
+//! path" was a fact about the dependency graph. One package for both binaries gave that up -
+//! see the note in `Cargo.toml`. What is left is this paragraph. Do not import `big_sql`,
+//! `big_plan` or `big_api` here. A client that validated a statement before sending it would
+//! be a second surface drifting from the first, and the second one always loses.
 //!
 //! So a statement travels as bytes and an error comes back as the server's own code and the
 //! server's own sentence. `sql_no_joins` means on the command line exactly what it means over
 //! HTTP, because it *is* the same string.
 //!
 //! [`run`] is the whole program, taking its streams as arguments so that the tests can drive it
-//! against a real `bigd` on a loopback port and read what a user would have seen.
-
-#![deny(unsafe_code)]
+//! against a real `big serve` on a loopback port and read what a user would have seen.
 
 pub mod args;
 pub mod http;
@@ -38,42 +38,20 @@ pub use args::{Command, Format, Options, Source};
 pub use http::{Client, Error as HttpError};
 pub use json::{Answer, Failure};
 
-use std::io::{BufRead, Write};
-
-/// Exit codes, which are part of the surface: a script branches on them.
-pub mod exit {
-    /// The server answered.
-    pub const OK: i32 = 0;
-    /// The server refused. The code and the sentence are on stderr.
-    pub const REFUSED: i32 = 1;
-    /// The command line was wrong, or an input could not be read.
-    pub const USAGE: i32 = 2;
-    /// Nothing was listening, or the exchange did not complete.
-    pub const UNREACHABLE: i32 = 3;
-}
-
-/// The streams a run works over, so that a test can supply its own.
-pub struct Io<'a> {
-    pub input: &'a mut dyn BufRead,
-    pub out: &'a mut dyn Write,
-    pub err: &'a mut dyn Write,
-    /// Whether `out` is a terminal, which decides the default format and whether the shell
-    /// prints a prompt. Passed in rather than asked, because `out` may not be a terminal *or* a
-    /// pipe - in a test it is a `Vec<u8>`.
-    pub tty: bool,
-}
+use crate::{exit, Io};
+use std::io::BufRead;
 
 /// Parses, sends, prints. Returns the process's exit code.
 pub fn run(args: &[String], io: &mut Io<'_>, env: &dyn Fn(&str) -> Option<String>) -> i32 {
     let options = match args::parse(args, env) {
         Ok(o) => o,
-        // `--help` is not a failure: usage to stdout, exit zero. The same split `bigd` makes.
+        // `--help` is not a failure: usage to stdout, exit zero. The same split `big serve` makes.
         Err(e) if e.is_empty() => {
             let _ = write!(io.out, "{}", args::USAGE);
             return exit::OK;
         }
         Err(e) => {
-            let _ = writeln!(io.err, "bigc: {e}\n");
+            let _ = writeln!(io.err, "bigctl: {e}\n");
             let _ = write!(io.err, "{}", args::USAGE);
             return exit::USAGE;
         }
@@ -84,22 +62,29 @@ pub fn run(args: &[String], io: &mut Io<'_>, env: &dyn Fn(&str) -> Option<String
         Some(path) => match read_token(path) {
             Ok(t) => Some(t),
             Err(e) => {
-                let _ = writeln!(io.err, "bigc: {e}");
+                let _ = writeln!(io.err, "bigctl: {e}");
                 return exit::USAGE;
             }
         },
     };
     let client = Client { addr: options.addr.clone(), token, timeout: options.timeout };
-    let format = options.format.unwrap_or_else(|| render::default_for(io.tty));
+    let format = options.format.unwrap_or_else(|| render::default_for(io.out_tty));
 
     if options.command == Command::Shell {
-        return shell::run(&client, io.input, io.out, io.err, format, io.tty);
+        return shell::run(&client, io.input, io.out, io.err, format, io.out_tty);
+    }
+
+    // A load is the one command that is a file rather than a request, so it has its own loop.
+    // Everything above this line - the token, the address, the format - was resolved once and
+    // means the same thing to both halves, which is the whole point of one parser.
+    if let Command::Load { verb, table, input, load } = &options.command {
+        return crate::ingest::run(&client, *verb, table, input, load, io, format);
     }
 
     let request = match request(&options.command, io.input) {
         Ok(r) => r,
         Err(e) => {
-            let _ = writeln!(io.err, "bigc: {e}");
+            let _ = writeln!(io.err, "bigctl: {e}");
             return exit::USAGE;
         }
     };
@@ -107,14 +92,14 @@ pub fn run(args: &[String], io: &mut Io<'_>, env: &dyn Fn(&str) -> Option<String
     let response = match client.send(request.method, &request.target, &request.body) {
         Ok(r) => r,
         Err(e) => {
-            let _ = writeln!(io.err, "bigc: {e}");
+            let _ = writeln!(io.err, "bigctl: {e}");
             return exit::UNREACHABLE;
         }
     };
 
     if !response.ok() {
         let failure = Failure::read(&response.body);
-        let _ = writeln!(io.err, "bigc: {} [{}]", failure.message, failure.code);
+        let _ = writeln!(io.err, "bigctl: {} [{}]", failure.message, failure.code);
         return exit::REFUSED;
     }
 
@@ -135,7 +120,7 @@ pub fn run(args: &[String], io: &mut Io<'_>, env: &dyn Fn(&str) -> Option<String
         Ok(answer) => {
             let _ = write!(io.out, "{}", render::answer(&answer, format));
             for note in &answer.notes {
-                let _ = writeln!(io.err, "bigc: {note}");
+                let _ = writeln!(io.err, "bigctl: {note}");
             }
             exit::OK
         }
@@ -143,7 +128,7 @@ pub fn run(args: &[String], io: &mut Io<'_>, env: &dyn Fn(&str) -> Option<String
             // The body is printed with the complaint rather than swallowed: the user asked a
             // question and the server answered it, and a client that cannot lay the answer out
             // should still hand it over.
-            let _ = writeln!(io.err, "bigc: could not read the answer: {why}");
+            let _ = writeln!(io.err, "bigctl: could not read the answer: {why}");
             let _ = writeln!(io.out, "{}", response.body.trim_end());
             exit::UNREACHABLE
         }
@@ -186,13 +171,6 @@ fn request(command: &Command, input: &mut dyn BufRead) -> Result<Request, String
                 if query.is_empty() { String::new() } else { format!("?{}", query.join("&")) };
             Request::new("GET", format!("/table/{}/records{suffix}", escape(table)), String::new())
         }
-        Command::Import { table, body } => {
-            Request::new("POST", format!("/table/{}/import", escape(table)), read(body, input)?)
-        }
-        Command::Delete { table, body } => {
-            Request::new("POST", format!("/table/{}/delete", escape(table)), read(body, input)?)
-        }
-
         Command::Schema => Request::new("GET", "/schema".to_string(), String::new()),
         Command::CreateTable { table, params } => {
             // Passed through as the query parameter the route already takes, exactly as
@@ -235,7 +213,9 @@ fn request(command: &Command, input: &mut dyn BufRead) -> Result<Request, String
             text: true,
         },
 
-        Command::Shell => unreachable!("handled before the request is built"),
+        Command::Shell | Command::Load { .. } => {
+            unreachable!("both are handled before the request is built")
+        }
     })
 }
 
@@ -285,7 +265,7 @@ pub fn escape(s: &str) -> String {
 /// to read one file would put the whole engine in this binary's dependency graph and undo the
 /// property the empty `[dependencies]` section exists to guarantee. Two implementations of a
 /// three-line check is the cheaper of the two prices.
-/// Public for the same reason [`escape`] is: `bigi` presents the same credential from the
+/// Public for the same reason [`escape`] is: `bigctl` presents the same credential from the
 /// same file, and a second reader is a second opinion about what mode 600 means.
 pub fn read_token(path: &str) -> Result<String, String> {
     #[cfg(unix)]

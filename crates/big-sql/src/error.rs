@@ -77,7 +77,7 @@ pub enum Refused {
     /// `USE`, which asks a stateless surface to remember something between statements.
     ///
     /// Databases exist; a *session* does not. `POST /sql` answers one statement and keeps
-    /// nothing, so `USE` is the client's to hold - `bigc` does, and sends it as `?database=`.
+    /// nothing, so `USE` is the client's to hold - `bigctl` does, and sends it as `?database=`.
     SessionUse,
     /// `sales.orders.amount`: a column qualified by more than an alias.
     ThreePartName,
@@ -474,7 +474,7 @@ impl Refused {
                 "`USE` asks this surface to remember a database between statements, and it \
                  remembers nothing: one statement is one request, answered and forgotten. The \
                  database is per request - send `?database=sales`, or qualify the name as \
-                 `sales.orders`. `bigc` accepts `USE` and does exactly that for you"
+                 `sales.orders`. `bigctl` accepts `USE` and does exactly that for you"
             }
             Self::ThreePartName => {
                 "a column is qualified by an alias and nothing else, so `sales.orders.amount` \

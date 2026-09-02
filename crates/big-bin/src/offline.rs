@@ -12,43 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! `big` - the offline half of operating a database: back it up, check it, shrink it.
+//! The offline half of `big`: back a database up, check it, shrink it.
 //!
-//! Deliberately separate from `bigd`. Every subcommand here takes the exclusive lock, so
-//! running one against a served database fails immediately and says so, rather than doing
-//! something clever behind the daemon's back.
+//! Every subcommand here takes the exclusive lock, so running one against a served database
+//! fails immediately and says so, rather than doing something clever behind the daemon's back.
+//! That is the line this file sits on the other side of from [`crate::serve`].
 
-// Unix only, like `bigd`: every subcommand works on a file through `MmapPager`, and the
+// Unix only, like `big serve`: every subcommand works on a file through `MmapPager`, and the
 // engine has no other file backend. Gating it would trade one confusing build error for
 // another, so the tool follows the repository's existing convention instead.
 use big_db::{copy, Db};
 
-const USAGE: &str = "\
-usage: big <command> [args]
-
-  backup <file> <dest>   write a consistent copy of <file> to <dest>
-                         safe while a writer is running; <dest> must not exist
-  restore <src> <dest>   copy a backup into place; <dest> must not exist
-  compact <file>         rewrite <file> as a compact copy of itself, in place
-                         offline: nothing else may have the file open
-  verify <file>          open <file> and report what it holds
-  drop-days <file> <table> <field> <unix-seconds>
-                         drop a time quantum field's day views older than <unix-seconds>
-                         the day that instant falls in is kept; the records are not
-                         removed, only the per-day index over them
-  scrub <file>           recompute every checksum <file> can reach
-                         opening checks the meta page and the chains; this checks the
-                         trees, which nothing on the query path ever does
-
-A backup is an ordinary database file. Restoring is opening it - `restore` exists so that the
-procedure has a name, not because the file needs converting.
-
-Copying a live database with `cp` is NOT safe: a commit can land between the bytes cp has
-already read and the ones it has not. Use `backup`.
-";
-
-fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+/// Runs one offline subcommand. `usage` is the whole binary's, so a mistake here shows every
+/// command including `serve` rather than only this half.
+pub fn main(args: &[String], usage: &str) {
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
 
     let outcome = match refs.as_slice() {
@@ -57,8 +34,21 @@ fn main() {
         ["verify", file] => verify(file),
         ["scrub", file] => scrub(file),
         ["drop-days", file, table, field, before] => drop_days(file, table, field, before),
-        _ => {
-            eprint!("{USAGE}");
+        // Named rather than answered with the usage alone: an operator who typed a real
+        // command with the wrong arguments has made a different mistake from one who typed a
+        // word this binary has never had.
+        [name, ..] if KNOWN.contains(name) => {
+            eprintln!("big: wrong arguments for `{name}`\n");
+            eprint!("{usage}");
+            std::process::exit(2);
+        }
+        [name, ..] => {
+            eprintln!("big: no such command `{name}`\n");
+            eprint!("{usage}");
+            std::process::exit(2);
+        }
+        [] => {
+            eprint!("{usage}");
             std::process::exit(2);
         }
     };
@@ -68,6 +58,11 @@ fn main() {
         std::process::exit(1);
     }
 }
+
+/// Every command word `big` answers to, for telling a typo from a misuse. `serve` is here
+/// because it is a real command of this binary, just not one this half handles - so
+/// `big serve` with no file reaches its own error rather than "no such command".
+const KNOWN: [&str; 7] = ["serve", "backup", "restore", "compact", "verify", "drop-days", "scrub"];
 
 fn backup(file: &str, dest: &str) -> Result<(), String> {
     let db = open(file)?;

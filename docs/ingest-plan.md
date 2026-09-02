@@ -1,5 +1,14 @@
 # A batch loader
 
+> **Superseded in part.** This document argued for `bigi` as a fourth binary (Decision 1),
+> reasoning that a chunking loop inside `bigc` would force Rule 1 to be weakened. The binaries
+> were later consolidated and the loop now lives in `bigctl import`. Rule 1 was indeed
+> restated rather than dropped: *every subcommand is one request, except `import` and `delete`,
+> which are one file* - and `every_subcommand_reaches_a_route_that_exists` still enforces it,
+> now with standard input supplied so the two load rows actually send something. Decision 2's
+> rule is unchanged; it is simply a rule about a subcommand instead of about a binary. See
+> `architecture.md` and `docs/versioning.md`.
+
 `architecture.md` drew one box with a dashed outline: **ingest**, captioned *"no batch client —
 callers POST to /import themselves"*. This document plans `bigi`, the fourth binary, and like
 `docs/cli-plan.md` it spends most of its length on what that binary is **not** — because a

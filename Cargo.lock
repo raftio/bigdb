@@ -581,6 +581,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "big-bin"
+version = "0.1.0"
+dependencies = [
+ "big-api",
+ "big-cluster",
+ "big-db",
+ "big-http",
+ "big-pager",
+ "tempfile",
+]
+
+[[package]]
 name = "big-btree"
 version = "0.1.0"
 dependencies = [
@@ -594,16 +606,6 @@ dependencies = [
 [[package]]
 name = "big-civil"
 version = "0.1.0"
-
-[[package]]
-name = "big-cli"
-version = "0.1.0"
-dependencies = [
- "big-api",
- "big-db",
- "big-http",
- "big-pager",
-]
 
 [[package]]
 name = "big-cluster"
@@ -686,18 +688,6 @@ dependencies = [
  "big-plan",
  "big-sql",
  "big-testfile",
- "tempfile",
-]
-
-[[package]]
-name = "big-ingest"
-version = "0.1.0"
-dependencies = [
- "big-api",
- "big-cli",
- "big-db",
- "big-http",
- "big-pager",
  "tempfile",
 ]
 

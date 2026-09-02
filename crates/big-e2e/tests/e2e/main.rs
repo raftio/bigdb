@@ -18,10 +18,10 @@
 //! tests call `big_cli::run`, `big-http`'s call `Server::bind`, and the cluster tests build an
 //! `Api::in_memory()`. All of that is the right shape for what it claims - but it means the
 //! `main` of every shipped binary, and every decision `main` makes before anything else runs,
-//! had no test at all. `bigd`'s argument parser had exactly one caller and zero tests.
+//! had no test at all. `big serve`'s argument parser had exactly one caller and zero tests.
 //!
 //! So the rule here is: **nothing is linked, everything is spawned.** A test starts a real
-//! `bigd` on a real file, talks to it with a real `bigc`, and reads the exit code a shell would
+//! `big serve` on a real file, talks to it with a real `bigctl`, and reads the exit code a shell would
 //! read. What it costs is process startup; what it buys is the only coverage of the surface an
 //! operator actually touches.
 //!

@@ -38,14 +38,14 @@ use crate::error::{PlanError, Result};
 ///
 /// **This is a bound on the stack, not a taste in queries.** The parser is recursive descent,
 /// so nesting depth is call depth, and without a limit `Count(Union(Union(...` overflows the
-/// stack and *aborts the process* - which on `bigd` means every other request in flight dies
+/// stack and *aborts the process* - which on `big serve` means every other request in flight dies
 /// with it. A stack overflow is not a panic and cannot be caught, so it cannot be turned into
 /// a `Result` after the fact; the only fix is to never recurse that far.
 ///
 /// 128 is far past anything a person writes and far short of where the default stack runs out.
 /// Measured, not guessed: 1,000 levels parse fine on a main thread and 10,000 abort, so the
 /// limit sits two orders of magnitude below the observed cliff. The margin is deliberate -
-/// `bigd` runs queries on pool threads, whose stacks are smaller than the main thread's.
+/// `big serve` runs queries on pool threads, whose stacks are smaller than the main thread's.
 pub const MAX_DEPTH: usize = 128;
 
 pub fn parse(input: &str) -> Result<Call> {

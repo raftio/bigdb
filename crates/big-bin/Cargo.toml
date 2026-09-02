@@ -1,0 +1,45 @@
+[package]
+name = "big-bin"
+description = "The two binaries big ships: the daemon and offline tool `big`, and the client `bigctl`"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "readme.md"
+keywords = ["bitmap","index","database","cli","command-line-utilities"]
+categories = ["database","command-line-utilities"]
+
+# Everything shipped as an executable lives here, and the two binaries below are the whole of
+# it. They were four, in four packages, which meant an operator had to know which name held the
+# exclusive lock before they could find out that the other one could not have it.
+#
+# **This crate links the engine, and so does `bigctl`.** That is a deliberate loss. The client
+# used to be its own package with an empty `[dependencies]` section, which made "the client
+# cannot grow an offline query path" a fact about the dependency graph rather than a rule
+# somebody remembers. Cargo gives every `[[bin]]` of a package the same dependencies, so one
+# package for both binaries is one package that links `big-http` - and nothing now stops a
+# future `use big_sql` in `bigctl`. What is left is the rule written down here and in
+# `architecture.md`: the client sends bytes and prints what comes back. It parses no SQL.
+[dependencies]
+big-api = { path = "../big-api", version = "0.1.0" }
+big-cluster = { path = "../big-cluster", version = "0.1.0" }
+big-db = { path = "../big-db", version = "0.1.0" }
+big-http = { path = "../big-http", version = "0.1.0" }
+big-pager = { path = "../big-pager", version = "0.1.0" }
+
+[dev-dependencies]
+# The client tests drive a real server in-process on a loopback port rather than a mock,
+# because the one thing worth testing there is agreement with what the server actually writes.
+# Every crate they need is already a dependency above; only the scratch directory is not.
+tempfile = "3"
+
+# `big` holds the file: it serves it, or it takes the exclusive lock and works on it offline.
+[[bin]]
+name = "big"
+path = "src/bin/big.rs"
+
+# `bigctl` holds nothing. It asks a running `big serve` over HTTP and prints the answer.
+[[bin]]
+name = "bigctl"
+path = "src/bin/bigctl.rs"

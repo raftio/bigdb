@@ -22,11 +22,32 @@ construct that is refused today may be answered later, which is a widening no cl
 broken by. `big-sql` itself is an internal crate and its types are free to move; what is
 promised is the statements and the codes, not the AST behind them.
 
-**`bigc`'s command surface follows `big-http`.** A subcommand that works today works next
+**`bigctl`'s command surface follows `big-http`.** A subcommand that works today works next
 release, and the exit codes do not change meaning: `0` answered, `1` refused, `2` usage, `3`
 nothing listening - a script branches on those. `--format tsv` is stable because scripts parse
 it. **Table rendering is not promised**: it is for a person looking at a terminal, and a column
-width is not an interface. The `big-cli` *library* is internal like the rest.
+width is not an interface. The `big-bin` *library* is internal like the rest.
+
+**The binaries were renamed before 1.0, and that broke the promise above once.** Four became
+two: `bigd` is `big serve`, `bigc` is `bigctl`, and `bigi` is `bigctl import`. The subcommands,
+the flags and the four exit codes came through unchanged, so a script that branches on a code
+still branches correctly - what it has to change is the name it invokes and, for a load, the
+fact that `import` now reads a *file* rather than taking the facts on the command line. That is
+the whole migration:
+
+| was | is |
+| --- | --- |
+| `bigd data.big 127.0.0.1:7654` | `big serve data.big 127.0.0.1:7654` |
+| `bigc sql "..."` | `bigctl sql "..."` |
+| `bigi import t facts.txt` | `bigctl import t facts.txt` |
+| `bigc import t "field 1 GB"` | write the facts to a file, or pipe them with `-` |
+
+A load's summary also moved: the fact count is on stdout, rendered like any other answer and
+honouring `--format`, and the loop's own numbers - lines, chunks, bytes, elapsed - are on
+stderr with the progress. A pipe now carries the count and nothing else.
+
+No name will be reused for something different, and there will be no further renames before
+1.0 without an entry here.
 
 ### 2. The on-disk format
 

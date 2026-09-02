@@ -14,10 +14,10 @@ members = [
     "crates/big-testfile",
     "crates/big-exec",
     "crates/big-api",
-    "crates/big-cli",
-    "crates/big-ingest",
     "crates/big-cluster",
     "crates/big-http",
+    # Everything that ships as an executable: `big` and `bigctl`, and nothing else.
+    "crates/big-bin",
     "crates/big-e2e",
     # Not part of the engine: it pulls in rival engines to measure against.
     "bench",

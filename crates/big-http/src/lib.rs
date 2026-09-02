@@ -32,7 +32,7 @@
 //! **Transport security is not here and is not going to be.** Termination belongs to a reverse
 //! proxy - see `runbook.md`. A TLS stack would be a larger dependency than the entire engine,
 //! and a hand-written one is out of the question. What *is* enforced is the half that keeps
-//! that from being an excuse: `bigd` refuses to bind anywhere but loopback without a token
+//! that from being an excuse: `big serve` refuses to bind anywhere but loopback without a token
 //! file.
 
 #![deny(unsafe_code)]
@@ -107,7 +107,7 @@ pub struct ServerConfig {
     pub max_keepalive_requests: usize,
     /// Wall-clock budget for one query. `None` lets a query run to completion.
     pub query_timeout: Option<Duration>,
-    /// Who may do what. [`Auth::disabled`] lets every request through, which `bigd` permits
+    /// Who may do what. [`Auth::disabled`] lets every request through, which `big serve` permits
     /// only on a loopback bind.
     pub auth: Auth,
     /// Where `POST /admin/backup` may write. `None` disables the route.

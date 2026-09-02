@@ -69,7 +69,7 @@ pub(super) fn sql<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request) -> Respon
     };
     // `?database=sales` says which database an unqualified name in the statement means. A
     // property of the request rather than of the text, because this route answers one statement
-    // and remembers nothing - there is no session for a `USE` to leave one in. `bigc` holds a
+    // and remembers nothing - there is no session for a `USE` to leave one in. `bigctl` holds a
     // typed `USE` on the caller's behalf and sends it here.
     //
     // Built before the statement is classified because classifying needs it: a name resolves
@@ -222,7 +222,7 @@ impl ParseError {
 ///
 /// A body is at most eight megabytes and a small one is over in microseconds, so fanning out
 /// unconditionally would charge every little write the price of spawning threads. Chosen from
-/// the profile rather than taste: parsing is a quarter of an import's CPU at the sizes `bigi`
+/// the profile rather than taste: parsing is a quarter of an import's CPU at the sizes `bigctl`
 /// sends, and nothing at the sizes a hand-written `curl` does.
 const PARALLEL_PARSE_MIN: usize = 256 * 1024;
 

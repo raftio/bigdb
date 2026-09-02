@@ -25,10 +25,10 @@
 //! asked *of* a table and the route carries it in the path. Without it the `pql>` prompt could
 //! not send anything at all.
 
-use crate::args::Format;
-use crate::http::Client;
-use crate::json::{Answer, Failure};
-use crate::render;
+use crate::client::args::Format;
+use crate::client::http::Client;
+use crate::client::json::{Answer, Failure};
+use crate::client::render;
 use std::io::{BufRead, Write};
 use std::time::Instant;
 
@@ -107,7 +107,7 @@ pub fn run(
             Ok(0) => return 0,
             Ok(_) => {}
             Err(e) => {
-                let _ = writeln!(err, "bigc: could not read input: {e}");
+                let _ = writeln!(err, "bigctl: could not read input: {e}");
                 return 2;
             }
         }
@@ -132,7 +132,7 @@ pub fn run(
                     continue;
                 }
                 Meta::Complain(message) => {
-                    let _ = writeln!(err, "bigc: {message}");
+                    let _ = writeln!(err, "bigctl: {message}");
                     continue;
                 }
             }
@@ -160,7 +160,7 @@ pub fn run(
             Lang::Pql => match &table {
                 Some(t) => ("POST", format!("/table/{t}/query")),
                 None => {
-                    let _ = writeln!(err, "bigc: PQL is asked of a table; set one with `.table`");
+                    let _ = writeln!(err, "bigctl: PQL is asked of a table; set one with `.table`");
                     continue;
                 }
             },
@@ -188,14 +188,14 @@ fn show(
     let response = match client.send(method, target, body) {
         Ok(r) => r,
         Err(e) => {
-            let _ = writeln!(err, "bigc: {e}");
+            let _ = writeln!(err, "bigctl: {e}");
             return;
         }
     };
 
     if !response.ok() {
         let failure = Failure::read(&response.body);
-        let _ = writeln!(err, "bigc: {} [{}]", failure.message, failure.code);
+        let _ = writeln!(err, "bigctl: {} [{}]", failure.message, failure.code);
         return;
     }
 
@@ -207,11 +207,11 @@ fn show(
         Ok(answer) => {
             let _ = write!(out, "{}", render::answer(&answer, format));
             for note in &answer.notes {
-                let _ = writeln!(err, "bigc: {note}");
+                let _ = writeln!(err, "bigctl: {note}");
             }
         }
         Err(why) => {
-            let _ = writeln!(err, "bigc: could not read the answer: {why}");
+            let _ = writeln!(err, "bigctl: could not read the answer: {why}");
         }
     }
 }

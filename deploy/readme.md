@@ -8,7 +8,7 @@ single-node database ends up with a cluster's configuration and none of its guar
 | [`single/`](single/) | One node, every shard, no peers | Anything that fits on one machine |
 | [`cluster/`](cluster/) | Two ranges and a copy of one | More data than one machine holds, or a range that has to survive losing one |
 
-**They are the same binary and the same code path.** `bigd` without `--cluster` builds itself a
+**They are the same binary and the same code path.** `big serve` without `--cluster` builds itself a
 cluster of one and runs every request through the same coordinator a three-machine deployment
 does; a second path for the un-clustered case would be the path nobody tests. What the two
 directories differ in is a config file and how many containers there are.
@@ -40,7 +40,7 @@ not.
 
 ## Four things worth knowing before you run either
 
-**`bigd` refuses to bind anywhere but loopback without a token file**, and a container's
+**`big serve` refuses to bind anywhere but loopback without a token file**, and a container's
 loopback is its own, so both compose files mount one. That refusal is the reason these examples
 have credentials in them at all; it is not decoration.
 
@@ -63,14 +63,15 @@ readable by that user, which is the trade you have chosen.
 exclusive lock - so two nodes pointed at one volume is two nodes fighting over a database only
 one of them can open.
 
-**A container that is killed outright loses nothing.** `bigd` has no signal handler and does not
+**A container that is killed outright loses nothing.** `big serve` has no signal handler and does not
 need one: a commit writes its pages, fsyncs, flips the meta page and fsyncs again, so a process
 that dies leaves a file that is either before that flip or after it. There is no state in
 between, nothing to replay, and `stop_grace_period` is short on purpose.
 
 ## Backups
 
-The image ships `big` as well as `bigd`, so a backup does not have to happen somewhere else:
+`big` serves the file and backs it up - one binary, two subcommands - so a backup does not have
+to happen somewhere else:
 
 ```sh
 # A consistent copy, taken while the daemon is running. `cp` is NOT safe - a commit can land

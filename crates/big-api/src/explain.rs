@@ -25,7 +25,7 @@
 //! tree in one cell and two of the three formats ruin it: TSV escapes the newlines and JSON
 //! turns them into `\n`, so what a person reads is one unreadable string. So the tree is *rows*,
 //! one line each, under a column called `explain` - which is what ClickHouse answers with, and
-//! what makes `bigc` need no change at all to render one.
+//! what makes `bigctl` need no change at all to render one.
 
 use crate::result::{Datum, ResultSet};
 use big_sql::ExplainMode;

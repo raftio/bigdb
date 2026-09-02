@@ -141,7 +141,7 @@ fn owning(primary: &[NodeId]) -> Decision {
 
 /// A node alone in its config file leads immediately: a majority of one is one.
 ///
-/// Not a special case so much as the general one, and it is what lets `bigd` without peers use
+/// Not a special case so much as the general one, and it is what lets `big serve` without peers use
 /// the same code path as everything else.
 #[test]
 fn one_node_leads_itself() {

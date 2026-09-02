@@ -186,7 +186,7 @@ fn a_point_that_does_not_start_a_fraction_is_not_part_of_the_number() {
 /// Before [`MAX_DEPTH`] existed, `Count(Union(Union(...` at ten thousand levels - seventy
 /// kilobytes, well inside `big-http`'s eight megabyte body cap - overflowed the stack and
 /// aborted the process. A stack overflow is not a panic: it cannot be caught, cannot be turned
-/// into a `Result`, and on `bigd` takes every other in-flight request down with it. Any client
+/// into a `Result`, and on `big serve` takes every other in-flight request down with it. Any client
 /// able to POST a query could do it.
 ///
 /// So this is a denial-of-service regression test, not a taste in queries.

@@ -1,6 +1,6 @@
 # Three nodes: two ranges and a copy of one of them.
 #
-# Three is the minimum once anything has a copy, and `bigd` refuses fewer: failing over is a
+# Three is the minimum once anything has a copy, and `big serve` refuses fewer: failing over is a
 # decision a majority has to agree on, and a majority of two is two. `b` counts towards that
 # majority even though it holds a different range.
 #

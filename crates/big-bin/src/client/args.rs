@@ -14,15 +14,20 @@
 
 //! `argv` to one [`Command`], which is one route.
 //!
-//! Hand-rolled, in the shape `bigd`'s own `Options::parse` uses, and for the same reason: a
-//! dozen options do not justify an argument-parsing dependency in a crate whose entire point is
-//! that it has none.
+//! Hand-rolled, in the shape `big serve`'s own `Options::parse` uses, and for the same reason: a
+//! dozen options do not justify an argument-parsing dependency for a surface this size.
 //!
-//! **Every command here is one request.** There is no subcommand that loops, pages, or composes
-//! two routes, and that is not laziness - a client that could answer something the server
-//! cannot has become a second engine with a worse test suite. Adding one means adding a route
-//! first.
+//! **This is the only parser `bigctl` has.** There were two, one per binary, agreeing by hand
+//! that `--addr`, `--token-file` and `--timeout` meant the same thing on both - and agreement
+//! by hand is the arrangement that eventually stops agreeing. Merging them is also what lets
+//! `only` refuse `--dry-run` on `schema`: neither parser could once see the other's flags.
+//!
+//! **Every command here is one request, except [`Command::Load`], which is one file.** There is
+//! no subcommand that pages or composes two routes, and that is not laziness - a client that
+//! could answer something the server cannot has become a second engine with a worse test suite.
+//! Adding one means adding a route first.
 
+use crate::ingest::args::{Input, Load, Verb, MAX_IN_FLIGHT};
 use std::time::Duration;
 
 /// Where a statement or a body comes from.
@@ -30,7 +35,7 @@ use std::time::Duration;
 pub enum Source {
     /// Written on the command line.
     Literal(String),
-    /// `-`, meaning standard input. What makes `bigc` compose with a shell rather than replace
+    /// `-`, meaning standard input. What makes `bigctl` compose with a shell rather than replace
     /// one.
     Stdin,
 }
@@ -61,15 +66,45 @@ impl Format {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Command {
     Sql(Source),
-    Query { table: String, text: Source },
-    Records { table: String, after: Option<u64>, limit: Option<u64> },
-    Import { table: String, body: Source },
-    Delete { table: String, body: Source },
+    Query {
+        table: String,
+        text: Source,
+    },
+    Records {
+        table: String,
+        after: Option<u64>,
+        limit: Option<u64>,
+    },
+    /// `import` and `delete`, which are the one pair that is a **file** rather than a request.
+    ///
+    /// Every other command here is exactly one route. These two are that same route sent again
+    /// with the next slice of the same file, which is why they carry [`Load`] and nothing else
+    /// does. A file under `--chunk-bytes` is one slice, so the common case is still one
+    /// request. There is no second, smaller code path for it: a path that only fires on inputs
+    /// too small for anyone to notice is a path that breaks quietly.
+    Load {
+        verb: Verb,
+        table: String,
+        input: Input,
+        load: Load,
+    },
     Schema,
-    CreateTable { table: String, params: Vec<(String, String)> },
-    CreateField { table: String, field: String, params: Vec<(String, String)> },
-    DropTable { table: String },
-    DropField { table: String, field: String },
+    CreateTable {
+        table: String,
+        params: Vec<(String, String)>,
+    },
+    CreateField {
+        table: String,
+        field: String,
+        params: Vec<(String, String)>,
+    },
+    DropTable {
+        table: String,
+    },
+    DropField {
+        table: String,
+        field: String,
+    },
     Verify,
     Repair,
     Health,
@@ -83,19 +118,19 @@ pub enum Command {
 pub struct Options {
     pub addr: String,
     pub token_file: Option<String>,
-    /// `None` means "decide from where the output is going" - see [`crate::render`].
+    /// `None` means "decide from where the output is going" - see [`crate::client::render`].
     pub format: Option<Format>,
     pub timeout: Option<Duration>,
     pub command: Command,
 }
 
-/// `BIG_ADDR` when set, this otherwise. The same default `bigd` binds to.
+/// `BIG_ADDR` when set, this otherwise. The same default `big serve` binds to.
 pub const DEFAULT_ADDR: &str = "127.0.0.1:7654";
 
 pub const USAGE: &str = "\
-usage: bigc [options] <command> [args]
+usage: bigctl [options] <command> [args]
 
-Asks a running bigd. Every command below is exactly one of its routes; there is no offline
+Asks a running `big serve`. Every command below is exactly one of its routes; there is no offline
 mode and no --file, because a second query path is a path nobody tests. Start a daemon.
 
 Queries:
@@ -126,8 +161,19 @@ Schema:
   drop field <table> <field>
 
 Data:
-  import <table> <facts>|-    one fact per line: `field record value`
-  delete <table> <ids>|-      one record id per line
+  import <table> <file>|-     one fact per line: `field record value`
+  delete <table> <file>|-     one record id per line
+      --chunk-bytes <n>         bytes per request; default 7340032, ceiling 8388608
+      --chunk-lines <n>         lines per request; default 1000000
+      --resume <file>           write the acknowledged offset here, and start from it
+      --retries <n>             retry a dropped connection this many times; default 3
+      --in-flight <n>           requests waiting on the server at once; default 2, ceiling 8
+                                the second lets the server parse one body while it commits
+                                the one before, which is worth about 1.6x. It does not make
+                                writes concurrent - the engine has one writer - so a third
+                                buys little. Drop to 1 to bound what a resumed load repeats
+      --progress|--no-progress  default: progress when stderr is a terminal
+      --dry-run                 chunk the input and report, without sending anything
 
 Operations:
   verify                      do the copies of every range still agree
@@ -144,13 +190,19 @@ Options:
 A token is read from a file and never taken as a flag: an argument is visible in `ps` and in
 shell history, and a bearer token in either is a token that has leaked.
 
-`bigc shell` has no line editing on purpose. `rlwrap bigc shell` gives it history and arrow
+`bigctl shell` has no line editing on purpose. `rlwrap bigctl shell` gives it history and arrow
 keys, and does it better than a hand-rolled termios mode would.
 
-`import` and `delete` take the facts themselves, or `-` for standard input. Neither reads a
-path: an argument is a body, the way it is for `sql`, and the whole body goes in one request
-that the server bounds at 8 MiB. A file is `bigi`'s job - it cuts one into chunks, resumes an
-interrupted load, and is a separate binary because this one sends exactly one request.
+`import` and `delete` read a FILE, or `-` for standard input. They are the one pair that is not
+one request: the server bounds a body at 8 MiB, so a larger file is cut into chunks and sent as
+several. A file under --chunk-bytes is one chunk and therefore one request, so the small case
+costs nothing. (`bigc` took the facts themselves on the command line and could not read a path.
+Write them to a file, or pipe them with `-`.)
+
+A load can be resumed and can be run twice. Every fact is a bit set at a record id written in
+the line, so sending a chunk twice writes what sending it once wrote - which is what --resume
+rests on, and what lets a dropped connection be retried at all. --resume needs a seekable file,
+so it does not go with `-`. A retry covers a dropped connection, never a refusal.
 
 Exit codes: 0 answered, 1 the server refused, 2 usage, 3 nothing was listening.
 ";
@@ -193,12 +245,21 @@ pub fn parse(args: &[String], env: &dyn Fn(&str) -> Option<String>) -> Result<Op
             "--timeout" => {
                 let secs: u64 = number(&value()?, arg)?;
                 // Zero means "wait", not "give up immediately", which would be a confusing way
-                // to spell a client that never works. Same reading `bigd` gives its own.
+                // to spell a client that never works. Same reading `big serve` gives its own.
                 timeout = (secs > 0).then(|| Duration::from_secs(secs));
                 i += 2;
             }
+            // The boolean ones go into the same list as the rest, carrying an empty value, so
+            // that `only()` polices them too. A flag that is silently dropped where it means
+            // nothing is the failure `only()` exists to prevent, and a `--dry-run` that did
+            // nothing on `schema` would be exactly that one level up.
+            "--progress" | "--no-progress" | "--dry-run" => {
+                scoped.push((arg.trim_start_matches("--").replace('-', "_"), String::new()));
+                i += 1;
+            }
             "--after" | "--limit" | "--kind" | "--bit-depth" | "--scale" | "--granularity"
-            | "--engine" => {
+            | "--engine" | "--chunk-bytes" | "--chunk-lines" | "--resume" | "--retries"
+            | "--in-flight" => {
                 // Values are passed through as the query parameter the route already takes,
                 // rather than re-spelled here. A field kind or an engine name this client has
                 // never heard of is a matter between the caller and the server.
@@ -255,6 +316,52 @@ fn command(positional: &[String], scoped: Vec<(String, String)>) -> Result<Comma
         }
     }
 
+    /// The knobs `import` and `delete` accept, and no other command does.
+    fn load(scoped: &[(String, String)]) -> Result<Load, String> {
+        let has = |name: &str| scoped.iter().any(|(k, _)| k == name);
+        let text = |name: &str| scoped.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone());
+
+        // `--progress` and `--no-progress` are two keys rather than one carrying `false`, so
+        // that `only()` can name the flag the caller actually typed.
+        let progress = match (has("progress"), has("no_progress")) {
+            (true, true) => return Err("--progress and --no-progress contradict".to_string()),
+            (true, false) => Some(true),
+            (false, true) => Some(false),
+            (false, false) => None,
+        };
+
+        let mut out =
+            Load { progress, dry_run: has("dry_run"), resume: text("resume"), ..Load::default() };
+
+        if let Some(n) = num(scoped, "chunk_bytes")? {
+            // The ceiling is the server's, and a chunk above it is refused for the whole
+            // chunk rather than trimmed - so it is caught here, where the flag has a name.
+            if n == 0 || n as usize > big_http::MAX_BODY {
+                return Err(format!(
+                    "--chunk-bytes must be between 1 and {}, got {n}",
+                    big_http::MAX_BODY
+                ));
+            }
+            out.chunk_bytes = n as usize;
+        }
+        if let Some(n) = num(scoped, "chunk_lines")? {
+            if n == 0 {
+                return Err("--chunk-lines cannot be zero".to_string());
+            }
+            out.chunk_lines = n as usize;
+        }
+        if let Some(n) = num(scoped, "retries")? {
+            out.retries = n as u32;
+        }
+        if let Some(n) = num(scoped, "in_flight")? {
+            if n == 0 || n as usize > MAX_IN_FLIGHT {
+                return Err(format!("--in-flight must be between 1 and {MAX_IN_FLIGHT}, got {n}"));
+            }
+            out.in_flight = n as usize;
+        }
+        Ok(out)
+    }
+
     Ok(match words.as_slice() {
         [] => return Err("a command is required".to_string()),
 
@@ -274,13 +381,11 @@ fn command(positional: &[String], scoped: Vec<(String, String)>) -> Result<Comma
                 limit: num(&scoped, "limit")?,
             }
         }
-        ["import", table, file] => {
-            only(&scoped, "import", &[])?;
-            Command::Import { table: (*table).to_string(), body: source(file) }
-        }
-        ["delete", table, file] => {
-            only(&scoped, "delete", &[])?;
-            Command::Delete { table: (*table).to_string(), body: source(file) }
+        [verb @ ("import" | "delete"), table, file] => {
+            only(&scoped, verb, &LOAD)?;
+            let verb = if *verb == "import" { Verb::Import } else { Verb::Delete };
+            let input = if *file == "-" { Input::Stdin } else { Input::Path((*file).to_string()) };
+            Command::Load { verb, table: (*table).to_string(), input, load: load(&scoped)? }
         }
 
         ["schema"] => {
@@ -342,6 +447,20 @@ fn command(positional: &[String], scoped: Vec<(String, String)>) -> Result<Comma
         [name, ..] => return Err(format!("no such command `{name}`")),
     })
 }
+
+/// The flags a load accepts. Every other subcommand's allow-list is unchanged, which now means
+/// `bigctl schema --dry-run` and `bigctl sql "..." --resume f` are refused by name - coverage
+/// the two separate binaries could not have had, because neither knew the other's flags.
+const LOAD: [&str; 8] = [
+    "chunk_bytes",
+    "chunk_lines",
+    "resume",
+    "retries",
+    "in_flight",
+    "progress",
+    "no_progress",
+    "dry_run",
+];
 
 /// Every first word this client answers to, for telling a typo from a misuse.
 const KNOWN: [&str; 15] = [

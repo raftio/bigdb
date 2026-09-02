@@ -12,17 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! `bigi` - one file, one route, many requests.
+//! One file, one route, many requests.
 //!
-//! `bigc` promises one request per subcommand, which is what keeps it from growing a second
-//! query surface. That promise is also why it cannot load a file: `POST /import` is bounded at
-//! `big_http::MAX_BODY`, 8 MiB, so anything larger has to be sent as several requests and
-//! several requests is a loop. This binary is that loop and nothing else.
+//! Every other `bigctl` subcommand is exactly one request, which is what keeps the client from
+//! growing a second query surface. `import` and `delete` cannot be: `POST /import` is bounded
+//! at [`big_http::MAX_BODY`], so anything larger has to be sent as several requests, and
+//! several requests is a loop. This module is that loop and nothing else - it was its own
+//! binary, `bigi`, for exactly as long as that difference seemed to need one.
 //!
 //! It adds no vocabulary either. It does not know what a field is, does not parse a value, does
 //! not ask for the schema. A line goes to the server as bytes and a refusal comes back as the
-//! server's own code and sentence - the same property `bigc` has, kept by the same means: the
-//! only dependency is `big-cli`, whose own `[dependencies]` section is empty.
+//! server's own code and sentence.
 //!
 //! **What makes the loop safe is not care taken here.** Every fact is a bit set at a record id
 //! the caller wrote into the line - `set_int`, `set_key`, `set_bool`, never an increment - so
@@ -30,20 +30,20 @@
 //! can be retried, why an interrupted load can resume at an offset, and why this binary must
 //! never invent a record id: a loader that did could not be run twice.
 
-#![deny(unsafe_code)]
-
 pub mod args;
 pub mod checkpoint;
 pub mod chunk;
 pub mod progress;
 
-pub use args::{Input, Options, Verb};
+pub use args::{Input, Load, Verb};
 pub use checkpoint::Checkpoint;
 pub use chunk::{Chunk, Chunker};
 
-use big_cli::exit;
-use big_cli::http::{Client, Error as HttpError};
-use big_cli::json::{self, Failure, Value};
+use crate::client::args::Format;
+use crate::client::http::{Client, Error as HttpError};
+use crate::client::json::{self, Answer, Failure, Value};
+use crate::client::{escape, render};
+use crate::{exit, Io};
 use progress::Progress;
 use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::PathBuf;
@@ -55,69 +55,45 @@ use std::time::Duration;
 const FIRST_BACKOFF: Duration = Duration::from_millis(250);
 const MAX_BACKOFF: Duration = Duration::from_secs(8);
 
-/// The streams a run works over, so that a test can supply its own.
-pub struct Io<'a> {
-    /// Where `-` reads from.
-    pub input: &'a mut dyn BufRead,
-    /// The summary. One `key value` line each, so `awk` can have it.
-    pub out: &'a mut dyn Write,
-    /// Progress, notes, and refusals.
-    pub err: &'a mut dyn Write,
-    /// Whether `err` is a terminal, which decides whether progress redraws one line or writes
-    /// plain ones. Passed in rather than asked, because in a test it is a `Vec<u8>`.
-    pub tty: bool,
-}
-
 /// Parses, loads, prints. Returns the process's exit code.
 ///
 /// What is left here is the loop and nothing else: read a chunk, send it, write down where it
 /// got to. Everything on either side of that - the token, the file, the checkpoint, the retry -
 /// is one named step below, each returning the exit code it would have printed.
-pub fn run(args: &[String], io: &mut Io<'_>, env: &dyn Fn(&str) -> Option<String>) -> i32 {
-    let options = match args::parse(args, env) {
-        Ok(o) => o,
-        // `--help` is not a failure: usage to stdout, exit zero. The split `bigd` and `bigc`
-        // both make.
-        Err(e) if e.is_empty() => {
-            let _ = write!(io.out, "{}", args::USAGE);
-            return exit::OK;
-        }
-        Err(e) => {
-            let _ = writeln!(io.err, "bigi: {e}\n");
-            let _ = write!(io.err, "{}", args::USAGE);
-            return exit::USAGE;
-        }
-    };
-
-    let token = match token_of(&options, io.err) {
-        Ok(t) => t,
-        Err(code) => return code,
-    };
-
-    let target = format!("/table/{}/{}", big_cli::escape(&options.table), options.verb.as_str());
+#[allow(clippy::too_many_arguments)]
+pub fn run(
+    client: &Client,
+    verb: Verb,
+    table: &str,
+    input: &Input,
+    load: &Load,
+    io: &mut Io<'_>,
+    format: Format,
+) -> i32 {
+    let target = format!("/table/{}/{}", escape(table), verb.as_str());
 
     // Opened before the reader is built, so that the size, the checkpoint and the seek are
     // settled while there is still one owner of the file.
-    let (opened, name, total) = match open_input(&options.input, io.err) {
+    let (opened, name, total) = match open_input(input, io.err) {
         Ok(o) => o,
         Err(code) => return code,
     };
 
     // What a resumed run carries forward: where to start, and the totals from its earlier legs,
     // so the summary is about the load rather than about this attempt.
-    let checkpoint_path = options.resume.as_ref().map(PathBuf::from);
-    let resumed =
-        match resume_from(checkpoint_path.as_deref(), &target, &name, total, &options, io.err) {
-            Ok(r) => r,
-            Err(code) => return code,
-        };
+    let checkpoint_path = load.resume.as_ref().map(PathBuf::from);
+    let resumed = match resume_from(checkpoint_path.as_deref(), &target, &name, total, verb, io.err)
+    {
+        Ok(r) => r,
+        Err(code) => return code,
+    };
     let Resumed { start, lines: mut lines_done, wrote: mut wrote_total } = resumed;
 
     let mut source: Box<dyn BufRead + '_> = match opened {
         Some(mut file) => {
             if start > 0 {
                 if let Err(e) = file.seek(SeekFrom::Start(start)) {
-                    let _ = writeln!(io.err, "bigi: could not seek {name} to {start}: {e}");
+                    let _ = writeln!(io.err, "bigctl: could not seek {name} to {start}: {e}");
                     return exit::USAGE;
                 }
             }
@@ -126,9 +102,8 @@ pub fn run(args: &[String], io: &mut Io<'_>, env: &dyn Fn(&str) -> Option<String
         None => Box::new(&mut *io.input),
     };
 
-    let client = Client { addr: options.addr.clone(), token, timeout: options.timeout };
-    let mut chunker = Chunker::new(&mut source, options.chunk_bytes, options.chunk_lines, start);
-    let mut bar = Progress::new(options.progress.unwrap_or(io.tty), io.tty, total);
+    let mut chunker = Chunker::new(&mut source, load.chunk_bytes, load.chunk_lines, start);
+    let mut bar = Progress::new(load.progress.unwrap_or(io.err_tty), io.err_tty, total);
 
     let mut offset = start;
     let mut chunks = 0u64;
@@ -151,7 +126,7 @@ pub fn run(args: &[String], io: &mut Io<'_>, env: &dyn Fn(&str) -> Option<String
     // Chunks still in flight when that happens may well land on the server. That is safe for the
     // reason the whole file rests on: a fact is a bit set at a record id the caller wrote, so a
     // resend writes what the first send wrote. The resumed run sends them again and is right.
-    let depth = options.in_flight;
+    let depth = load.in_flight;
     let mut code = exit::OK;
 
     std::thread::scope(|scope| {
@@ -167,7 +142,7 @@ pub fn run(args: &[String], io: &mut Io<'_>, env: &dyn Fn(&str) -> Option<String
                         let began = chunk.end - chunk.body.len() as u64;
                         chunks += 1;
 
-                        if options.dry_run {
+                        if load.dry_run {
                             offset = chunk.end;
                             lines_done += chunk.lines as u64;
                             bar.tick(io.err, offset, lines_done);
@@ -176,7 +151,7 @@ pub fn run(args: &[String], io: &mut Io<'_>, env: &dyn Fn(&str) -> Option<String
 
                         let client = &client;
                         let target = target.as_str();
-                        let retries = options.retries;
+                        let retries = load.retries;
                         let body = chunk.body;
                         window.push_back(Flight {
                             began,
@@ -188,7 +163,7 @@ pub fn run(args: &[String], io: &mut Io<'_>, env: &dyn Fn(&str) -> Option<String
                     Ok(None) => drained = true,
                     Err(e) => {
                         bar.clear(io.err);
-                        let _ = writeln!(io.err, "bigi: {e}");
+                        let _ = writeln!(io.err, "bigctl: {e}");
                         code = exit::USAGE;
                         // Not an immediate return: what is already in flight has been sent, and
                         // retiring it is what lets the checkpoint record how far the load got.
@@ -204,13 +179,13 @@ pub fn run(args: &[String], io: &mut Io<'_>, env: &dyn Fn(&str) -> Option<String
             // interleave halfway through each other's lines.
             for note in &sent.notes {
                 bar.clear(io.err);
-                let _ = writeln!(io.err, "bigi: {note}");
+                let _ = writeln!(io.err, "bigctl: {note}");
             }
 
             let response = match sent.result {
                 Ok(r) => r,
                 Err(c) => {
-                    let _ = writeln!(io.err, "bigi: stopped at byte {} of {name}", flight.began);
+                    let _ = writeln!(io.err, "bigctl: stopped at byte {} of {name}", flight.began);
                     code = c;
                     break;
                 }
@@ -222,19 +197,19 @@ pub fn run(args: &[String], io: &mut Io<'_>, env: &dyn Fn(&str) -> Option<String
                 // than the delay.
                 bar.clear(io.err);
                 let failure = Failure::read(&response.body);
-                let _ = writeln!(io.err, "bigi: {} [{}]", failure.message, failure.code);
+                let _ = writeln!(io.err, "bigctl: {} [{}]", failure.message, failure.code);
                 let _ = writeln!(
                     io.err,
-                    "bigi: stopped at byte {} of {name}; {} {} before it",
+                    "bigctl: stopped at byte {} of {name}; {} {} before it",
                     flight.began,
                     progress::thousands(wrote_total),
-                    options.verb.noun()
+                    verb.noun()
                 );
                 code = exit::REFUSED;
                 break;
             }
 
-            let (count, missed) = outcome(&response.body, options.verb);
+            let (count, missed) = outcome(&response.body, verb);
             wrote_total += count;
             lines_done += flight.lines as u64;
             offset = flight.end;
@@ -248,7 +223,7 @@ pub fn run(args: &[String], io: &mut Io<'_>, env: &dyn Fn(&str) -> Option<String
                     bar.clear(io.err);
                     let _ = writeln!(
                         io.err,
-                        "bigi: a copy did not take this write: {note} (run `bigc repair`)"
+                        "bigctl: a copy did not take this write: {note} (run `bigctl repair`)"
                     );
                     reported.push(note);
                 }
@@ -290,12 +265,32 @@ pub fn run(args: &[String], io: &mut Io<'_>, env: &dyn Fn(&str) -> Option<String
         clear_checkpoint(path, io.err);
     }
 
-    let verb = if options.dry_run { "would send" } else { options.verb.noun() };
-    let _ = writeln!(io.out, "{verb} {wrote_total}");
-    let _ = writeln!(io.out, "lines {lines_done}");
-    let _ = writeln!(io.out, "chunks {chunks}");
-    let _ = writeln!(io.out, "bytes {}", offset - start);
-    let _ = writeln!(io.out, "elapsed {:.1}", bar.elapsed().as_secs_f64());
+    // **stdout carries what the server said; stderr carries what the loop did.** That is the
+    // same split the rest of this client already makes - a records cursor is a note, and
+    // `Answer::notes` is documented as being about the answer rather than in it. A load's
+    // `chunks` and `elapsed` are numbers no server body ever held, and a script asking how many
+    // facts landed should not have to skip four lines it did not ask for.
+    //
+    // It also means `--format` finally means something here. It used to be accepted and
+    // dropped, which is the exact failure `only()` exists to refuse one level up.
+    let column = if load.dry_run { "would_send" } else { verb.noun() };
+    if format == Format::Json {
+        // Before `render::answer`, which has an `unreachable!()` on this arm: the raw body is
+        // what `json` promises, and there is no raw body for a summary this side invented.
+        let _ = writeln!(io.out, "{{\"{column}\":{wrote_total}}}");
+    } else {
+        let answer = Answer {
+            columns: vec![column.to_string()],
+            rows: vec![vec![wrote_total.to_string()]],
+            notes: Vec::new(),
+        };
+        let _ = write!(io.out, "{}", render::answer(&answer, format));
+    }
+
+    let _ = writeln!(io.err, "bigctl: lines {lines_done}");
+    let _ = writeln!(io.err, "bigctl: chunks {chunks}");
+    let _ = writeln!(io.err, "bigctl: bytes {}", offset - start);
+    let _ = writeln!(io.err, "bigctl: elapsed {:.1}", bar.elapsed().as_secs_f64());
     exit::OK
 }
 
@@ -313,20 +308,6 @@ struct Resumed {
     wrote: u64,
 }
 
-/// The bearer token, read from the file the options named.
-///
-/// The same reader `bigc` uses, including its refusal of a token file anyone can read.
-fn token_of(options: &Options, err: &mut dyn Write) -> Result<Option<String>, i32> {
-    let Some(path) = &options.token_file else { return Ok(None) };
-    match big_cli::read_token(path) {
-        Ok(t) => Ok(Some(t)),
-        Err(e) => {
-            let _ = writeln!(err, "bigi: {e}");
-            Err(exit::USAGE)
-        }
-    }
-}
-
 /// Opens the input and measures it, before anything else holds it.
 ///
 /// The size is taken here rather than later so that the checkpoint and the seek are settled
@@ -340,14 +321,14 @@ fn open_input(
     let file = match std::fs::File::open(path) {
         Ok(f) => f,
         Err(e) => {
-            let _ = writeln!(err, "bigi: could not open {path}: {e}");
+            let _ = writeln!(err, "bigctl: could not open {path}: {e}");
             return Err(exit::USAGE);
         }
     };
     match file.metadata() {
         Ok(m) => Ok((Some(file), path.clone(), Some(m.len()))),
         Err(e) => {
-            let _ = writeln!(err, "bigi: could not measure {path}: {e}");
+            let _ = writeln!(err, "bigctl: could not measure {path}: {e}");
             Err(exit::USAGE)
         }
     }
@@ -363,7 +344,7 @@ fn resume_from(
     target: &str,
     name: &str,
     total: Option<u64>,
-    options: &Options,
+    verb: Verb,
     err: &mut dyn Write,
 ) -> Result<Resumed, i32> {
     let nothing = Resumed { start: 0, lines: 0, wrote: 0 };
@@ -372,23 +353,23 @@ fn resume_from(
         Ok(None) => return Ok(nothing),
         Ok(Some(f)) => f,
         Err(e) => {
-            let _ = writeln!(err, "bigi: {e}");
+            let _ = writeln!(err, "bigctl: {e}");
             return Err(exit::USAGE);
         }
     };
     let offset = match found.resume_at(target, name, total.unwrap_or_default()) {
         Ok(o) => o,
         Err(why) => {
-            let _ = writeln!(err, "bigi: {}: {why}", path.display());
+            let _ = writeln!(err, "bigctl: {}: {why}", path.display());
             return Err(exit::USAGE);
         }
     };
     if offset > 0 {
         let _ = writeln!(
             err,
-            "bigi: resuming {name} at byte {offset} ({} already {})",
+            "bigctl: resuming {name} at byte {offset} ({} already {})",
             progress::thousands(found.wrote),
-            options.verb.noun()
+            verb.noun()
         );
     }
     Ok(Resumed { start: offset, lines: found.lines, wrote: found.wrote })
@@ -414,7 +395,7 @@ struct Flight<'s> {
 /// Collected rather than printed, because a request now runs on its own thread and two of them
 /// writing retry notes at once would interleave mid-line.
 struct Sent {
-    result: Result<big_cli::http::Response, i32>,
+    result: Result<crate::client::http::Response, i32>,
     notes: Vec<String>,
 }
 
@@ -456,10 +437,10 @@ fn write_checkpoint(
 ) -> Result<(), i32> {
     let Err(e) = record.write(path) else { return Ok(()) };
     bar.clear(err);
-    let _ = writeln!(err, "bigi: {e}");
+    let _ = writeln!(err, "bigctl: {e}");
     let _ = writeln!(
         err,
-        "bigi: the load reached byte {} and stops here rather than continuing without a way \
+        "bigctl: the load reached byte {} and stops here rather than continuing without a way \
          to resume",
         record.offset
     );
@@ -474,8 +455,11 @@ fn write_checkpoint(
 fn clear_checkpoint(path: &std::path::Path, err: &mut dyn Write) {
     if let Err(e) = std::fs::remove_file(path) {
         if e.kind() != std::io::ErrorKind::NotFound {
-            let _ =
-                writeln!(err, "bigi: the load finished; could not remove {}: {e}", path.display());
+            let _ = writeln!(
+                err,
+                "bigctl: the load finished; could not remove {}: {e}",
+                path.display()
+            );
         }
     }
 }

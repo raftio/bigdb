@@ -37,7 +37,7 @@ a benchmark number without the machine under it is not a result.
 
 **Both are single-node, and neither is a measurement of distribution.** Every engine here — `big`
 included — is asked from one process against one file. There is no shard fan-out, no replication,
-no merge and no network in any number this crate produces, and `bigd --cluster` is never started.
+no merge and no network in any number this crate produces, and `big serve --cluster` is never started.
 That keeps the comparison honest, because every peer is single-node too, and it also means the
 clustered path is something this crate deliberately does *not* speak to: a fanned-out query pays
 a plan encode, a round trip per owner and a merge, and none of those costs is on any table here.

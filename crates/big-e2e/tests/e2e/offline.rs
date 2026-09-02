@@ -24,13 +24,13 @@ use crate::common::*;
 
 /// The schema and facts both halves of a restart test agree about.
 fn stock(daemon: &Daemon) {
-    daemon.bigc(&["create", "table", "tx"]).expect(0);
+    daemon.bigctl(&["create", "table", "tx"]).expect(0);
     daemon
-        .bigc(&["create", "field", "tx", "amount", "--kind", "int", "--bit-depth", "20"])
+        .bigctl(&["create", "field", "tx", "amount", "--kind", "int", "--bit-depth", "20"])
         .expect(0);
-    daemon.bigc(&["create", "field", "tx", "country", "--kind", "set"]).expect(0);
+    daemon.bigctl(&["create", "field", "tx", "country", "--kind", "set"]).expect(0);
     daemon
-        .bigc_stdin(
+        .bigctl_stdin(
             &["import", "tx", "-"],
             "country 1 GB\ncountry 2 US\ncountry 3 GB\namount 1 100\namount 2 250\namount 3 75\n",
         )
@@ -38,7 +38,7 @@ fn stock(daemon: &Daemon) {
 }
 
 fn count(daemon: &Daemon) -> String {
-    daemon.bigc(&["--format", "json", "sql", "SELECT count(*) FROM tx"]).expect(0).out
+    daemon.bigctl(&["--format", "json", "sql", "SELECT count(*) FROM tx"]).expect(0).out
 }
 
 #[test]
@@ -58,7 +58,7 @@ fn what_was_committed_is_there_after_the_daemon_is_restarted() {
     let second = workspace.daemon(&[]);
 
     assert!(count(&second).contains("[3]"), "the facts came back: {}", count(&second));
-    let schema = second.bigc(&["--format", "json", "schema"]).expect(0);
+    let schema = second.bigctl(&["--format", "json", "schema"]).expect(0);
     assert!(schema.out.contains("country"), "and so did the schema: {}", schema.out);
 }
 
@@ -133,7 +133,7 @@ fn compact_returns_space_and_keeps_the_answers() {
     let workspace = Workspace::new();
     let daemon = workspace.daemon(&[]);
     stock(&daemon);
-    daemon.bigc(&["drop", "field", "tx", "country"]).expect(0);
+    daemon.bigctl(&["drop", "field", "tx", "country"]).expect(0);
     let path = daemon.path.clone();
     daemon.stop();
 
@@ -143,7 +143,7 @@ fn compact_returns_space_and_keeps_the_answers() {
     let after = workspace.daemon(&[]);
 
     assert!(count(&after).contains("[3]"), "the records are still there: {}", count(&after));
-    let schema = after.bigc(&["--format", "json", "schema"]).expect(0);
+    let schema = after.bigctl(&["--format", "json", "schema"]).expect(0);
     assert!(!schema.out.contains("country"), "and the dropped field is gone: {}", schema.out);
 }
 

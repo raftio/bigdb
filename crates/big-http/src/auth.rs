@@ -101,13 +101,13 @@ pub enum Outcome {
 /// The token table, and the decision of who may do what.
 ///
 /// `Default` is disabled, which is safe only because binding anywhere but loopback without a
-/// token file is refused by `bigd`. See its `--insecure-no-auth` flag for the deliberate
+/// token file is refused by `big serve`. See its `--insecure-no-auth` flag for the deliberate
 /// override.
 #[derive(Clone, Default)]
 pub struct Auth {
     /// `None` means authentication is switched off and every request is allowed. That is the
     /// default only because a loopback-only server is the default; binding anywhere else
-    /// without a token file is refused by `bigd`, not here.
+    /// without a token file is refused by `big serve`, not here.
     tokens: Option<Vec<(String, Role)>>,
 }
 

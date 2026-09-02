@@ -1,5 +1,14 @@
 # A client on the command line
 
+> **Superseded in part.** This document argued for `bigc` as a third binary (Decision 1). The
+> binaries were later consolidated: four became two, and the client is now `bigctl`, built from
+> `crates/big-bin` alongside `big`. Decision 1's *structural* half no longer holds - one package
+> ships both, so the client links the engine and the empty-`[dependencies]` guarantee is gone.
+> Its other half still does: `big`'s offline subcommands take the exclusive lock, which is why
+> `big serve` and `bigctl` are separate commands rather than one. Decision 2 is unchanged -
+> there is still no offline query mode. Read the rest as the reasoning that produced the
+> surface, not as a description of the build. See `architecture.md` and `docs/versioning.md`.
+
 `big` backs a file up, checks it and shrinks it. `bigd` serves one. Nothing in this repository
 *asks* a running database a question — that is `curl`, in the README and ten times in the
 runbook. This document plans the third binary, and spends most of its length on what that

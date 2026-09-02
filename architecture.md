@@ -6,16 +6,14 @@ the bottom.
 
 ```
    client     ┌──────────────────────────────────────────────────────────────┐
-              │ big-cli   bigc: one subcommand per route, links no engine     │  cannot answer
-              │           a statement travels as bytes; errors come back whole│  what bigd cannot
+              │ big-bin   bigctl: one subcommand per route                   │  cannot answer
+              │           a statement goes as bytes; errors come back whole  │  what big cannot
+              ├──────────────────────────────────────────────────────────────┤
+              │           bigctl import: one file, one route, many requests  │  idempotent by
+              │           whole lines under the body cap, in order           │  construction, so
+              │           a byte offset written down after each ack          │  a resend repeats
               └───────────────────────────────┬──────────────────────────────┘
                                               │  HTTP, the same twelve routes
-   ingest     ┌───────────────────────────────▼──────────────────────────────┐
-              │ big-ingest  bigi: one file, one route, many requests         │  idempotent by
-              │             whole lines under the body cap, in order         │  construction, so
-              │             a byte offset written down after each ack        │  a resend repeats
-              └───────────────────────────────┬──────────────────────────────┘
-                                              │  HTTP, line format
    edge       ┌───────────────────────────────▼──────────────────────────────┐
               │ big-http  HTTP/1.1, twelve routes, hand written, no framework│  bearer tokens,
               │           bounded worker pool, socket and query deadlines    │  three roles
@@ -91,11 +89,11 @@ authenticates with bearer tokens read from a file and authorises with three role
 `write`, `admin` - which are about *verbs*, not about rows. There is no TLS and there will not
 be: a TLS stack is a larger dependency than the entire engine, and a hand-written one is out of
 the question, so termination belongs to a reverse proxy. What keeps that from being an excuse
-is that `bigd` **refuses** to bind anywhere but loopback without a token file. A warning is the
+is that `big serve` **refuses** to bind anywhere but loopback without a token file. A warning is the
 right shape for something recoverable; a public port with no authentication is not one.
 
 **One tenant per process.** Table names are a flat global namespace with no notion of an owner,
-so a credential that can read one table can read every table. Isolation means one `bigd` per
+so a credential that can read one table can read every table. Isolation means one `big serve` per
 tenant against one file per tenant, which the exclusive file lock already pushes toward. Stated
 here so that nobody assumes otherwise from the presence of roles. It is not a dead end: a
 tenant id would enter the catalog as a new record kind, which is additive and needs no format
@@ -164,16 +162,25 @@ statistics this engine does not keep, and a rule that guesses is worse than one 
 the simple one is predictable, and the guessing one is a cliff nobody sees coming. The figures are
 written down in that test so whoever builds the cost model starts from a measurement.
 
-**The command-line client links none of the engine, and that is what keeps it honest.**
-`big-cli` has an empty `[dependencies]` section. It cannot link `big-sql` or `big-plan`, so it
-cannot validate a statement before sending it and cannot grow an offline query path - both of
-which would be a second surface drifting from the first. A statement travels as bytes; an error
-comes back as the server's own code and the server's own sentence, printed without rewording, so
-`sql_no_joins` on a terminal *is* the string `bigd` chose. Every subcommand is exactly one route,
-which means a feature request for the client is a feature request for the server. `big` stays
-what it was - the offline half, which takes the exclusive lock - and `bigc` is a third binary
-rather than a subcommand of it, because a query subcommand there would be the one command that
-fails whenever the database is actually being served.
+**Two binaries, split on which process owns the file.** `big` owns it: `big serve` holds it open
+and answers over HTTP, and `big backup`, `compact`, `verify`, `drop-days` and `scrub` take the
+exclusive lock instead, so running one against a served database fails immediately rather than
+doing something clever behind the daemon's back. `bigctl` owns nothing; it asks a running
+daemon. That is the only distinction an operator has to hold, and it used to be spread over four
+executables - `big`, `big serve`, `bigctl` and `bigctl` - which meant knowing which name held the lock
+before you could find out that the other one could not have it.
+
+**The client adds no vocabulary, and this is now a rule rather than a fact about the build.**
+It was a fact: `big-cli` was its own package with an empty `[dependencies]` section, so it
+*could* not link `big-sql` or `big-plan`, could not validate a statement before sending it, and
+could not grow an offline query path. Cargo gives every `[[bin]]` of a package the same
+dependencies, so folding the client in beside the daemon gave that up - `bigctl` links the
+engine today, and nothing but this paragraph and the note in `big-bin/src/client/mod.rs` stops
+someone importing it. **Do not.** A statement travels as bytes; an error comes back as the
+server's own code and the server's own sentence, printed without rewording, so `sql_no_joins` on
+a terminal *is* the string the server chose. Every subcommand is exactly one route - except
+`import` and `delete`, which are one *file*, cut into as many requests as the 8 MiB body cap
+needs - which means a feature request for the client is a feature request for the server.
 
 **Distribution is built, and the engine had decided most of it.** A record id names
 its shard by a shift, and the client picks the record id, so placement needs no agreement.
@@ -188,7 +195,7 @@ a skip: a count missing one node's contribution looks exactly like a correct cou
 the CAP choice, and it is CP** - an answer here is an aggregate, so a stale one is a wrong
 number with no symptom, while a refusal is an outage that lasts as long as a failover. A range
 with a copy fails over on its own, by an agreement over one small value: which copy serves it.
-`bigd --cluster` is the flag; a daemon without it is a cluster of one, running the same
+`big serve --cluster` is the flag; a daemon without it is a cluster of one, running the same
 coordinator, because a second path for the un-clustered case would be the path nobody tests.
 The full design, including what it deliberately does not give - no rebalancing, no cluster-wide
 snapshot, no quorum reads - is in [docs/clustering.md](docs/clustering.md).

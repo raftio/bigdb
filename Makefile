@@ -1,8 +1,8 @@
-# Running big on this machine: one daemon, one file, three clients.
+# Running big on this machine: one daemon, one file, two binaries.
 #
 # `make serve` in one terminal and `make shell` in another is the whole workflow. Nothing here
-# does anything the binaries cannot - every target is a spelling of `bigd`, `bigc` or `bigi`,
-# and a recipe that hides which one it ran would be another way to run the engine.
+# does anything the binaries cannot - every target is a spelling of `big` or `bigctl`, and a
+# recipe that hides which one it ran would be another way to run the engine.
 
 CARGO   ?= cargo
 # Debug by default, because this is a local playground and a release build of the workspace
@@ -14,22 +14,21 @@ ADDR    ?= 127.0.0.1:7654
 # eventually commits.
 RUN     ?= .local
 DATA    ?= $(RUN)/data.big
-# off|error|warn|info|debug, read by bigd as BIG_LOG.
+# off|error|warn|info|debug, read by `big serve` as BIG_LOG.
 LOG     ?= info
 # Anything else for the daemon: --tokens, --durability, --query-timeout, --cluster.
 FLAGS   ?=
 # Where `make install` puts the two binaries. Anyone who has cargo already has this on PATH.
 PREFIX  ?= $(HOME)/.cargo/bin
 
-BIGD    := target/$(PROFILE)/bigd
-BIGC    := target/$(PROFILE)/bigc
-BIGI    := target/$(PROFILE)/bigi
-PIDFILE := $(RUN)/bigd.pid
-LOGFILE := $(RUN)/bigd.log
+BIG     := target/$(PROFILE)/big
+BIGCTL  := target/$(PROFILE)/bigctl
+PIDFILE := $(RUN)/big.pid
+LOGFILE := $(RUN)/big.log
 RELEASE := $(if $(filter release,$(PROFILE)),--release,)
 # Every client call goes to the daemon this Makefile started, whatever ADDR was overridden to.
-CLIENT  := $(BIGC) --addr $(ADDR)
-LOADER  := $(BIGI) --addr $(ADDR)
+# One variable where there were two: a load is a subcommand now, not a second binary.
+CLIENT  := $(BIGCTL) --addr $(ADDR)
 
 .DEFAULT_GOAL := help
 .PHONY: help build install uninstall serve start stop restart status logs shell sql cli load demo clean-data \
@@ -38,19 +37,19 @@ LOADER  := $(BIGI) --addr $(ADDR)
 help:
 	@echo 'big, locally. Server on $(ADDR), database at $(DATA).'
 	@echo
-	@echo '  make build        build bigd, bigc and bigi ($(PROFILE))'
-	@echo '  make install      link all three into $(PREFIX)'
+	@echo '  make build        build big and bigctl ($(PROFILE))'
+	@echo '  make install      link both into $(PREFIX)'
 	@echo '  make uninstall    remove those links'
-	@echo '  make serve        run bigd in the foreground; ^C stops it'
-	@echo '  make start        run bigd in the background, wait for /health'
+	@echo '  make serve        run big serve in the foreground; ^C stops it'
+	@echo '  make start        run big serve in the background, wait for /health'
 	@echo '  make stop         stop the background daemon'
 	@echo '  make restart      stop, then start'
 	@echo '  make status       pid, health and ready'
 	@echo '  make logs         follow $(LOGFILE)'
-	@echo '  make shell        bigc shell against the running daemon'
+	@echo '  make shell        bigctl shell against the running daemon'
 	@echo '  make sql Q="SELECT count(*) FROM tx"'
-	@echo '  make cli ARGS="schema"    any other bigc command'
-	@echo '  make load TABLE=tx FILE=facts.txt   bigi, chunked and resumable'
+	@echo '  make cli ARGS="schema"    any other bigctl command'
+	@echo '  make load TABLE=tx FILE=facts.txt   bigctl import, chunked and resumable'
 	@echo '  make demo         a table, a few facts and one query, to prove it answers'
 	@echo '  make clean-data   stop and delete $(RUN)'
 	@echo
@@ -60,63 +59,63 @@ help:
 	@echo '  make lint         cargo fmt --check, then clippy -D warnings'
 	@echo '  make docs         cargo doc with warnings denied'
 	@echo '  make cov          line coverage per crate (needs cargo-llvm-cov)'
-	@echo '  make e2e          the four binaries, run as processes'
+	@echo '  make e2e          both binaries, run as processes'
 	@echo '  make e2e-cluster  two real daemons and a failover; slow, run deliberately'
 	@echo '  make rewrite      regenerate the SQL test corpora, then read the diff'
 	@echo
 	@echo 'Variables: PROFILE=debug|release ADDR=host:port DATA=path LOG=level FLAGS="--durability none"'
 
+# One package builds both, so this is one invocation rather than three - and `big` is built
+# here for the first time. It used not to be: the offline tool lived in a package this target
+# never named, so `make install` linked a binary `make build` had not necessarily produced.
 build:
-	$(CARGO) build $(RELEASE) -p big-http --bin bigd
-	$(CARGO) build $(RELEASE) -p big-cli --bin bigc
-	$(CARGO) build $(RELEASE) -p big-ingest --bin bigi
+	$(CARGO) build $(RELEASE) -p big-bin --bin big --bin bigctl
 
-# Symlinks rather than copies: the next `cargo build` is then the next `bigc`, which is what a
+# Symlinks rather than copies: the next `cargo build` is then the next `bigctl`, which is what a
 # playground wants and what a copy would quietly get wrong. They dangle after a `cargo clean` or
 # a change of PROFILE - run this again, it is idempotent.
 install: build
 	@mkdir -p $(PREFIX)
-	ln -sf $(CURDIR)/$(BIGD) $(PREFIX)/bigd
-	ln -sf $(CURDIR)/$(BIGC) $(PREFIX)/bigc
-	ln -sf $(CURDIR)/$(BIGI) $(PREFIX)/bigi
-	@echo "linked bigd, bigc and bigi from target/$(PROFILE) into $(PREFIX)"
-	@command -v bigc >/dev/null 2>&1 || echo "warning: $(PREFIX) is not on your PATH"
+	ln -sf $(CURDIR)/$(BIG) $(PREFIX)/big
+	ln -sf $(CURDIR)/$(BIGCTL) $(PREFIX)/bigctl
+	@echo "linked big and bigctl from target/$(PROFILE) into $(PREFIX)"
+	@command -v bigctl >/dev/null 2>&1 || echo "warning: $(PREFIX) is not on your PATH"
 
 # Removes only what `install` made. A real file there came from somewhere else - `cargo install`,
 # a package manager - and deleting it would be this Makefile reaching outside its own checkout.
 uninstall:
-	@for b in bigd bigc bigi; do \
+	@for b in big bigctl; do \
 		if [ -L $(PREFIX)/$$b ]; then rm -f $(PREFIX)/$$b; echo "removed $(PREFIX)/$$b"; \
 		elif [ -e $(PREFIX)/$$b ]; then echo "$(PREFIX)/$$b is not a symlink; left alone"; \
 		else echo "no $(PREFIX)/$$b"; fi; \
 	done
 
-# The foreground one. `bigd` writes its own startup lines to stderr, so there is nothing for
+# The foreground one. `big serve` writes its own startup lines to stderr, so there is nothing for
 # this recipe to announce that the daemon does not announce better.
 serve: build
 	@mkdir -p $(dir $(DATA))
-	BIG_LOG=$(LOG) $(BIGD) $(DATA) $(ADDR) $(FLAGS)
+	BIG_LOG=$(LOG) $(BIG) serve $(DATA) $(ADDR) $(FLAGS)
 
 # The background one, for a single terminal. It waits for /health rather than returning the
-# moment the fork succeeds: `bigd` takes an exclusive lock on the file and refuses a bad
+# moment the fork succeeds: `big serve` takes an exclusive lock on the file and refuses a bad
 # cluster file *after* the process exists, so "started" has to mean "answered", not "spawned".
 start: build
 	@mkdir -p $(dir $(DATA))
 	@if [ -f $(PIDFILE) ] && kill -0 `cat $(PIDFILE)` 2>/dev/null; then \
-		echo "bigd already running (pid `cat $(PIDFILE)`); make stop, or make restart"; exit 1; \
+		echo "big serve already running (pid `cat $(PIDFILE)`); make stop, or make restart"; exit 1; \
 	fi
-	@BIG_LOG=$(LOG) nohup $(BIGD) $(DATA) $(ADDR) $(FLAGS) >>$(LOGFILE) 2>&1 & echo $$! >$(PIDFILE)
+	@BIG_LOG=$(LOG) nohup $(BIG) serve $(DATA) $(ADDR) $(FLAGS) >>$(LOGFILE) 2>&1 & echo $$! >$(PIDFILE)
 	@i=0; while [ $$i -lt 50 ]; do \
 		if $(CLIENT) health >/dev/null 2>&1; then \
-			echo "bigd serving $(DATA) on http://$(ADDR) (pid `cat $(PIDFILE)`, log $(LOGFILE))"; \
+			echo "big serving $(DATA) on http://$(ADDR) (pid `cat $(PIDFILE)`, log $(LOGFILE))"; \
 			exit 0; \
 		fi; \
 		if ! kill -0 `cat $(PIDFILE)` 2>/dev/null; then \
-			echo "bigd exited during startup:"; tail -n 20 $(LOGFILE); rm -f $(PIDFILE); exit 1; \
+			echo "big serve exited during startup:"; tail -n 20 $(LOGFILE); rm -f $(PIDFILE); exit 1; \
 		fi; \
 		i=`expr $$i + 1`; sleep 0.1; \
 	done; \
-	echo "bigd did not answer /health within 5s; see $(LOGFILE)"; exit 1
+	echo "big serve did not answer /health within 5s; see $(LOGFILE)"; exit 1
 
 # TERM, then wait. A bitmap file left behind by a killed daemon is a file the next start has to
 # recover, so the polite signal gets the whole five seconds before anything harsher is sent.
@@ -145,7 +144,7 @@ status:
 logs:
 	@tail -f $(LOGFILE)
 
-# `bigc shell` has no line editing on purpose; rlwrap does it better than a hand-rolled termios
+# `bigctl shell` has no line editing on purpose; rlwrap does it better than a hand-rolled termios
 # mode would, so use it when it is installed and say nothing when it is not.
 shell: build
 	@if command -v rlwrap >/dev/null 2>&1; then \
@@ -163,10 +162,10 @@ cli: build
 	@$(CLIENT) $(ARGS)
 
 # The checkpoint goes next to the file rather than into $(RUN): it belongs to the load, and a
-# load is re-run from wherever the file is. Deleted by `bigi` itself when the load finishes.
+# load is re-run from wherever the file is. Deleted by `bigctl` itself when the load finishes.
 load: build
 	@test -n "$(TABLE)" -a -n "$(FILE)" || { echo 'usage: make load TABLE=tx FILE=facts.txt'; exit 2; }
-	@$(LOADER) import $(TABLE) $(FILE) --resume $(FILE).ck
+	@$(CLIENT) import $(TABLE) $(FILE) --resume $(FILE).ck
 
 # Enough to show the whole path works: schema, ingest, and an aggregate that has to intersect
 # something to answer. Re-runnable - the table already existing is not a failure here.

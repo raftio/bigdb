@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! `bigd <file> [addr] [options]` - serve one database over HTTP.
+//! `big serve <file> [addr] [options]` - serve one database over HTTP.
 //!
 //! **Binding off loopback without a token file is refused.** It used to print a warning and
 //! bind anyway, which is a warning nobody reads on a port anybody can reach. A warning is the
@@ -30,7 +30,7 @@ use std::time::Duration;
 const DEFAULT_ADDR: &str = "127.0.0.1:7654";
 
 const USAGE: &str = "\
-usage: bigd <file> [addr] [options]
+usage: big serve <file> [addr] [options]
 
   addr                        defaults to 127.0.0.1:7654
 
@@ -87,9 +87,9 @@ Probes and metrics:
   GET /metrics   Prometheus text; needs a `read` token when tokens are configured
 ";
 
-fn main() -> std::io::Result<()> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let opts = match Options::parse(&args) {
+/// `big serve`, with the word already stripped by the dispatcher.
+pub fn main(args: &[String]) -> std::io::Result<()> {
+    let opts = match Options::parse(args) {
         Ok(o) => o,
         // `--help` is not a failure, so it prints the usage to stdout and exits zero.
         // Anything else is, and says what was wrong before repeating the usage.
@@ -98,7 +98,7 @@ fn main() -> std::io::Result<()> {
             return Ok(());
         }
         Err(e) => {
-            eprintln!("bigd: {e}\n");
+            eprintln!("big serve: {e}\n");
             eprint!("{USAGE}");
             std::process::exit(2);
         }
@@ -134,7 +134,7 @@ fn authenticator(opts: &Options) -> std::io::Result<Auth> {
     let Some(path) = &opts.tokens else { return Ok(Auth::disabled()) };
     let auth = Auth::from_file(path)
         .map_err(|e| std::io::Error::new(e.kind(), format!("could not read {path}: {e}")))?;
-    eprintln!("bigd: {} tokens loaded from {path}", auth.len());
+    eprintln!("big: {} tokens loaded from {path}", auth.len());
     Ok(auth)
 }
 
@@ -161,7 +161,7 @@ fn assemble(
         .for_node(opts.node.as_deref(), &opts.addr)
         .map_err(|e| std::io::Error::other(format!("{path}: {e}")))?;
     eprintln!(
-        "bigd: node `{}` owns shards {}, schema leader is `{}`, {} peers",
+        "big: node `{}` owns shards {}, schema leader is `{}`, {} peers",
         config.this().name,
         config.this().shards,
         config.leader().name,
@@ -172,14 +172,14 @@ fn assemble(
         // already allows, and refusing it here would refuse it only for clusters. Said out loud,
         // because a peer that presents nothing can only talk to a peer that asks for nothing.
         eprintln!(
-            "bigd: no peer_token_file in {path}; this node presents no credential to its peers"
+            "big: no peer_token_file in {path}; this node presents no credential to its peers"
         );
     }
     // Next to the database, because it belongs to this node and to this file: two daemons on one
     // machine are two databases, and giving them one vote between them would be giving one node
     // two.
     let state = format!("{}.raft", opts.path);
-    eprintln!("bigd: agreement state in {state}");
+    eprintln!("big: agreement state in {state}");
     Ok(Cluster::new(api, config, token, Box::new(big_cluster::raft::FileStore::new(state))))
 }
 
@@ -211,7 +211,7 @@ fn refuse_an_open_port(
         return;
     }
     eprintln!(
-        "bigd: refusing to serve {bound} with no authentication.\n\
+        "big: refusing to serve {bound} with no authentication.\n\
          \n\
          Anyone who can reach this port can read and delete everything in the database.\n\
          Either pass --tokens <file>, or bind to loopback and put a reverse proxy in\n\
@@ -226,21 +226,21 @@ fn refuse_an_open_port(
 /// reading a log after an incident needs to know what the setting *was*, and a line that only
 /// appears sometimes is one they have to remember the absence of.
 fn announce(server: &Server<big_api::MmapPager>, bound: std::net::SocketAddr, opts: &Options) {
-    eprintln!("bigd serving {} on http://{bound}", opts.path);
-    eprintln!("bigd: durability {}", server.api().durability().label());
+    eprintln!("big serving {} on http://{bound}", opts.path);
+    eprintln!("big: durability {}", server.api().durability().label());
     // Printed on every start for the same reason durability is: the ceiling that made a write
     // fail is one an operator has to be able to read out of a log after the fact, and a line
     // that only appears when the flag was passed is one they have to remember the absence of.
-    eprintln!("bigd: mapsize {}", human_size(opts.mapsize));
+    eprintln!("big: mapsize {}", human_size(opts.mapsize));
     if let Some(n) = opts.max_row_keys {
-        eprintln!("bigd: at most {n} row keys");
+        eprintln!("big: at most {n} row keys");
     }
     match &opts.backup_dir {
-        Some(d) => eprintln!("bigd: POST /admin/backup writes into {d}"),
-        None => eprintln!("bigd: no --backup-dir; POST /admin/backup is not configured"),
+        Some(d) => eprintln!("big: POST /admin/backup writes into {d}"),
+        None => eprintln!("big: no --backup-dir; POST /admin/backup is not configured"),
     }
     if !server.config().auth.is_enabled() {
-        eprintln!("bigd: no authentication; this port must not be reachable from anywhere else");
+        eprintln!("big: no authentication; this port must not be reachable from anywhere else");
     }
     log::emit(
         log::Level::Info,

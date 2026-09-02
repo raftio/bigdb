@@ -14,8 +14,8 @@
 
 //! The three binaries against one daemon, the way the readme tells an operator to use them.
 //!
-//! **The claim being tested is that they are one product.** `bigc` links none of the engine and
-//! `bigi` links only `bigc`, so what makes them agree with `bigd` is a wire format and nothing
+//! **The claim being tested is that they are one product.** `bigctl` links none of the engine and
+//! `bigctl` links only `bigctl`, so what makes them agree with `big serve` is a wire format and nothing
 //! else. A test that called the library functions would keep passing after `main` stopped
 //! wiring them up; these run the binaries.
 
@@ -24,15 +24,15 @@ use crate::common::*;
 /// The schema the readme's example builds, and a few facts under it.
 fn stocked() -> Daemon {
     let daemon = Daemon::start();
-    daemon.bigc(&["create", "table", "tx"]).expect(0);
+    daemon.bigctl(&["create", "table", "tx"]).expect(0);
     daemon
-        .bigc(&["create", "field", "tx", "amount", "--kind", "int", "--bit-depth", "20"])
+        .bigctl(&["create", "field", "tx", "amount", "--kind", "int", "--bit-depth", "20"])
         .expect(0);
-    daemon.bigc(&["create", "field", "tx", "country", "--kind", "set"]).expect(0);
+    daemon.bigctl(&["create", "field", "tx", "country", "--kind", "set"]).expect(0);
     daemon
 }
 
-/// The facts `make demo` loads, as a file `bigi` can take.
+/// The facts `make demo` loads, as a file `bigctl` can take.
 const FACTS: &str = "country 1 GB\ncountry 2 US\ncountry 3 GB\n\
                      amount 1 100\namount 2 250\namount 3 75\n";
 
@@ -44,11 +44,11 @@ fn the_readme_walkthrough_works_as_three_processes() {
     let facts = dir.path().join("facts.txt");
     std::fs::write(&facts, FACTS).unwrap();
 
-    let load = daemon.bigi(&["import", "tx", &facts.display().to_string()]).expect(0);
-    assert!(load.out.contains("imported 6"), "six facts went in: {:?}", load.out);
+    let load = daemon.bigctl(&["import", "tx", &facts.display().to_string()]).expect(0);
+    assert_eq!(load.out, "imported\n6\n", "six facts went in: {:?}", load.out);
 
     let answer = daemon
-        .bigc(&[
+        .bigctl(&[
             "--format",
             "json",
             "sql",
@@ -62,11 +62,11 @@ fn the_readme_walkthrough_works_as_three_processes() {
 
 #[test]
 fn a_statement_the_server_refuses_comes_back_as_the_servers_own_code() {
-    // **`bigc` cannot rewrite this.** It links no planner, so the code and the sentence on the
-    // terminal are the ones `bigd` chose - which is the whole reason it links nothing.
+    // **`bigctl` cannot rewrite this.** It links no planner, so the code and the sentence on the
+    // terminal are the ones `big serve` chose - which is the whole reason it links nothing.
     let daemon = stocked();
 
-    let run = daemon.bigc(&["sql", "SELECT * FROM tx JOIN other ON tx.k = other.k"]);
+    let run = daemon.bigctl(&["sql", "SELECT * FROM tx JOIN other ON tx.k = other.k"]);
 
     assert_eq!(run.code, 1, "the server refused, so exit 1: {:?}", run.err);
     assert!(run.said("sql_"), "and the server's own code is printed: {}{}", run.out, run.err);
@@ -76,7 +76,7 @@ fn a_statement_the_server_refuses_comes_back_as_the_servers_own_code() {
 fn nothing_listening_is_its_own_exit_code() {
     // Told apart from a refusal on purpose: a script that retries wants to know whether the
     // server said no or was not there.
-    let run = run("bigc", &["--addr", "127.0.0.1:1", "schema"]);
+    let run = run("bigctl", &["--addr", "127.0.0.1:1", "schema"]);
 
     assert_eq!(run.code, 3, "nothing listening is 3: {}{}", run.out, run.err);
 }
@@ -86,11 +86,11 @@ fn a_load_from_standard_input_reaches_the_same_place_a_file_does() {
     let daemon = stocked();
 
     let load =
-        run_with_stdin("bigi", &["--addr", &daemon.addr.to_string(), "import", "tx", "-"], FACTS)
+        run_with_stdin("bigctl", &["--addr", &daemon.addr.to_string(), "import", "tx", "-"], FACTS)
             .expect(0);
-    assert!(load.out.contains("imported 6"), "{:?}", load.out);
+    assert_eq!(load.out, "imported\n6\n", "{:?}", load.out);
 
-    let count = daemon.bigc(&["--format", "json", "sql", "SELECT count(*) FROM tx"]).expect(0);
+    let count = daemon.bigctl(&["--format", "json", "sql", "SELECT count(*) FROM tx"]).expect(0);
     assert!(count.out.contains("[3]"), "three records: {}", count.out);
 }
 
@@ -112,7 +112,7 @@ fn an_interrupted_load_resumes_where_its_checkpoint_says() {
     let half = dir.path().join("half.txt");
     std::fs::write(&half, &all[..all.len() / 2]).unwrap();
     daemon
-        .bigi(&[
+        .bigctl(&[
             "--resume",
             &resume.display().to_string(),
             "import",
@@ -122,14 +122,14 @@ fn an_interrupted_load_resumes_where_its_checkpoint_says() {
         .expect(0);
 
     let count = |d: &Daemon| -> String {
-        d.bigc(&["--format", "json", "sql", "SELECT count(*) FROM tx"]).expect(0).out
+        d.bigctl(&["--format", "json", "sql", "SELECT count(*) FROM tx"]).expect(0).out
     };
     assert!(count(&daemon).contains("[100]"), "half landed: {}", count(&daemon));
 
     // A finished load removes its checkpoint, so the second run starts from the beginning of
     // the full file - and lands on exactly the same bits for the first hundred.
     daemon
-        .bigi(&[
+        .bigctl(&[
             "--resume",
             &resume.display().to_string(),
             "import",
@@ -148,10 +148,10 @@ fn a_dry_run_sends_nothing() {
     let facts = dir.path().join("facts.txt");
     std::fs::write(&facts, FACTS).unwrap();
 
-    let run = daemon.bigi(&["--dry-run", "import", "tx", &facts.display().to_string()]).expect(0);
+    let run = daemon.bigctl(&["--dry-run", "import", "tx", &facts.display().to_string()]).expect(0);
 
-    assert!(run.out.contains("would send"), "it says it would: {:?}", run.out);
-    let count = daemon.bigc(&["--format", "json", "sql", "SELECT count(*) FROM tx"]).expect(0);
+    assert_eq!(run.out, "would_send\n0\n", "it says it would: {:?}", run.out);
+    let count = daemon.bigctl(&["--format", "json", "sql", "SELECT count(*) FROM tx"]).expect(0);
     assert!(count.out.contains("[0]"), "and nothing arrived: {}", count.out);
 }
 
@@ -163,7 +163,7 @@ fn a_token_is_read_from_a_file_and_never_taken_as_a_flag() {
     let tokens = token_file(workspace.path(), "sekrit admin\n");
     let daemon = workspace.daemon(&["--tokens", &tokens.display().to_string()]);
 
-    let refused = daemon.bigc(&["schema"]);
+    let refused = daemon.bigctl(&["schema"]);
     assert_ne!(refused.code, 0, "no credential, no schema");
 
     // The client's token file is a different file with the same contents rule: mode 600, and
@@ -173,6 +173,6 @@ fn a_token_is_read_from_a_file_and_never_taken_as_a_flag() {
     std::fs::write(&mine, "sekrit").unwrap();
     set_mode(&mine, 0o600);
 
-    let allowed = daemon.bigc(&["--token-file", &mine.display().to_string(), "schema"]).expect(0);
+    let allowed = daemon.bigctl(&["--token-file", &mine.display().to_string(), "schema"]).expect(0);
     assert!(allowed.code == 0, "with the token it answers: {}", allowed.err);
 }

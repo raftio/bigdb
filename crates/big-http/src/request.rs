@@ -166,7 +166,7 @@ impl Request {
 
     /// The value of one query-string parameter, percent-decoded, if present.
     ///
-    /// **Decoded, because it used not to be and that was a bug with teeth.** `bigc` escapes
+    /// **Decoded, because it used not to be and that was a bug with teeth.** `bigctl` escapes
     /// every value it sends - correctly, since a query string is not allowed to carry arbitrary
     /// bytes - so `--engine bitmap+columnar` arrived here as `bitmap%2Bcolumnar` and was handed
     /// straight to a parser that had never heard of it. The refusal named the three engines it
@@ -301,7 +301,7 @@ mod decode_tests {
 
     #[test]
     fn an_escaped_value_arrives_as_what_was_typed() {
-        // The case that was broken: `bigc create table t --engine bitmap+columnar` escapes the
+        // The case that was broken: `bigctl create table t --engine bitmap+columnar` escapes the
         // plus, and the engine parser had never heard of `bitmap%2Bcolumnar`.
         assert_eq!(
             req("engine=bitmap%2Bcolumnar").param("engine").as_deref(),

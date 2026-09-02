@@ -100,7 +100,7 @@ pub struct QueryOptions {
     ///
     /// **A property of the request, not of the text.** `POST /sql` answers one statement and
     /// remembers nothing, so there is no session for a `USE` to leave a database in - it
-    /// arrives as `?database=`, and `bigc` is what turns a typed `USE` into one. `None` means
+    /// arrives as `?database=`, and `bigctl` is what turns a typed `USE` into one. `None` means
     /// [`big_db::DEFAULT_DATABASE_NAME`], which is what every statement written before
     /// databases existed asked for.
     ///

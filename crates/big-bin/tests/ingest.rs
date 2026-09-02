@@ -17,15 +17,15 @@
 //! Nothing is mocked, for the same reason `big-cli`'s tests are not: the risk this crate carries
 //! is a *sequence* of requests agreeing with what one server actually commits, and a fixture
 //! would keep agreeing after the two had parted company. Every assertion below went through
-//! `Server::bind`, a loopback port, and `big_ingest::run` - the same function `main` calls.
+//! `Server::bind`, a loopback port, and `big_bin::client::run` - the same function `main` calls.
 //!
 //! Ids are written four digits wide so that every line is exactly sixteen bytes. That is not
 //! tidiness: it makes a checkpoint's offset a number this file can state rather than compute,
 //! and an offset nobody can predict is an offset no test can check.
 
 use big_api::Api;
-use big_cli::exit;
-use big_cli::http::Client;
+use big_bin::client::http::Client;
+use big_bin::exit;
 use big_db::catalog::FieldKind;
 use big_http::{Server, ServerConfig};
 use std::io::{Read, Write};
@@ -65,9 +65,15 @@ fn run_with(addr: SocketAddr, args: &[&str], stdin: &str) -> Run {
         .chain(args.iter().map(|a| (*a).to_string()))
         .collect();
     let code = {
-        let mut io = big_ingest::Io { input: &mut input, out: &mut out, err: &mut err, tty: false };
+        let mut io = big_bin::Io {
+            input: &mut input,
+            out: &mut out,
+            err: &mut err,
+            out_tty: false,
+            err_tty: false,
+        };
         // No environment: every test says what it means on the command line.
-        big_ingest::run(&owned, &mut io, &|_| None)
+        big_bin::client::run(&owned, &mut io, &|_| None)
     };
     Run {
         code,
@@ -96,10 +102,10 @@ fn stocked(requests: usize) -> SocketAddr {
 
 /// One value out of a `{"key":n}` answer, read with the client's own reader.
 fn number(body: &str, key: &str) -> u64 {
-    big_cli::json::parse(body)
+    big_bin::client::json::parse(body)
         .unwrap_or_else(|e| panic!("not JSON: {body:?} ({e})"))
         .get(key)
-        .and_then(big_cli::json::Value::cell)
+        .and_then(big_bin::client::json::Value::cell)
         .unwrap_or_else(|| panic!("no `{key}` in {body:?}"))
         .parse()
         .unwrap()
@@ -159,7 +165,7 @@ fn the_default_chunk_leaves_room_under_the_ceiling() {
     // build is a better place to find out than the test run is.
     const {
         assert!(
-            big_ingest::args::DEFAULT_CHUNK_BYTES < big_http::MAX_BODY,
+            big_bin::ingest::args::DEFAULT_CHUNK_BYTES < big_http::MAX_BODY,
             "a default chunk must fit under the server's body ceiling, or every chunk is a 413"
         );
     };
@@ -178,9 +184,12 @@ fn a_file_that_needs_many_requests_lands_whole() {
 
     let r = run(addr, &["import", "tx", &path, "--chunk-lines", "10"]);
     assert_eq!(r.code, exit::OK, "{}", r.err);
-    assert!(r.out.contains("imported 100"), "{}", r.out);
-    assert!(r.out.contains("chunks 10"), "{}", r.out);
-    assert!(r.out.contains(&format!("bytes {}", 100 * LINE)), "{}", r.out);
+    // stdout carries what the server said, and only that: one column, one row, tsv because
+    // these streams are not terminals. A script counting facts reads this and nothing else.
+    assert_eq!(r.out, "imported\n100\n", "{}", r.out);
+    // What the loop did is on stderr, where it cannot get into a pipe.
+    assert!(r.err.contains("chunks 10"), "{}", r.err);
+    assert!(r.err.contains(&format!("bytes {}", 100 * LINE)), "{}", r.err);
     assert_eq!(counted(addr), 100);
 }
 
@@ -209,7 +218,7 @@ fn delete_takes_the_same_loop() {
     assert_eq!(run(addr, &["import", "tx", &facts_path, "--chunk-lines", "10"]).code, exit::OK);
     let r = run(addr, &["delete", "tx", &ids_path, "--chunk-lines", "10"]);
     assert_eq!(r.code, exit::OK, "{}", r.err);
-    assert!(r.out.contains("deleted 50"), "{}", r.out);
+    assert_eq!(r.out, "deleted\n50\n", "{}", r.out);
     assert_eq!(counted(addr), 50);
 }
 
@@ -230,8 +239,8 @@ fn a_dry_run_reaches_no_server() {
     let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
     let r = run(addr, &["import", "tx", &path, "--chunk-lines", "10", "--dry-run"]);
     assert_eq!(r.code, exit::OK, "{}", r.err);
-    assert!(r.out.contains("chunks 10"), "{}", r.out);
-    assert!(r.out.contains("would send 0"), "{}", r.out);
+    assert!(r.err.contains("chunks 10"), "{}", r.err);
+    assert_eq!(r.out, "would_send\n0\n", "{}", r.out);
 }
 
 // ------------------------------------------------------------------------------------------
@@ -258,7 +267,8 @@ fn a_line_the_server_refuses_stops_the_load_where_it_is() {
     assert!(r.err.contains(&format!("stopped at byte {}", 30 * LINE)), "{}", r.err);
 
     // The checkpoint holds what landed, and only what landed.
-    let found = big_ingest::Checkpoint::read(&check).unwrap().expect("a checkpoint was written");
+    let found =
+        big_bin::ingest::Checkpoint::read(&check).unwrap().expect("a checkpoint was written");
     assert_eq!(found.offset, (30 * LINE) as u64);
     assert_eq!(found.wrote, 30);
 }
@@ -280,7 +290,7 @@ fn a_checkpoint_from_another_load_is_refused_rather_than_applied() {
     let dir = tempfile::tempdir().unwrap();
     let path = write(dir.path(), "facts", &facts(1..=100));
     let check = dir.path().join("load.ck");
-    big_ingest::Checkpoint {
+    big_bin::ingest::Checkpoint {
         target: "/table/other/import".to_string(),
         input: path.clone(),
         size: (100 * LINE) as u64,
@@ -304,7 +314,7 @@ fn a_checkpoint_from_another_load_is_refused_rather_than_applied() {
 ///
 /// The server answers three chunks and stops accepting. The fourth request is written into a
 /// connection nobody is reading, so the client's own deadline ends it - which is exactly the
-/// case Decision 4 covers: `bigd` may or may not have committed that chunk, and re-sending it
+/// case Decision 4 covers: `big serve` may or may not have committed that chunk, and re-sending it
 /// is correct either way.
 ///
 /// **`--in-flight 1`, stated rather than inherited.** Every count below - three answered, an
@@ -346,7 +356,8 @@ fn an_interrupted_load_resumes_where_it_stopped() {
     serving.join().unwrap();
 
     // Thirty lines acknowledged, and the checkpoint says so.
-    let found = big_ingest::Checkpoint::read(&check).unwrap().expect("a checkpoint was written");
+    let found =
+        big_bin::ingest::Checkpoint::read(&check).unwrap().expect("a checkpoint was written");
     assert_eq!(found.offset, (30 * LINE) as u64);
 
     // Seven chunks are left, plus the one the interrupted run left in the backlog, plus a query.
@@ -358,16 +369,16 @@ fn an_interrupted_load_resumes_where_it_stopped() {
     assert_eq!(r.code, exit::OK, "{}", r.err);
     assert!(r.err.contains("resuming"), "{}", r.err);
     // Seventy lines this time, not a hundred: the first thirty were not read again.
-    assert!(r.out.contains(&format!("bytes {}", 70 * LINE)), "{}", r.out);
+    assert!(r.err.contains(&format!("bytes {}", 70 * LINE)), "{}", r.err);
     // And the total is about the load rather than about the leg.
-    assert!(r.out.contains("imported 100"), "{}", r.out);
+    assert_eq!(r.out, "imported\n100\n", "{}", r.out);
 
     assert_eq!(counted(addr), 100);
     serving.join().unwrap();
 
     // A finished load leaves no checkpoint: one that stayed would make the same command run
     // again do nothing, which looks exactly like a load that worked.
-    assert!(big_ingest::Checkpoint::read(&check).unwrap().is_none());
+    assert!(big_bin::ingest::Checkpoint::read(&check).unwrap().is_none());
 }
 
 /// A window in flight loses nothing when the load is interrupted and resumed.
@@ -415,7 +426,8 @@ fn a_windowed_load_resumes_without_losing_a_record() {
 
     // The checkpoint is a contiguous prefix, so it can only be a whole number of chunks and
     // never past what was acknowledged.
-    let found = big_ingest::Checkpoint::read(&check).unwrap().expect("a checkpoint was written");
+    let found =
+        big_bin::ingest::Checkpoint::read(&check).unwrap().expect("a checkpoint was written");
     assert!(found.offset <= (30 * LINE) as u64, "checkpoint ran ahead: {}", found.offset);
     assert_eq!(found.offset as usize % LINE, 0, "checkpoint fell inside a line");
 

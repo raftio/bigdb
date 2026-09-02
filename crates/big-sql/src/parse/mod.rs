@@ -70,7 +70,7 @@ use big_plan::Literal;
 /// **A bound on the stack, not a taste in conditions.** The reasoning is
 /// [`big_plan::parse::MAX_DEPTH`]'s, unchanged and for the same reason: this is a recursive
 /// descent, nesting is call depth, a stack overflow aborts the process rather than unwinding,
-/// and `bigd` runs queries on pool threads whose stacks are smaller than the main thread's. The
+/// and `big serve` runs queries on pool threads whose stacks are smaller than the main thread's. The
 /// limit is the same number so that neither language is the one that overflows first.
 pub const MAX_DEPTH: usize = big_plan::parse::MAX_DEPTH;
 

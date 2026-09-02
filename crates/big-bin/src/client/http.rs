@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! One exchange with `bigd`, written by hand for the same reason the server's reader is.
+//! One exchange with `big serve`, written by hand for the same reason the server's reader is.
 //!
 //! This talks to exactly one server, and that server always answers with a `Content-Length` and
 //! never chunks. So this client insists on both: a `Transfer-Encoding` is an error rather than
@@ -22,7 +22,7 @@
 //! table with some rows missing, which is the failure mode a person cannot see.
 //!
 //! No connection reuse. One command is one exchange, the process exits afterwards, and a pool
-//! would be state to get wrong for no gain. `bigc shell` opens a connection per statement for
+//! would be state to get wrong for no gain. `bigctl shell` opens a connection per statement for
 //! the same reason - the server's keep-alive holds a worker from a fixed pool, and a human
 //! typing is the worst possible thing to hold one for.
 
@@ -90,7 +90,7 @@ impl Client {
         let request = format!(
             "{method} {target} HTTP/1.1\r\n\
              Host: {}\r\n\
-             User-Agent: bigc\r\n\
+             User-Agent: bigctl\r\n\
              {auth}\
              Content-Length: {}\r\n\
              Connection: close\r\n\r\n{body}",
@@ -159,10 +159,10 @@ fn read_response(mut reader: BufReader<TcpStream>) -> Result<Response, Error> {
             })?);
         }
         if name.eq_ignore_ascii_case("transfer-encoding") {
-            // `bigd` never sends one. Refused rather than implemented, because implementing a
+            // `big serve` never sends one. Refused rather than implemented, because implementing a
             // decoder that nothing produces means shipping a path no test can reach.
             return Err(Error::Protocol(format!(
-                "this server sent Transfer-Encoding: {value}, which bigd does not use"
+                "this server sent Transfer-Encoding: {value}, which big does not use"
             )));
         }
     }

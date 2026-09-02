@@ -16,7 +16,7 @@ Cluster::solo(api)                    // every shard, no peers, its own schema l
 Cluster::new(api, config, token)      // one node of a configured cluster
 ```
 
-`big-http`'s `Server` holds a `Cluster`, never an `Api`, so a `bigd` started without `--cluster`
+`big-http`'s `Server` holds a `Cluster`, never an `Api`, so a `big serve` started without `--cluster`
 runs every request through the same coordinator that a four-node deployment does. A second path
 for the un-clustered case would be the path nobody tests.
 

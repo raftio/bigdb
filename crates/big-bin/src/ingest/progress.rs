@@ -19,7 +19,7 @@
 //! rewritten in place with `\r`, and anything else gets a plain line every few seconds that
 //! `grep` and `journalctl` can hold. No colour, no cursor movement, no bar - `\r` is the whole
 //! of the terminal handling, because everything past it is a termios mode this repository has
-//! already declined once for `bigc shell`.
+//! already declined once for `bigctl shell`.
 //!
 //! On **stderr** rather than stdout so that the summary a script reads is not interleaved with
 //! the noise a person watches.
@@ -117,14 +117,14 @@ impl Progress {
         };
 
         if self.tty {
-            let _ = write!(err, "\rbigi: {line:<72}");
+            let _ = write!(err, "\rbigctl: {line:<72}");
             self.dirty = true;
             if last {
                 let _ = writeln!(err);
                 self.dirty = false;
             }
         } else {
-            let _ = writeln!(err, "bigi: {line}");
+            let _ = writeln!(err, "bigctl: {line}");
         }
         let _ = err.flush();
     }
@@ -214,7 +214,7 @@ mod tests {
         let mut p = Progress::new(true, false, None);
         p.finish(&mut out, 2048, 10);
         let text = String::from_utf8(out).unwrap();
-        assert!(text.starts_with("bigi: "), "{text}");
+        assert!(text.starts_with("bigctl: "), "{text}");
         assert!(text.ends_with('\n'), "{text:?}");
         assert!(!text.contains('%'), "a pipe has no total to be a percentage of: {text}");
         assert!(!text.contains('\r'), "{text:?}");

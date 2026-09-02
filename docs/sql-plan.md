@@ -73,7 +73,7 @@ answers with record ids under a column called `id`, and a bare column is
 **3. There is no `big sql` subcommand.** The plan listed one. `big` is the offline half of
 operating a database — back it up, check it, shrink it — and has no query subcommand for PQL
 either; adding one only for SQL would make SQL the privileged surface. It would also mean
-`big-db` depending on crates that depend on `big-db`. Querying goes through `bigd`, in both
+`big-db` depending on crates that depend on `big-db`. Querying goes through `big serve`, in both
 languages.
 
 A fourth, smaller: **the time-quantum window is refused** (`sql_no_time_window`). PQL answers it

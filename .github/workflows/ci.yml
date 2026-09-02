@@ -22,7 +22,7 @@ jobs:
       # building the rival engines it was written to skip.
       - run: cargo test --workspace --exclude big-bench
 
-  # Two real `bigd` processes and a failover decided by wall-clock heartbeats. Out of the job
+  # Two real `big serve` processes and a failover decided by wall-clock heartbeats. Out of the job
   # above because a timing test in the default run is a test that eventually fails for reasons
   # nobody changed - and its own job so that when it does, it says so rather than reddening the
   # suite that has nothing to do with it.

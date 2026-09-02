@@ -17,10 +17,10 @@
 //! Nothing is mocked, and the reason is the risk this crate actually carries: the JSON reader
 //! here and the JSON writer in `big-http` are two files with one producer between them, and a
 //! test against a fixture would keep passing after they disagreed. Every assertion below went
-//! through `Server::bind`, a loopback port, and `big_cli::run` - the same function `main` calls.
+//! through `Server::bind`, a loopback port, and `big_bin::client::run` - the same function `main` calls.
 
 use big_api::Api;
-use big_cli::{exit, Io};
+use big_bin::{exit, Io};
 use big_db::catalog::FieldKind;
 use big_http::{Auth, Server, ServerConfig};
 use std::net::SocketAddr;
@@ -43,10 +43,11 @@ fn run_at(addr: SocketAddr, args: &[&str], stdin: &str, tty: bool) -> Run {
         .collect();
 
     let code = {
-        let mut io = Io { input: &mut input, out: &mut out, err: &mut err, tty };
+        let mut io =
+            Io { input: &mut input, out: &mut out, err: &mut err, out_tty: tty, err_tty: false };
         // No environment: every test says what it means on the command line, so none of them
         // depends on what the machine running them happens to export.
-        big_cli::run(&owned, &mut io, &|_| None)
+        big_bin::client::run(&owned, &mut io, &|_| None)
     };
     Run {
         code,
@@ -97,7 +98,7 @@ fn spawn(requests: usize, config: ServerConfig) -> SocketAddr {
 ///
 /// **This list is maintained against `big-http`'s route table, not derived from it.** Deriving
 /// it would make the test agree with the client by construction and prove nothing; written out,
-/// it breaks when a thirteenth route ships without a spelling in `bigc`, which is the direction
+/// it breaks when a thirteenth route ships without a spelling in `bigctl`, which is the direction
 /// that actually goes wrong.
 const PUBLIC_ROUTES: [&str; 12] = [
     "GET /health",
@@ -121,29 +122,33 @@ const PUBLIC_ROUTES: [&str; 12] = [
 /// content by a single-node daemon and that is not what this test is about.
 #[test]
 fn every_subcommand_reaches_a_route_that_exists() {
-    let commands: [&[&str]; 14] = [
-        &["health"],
-        &["ready"],
-        &["metrics"],
-        &["schema"],
-        &["verify"],
-        &["repair"],
-        &["query", "tx", "Count(All())"],
-        &["sql", "SELECT count(*) FROM tx"],
-        &["records", "tx"],
-        &["import", "tx", "-"],
-        &["delete", "tx", "-"],
-        &["create", "table", "t2"],
-        &["create", "field", "t2", "c", "--kind", "set"],
-        &["drop", "table", "t2"],
+    // **Each command carries the standard input it needs to send anything.** `import` and
+    // `delete` are a load now, and a load of nothing is zero chunks and therefore zero
+    // requests - so with the empty string these two rows passed while reaching no route at
+    // all, which is this test failing silently at the one thing it is here to check.
+    let commands: [(&[&str], &str); 14] = [
+        (&["health"], ""),
+        (&["ready"], ""),
+        (&["metrics"], ""),
+        (&["schema"], ""),
+        (&["verify"], ""),
+        (&["repair"], ""),
+        (&["query", "tx", "Count(All())"], ""),
+        (&["sql", "SELECT count(*) FROM tx"], ""),
+        (&["records", "tx"], ""),
+        (&["import", "tx", "-"], "amount 9 42\n"),
+        (&["delete", "tx", "-"], "9\n"),
+        (&["create", "table", "t2"], ""),
+        (&["create", "field", "t2", "c", "--kind", "set"], ""),
+        (&["drop", "table", "t2"], ""),
     ];
     let addr = stocked(commands.len() + 1);
 
-    for command in commands {
-        let r = run_at(addr, command, "", true);
+    for (command, stdin) in commands {
+        let r = run_at(addr, command, stdin, true);
         assert!(
             !r.err.contains("no_such_route"),
-            "`bigc {}` reached no route: {}",
+            "`bigctl {}` reached no route: {}",
             command.join(" "),
             r.err
         );
@@ -229,7 +234,7 @@ fn a_body_can_come_from_standard_input() {
     assert_eq!(r.code, exit::OK, "{}", r.err);
     assert_eq!(r.out, "imported\n--------\n2\n");
 
-    // And so can a statement, which is what makes `bigc` compose with a shell.
+    // And so can a statement, which is what makes `bigctl` compose with a shell.
     let r = run_at(addr, &["sql", "-"], "SELECT count(*) FROM tx WHERE country = 'FR'", true);
     assert_eq!(r.out, "count\n-----\n1\n");
 }
@@ -305,7 +310,7 @@ fn help_goes_to_stdout_and_a_mistake_goes_to_stderr() {
 
     let r = run(addr, &["--help"]);
     assert_eq!(r.code, exit::OK);
-    assert!(r.out.starts_with("usage: bigc"), "{}", r.out);
+    assert!(r.out.starts_with("usage: bigctl"), "{}", r.out);
     assert!(r.err.is_empty());
 
     let r = run(addr, &["--nope"]);
@@ -321,7 +326,7 @@ fn help_goes_to_stdout_and_a_mistake_goes_to_stderr() {
 /// A file this test owns, at a mode it chooses.
 fn token_file(name: &str, contents: &str, mode: u32) -> String {
     use std::os::unix::fs::PermissionsExt;
-    let path = std::env::temp_dir().join(format!("bigc-{}-{name}", std::process::id()));
+    let path = std::env::temp_dir().join(format!("bigctl-{}-{name}", std::process::id()));
     std::fs::write(&path, contents).unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
     path.to_string_lossy().into_owned()
@@ -415,7 +420,7 @@ fn a_meta_command_that_does_not_exist_is_named() {
 /// `--engine` reaches the route as the query parameter it already takes.
 ///
 /// The client adds no vocabulary here either: it does not know what a valid engine name is, so
-/// a misspelling comes back as the *server's* refusal rather than one `bigc` invented.
+/// a misspelling comes back as the *server's* refusal rather than one `bigctl` invented.
 #[test]
 fn create_table_carries_the_engine_through() {
     let addr = stocked(3);
@@ -448,6 +453,15 @@ fn a_flag_from_another_subcommand_is_refused() {
         (vec!["create", "table", "t2", "--kind", "set"], "--kind"),
         (vec!["schema", "--limit", "5"], "--limit"),
         (vec!["sql", "SELECT count(*) FROM tx", "--after", "3"], "--after"),
+        // The other direction, which no amount of care could have caught while the load was a
+        // separate binary: neither parser could see the other's flags, so each silently
+        // dropped what it did not recognise. One parser is what makes these five refusals
+        // possible at all.
+        (vec!["schema", "--dry-run"], "--dry-run"),
+        (vec!["sql", "SELECT count(*) FROM tx", "--resume", "f"], "--resume"),
+        (vec!["records", "tx", "--in-flight", "2"], "--in-flight"),
+        (vec!["query", "tx", "Count(All())", "--chunk-lines", "10"], "--chunk-lines"),
+        (vec!["verify", "--no-progress"], "--no-progress"),
     ] {
         let r = run_at(addr, &args, "", true);
         assert_eq!(r.code, 2, "`{}` should be a usage error: {} {}", args.join(" "), r.out, r.err);
@@ -469,6 +483,10 @@ fn a_subcommands_own_flags_still_reach_it() {
         vec!["records", "tx", "--after", "1"],
         vec!["create", "table", "t3", "--engine", "bitmap"],
         vec!["create", "field", "t3", "n", "--kind", "int", "--bit-depth", "16"],
+        // A load's own flags, on a load. Nothing is sent - the input is empty - so this costs
+        // the server no request and the budget above stays right.
+        vec!["import", "tx", "-", "--chunk-lines", "10"],
+        vec!["delete", "tx", "-", "--dry-run", "--no-progress"],
     ] {
         let r = run_at(addr, &args, "", true);
         assert_ne!(r.code, 2, "`{}` was refused as usage: {}", args.join(" "), r.err);

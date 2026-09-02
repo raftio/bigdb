@@ -23,8 +23,8 @@
 //! Only `tsv` is promised to stay put. Table rendering is for a person looking at a screen, and
 //! a column width is not an interface.
 
-use crate::args::Format;
-use crate::json::Answer;
+use crate::client::args::Format;
+use crate::client::json::Answer;
 
 /// Which format to use when the caller did not say.
 pub fn default_for(tty: bool) -> Format {

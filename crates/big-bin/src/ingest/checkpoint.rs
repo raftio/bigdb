@@ -106,7 +106,7 @@ impl Checkpoint {
         let mut text = String::new();
         let _ = write!(
             text,
-            "# bigi checkpoint. Delete this file to start the load over.\n\
+            "# bigctl checkpoint. Delete this file to start the load over.\n\
              target {}\ninput {}\nsize {}\noffset {}\nlines {}\nwrote {}\n",
             self.target, self.input, self.size, self.offset, self.lines, self.wrote
         );
