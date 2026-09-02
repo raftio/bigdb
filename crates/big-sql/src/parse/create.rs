@@ -256,7 +256,12 @@ impl Parser<'_> {
             "BOOL" | "BOOLEAN" => {
                 Column { name, kind: Bool, bit_depth: KEYLESS_DEPTH, scale: None }
             }
-            "TIMEQUANTUM" | "TIMESTAMP" | "DATETIME" => {
+            // `DATE` joins the other three rather than getting a kind of its own: a time quantum
+            // field is keyed by a moment and viewed by day, which is what a date column is asked
+            // to answer about. Giving it a separate kind would mean a second routing for facts
+            // that are already routed - and a `DATE` that could not be windowed by day would be
+            // the one spelling of a time that does not do the thing times are here for.
+            "TIMEQUANTUM" | "TIMESTAMP" | "DATETIME" | "DATE" => {
                 Column { name, kind: TimeQuantum, bit_depth: KEYLESS_DEPTH, scale: None }
             }
             // A length on a key is a bound on nothing: keys are stored whole, and there is no

@@ -19,8 +19,10 @@
 //! that: the same aggregate over the same column is the same number, and anything else would
 //! have to be computed.
 
-use crate::ast::{Agg, HavingAgg, Item, Name, Proj};
-use crate::shape::{Absent, Of, Units};
+use crate::ast::{Agg, HavingAgg, Item, Name, Proj, Select};
+use crate::error::{Refused, Result, SqlError};
+use crate::shape::{Absent, Having, Of, Threshold, Units};
+use big_plan::ast::Literal;
 
 /// What the number one select-list entry produces is measured in.
 ///
@@ -105,6 +107,41 @@ pub(super) fn names(having: &HavingAgg, measures: &[(Measure, Of)]) -> Option<Of
         return Some(Of::Group { plan: 0, absent: Absent::Zero });
     }
     measures.iter().find(|(m, _)| *m == want).map(|(_, of)| *of)
+}
+
+/// The `HAVING`, resolved against the numbers this answer actually holds.
+///
+/// Here rather than beside one caller because two shapes ask it: a grouping filters the row per
+/// group, and an ungrouped aggregate filters the single row it answers with. The question is the
+/// same one either way - does this answer hold the number the `HAVING` names, and is that number
+/// a whole one - so it is asked in one place.
+pub(super) fn having_of(
+    select: &Select,
+    table: &str,
+    measures: &[(Measure, Of)],
+) -> Result<Option<Having>> {
+    let Some(h) = &select.having else { return Ok(None) };
+    let of =
+        names(&h.agg, measures).ok_or(SqlError::Refused { what: Refused::Having, at: h.at })?;
+    // An average is fractional and this comparison is not. Rounding one into the other would
+    // answer a question next to the one that was asked.
+    if matches!(of, Of::Ratio { .. }) {
+        return Err(SqlError::Refused { what: Refused::Having, at: h.at });
+    }
+    let value = match field_of(&h.agg) {
+        // An aggregate's threshold is in the field's units, and only a schema knows what those
+        // are. `Shape::resolve` asks, with the planner's own conversion.
+        Some(field) => {
+            Threshold::Written { table: table.to_string(), field, value: h.value.clone() }
+        }
+        // A count is in records, which is a unit no field defines. Anything but a whole number
+        // of them is not a count, and is refused here rather than rounded into one.
+        None => match h.value {
+            Literal::Int(n) => Threshold::Units(i128::from(n)),
+            _ => return Err(SqlError::Refused { what: Refused::Having, at: h.at }),
+        },
+    };
+    Ok(Some(Having { of, op: h.op, value }))
 }
 
 /// The column an aggregate's threshold is written in the units of, if any.

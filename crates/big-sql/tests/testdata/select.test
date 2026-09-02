@@ -269,3 +269,36 @@ SELECT amount, country FROM t WHERE active = true
 ----
 Project t.(amount, country)
 └── active = true
+
+# A `HAVING` with no `GROUP BY` is a test on the one row the answer is, which standard SQL
+# defines as a grouping over the whole filtered set. It is not in the plan: the threshold is
+# checked at the coordinator, after every node has contributed, because a total under it on one
+# node can be over it once the rest are added. Failing the test empties the answer.
+plan
+SELECT count(*) FROM t HAVING count(*) > 1000
+----
+Count t
+└── all
+
+shape
+SELECT count(*) FROM t HAVING count(*) > 1000
+----
+Row
+├── count = #0
+└── having: #0 > 1000
+
+shape
+SELECT sum(amount) FROM t WHERE country = 'GB' HAVING sum(amount) >= 500
+----
+Row
+├── sum = #0
+└── having: #0 >= 500
+
+# The threshold is in the field's units, so a decimal is scaled by the same conversion a `WHERE`
+# comparison gets - 100.00 against a field keeping two digits is 10000.
+shape
+SELECT sum(price) FROM t HAVING sum(price) > 100.00
+----
+Row
+├── sum = #0 scale=2
+└── having: #0 > 10000

@@ -614,6 +614,15 @@ pub enum Shape {
     Row {
         /// The cells, in the order the select list wrote them.
         cells: Vec<Cell>,
+        /// `HAVING` over the implicit single group, absent when the row is always kept.
+        ///
+        /// **The one shape whose `HAVING` decides how many rows there are rather than which.**
+        /// A grouping drops the groups that fail; here there is exactly one row, so failing the
+        /// test empties the answer. That is what standard SQL says an ungrouped `HAVING` means -
+        /// the whole filtered set is one group - and it is a question worth being able to ask:
+        /// `SELECT count(*) FROM t WHERE ... HAVING count(*) > 1000` is a threshold alarm that
+        /// answers with nothing until it fires.
+        having: Option<Having>,
     },
     /// Record ids, one per row.
     ///
@@ -762,7 +771,7 @@ impl Shape {
             Self::Pairs { cells, .. } => cells.iter().map(|c| c.column.as_str()).collect(),
             Self::Records { column, .. } => vec![column.as_str()],
             Self::Table { columns } => columns.named().iter().map(|c| c.column.as_str()).collect(),
-            Self::Row { cells } | Self::Groups { cells, .. } | Self::Join { cells, .. } => {
+            Self::Row { cells, .. } | Self::Groups { cells, .. } | Self::Join { cells, .. } => {
                 cells.iter().map(|c| c.column.as_str()).collect()
             }
         }
@@ -778,7 +787,7 @@ impl Shape {
         match self {
             Self::Records { .. } | Self::Table { .. } => Vec::new(),
             Self::Union { branches } => branches.iter().flat_map(Shape::cells).collect(),
-            Self::Row { cells }
+            Self::Row { cells, .. }
             | Self::Groups { cells, .. }
             | Self::Pairs { cells, .. }
             | Self::Join { cells, .. } => cells.iter().collect(),
@@ -836,7 +845,7 @@ impl Shape {
                 .collect()
         };
         Ok(match self {
-            Self::Row { cells } => Self::Row { cells: all(cells)? },
+            Self::Row { cells, having } => Self::Row { cells: all(cells)?, having: one(having)? },
             Self::Groups { keys, cells, having, order, cut } => {
                 Self::Groups { keys, cells: all(cells)?, having: one(having)?, order, cut }
             }
@@ -932,7 +941,10 @@ impl Shape {
                 .collect()
         };
         match self {
-            Self::Row { cells: c } => Self::Row { cells: cells(c) },
+            // The `HAVING` names one of the cells' own numbers, and a `HavingAgg` is never a
+            // quantile - so there is nothing there to move. Carried through unchanged rather
+            // than dropped.
+            Self::Row { cells: c, having } => Self::Row { cells: cells(c), having },
             Self::Union { branches } => Self::Union {
                 branches: branches.into_iter().map(|b| b.rebase_probes(by)).collect(),
             },
@@ -964,7 +976,7 @@ impl Shape {
             })
         };
         match self {
-            Self::Row { cells: c } => Self::Row { cells: cells(c) },
+            Self::Row { cells: c, having: h } => Self::Row { cells: cells(c), having: having(h) },
             Self::Pairs { keys, cells: c, having: h, order: o, cut } => Self::Pairs {
                 keys: keys.into_iter().map(|k| k + by).collect(),
                 cells: cells(c),

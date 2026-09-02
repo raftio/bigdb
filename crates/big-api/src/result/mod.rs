@@ -31,7 +31,7 @@ mod num;
 
 use crate::{Answer, Shape, Value};
 use group::{grouped, joined, paired};
-use num::{scalar_cell, Num};
+use num::{int_of, number, scalar_cell, Num};
 
 /// One row of a result set.
 pub type Row = Vec<Datum>;
@@ -160,7 +160,18 @@ pub fn result_set(answer: &Answer, values: &[Value]) -> ResultSet {
 /// Recursive for exactly one reason: a `UNION ALL` is branches of this.
 fn rows_of(shape: &Shape, values: &[Value], probes_at: usize) -> Vec<Row> {
     match shape {
-        Shape::Row { cells } => {
+        // The one shape whose `HAVING` decides *how many* rows there are rather than which: the
+        // whole filtered set is one group, so failing the test leaves no row at all. Applied
+        // here, after the merge, for the same reason a grouping's is - a total under the
+        // threshold on one node can be over it once every node has contributed.
+        Shape::Row { cells, having } => {
+            let kept = match having {
+                None => true,
+                Some(h) => h.keeps(int_of(number(h.of, values, None))),
+            };
+            if !kept {
+                return Vec::new();
+            }
             vec![cells.iter().map(|c| scalar_cell(c, values, probes_at)).collect()]
         }
 

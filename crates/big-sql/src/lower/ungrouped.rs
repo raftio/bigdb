@@ -14,7 +14,7 @@
 
 //! `SELECT *`, a projection of stored values, or aggregates over the whole filtered set.
 
-use super::measure::units_of;
+use super::measure::{having_of, measure_of, units_of, Measure};
 use super::pql::{as_call, call_of, field_arg, named};
 use super::{answer, rows_of, Ask, Calls, Probe, Statement};
 use crate::ast::{Item, Name, Proj, Select};
@@ -31,11 +31,14 @@ pub(super) fn ungrouped(
     columns: &[(&Item, Name)],
     aggregates: &[&Item],
 ) -> Result<Statement> {
+    // A `HAVING` names an aggregate, and the two shapes below answer with values rather than
+    // with aggregates - so there is no number in either for one to be about. Refused here, once,
+    // rather than in each of them: the aggregate case is the only one that can carry it, and it
+    // does so at the bottom of this function.
     if let Some(h) = &select.having {
-        // No `GROUP BY`, so there are no groups for a `HAVING` to keep or drop. SQL allows one
-        // over the implicit single group; here that answer is a scalar and filtering it would
-        // mean returning zero rows or one, which is a question nobody asks in this dialect.
-        return Err(SqlError::Refused { what: Refused::Having, at: h.at });
+        if !columns.is_empty() || !stars.is_empty() {
+            return Err(SqlError::Refused { what: Refused::Having, at: h.at });
+        }
     }
 
     if let Some((first, _)) = columns.first() {
@@ -143,6 +146,10 @@ pub(super) fn ungrouped(
     let mut calls = Calls::new(at);
     let mut probes: Vec<Probe> = Vec::new();
     let mut cells = Vec::new();
+    // What each entry measures, paired with where its number comes from - the same list a
+    // grouping builds, and read by the same `having_of`. A `HAVING` may only name a number the
+    // select list already asked for, and this is what decides that.
+    let mut measures: Vec<(Measure, Of)> = Vec::new();
     for item in aggregates {
         let rows = rows_of(rows, item);
         let of = match &item.proj {
@@ -181,8 +188,10 @@ pub(super) fn ungrouped(
             }
             Proj::Star | Proj::Column(_) => unreachable!("sorted into the other two buckets"),
         };
+        measures.push((measure_of(item), of));
         cells.push(Cell { column: item.column(), of, units: units_of(table, &item.proj) });
     }
 
-    Ok(Statement { calls: calls.out, probes, answer: answer(select, Shape::Row { cells }) })
+    let having = having_of(select, table, &measures)?;
+    Ok(Statement { calls: calls.out, probes, answer: answer(select, Shape::Row { cells, having }) })
 }
