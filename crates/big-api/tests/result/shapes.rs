@@ -19,13 +19,10 @@ use big_api::{result_set, Absent, Columns, Cut, Datum, Of, Projected, Projection
 
 #[test]
 fn a_single_row_reads_one_cell_per_plan() {
-    let shape = Shape::Row {
-        cells: vec![
-            cell("count()", Of::Value { plan: 0 }),
-            cell("sum(amount)", Of::Value { plan: 1 }),
-        ],
-        having: None,
-    };
+    let shape = Shape::row(vec![
+        cell("count()", Of::Value { plan: 0 }),
+        cell("sum(amount)", Of::Value { plan: 1 }),
+    ]);
     let values = vec![Value::Count(3), Value::Sum(250)];
 
     let set = result_set(&answer(shape), &values);
@@ -36,10 +33,7 @@ fn a_single_row_reads_one_cell_per_plan() {
 
 #[test]
 fn an_average_is_a_quotient_and_keeps_its_fractional_part() {
-    let shape = Shape::Row {
-        cells: vec![cell("avg(amount)", Of::Ratio { plan: 0, over: 1 })],
-        having: None,
-    };
+    let shape = Shape::row(vec![cell("avg(amount)", Of::Ratio { plan: 0, over: 1 })]);
     let values = vec![Value::Sum(250), Value::Count(4)];
 
     let set = result_set(&answer(shape), &values);
@@ -51,8 +45,7 @@ fn an_average_is_a_quotient_and_keeps_its_fractional_part() {
 fn counting_distinct_counts_the_groups_after_the_merge() {
     // The whole reason this lives here: two nodes each holding the same group must count as
     // one, and they are only one once both answers are in.
-    let shape =
-        Shape::Row { cells: vec![cell("uniq(country)", Of::Groups { plan: 0 })], having: None };
+    let shape = Shape::row(vec![cell("uniq(country)", Of::Groups { plan: 0 })]);
     let values = vec![groups(vec![
         group(1, Some("GB"), Value::Count(2)),
         group(2, Some("US"), Value::Count(1)),
@@ -66,13 +59,10 @@ fn counting_distinct_counts_the_groups_after_the_merge() {
 #[test]
 fn a_search_answer_is_read_from_after_the_calls() {
     // `calls` is where a probe's index starts, because the two lists are built separately.
-    let shape = Shape::Row {
-        cells: vec![
-            cell("count()", Of::Value { plan: 0 }),
-            cell("quantile(amount)", Of::Probe { probe: 0 }),
-        ],
-        having: None,
-    };
+    let shape = Shape::row(vec![
+        cell("count()", Of::Value { plan: 0 }),
+        cell("quantile(amount)", Of::Probe { probe: 0 }),
+    ]);
     let values = vec![Value::Count(9), Value::Count(41)];
 
     let set = result_set(&answer_with_probes(shape, 1), &values);
@@ -82,8 +72,7 @@ fn a_search_answer_is_read_from_after_the_calls() {
 
 #[test]
 fn top_k_answers_with_the_list_of_keys() {
-    let shape =
-        Shape::Row { cells: vec![cell("topK(3)(country)", Of::Keys { plan: 0 })], having: None };
+    let shape = Shape::row(vec![cell("topK(3)(country)", Of::Keys { plan: 0 })]);
     let values = vec![groups(vec![
         group(1, Some("GB"), Value::Count(9)),
         group(2, Some("US"), Value::Count(4)),
@@ -98,8 +87,7 @@ fn top_k_answers_with_the_list_of_keys() {
 fn a_group_with_no_interned_name_is_left_out_of_a_list_of_names() {
     // Distinct from the grouped case below, where the same group is a `null` cell: a list of
     // names has nowhere to put a group that has none, and a row does.
-    let shape =
-        Shape::Row { cells: vec![cell("topK(3)(country)", Of::Keys { plan: 0 })], having: None };
+    let shape = Shape::row(vec![cell("topK(3)(country)", Of::Keys { plan: 0 })]);
     let values =
         vec![groups(vec![group(1, Some("GB"), Value::Count(9)), group(2, None, Value::Count(4))])];
 
@@ -176,16 +164,13 @@ fn a_decimal_total_carries_the_scale_its_field_keeps() {
         of,
         units: big_api::Units::Digits(scale),
     };
-    let shape = Shape::Row {
-        cells: vec![
-            scaled("sum", Of::Value { plan: 0 }, 2),
-            cell("count", Of::Value { plan: 1 }),
-            // An average is already a quotient and already a float, so it is divided rather
-            // than pointed.
-            scaled("avg", Of::Ratio { plan: 0, over: 1 }, 2),
-        ],
-        having: None,
-    };
+    let shape = Shape::row(vec![
+        scaled("sum", Of::Value { plan: 0 }, 2),
+        cell("count", Of::Value { plan: 1 }),
+        // An average is already a quotient and already a float, so it is divided rather
+        // than pointed.
+        scaled("avg", Of::Ratio { plan: 0, over: 1 }, 2),
+    ]);
     let values = vec![Value::Sum(1250), Value::Count(2)];
 
     let set = result_set(&answer(shape), &values);
@@ -198,8 +183,7 @@ fn a_decimal_total_carries_the_scale_its_field_keeps() {
 
 #[test]
 fn a_union_stacks_its_branches_in_the_order_written() {
-    let branch =
-        |plan: usize| Shape::Row { cells: vec![cell("n", Of::Value { plan })], having: None };
+    let branch = |plan: usize| Shape::row(vec![cell("n", Of::Value { plan })]);
     let shape = Shape::Union { branches: vec![branch(0), branch(1)] };
     let values = vec![Value::Count(1), Value::Count(2)];
 

@@ -119,13 +119,7 @@ fn the_shape_says_how_the_answer_becomes_columns() {
     let api = stocked();
     let (value, shape) = one(&api, "SELECT count(DISTINCT country) FROM tx");
     // The plan is a `Distinct`; the counting is the shape's job, after any merge.
-    assert_eq!(
-        shape,
-        Shape::Row {
-            cells: vec![Cell::plain("count".to_string(), Of::Groups { plan: 0 })],
-            having: None
-        }
-    );
+    assert_eq!(shape, Shape::row(vec![Cell::plain("count".to_string(), Of::Groups { plan: 0 })]));
     assert_eq!(value.as_groups().unwrap().len(), 3);
 
     let (_, shape) = one(&api, "SELECT country, count(*) FROM tx GROUP BY country");
@@ -153,16 +147,13 @@ fn several_aggregates_are_several_plans_over_the_same_records() {
     assert_eq!(plans.len(), 3);
     assert_eq!(
         answer.shape,
-        Shape::Row {
-            cells: vec![
-                Cell::plain("count".to_string(), Of::Value { plan: 0 }),
-                // Resolved, because a shape that reached here has met the schema: `amount`
-                // keeps no digits after the point, so its cells are plain.
-                Cell::plain("sum", Of::Value { plan: 1 }),
-                Cell::plain("max", Of::Value { plan: 2 }),
-            ],
-            having: None,
-        }
+        Shape::row(vec![
+            Cell::plain("count".to_string(), Of::Value { plan: 0 }),
+            // Resolved, because a shape that reached here has met the schema: `amount`
+            // keeps no digits after the point, so its cells are plain.
+            Cell::plain("sum", Of::Value { plan: 1 }),
+            Cell::plain("max", Of::Value { plan: 2 }),
+        ])
     );
     // Each plan is what the aggregate alone would have produced.
     for (i, alone) in [
@@ -201,13 +192,10 @@ fn a_repeated_question_is_one_plan() {
     assert_eq!(plans.len(), 2, "a count and a sum, with the count shared");
     assert_eq!(
         answer.shape,
-        Shape::Row {
-            cells: vec![
-                Cell::plain("count".to_string(), Of::Value { plan: 0 }),
-                Cell::plain("avg", Of::Ratio { plan: 1, over: 0 }),
-            ],
-            having: None,
-        }
+        Shape::row(vec![
+            Cell::plain("count".to_string(), Of::Value { plan: 0 }),
+            Cell::plain("avg", Of::Ratio { plan: 1, over: 0 }),
+        ])
     );
 }
 
@@ -286,10 +274,7 @@ fn a_statement_can_be_planned_without_being_run() {
     assert_eq!(plans[0].table(), "tx");
     assert_eq!(
         answer.shape,
-        Shape::Row {
-            cells: vec![Cell::plain("count".to_string(), Of::Value { plan: 0 })],
-            having: None
-        }
+        Shape::row(vec![Cell::plain("count".to_string(), Of::Value { plan: 0 })])
     );
     assert!(api.plan_sql("SELECT count(*) FROM nope").is_err());
 }

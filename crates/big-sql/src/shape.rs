@@ -762,6 +762,21 @@ pub enum Shape {
 }
 
 impl Shape {
+    /// One row of cells, kept whatever it holds.
+    ///
+    /// The companion to [`Cell::plain`], and it exists for the same reason: a caller that has
+    /// nothing to say about a field should not have to name it. Only the lowering ever has a
+    /// `HAVING` to put here, so every other construction of a `Shape::Row` — every test
+    /// fixture, every example — was spelling out `having: None` to say nothing.
+    ///
+    /// That is not tidiness. A struct-like variant is constructed by naming every field, so a
+    /// field added to `Row` churns each of those sites without any of them meaning anything
+    /// different afterwards; the diff then hides the two or three places where the new field
+    /// genuinely had to be decided. Going through here keeps that from happening again.
+    pub fn row(cells: Vec<Cell>) -> Self {
+        Self::Row { cells, having: None }
+    }
+
     /// The column names, in order, for a caller rendering a header.
     pub fn columns(&self) -> Vec<&str> {
         match self {
