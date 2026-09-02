@@ -182,7 +182,7 @@ merge arm, no wire change.
 **plans are equal** — not that SQL produced *some* plan. That is what makes "SQL is a
 translation" checkable rather than descriptive. It compares plans rather than ASTs because the
 two surfaces spell an equality differently and the planner resolves both to the same thing,
-which is the level the claim is made at. `crates/big-api/tests/sql.rs` does the same against a
+which is the level the claim is made at. `crates/big-embed/tests/sql.rs` does the same against a
 real database, comparing answers; `crates/big-http/tests/sql.rs` covers the route, the result-set
 shape, and the status of every kind of refusal.
 
@@ -556,13 +556,13 @@ list divides cleanly in two, and v4 does both halves.
 
 `INSERT INTO t (id, …) VALUES (…)`, `DROP TABLE [IF EXISTS]`, `CREATE TABLE IF NOT EXISTS`, and
 `DESCRIBE` / `SHOW TABLES` / `SHOW CREATE TABLE`. None of these needed anything new below
-`big-api`: the import path, `drop_table` and the schema snapshot were all reachable over HTTP
+`big-embed`: the import path, `drop_table` and the schema snapshot were all reachable over HTTP
 already. What was missing was a way to say them in the language the rest of the session is
 written in.
 
 **An `INSERT` carries literals, not facts.** `big-sql` reads no schema — that is the invariant
 the whole crate rests on — so what a value *means* for a field is resolved one layer up, by the
-new `big_api::fact`. The import route now reads its lines with that same function, which turns a
+new `big_embed::fact`. The import route now reads its lines with that same function, which turns a
 refactor into a checkable claim: `an_inserted_value_is_read_the_way_an_imported_one_is` writes
 one record each way and asks one question of both.
 
@@ -605,7 +605,7 @@ make no plan at all. `sql_ddl` was already coping by building a `Shape::Row` who
 `plan: 0` when there was no plan, and `DESCRIBE` would have had to fake one harder.
 
 So the last step moved down one layer, to the coordinator, where the same argument
-`big-api/src/result` already makes applies: a shape is only right once every owner has answered,
+`big-embed/src/result` already makes applies: a shape is only right once every owner has answered,
 and that is where every owner has answered. `big-http` lost a function and gained nothing to
 know. The public JSON did not change, which the byte-exact assertions in `big-http/tests/sql.rs`
 confirm without having been edited.

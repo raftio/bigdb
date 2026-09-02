@@ -52,7 +52,7 @@ pub use auth::{Auth, Role};
 pub use request::Request;
 pub use response::{reason_for, Response};
 
-use big_api::Api;
+use big_embed::Api;
 use big_cluster::Cluster;
 use big_pager::PagerMut;
 use metrics::ServerMetrics;

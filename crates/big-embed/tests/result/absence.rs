@@ -19,8 +19,8 @@
 //! claimed one at a time.
 
 use crate::common::*;
-use big_api::Value;
-use big_api::{
+use big_embed::Value;
+use big_embed::{
     result_set, Absent, Cut, Datum, GroupOrder, Having, Of, OrderBy, Shape, Threshold, Units,
 };
 
@@ -97,7 +97,7 @@ fn an_ordering_puts_an_absent_number_last_in_both_directions() {
         by: OrderBy::Value { of: Of::Group { plan: 1, absent: Absent::Null } },
         desc,
     };
-    let keys = |set: big_api::ResultSet| -> Vec<Datum> {
+    let keys = |set: big_embed::ResultSet| -> Vec<Datum> {
         set.rows.into_iter().map(|r| r[0].clone()).collect()
     };
 

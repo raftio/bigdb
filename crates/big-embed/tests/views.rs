@@ -22,7 +22,7 @@
 //! a rewritten parse tree. That is the thing that has to be right: a view is only correct if
 //! `FROM v` asks the engine exactly what writing the substitution by hand would have asked.
 
-use big_api::{Api, Sql};
+use big_embed::{Api, Sql};
 use big_db::FieldKind;
 use big_pager::MemPager;
 
@@ -290,13 +290,13 @@ fn describing_a_view_lists_what_it_exposes_and_not_what_it_hides() {
         .rows
         .iter()
         .map(|r| match &r[0] {
-            big_api::Datum::Text(t) => t.clone(),
+            big_embed::Datum::Text(t) => t.clone(),
             other => panic!("a name is text: {other:?}"),
         })
         .collect();
     assert_eq!(names, ["amount", "cc"]);
     // The kind is the underlying column's, because that is what the bits are.
-    assert_eq!(set.rows[1][1], big_api::Datum::Text("set".to_string()));
+    assert_eq!(set.rows[1][1], big_embed::Datum::Text("set".to_string()));
 }
 
 /// `SHOW TABLES` lists both, under a `type` column; `SHOW CREATE VIEW` answers with the stored
@@ -306,13 +306,13 @@ fn a_view_is_in_the_listings_and_writes_itself_back_out() {
     let api = fixture();
     let set = api.show_tables();
     assert_eq!(set.columns, ["name", "type", "engine", "fields"]);
-    let row = set.rows.iter().find(|r| r[0] == big_api::Datum::Text("big".to_string())).unwrap();
-    assert_eq!(row[1], big_api::Datum::Text("VIEW".to_string()));
+    let row = set.rows.iter().find(|r| r[0] == big_embed::Datum::Text("big".to_string())).unwrap();
+    assert_eq!(row[1], big_embed::Datum::Text("VIEW".to_string()));
     // A view stores nothing, so it has no engine to report rather than a made-up one.
-    assert_eq!(row[2], big_api::Datum::Null);
+    assert_eq!(row[2], big_embed::Datum::Null);
 
     let set = api.show_create("big").unwrap();
-    let big_api::Datum::Text(statement) = &set.rows[0][0] else { panic!("a statement is text") };
+    let big_embed::Datum::Text(statement) = &set.rows[0][0] else { panic!("a statement is text") };
     // The gate `SHOW CREATE TABLE` has, applied here: what comes out has to read back as the
     // same view. Otherwise a schema somebody dumped and replayed is a different schema.
     let big_sql::Sql::Ddl(big_sql::Ddl::CreateView { name, body, .. }) =

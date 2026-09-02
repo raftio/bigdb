@@ -61,7 +61,7 @@ jobs:
       - run: cargo clippy --workspace --exclude big-bench --all-targets
 
   # A dead doc link is a broken promise in the one place a reader cannot check it for
-  # themselves, and `big-api` and `big-http` deny `missing_docs`, so this also catches a public
+  # themselves, and `big-embed` and `big-http` deny `missing_docs`, so this also catches a public
   # item added without a word about it.
   docs:
     runs-on: ubuntu-latest
@@ -82,7 +82,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace --exclude big-bench
 
-  # `big-api` and `big-http` are the only two crates that promise anything, so they are the only
+  # `big-embed` and `big-http` are the only two crates that promise anything, so they are the only
   # two checked. Nothing is on crates.io yet, so this has no baseline to compare against and
   # passes trivially; it is wired in now so that it does not have to be remembered later, when
   # the first accidental breaking change is the thing that would have prompted it.
@@ -95,7 +95,7 @@ jobs:
       - uses: obi1kenobi/cargo-semver-checks-action@v2
         continue-on-error: true
         with:
-          package: big-api, big-http
+          package: big-embed, big-http
 
   # The crash tests drive real failpoints and are the reason a commit can be trusted to be
   # atomic. They run behind a feature flag, so a plain `cargo test` misses them.

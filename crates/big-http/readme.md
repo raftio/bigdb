@@ -75,5 +75,9 @@ guess.
 
 ## Stability
 
-This crate and `big-api` are the published surface and carry a semver guarantee. See
+This crate and `big-embed` are the published surface and carry a semver guarantee. See
 `../../docs/versioning.md`.
+
+**`big-embed` is the same database without the socket.** If the code that queries big runs in
+the same process as the data, depend on that instead and skip the encoding, the request and the
+port. This crate is for when it does not.

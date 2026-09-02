@@ -45,7 +45,7 @@ pub use views::ViewInfo;
 // Everything below appears in a signature on this page, and a type a caller cannot name is a
 // type they cannot hold: `query` returns a `Value`, so a function that wraps `query` has no way
 // to write its own return type unless `Value` is reachable from here. These crates are not
-// published - `big-api` and `big-http` are the only two that are - so a re-export is the only
+// published - `big-embed` and `big-http` are the only two that are - so a re-export is the only
 // route to them, not merely the convenient one.
 pub use big_db::catalog::FragmentMeta;
 pub use big_db::catalog::{FieldId, FieldKind, TableEngine, TableId};
@@ -370,8 +370,8 @@ pub struct KeyAssignment<'a> {
 /// gives the file-backed one; [`Api::in_memory`] gives the other.
 ///
 /// ```
-/// # fn main() -> Result<(), big_api::ApiError> {
-/// use big_api::{Api, Fact, FieldKind};
+/// # fn main() -> Result<(), big_embed::ApiError> {
+/// use big_embed::{Api, Fact, FieldKind};
 ///
 /// let api = Api::in_memory()?;
 /// api.create_table("tx")?;

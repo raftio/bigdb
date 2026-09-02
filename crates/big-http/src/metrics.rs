@@ -357,7 +357,7 @@ fn io_counter(out: &mut String, name: &str, backend: &str, help: &str, value: u6
 /// process whose whole read path is otherwise a borrow out of a mapping - a database with a
 /// high-cardinality keyed column runs out of memory long before it runs out of disk, and
 /// without this gauge the first symptom is the OOM killer.
-pub fn render_keys(out: &mut String, k: &big_api::KeyStats) {
+pub fn render_keys(out: &mut String, k: &big_embed::KeyStats) {
     gauge(out, "big_row_keys", "Distinct row keys held in memory.", k.count as u64);
     gauge(
         out,

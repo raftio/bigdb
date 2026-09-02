@@ -1,6 +1,6 @@
 [package]
-name = "big-api"
-description = "The facade: one entry point for schema, ingest and queries"
+name = "big-embed"
+description = "In-process facade for big: schema, ingest and queries with no server in between"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

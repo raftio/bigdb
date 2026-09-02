@@ -213,7 +213,7 @@ lint:
 	$(CARGO) fmt --all --check
 	RUSTFLAGS='-D warnings' $(CARGO) clippy $(WORKSPACE) --all-targets
 
-# A dead doc link is a broken promise, and `big-api` and `big-http` deny `missing_docs`, so this
+# A dead doc link is a broken promise, and `big-embed` and `big-http` deny `missing_docs`, so this
 # also catches a public item added without a word about it.
 docs:
 	RUSTDOCFLAGS='-D warnings' $(CARGO) doc $(WORKSPACE) --no-deps

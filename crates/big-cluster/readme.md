@@ -2,7 +2,7 @@
 
 Static shard ownership, the fan-out over it, and the wire it travels on.
 
-Above `big-api` and below `big-http`, which is the whole reason it is its own crate: the merge
+Above `big-embed` and below `big-http`, which is the whole reason it is its own crate: the merge
 has to live somewhere that has never heard of a socket handler and somewhere `big-db` has never
 heard of, and neither of those places existed.
 

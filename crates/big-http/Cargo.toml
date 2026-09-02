@@ -13,7 +13,7 @@ categories = ["database-implementations","web-programming::http-server"]
 # No web framework. The surface is a dozen routes and a JSON writer; pulling in an async
 # runtime for that would be a larger commitment than the whole engine has made so far.
 [dependencies]
-big-api = { path = "../big-api", version = "0.1.0" }
+big-embed = { path = "../big-embed", version = "0.1.0" }
 # The coordinator. Every route goes through it, including on a node with no peers: a second
 # path for the un-clustered case would be the path nobody tests.
 big-cluster = { path = "../big-cluster", version = "0.1.0" }

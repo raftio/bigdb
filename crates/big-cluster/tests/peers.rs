@@ -23,7 +23,7 @@
 //! What this cannot claim is anything about sockets: pooling, keep-alive, or a deadline against
 //! a real clock. Those stay in `big-http/tests/cluster.rs`, over real ports, where they belong.
 
-use big_api::{Api, FieldKind, MemPager, QueryOptions, Value};
+use big_embed::{Api, FieldKind, MemPager, QueryOptions, Value};
 use big_cluster::client::{ClientError, PeerResponse, Peers, Repeatable};
 use big_cluster::{
     raft, wire, Cluster, ClusterConfig, ClusterError, ClusterFile, FactValue, OwnedFact,

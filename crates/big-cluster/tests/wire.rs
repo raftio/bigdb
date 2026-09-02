@@ -19,7 +19,7 @@
 //! did not write: the peer is authenticated, not trusted, and a build on the other side of an
 //! upgrade is not hostile but is just as capable of sending something this one cannot read.
 
-use big_api::{Plan, Rows, Value};
+use big_embed::{Plan, Rows, Value};
 use big_cluster::wire::{self, Assignment, FactValue, OwnedFact, WireError};
 use big_container::Container;
 use big_db::Matches;
@@ -169,16 +169,16 @@ fn every_schema_change_survives() {
     let cases = vec![
         // One per engine, because the engine is a tag on the wire and a tag that only ever
         // travels as its default is a tag nothing has tested.
-        wire::Ddl::CreateTable { table: "tx".to_string(), engine: big_api::TableEngine::Bitmap },
+        wire::Ddl::CreateTable { table: "tx".to_string(), engine: big_embed::TableEngine::Bitmap },
         wire::Ddl::CreateTable {
             table: "tx".to_string(),
-            engine: big_api::TableEngine::BitmapColumnar,
+            engine: big_embed::TableEngine::BitmapColumnar,
         },
-        wire::Ddl::CreateTable { table: "tx".to_string(), engine: big_api::TableEngine::Columnar },
+        wire::Ddl::CreateTable { table: "tx".to_string(), engine: big_embed::TableEngine::Columnar },
         wire::Ddl::CreateField {
             table: "tx".to_string(),
             field: "amount".to_string(),
-            kind: big_api::FieldKind::SignedInt,
+            kind: big_embed::FieldKind::SignedInt,
             bit_depth: 20,
         },
         wire::Ddl::CreateDecimal {
@@ -190,7 +190,7 @@ fn every_schema_change_survives() {
         wire::Ddl::CreateTimeQuantum {
             table: "tx".to_string(),
             field: "visit".to_string(),
-            granularity: vec![big_api::Granularity::Year, big_api::Granularity::Hour],
+            granularity: vec![big_embed::Granularity::Year, big_embed::Granularity::Hour],
         },
         wire::Ddl::DropTable { table: "tx".to_string() },
         wire::Ddl::DropField { table: "tx".to_string(), field: "amount".to_string() },
@@ -201,7 +201,7 @@ fn every_schema_change_survives() {
         // that the string survives the `.` it now carries.
         wire::Ddl::CreateTable {
             table: "sales.orders".to_string(),
-            engine: big_api::TableEngine::Bitmap,
+            engine: big_embed::TableEngine::Bitmap,
         },
         wire::Ddl::DropTable { table: "sales.orders".to_string() },
         wire::Ddl::DropField { table: "sales.orders".to_string(), field: "amount".to_string() },
@@ -344,7 +344,7 @@ proptest! {
 /// the value alone does not say which.
 #[test]
 fn a_segment_body_survives_the_wire() {
-    let addr = big_api::FragmentAddr {
+    let addr = big_embed::FragmentAddr {
         table: "tx".to_string(),
         field: Some("country".to_string()),
         view: None,
@@ -354,11 +354,11 @@ fn a_segment_body_survives_the_wire() {
     };
     let body = wire::FragmentBody {
         addr,
-        meta: big_api::FragmentMeta { bit_depth: 7, min: 1, max: 99, has_values: true },
-        data: big_api::FragmentData::Cells(vec![
-            (0, big_api::ColumnCell::Value(42)),
-            (1023, big_api::ColumnCell::List(vec![1, 2, 3])),
-            (1024, big_api::ColumnCell::List(vec![])),
+        meta: big_embed::FragmentMeta { bit_depth: 7, min: 1, max: 99, has_values: true },
+        data: big_embed::FragmentData::Cells(vec![
+            (0, big_embed::ColumnCell::Value(42)),
+            (1023, big_embed::ColumnCell::List(vec![1, 2, 3])),
+            (1024, big_embed::ColumnCell::List(vec![])),
         ]),
     };
 
@@ -366,7 +366,7 @@ fn a_segment_body_survives_the_wire() {
     assert_eq!(back.addr, body.addr);
     assert_eq!(back.meta, body.meta);
     match (&back.data, &body.data) {
-        (big_api::FragmentData::Cells(a), big_api::FragmentData::Cells(b)) => {
+        (big_embed::FragmentData::Cells(a), big_embed::FragmentData::Cells(b)) => {
             assert_eq!(a, b)
         }
         other => panic!("a segment came back as {other:?}"),
@@ -378,7 +378,7 @@ fn a_segment_body_survives_the_wire() {
 /// *receiver's* catalog - and a body has to be readable before that resolution.
 #[test]
 fn a_body_with_an_unknown_data_tag_is_refused() {
-    let addr = big_api::FragmentAddr {
+    let addr = big_embed::FragmentAddr {
         table: "tx".to_string(),
         field: None,
         view: None,
@@ -388,8 +388,8 @@ fn a_body_with_an_unknown_data_tag_is_refused() {
     };
     let body = wire::FragmentBody {
         addr,
-        meta: big_api::FragmentMeta::default(),
-        data: big_api::FragmentData::Containers(Vec::new()),
+        meta: big_embed::FragmentMeta::default(),
+        data: big_embed::FragmentData::Containers(Vec::new()),
     };
     let mut bytes = body.encode();
     // The tag sits right after the address and the meta; find it by round-tripping a known-good

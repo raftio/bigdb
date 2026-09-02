@@ -19,7 +19,7 @@
 //! test against a fixture would keep passing after they disagreed. Every assertion below went
 //! through `Server::bind`, a loopback port, and `big_bin::client::run` - the same function `main` calls.
 
-use big_api::Api;
+use big_embed::Api;
 use big_bin::{exit, Io};
 use big_db::catalog::FieldKind;
 use big_http::{Auth, Server, ServerConfig};
@@ -75,8 +75,8 @@ fn spawn(requests: usize, config: ServerConfig) -> SocketAddr {
         api.import(
             "tx",
             &[
-                big_api::Fact::Int { field: "amount", record: id, value: amount },
-                big_api::Fact::Key { field: "country", record: id, value: country },
+                big_embed::Fact::Int { field: "amount", record: id, value: amount },
+                big_embed::Fact::Key { field: "country", record: id, value: country },
             ],
         )
         .unwrap();

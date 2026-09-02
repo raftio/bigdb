@@ -142,7 +142,7 @@ pub use big_engine::FieldKind;
 /// # Why this is a type and not a second parameter
 ///
 /// Every method that reaches a table by name needs the database too, and there are about forty
-/// of them across this crate and `big-api`. Adding a parameter to each would touch every call
+/// of them across this crate and `big-embed`. Adding a parameter to each would touch every call
 /// site in the workspace to say `default` - noise that hides the handful of call sites where
 /// the database is a real decision.
 ///

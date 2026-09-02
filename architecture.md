@@ -30,7 +30,7 @@ the bottom.
                                               │  the local share; peers get
                                               │  the same plan over /internal
    facade     ┌───────────────────────────────▼──────────────────────────────┐
-              │ big-api    schema, batch import, query                       │  owns the transaction boundary
+              │ big-embed  schema, batch import, query                       │  owns the transaction boundary
               └───────────────────────────────┬──────────────────────────────┘
                                               │
    query      ┌───────────────────────────────▼──────────────────────────────┐

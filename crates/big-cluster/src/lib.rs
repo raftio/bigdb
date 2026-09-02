@@ -76,7 +76,7 @@ pub use config::{ClusterConfig, ClusterFile, ConfigError, Node, ShardRange};
 pub use error::{ClusterError, Result};
 pub use wire::{Assignment, Ddl, FactValue, OwnedFact};
 
-use big_api::{Api, KeyAssignment, PagerMut, Plan, QueryOptions, RecordId, RowId, Value};
+use big_embed::{Api, KeyAssignment, PagerMut, Plan, QueryOptions, RecordId, RowId, Value};
 use client::{ClientError, Repeatable};
 use controller::{Controller, Leases};
 use merge::Merge;

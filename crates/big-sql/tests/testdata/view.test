@@ -7,7 +7,7 @@
 # table and nothing else.
 #
 # This crate holds no catalog, so nothing here is expanded. What these cases pin is the two
-# statements and the body rule; the substitution itself is `big-api`'s, in `tests/views.rs`.
+# statements and the body rule; the substitution itself is `big-embed`'s, in `tests/views.rs`.
 #
 # The body is stored as **text**, sliced from the statement as it was written, and re-parsed at
 # every read. That is what `SHOW CREATE VIEW` answers with, and it is why the printer below

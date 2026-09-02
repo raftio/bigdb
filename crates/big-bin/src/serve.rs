@@ -22,7 +22,7 @@
 //! There is no TLS here and there will not be. Terminate it at a reverse proxy - `runbook.md`
 //! has a configuration that works.
 
-use big_api::Api;
+use big_embed::Api;
 use big_cluster::{Cluster, ClusterFile};
 use big_http::{log, Auth, Server, ServerConfig};
 use std::time::Duration;
@@ -144,9 +144,9 @@ fn authenticator(opts: &Options) -> std::io::Result<Auth> {
 /// itself is a fact the operator has to fix, and finding that out after the port is open would
 /// mean a node answering for a range nobody agreed it owns.
 fn assemble(
-    api: Api<big_api::MmapPager>,
+    api: Api<big_embed::MmapPager>,
     opts: &Options,
-) -> std::io::Result<Cluster<big_api::MmapPager>> {
+) -> std::io::Result<Cluster<big_embed::MmapPager>> {
     let Some(path) = &opts.cluster else { return Ok(Cluster::solo(api)) };
     let text = std::fs::read_to_string(path)
         .map_err(|e| std::io::Error::new(e.kind(), format!("could not read {path}: {e}")))?;
@@ -203,7 +203,7 @@ fn serving(auth: Auth, opts: &Options) -> ServerConfig {
 /// operator who wrote `0.0.0.0:7654` and one who wrote a hostname that resolves off-box have
 /// made the same decision, and only the resolved address shows it.
 fn refuse_an_open_port(
-    server: &Server<big_api::MmapPager>,
+    server: &Server<big_embed::MmapPager>,
     bound: std::net::SocketAddr,
     opts: &Options,
 ) {
@@ -225,7 +225,7 @@ fn refuse_an_open_port(
 /// The durability line is printed on every start, not only when it is relaxed. An operator
 /// reading a log after an incident needs to know what the setting *was*, and a line that only
 /// appears sometimes is one they have to remember the absence of.
-fn announce(server: &Server<big_api::MmapPager>, bound: std::net::SocketAddr, opts: &Options) {
+fn announce(server: &Server<big_embed::MmapPager>, bound: std::net::SocketAddr, opts: &Options) {
     eprintln!("big serving {} on http://{bound}", opts.path);
     eprintln!("big: durability {}", server.api().durability().label());
     // Printed on every start for the same reason durability is: the ceiling that made a write
@@ -285,7 +285,7 @@ impl Default for Options {
             node: None,
             backup_dir: None,
             max_row_keys: None,
-            mapsize: big_api::DEFAULT_MAPSIZE,
+            mapsize: big_embed::DEFAULT_MAPSIZE,
         }
     }
 }

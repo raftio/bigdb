@@ -57,7 +57,7 @@ file. It still adds no vocabulary: it does not know what a field is, does not pa
 not consult the schema. A line is bytes on their way to the only thing that understands them,
 and a refusal comes back as the server's own code and sentence — the property `bigc` has, kept.
 
-**3. The only dependency is `big-cli`.** Not `big-api`, not `big-http`. `big-cli` has an empty
+**3. The only dependency is `big-cli`.** Not `big-embed`, not `big-http`. `big-cli` has an empty
 `[dependencies]` section, so depending on it leaves the dependency graph proving the same thing
 it proved before: **this binary cannot link the engine.** In exchange `bigi` reuses
 `big_cli::http::Client`, `big_cli::json::Failure`, `big_cli::read_token` and
@@ -70,7 +70,7 @@ know."* That reasoning is about a client that cannot know. This one can, and the
 the engine rather than in the client's care:
 
 ```rust
-Fact::Int  { .. } => w.set_int(..)      // crates/big-api/src/lib.rs
+Fact::Int  { .. } => w.set_int(..)      // crates/big-embed/src/lib.rs
 Fact::Key  { .. } => w.set_key(..)
 Fact::Bool { .. } => w.set_bool(..)
 ```
@@ -161,7 +161,7 @@ underneath it.
 
 `docs/performance-plan.md` measured `Db::ingest(capacity)` at 240× and `Db::bulk_load` at 19×,
 and says what they do: *"It does not make a commit cheaper; it makes commits rarer."* Both exist
-on `Db` — `crates/big-db/src/db.rs:212` and `:216` — and **nothing in `big-api`, `big-http` or
+on `Db` — `crates/big-db/src/db.rs:212` and `:216` — and **nothing in `big-embed`, `big-http` or
 `big-cluster` calls either.** The HTTP path is `Api::import`, which is a loop over facts and
 then `w.commit()`, once per request.
 

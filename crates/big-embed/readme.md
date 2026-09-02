@@ -1,4 +1,4 @@
-# big-api
+# big-embed
 
 One entry point for everything above the engine.
 
@@ -8,7 +8,7 @@ the facade over that — schema, ingest and queries — and it is one of the two
 workspace that carry a semver guarantee.
 
 ```rust
-use big_api::{Api, Fact, FieldKind};
+use big_embed::{Api, Fact, FieldKind};
 
 let api = Api::open("data.big")?;
 
@@ -22,7 +22,7 @@ api.import("tx", &[
 ])?;
 
 let n = api.query("tx", r#"Count(Row(country="GB"))"#)?;
-# Ok::<(), big_api::ApiError>(())
+# Ok::<(), big_embed::ApiError>(())
 ```
 
 ## What this crate decides, because nothing below it could
@@ -42,7 +42,7 @@ serialising it must never keep a reader inside the engine while bytes go down a 
 compose and every combination of them is legitimate:
 
 ```rust
-use big_api::QueryOptions;
+use big_embed::QueryOptions;
 use std::{sync::{Arc, atomic::AtomicBool}, time::Duration};
 
 let cancel = Arc::new(AtomicBool::new(false));
@@ -70,6 +70,11 @@ be reasoned about rather than simply dropped.
 This crate and `big-http` are the published surface. Everything they return is nameable from
 here — `Value`, `Metrics`, `Durability`, `FieldKind` and the rest are re-exported, because a type
 a caller cannot name is a type they cannot hold.
+
+**Which of the two you want is a question of where your code runs, not what it can do.**
+`big-embed` is this database inside your own process, reached by a function call; `big-http` is
+the same database over a socket. Same planner, same answers, same refusals. The name says
+`embed` because that is the whole difference — there is no server in between.
 
 `Api::db()`, which hands out the raw `Db`, is behind the **`unstable`** feature. `Db` belongs to a
 crate with no version guarantee, so reaching for it is an explicit opt-out rather than the

@@ -24,7 +24,7 @@
 
 use crate::config::ConfigError;
 use crate::wire::WireError;
-use big_api::ApiError;
+use big_embed::ApiError;
 
 /// A failure of the cluster, or of the node under it.
 #[derive(Debug)]

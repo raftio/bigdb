@@ -192,7 +192,7 @@ cannot drift from what the crate does.
 **It carries literals, not facts.** What a value *means* is the field's kind to decide — `'GB'`
 is a key to intern, `12.50` is 1250 units on a decimal of scale two, `now@1750000000` is a key
 and a moment — and deciding any of that here would be this crate reading a schema. So an
-[`Insert`] holds the literals exactly as written and `big_api::fact` turns each into a fact
+[`Insert`] holds the literals exactly as written and `big_embed::fact` turns each into a fact
 against the `FieldInfo` it is for. That is the same function the import route reads its lines
 with, so the two write paths cannot come to disagree about what a value means.
 

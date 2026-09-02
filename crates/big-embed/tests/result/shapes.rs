@@ -15,7 +15,7 @@
 //! Each shape reads the answers it names, and nothing else.
 
 use crate::common::*;
-use big_api::{result_set, Absent, Columns, Cut, Datum, Of, Projected, Projection, Shape, Value};
+use big_embed::{result_set, Absent, Columns, Cut, Datum, Of, Projected, Projection, Shape, Value};
 
 #[test]
 fn a_single_row_reads_one_cell_per_plan() {
@@ -149,20 +149,20 @@ fn a_decimal_column_is_rendered_with_the_point_its_field_keeps() {
             vec![Datum::Dec { units: 5, scale: 2 }, Datum::Null],
         ]
     );
-    assert_eq!(big_api::fixed(1250, 2), "12.50");
-    assert_eq!(big_api::fixed(5, 2), "0.05");
-    assert_eq!(big_api::fixed(-5, 2), "-0.05");
+    assert_eq!(big_embed::fixed(1250, 2), "12.50");
+    assert_eq!(big_embed::fixed(5, 2), "0.05");
+    assert_eq!(big_embed::fixed(-5, 2), "-0.05");
     // A scale of zero is the integer itself, which is every field but a decimal.
-    assert_eq!(big_api::fixed(1250, 0), "1250");
+    assert_eq!(big_embed::fixed(1250, 0), "1250");
 }
 
 /// A scalar cell out of a decimal field: a `sum`, a `min`, a quantile.
 #[test]
 fn a_decimal_total_carries_the_scale_its_field_keeps() {
-    let scaled = |column: &str, of: Of, scale: u8| big_api::Cell {
+    let scaled = |column: &str, of: Of, scale: u8| big_embed::Cell {
         column: column.to_string(),
         of,
-        units: big_api::Units::Digits(scale),
+        units: big_embed::Units::Digits(scale),
     };
     let shape = Shape::row(vec![
         scaled("sum", Of::Value { plan: 0 }, 2),

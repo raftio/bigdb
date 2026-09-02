@@ -20,7 +20,7 @@
 //! wrong in both places; a disagreement between the two surfaces cannot be anything but a bug
 //! in the translation.
 
-use big_api::*;
+use big_embed::*;
 use big_db::catalog::FieldKind;
 
 fn stocked() -> Api<big_pager::MemPager> {

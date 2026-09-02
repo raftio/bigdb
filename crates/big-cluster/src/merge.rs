@@ -30,7 +30,7 @@
 //! two ways depending on how many nodes were asked.
 
 use crate::error::{ClusterError, Result};
-use big_api::{Plan, RowId, Value};
+use big_embed::{Plan, RowId, Value};
 use big_exec::Group;
 use std::collections::BTreeMap;
 
@@ -109,10 +109,10 @@ impl<'a> Merge<'a> {
 fn merge_pairs(
     aggregate: &Plan,
     node: &str,
-    a: Vec<big_api::Pair>,
-    b: Vec<big_api::Pair>,
-) -> Result<Vec<big_api::Pair>> {
-    let mut held: BTreeMap<(RowId, RowId), big_api::Pair> = BTreeMap::new();
+    a: Vec<big_embed::Pair>,
+    b: Vec<big_embed::Pair>,
+) -> Result<Vec<big_embed::Pair>> {
+    let mut held: BTreeMap<(RowId, RowId), big_embed::Pair> = BTreeMap::new();
     for p in a.into_iter().chain(b) {
         match held.get_mut(&(p.left.row, p.right.row)) {
             None => {
@@ -134,7 +134,7 @@ fn merge_pairs(
             }
         }
     }
-    let mut out: Vec<big_api::Pair> = held.into_values().collect();
+    let mut out: Vec<big_embed::Pair> = held.into_values().collect();
     big_exec::sort_pairs(&mut out);
     Ok(out)
 }

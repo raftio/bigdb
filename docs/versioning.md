@@ -7,12 +7,16 @@ implementation detail that happens to be visible.
 
 ### 1. The published crates
 
-**`big-api`** and **`big-http`** are the API. They follow [SemVer](https://semver.org): after
+**`big-embed`** and **`big-http`** are the API. They follow [SemVer](https://semver.org): after
 `1.0.0`, a breaking change to either takes a major version.
 
-Every type that appears in a `big-api` signature is re-exported from `big-api`, and every type in
-a `big-http` signature from `big-http`. That is not a convenience — a type a caller cannot name
-is a type they cannot hold — and it is what makes the guarantee mean anything.
+Every type that appears in a `big-embed` signature is re-exported from `big-embed`, and every
+type in a `big-http` signature from `big-http`. That is not a convenience — a type a caller
+cannot name is a type they cannot hold — and it is what makes the guarantee mean anything.
+
+**They are the same database reached two ways.** `big-embed` is big in your own process;
+`big-http` is big over a socket. Neither is a layer above the other in the sense a caller has to
+care about — pick by where the code runs, not by what it can do.
 
 **Both query surfaces carry the same promise, and it is `big-http`'s.** A statement that
 `POST /sql` accepts today is accepted by the next release, and so is a query `POST
@@ -46,6 +50,18 @@ A load's summary also moved: the fact count is on stdout, rendered like any othe
 honouring `--format`, and the loop's own numbers - lines, chunks, bytes, elapsed - are on
 stderr with the progress. A pipe now carries the count and nothing else.
 
+**One published crate was renamed before 1.0 as well: `big-api` is `big-embed`.** Nothing had
+been published when it moved, so no `Cargo.toml` outside this repository ever named the old one.
+The name was the whole defect: `big-api` read as the layer that speaks to a network, which is
+`big-http`'s job and was never this crate's - the module doc had to say so in prose because the
+name said the opposite. Nothing else moved. The types, the re-exports and the `unstable` feature
+came through untouched, so the migration is two lines:
+
+| was | is |
+| --- | --- |
+| `big-api = "0.1"` | `big-embed = "0.1"` |
+| `use big_api::Api;` | `use big_embed::Api;` |
+
 No name will be reused for something different, and there will be no further renames before
 1.0 without an entry here.
 
@@ -58,16 +74,16 @@ and format migration are the same walk over every page reachable from a consiste
 
 ## What is not guaranteed
 
-**The twelve internal crates.** `big-btree`, `big-cli`, `big-cluster`, `big-container`,
-`big-db`, `big-engine`, `big-exec`, `big-keys`, `big-page`, `big-pager`, `big-plan`,
-`big-sql`.
+**The thirteen internal crates.** `big-bin`, `big-btree`, `big-civil`, `big-cluster`,
+`big-container`, `big-db`, `big-engine`, `big-exec`, `big-keys`, `big-page`, `big-pager`,
+`big-plan`, `big-sql`.
 
 They are on crates.io because a published crate cannot depend on an unpublished one, and
-`big-api` and `big-http` depend on four of them between them — **that is the only reason.** Their shape is free to change
-in any release. Depending on one directly means pinning an exact version and reading the diff
-before every upgrade.
+`big-embed` and `big-http` depend on most of them between them — **that is the only reason.**
+Their shape is free to change in any release. Depending on one directly means pinning an exact
+version and reading the diff before every upgrade.
 
-**`big-api`'s `unstable` feature.** It exposes `Api::db()`, which hands out the raw `Db` from a
+**`big-embed`'s `unstable` feature.** It exposes `Api::db()`, which hands out the raw `Db` from a
 crate with no guarantee. Turning it on is an explicit opt-out of everything above.
 
 **Anything before `1.0.0`.** While the version is `0.x`, a minor bump may break the API. The
@@ -84,25 +100,28 @@ why the job exists rather than the field alone.
 
 ## Releasing
 
-Versions move together. Thirteen crates in one workspace at one `workspace.package.version`, so
-there is one number to reason about and no possibility of a partial release where `big-api`
+Versions move together. Fifteen crates in one workspace at one `workspace.package.version`, so
+there is one number to reason about and no possibility of a partial release where `big-embed`
 `0.2` sits on a `big-db` `0.1` that no longer means what it did.
 
 Publish order follows the dependency graph, leaves first:
 
 ```
-big-container  big-page
-big-pager  big-btree  big-keys  big-plan
-big-engine
-big-db  big-exec
-big-api
+big-container  big-civil
+big-page
+big-pager  big-keys
+big-btree  big-plan
+big-engine  big-sql
+big-db
+big-exec
+big-embed
 big-cluster
 big-http
-big-cli
+big-bin
 ```
 
-`big-bench` is `publish = false`: it pulls in rival engines to measure against and is no part
-of the product.
+Three members are `publish = false` and are no part of the product: `big-bench`, which pulls in
+rival engines to measure against, and `big-e2e` and `big-testfile`, which exist only to test.
 
 ### Checklist
 
@@ -115,5 +134,5 @@ of the product.
 4. `cargo publish` in the order above.
 5. Tag `v<version>`.
 
-`cargo-semver-checks` runs in CI against `big-api` and `big-http`. It has nothing to compare
+`cargo-semver-checks` runs in CI against `big-embed` and `big-http`. It has nothing to compare
 against until the first release, and is wired in now so that it does from the second.

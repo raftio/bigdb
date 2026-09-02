@@ -31,11 +31,11 @@ a second engine with a worse test suite.
                         table (a tty) │ tsv (a pipe) │ json (verbatim)
 ```
 
-`big-cli` depends on **nothing** — not `big-api`, not `big-plan`, not `big-sql`, not `std`'s
+`big-cli` depends on **nothing** — not `big-embed`, not `big-plan`, not `big-sql`, not `std`'s
 async because there isn't one. That is not minimalism for its own sake: a client that cannot
 link the engine cannot accidentally grow an offline path, so
 [Rule 1](#rule-1--the-client-adds-no-vocabulary) is enforced by the dependency graph rather than
-by discipline. `big-http` and `big-api` appear as **dev**-dependencies only, so the tests drive
+by discipline. `big-http` and `big-embed` appear as **dev**-dependencies only, so the tests drive
 a real server in-process the way `crates/big-http/tests/sql.rs` already does.
 
 ## Four decisions, taken here

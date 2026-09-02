@@ -23,7 +23,7 @@
 //! tidiness: it makes a checkpoint's offset a number this file can state rather than compute,
 //! and an offset nobody can predict is an offset no test can check.
 
-use big_api::Api;
+use big_embed::Api;
 use big_bin::client::http::Client;
 use big_bin::exit;
 use big_db::catalog::FieldKind;

@@ -42,7 +42,7 @@
 
 use std::sync::OnceLock;
 
-use big_api::{Api, FieldKind, MemPager, QueryOptions, Value};
+use big_embed::{Api, FieldKind, MemPager, QueryOptions, Value};
 use big_cluster::Cluster;
 use proptest::prelude::*;
 
@@ -94,11 +94,11 @@ fn db() -> &'static Cluster<MemPager> {
             api.import(
                 "t",
                 &[
-                    big_api::Fact::Int { field: "amount", record: r.id, value: r.amount },
-                    big_api::Fact::Int { field: "price", record: r.id, value: r.price },
-                    big_api::Fact::Signed { field: "balance", record: r.id, value: r.balance },
-                    big_api::Fact::Key { field: "country", record: r.id, value: r.country },
-                    big_api::Fact::Bool { field: "active", record: r.id, value: r.active },
+                    big_embed::Fact::Int { field: "amount", record: r.id, value: r.amount },
+                    big_embed::Fact::Int { field: "price", record: r.id, value: r.price },
+                    big_embed::Fact::Signed { field: "balance", record: r.id, value: r.balance },
+                    big_embed::Fact::Key { field: "country", record: r.id, value: r.country },
+                    big_embed::Fact::Bool { field: "active", record: r.id, value: r.active },
                 ],
             )
             .unwrap();
@@ -319,7 +319,7 @@ proptest! {
             .rows
             .iter()
             .map(|r| match r[1] {
-                big_api::Datum::Int(n) => n,
+                big_embed::Datum::Int(n) => n,
                 ref other => panic!("a group counted {other:?}"),
             })
             .sum();

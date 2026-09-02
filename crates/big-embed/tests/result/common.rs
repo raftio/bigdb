@@ -18,7 +18,7 @@
 //! coordinator holds when it applies the shape, so that is what a test holds. Everything here
 //! used to be reachable only through a socket.
 
-use big_api::{
+use big_embed::{
     Answer, Cell, Container, Format, Group, Matches, Of, Pair, RowSet, Selected, Shape, Units,
     Value,
 };

@@ -1081,7 +1081,7 @@ fn rows_written_by_a_statement_are_read_back_by_one() {
     assert_eq!(body, r#"{"columns":["count"],"rows":[[2]]}"#);
 }
 
-/// **The test that makes one shared `big_api::fact` a checkable claim rather than a refactor.**
+/// **The test that makes one shared `big_embed::fact` a checkable claim rather than a refactor.**
 ///
 /// The import route and an `INSERT` write into the same fields, and a field's kind is what
 /// decides how a value is read. If the two disagreed - about `true`, about `key@seconds`, about

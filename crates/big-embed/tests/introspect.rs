@@ -18,8 +18,8 @@
 //! no socket, and a table of cases instead of a fixture. What they answer is what `DESCRIBE`,
 //! `SHOW` and `INSERT` answer, so the claims here are the ones those statements rest on.
 
-use big_api::fact::{from_literal, from_text, ValueError};
-use big_api::{introspect, Datum, Fact, FieldInfo, FieldKind, TableEngine, TableInfo};
+use big_embed::fact::{from_literal, from_text, ValueError};
+use big_embed::{introspect, Datum, Fact, FieldInfo, FieldKind, TableEngine, TableInfo};
 use big_db::Granularity;
 use big_plan::Literal;
 
@@ -195,7 +195,7 @@ fn a_value_a_field_cannot_hold_says_what_the_field_wanted() {
     // The sentence names the field and what it was given, and it is the same sentence whichever
     // spelling the value arrived in.
     assert_eq!(ValueError::NeedsNumber.why("n", "five"), "`n` needs a number, got `five`");
-    assert_eq!(big_api::fact::written(&Literal::Dec { units: 1250, scale: 2 }), "12.50");
-    assert_eq!(big_api::fact::written(&Literal::Dec { units: 5, scale: 3 }), "0.005");
-    assert_eq!(big_api::fact::written(&Literal::Sint(-5)), "-5");
+    assert_eq!(big_embed::fact::written(&Literal::Dec { units: 1250, scale: 2 }), "12.50");
+    assert_eq!(big_embed::fact::written(&Literal::Dec { units: 5, scale: 3 }), "0.005");
+    assert_eq!(big_embed::fact::written(&Literal::Sint(-5)), "-5");
 }

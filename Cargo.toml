@@ -13,7 +13,7 @@ members = [
     "crates/big-sql",
     "crates/big-testfile",
     "crates/big-exec",
-    "crates/big-api",
+    "crates/big-embed",
     "crates/big-cluster",
     "crates/big-http",
     # Everything that ships as an executable: `big` and `bigctl`, and nothing else.

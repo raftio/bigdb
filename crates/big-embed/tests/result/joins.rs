@@ -19,9 +19,9 @@
 //! multiplication waits until both sides have been merged - and this is where it waits.
 
 use crate::common::*;
-use big_api::{result_set, Cut, Datum, JoinSide, Keying, Of, Pairing, ResultSet, Shape, Value};
+use big_embed::{result_set, Cut, Datum, JoinSide, Keying, Of, Pairing, ResultSet, Shape, Value};
 
-fn shape(per_key: bool, cells: Vec<big_api::Cell>) -> Shape {
+fn shape(per_key: bool, cells: Vec<big_embed::Cell>) -> Shape {
     let side = |plan| JoinSide { keyed: Keying::By { plan, axis: 0 }, required: true };
     Shape::Join {
         axes: 1,

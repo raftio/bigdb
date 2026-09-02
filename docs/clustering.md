@@ -66,7 +66,7 @@ the storage layer, so the cluster layer inherits them rather than choosing:
 **A record id names its shard, and the client picks the record id.** `shard_of` is a shift —
 `record_id >> SHARD_WIDTH_EXPONENT` ([coords.rs:41](../crates/big-engine/src/coords.rs#L41)) —
 and every write path takes the record id from the caller: `Fact::Int { record, .. }` and its
-siblings in [big-api](../crates/big-api/src/lib.rs), one id per line in `POST /import`. Nothing
+siblings in [big-embed](../crates/big-embed/src/lib.rs), one id per line in `POST /import`. Nothing
 in the engine ever allocates a record id. So placement needs no coordination at all: by the time
 a fact arrives, the client has already chosen which node should hold it, without knowing that it
 did.
@@ -488,7 +488,7 @@ The most important section on this page.
   easier ones.
 - **No cross-node atomicity**, as above — and not for want of a protocol. Two-phase commit
   needs a transaction held open across a network round trip, and this engine will not do that
-  for two reasons it already had: `big-api` exists so that a read or write transaction never
+  for two reasons it already had: `big-embed` exists so that a read or write transaction never
   outlives one call, and a node has a single writer, so a held-open write would block every
   other write to that node until a coordinator that may have died said otherwise. Building 2PC
   here means giving up the single-writer lock or the facade's rule, and both of those are load

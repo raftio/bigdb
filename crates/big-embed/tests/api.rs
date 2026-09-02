@@ -14,7 +14,7 @@
 
 //! The facade end to end, including through a real file.
 
-use big_api::*;
+use big_embed::*;
 use big_db::catalog::FieldKind;
 use big_exec::Value;
 

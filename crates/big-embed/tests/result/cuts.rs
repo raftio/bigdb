@@ -19,7 +19,7 @@
 //! sort would skip into a list nobody asked for.
 
 use crate::common::*;
-use big_api::{
+use big_embed::{
     result_set, Absent, Cut, Datum, GroupOrder, Having, Of, OrderBy, ResultSet, Shape, Threshold,
     Units, Value,
 };

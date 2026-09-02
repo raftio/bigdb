@@ -178,7 +178,7 @@ pub fn format_date(days: i64) -> String {
 ///
 /// Always with the time, even at midnight. A timestamp column that rendered some of its values
 /// as dates and some as timestamps would be a column a client has to sniff - the same reason
-/// [`Datum::Real`](../big_api/result/enum.Datum.html) is kept apart from `Int`.
+/// [`Datum::Real`](../big_embed/result/enum.Datum.html) is kept apart from `Int`.
 pub fn format_datetime(unix_seconds: i64) -> String {
     let t = decompose(unix_seconds);
     format!(

@@ -19,7 +19,7 @@
 //! a read timeout are properties of the listener, and a test that called the router directly
 //! would assert nothing about either.
 
-use big_api::Api;
+use big_embed::Api;
 use big_http::{Auth, Server, ServerConfig};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -37,7 +37,7 @@ fn spawn(requests: usize, config: ServerConfig) -> SocketAddr {
     // Enough facts that a scan has fragments to visit. A query over an empty table does no
     // work, and a test that asserts on a scan being interrupted has to give it a scan.
     let facts: Vec<_> = (1..=32)
-        .map(|r| big_api::Fact::Int { field: "amount", record: r, value: r * 10 })
+        .map(|r| big_embed::Fact::Int { field: "amount", record: r, value: r * 10 })
         .collect();
     api.import("tx", &facts).unwrap();
 
@@ -504,7 +504,7 @@ fn the_file_a_backup_writes_opens_as_a_database() {
     assert_eq!(send(addr, "POST", "/admin/backup?name=two.big", "").status, 200);
 
     // `spawn` stocked `tx` with thirty-two records, and the copy has to hold every one of them.
-    let restored = big_api::Api::open(dir.path().join("two.big")).unwrap();
+    let restored = big_embed::Api::open(dir.path().join("two.big")).unwrap();
     let schema = restored.schema();
     assert_eq!(schema.len(), 1, "the copy lost the schema");
     assert_eq!(schema[0].name, "tx");

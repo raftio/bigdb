@@ -18,7 +18,7 @@
 //! its own package with an empty `[dependencies]` section, so "cannot grow an offline query
 //! path" was a fact about the dependency graph. One package for both binaries gave that up -
 //! see the note in `Cargo.toml`. What is left is this paragraph. Do not import `big_sql`,
-//! `big_plan` or `big_api` here. A client that validated a statement before sending it would
+//! `big_plan` or `big_embed` here. A client that validated a statement before sending it would
 //! be a second surface drifting from the first, and the second one always loses.
 //!
 //! So a statement travels as bytes and an error comes back as the server's own code and the

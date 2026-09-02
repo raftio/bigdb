@@ -25,7 +25,7 @@ use super::*;
 
 /// One fact, owning its strings.
 ///
-/// [`big_api::Fact`] borrows, which is right for the call it was written for and wrong for a
+/// [`big_embed::Fact`] borrows, which is right for the call it was written for and wrong for a
 /// batch that is being split by owner and sent to several places: the split outlives whatever
 /// the request body was parsed out of.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -57,24 +57,24 @@ impl OwnedFact {
     /// The inverse of [`OwnedFact::as_fact`], and the slow direction on purpose: a batch is
     /// parsed into borrowed facts because that costs nothing, and only a batch that has to be
     /// *shipped to a peer* pays to own them.
-    pub fn from_fact(fact: &big_api::Fact<'_>) -> Self {
+    pub fn from_fact(fact: &big_embed::Fact<'_>) -> Self {
         let (field, record, value) = match fact {
-            big_api::Fact::Int { field, record, value } => {
+            big_embed::Fact::Int { field, record, value } => {
                 (*field, *record, FactValue::Int(*value))
             }
-            big_api::Fact::Signed { field, record, value } => {
+            big_embed::Fact::Signed { field, record, value } => {
                 (*field, *record, FactValue::Signed(*value))
             }
-            big_api::Fact::Float { field, record, bits } => {
+            big_embed::Fact::Float { field, record, bits } => {
                 (*field, *record, FactValue::Float(*bits))
             }
-            big_api::Fact::Bool { field, record, value } => {
+            big_embed::Fact::Bool { field, record, value } => {
                 (*field, *record, FactValue::Bool(*value))
             }
-            big_api::Fact::Key { field, record, value } => {
+            big_embed::Fact::Key { field, record, value } => {
                 (*field, *record, FactValue::Key((*value).to_string()))
             }
-            big_api::Fact::Time { field, record, value, unix_seconds } => (
+            big_embed::Fact::Time { field, record, value, unix_seconds } => (
                 *field,
                 *record,
                 FactValue::Time { value: (*value).to_string(), unix_seconds: *unix_seconds },
@@ -84,24 +84,24 @@ impl OwnedFact {
     }
 
     /// The borrowed form the engine takes, valid as long as this one is.
-    pub fn as_fact(&self) -> big_api::Fact<'_> {
+    pub fn as_fact(&self) -> big_embed::Fact<'_> {
         match &self.value {
             FactValue::Int(v) => {
-                big_api::Fact::Int { field: &self.field, record: self.record, value: *v }
+                big_embed::Fact::Int { field: &self.field, record: self.record, value: *v }
             }
             FactValue::Signed(v) => {
-                big_api::Fact::Signed { field: &self.field, record: self.record, value: *v }
+                big_embed::Fact::Signed { field: &self.field, record: self.record, value: *v }
             }
             FactValue::Float(v) => {
-                big_api::Fact::Float { field: &self.field, record: self.record, bits: *v }
+                big_embed::Fact::Float { field: &self.field, record: self.record, bits: *v }
             }
             FactValue::Key(v) => {
-                big_api::Fact::Key { field: &self.field, record: self.record, value: v }
+                big_embed::Fact::Key { field: &self.field, record: self.record, value: v }
             }
             FactValue::Bool(v) => {
-                big_api::Fact::Bool { field: &self.field, record: self.record, value: *v }
+                big_embed::Fact::Bool { field: &self.field, record: self.record, value: *v }
             }
-            FactValue::Time { value, unix_seconds } => big_api::Fact::Time {
+            FactValue::Time { value, unix_seconds } => big_embed::Fact::Time {
                 field: &self.field,
                 record: self.record,
                 value,
