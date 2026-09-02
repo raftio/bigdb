@@ -724,14 +724,22 @@ impl<P: PagerMut + Sync> Api<P> {
             // change goes to the leader, an insert goes to the shard owners, and a listing is
             // already in this node's catalog. Reachable only through the un-clustered path; a
             // coordinator classifies first - see `Api::translate`.
-            // ...and an `EXPLAIN`, which is a statement *about* a statement: there is no value
+            big_sql::Sql::Ddl(_) | big_sql::Sql::Insert(_) | big_sql::Sql::Show(_) => {
+                Err(ApiError::Sql(big_sql::SqlError::Refused {
+                    what: big_sql::Refused::Write,
+                    at: 0,
+                }))
+            }
+            // ...and an `EXPLAIN`, which is a statement *about* a statement: there is no plan
             // for this to answer with, because the whole of what it asks for is that nothing
             // runs. The surface that answers one is `Cluster::sql`, which builds rows.
-            big_sql::Sql::Ddl(_)
-            | big_sql::Sql::Insert(_)
-            | big_sql::Sql::Show(_)
-            | big_sql::Sql::Explain { .. } => Err(ApiError::Sql(big_sql::SqlError::Refused {
-                what: big_sql::Refused::Write,
+            //
+            // **Its own refusal, not the one above.** That one says this surface does not
+            // write, a sentence which is simply untrue of `EXPLAIN SELECT count(*) FROM t` -
+            // and a caller who reads it is told the wrong thing about a statement that is
+            // fine. What is refused here is the question, not the text.
+            big_sql::Sql::Explain { .. } => Err(ApiError::Sql(big_sql::SqlError::Refused {
+                what: big_sql::Refused::ExplainRows,
                 at: 0,
             })),
         }

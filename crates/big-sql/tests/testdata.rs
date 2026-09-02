@@ -193,20 +193,32 @@ fn explained(mode: big_sql::ExplainMode, inner: Sql) -> String {
     use big_sql::explain::{Explained, Probed};
     match inner {
         Sql::Query(statement) => {
-            let plans: Vec<_> = statement
+            // **Collected, never filtered**, which is what `Cluster::sql_explain` does with the
+            // same two lists - and the difference is not tidiness. A call that does not resolve
+            // is what an `EXPLAIN` reports; dropping it instead renumbers everything after it,
+            // and the shape names its plans by index, so `plan #0` here would print the tree
+            // the shape calls `#1`. A corpus that pinned that would be pinning two halves that
+            // contradict each other, and `BIG_REWRITE=1` would write it in without a word.
+            let plans = match statement
                 .calls
                 .iter()
-                .filter_map(|ask| big_plan::plan(&ask.table, &ask.call, &Stub).ok())
-                .collect();
-            let probes: Vec<_> = statement
+                .map(|ask| big_plan::plan(&ask.table, &ask.call, &Stub))
+                .collect::<core::result::Result<Vec<_>, _>>()
+            {
+                Ok(plans) => plans,
+                Err(e) => return format!("did not resolve: {e}"),
+            };
+            let probes = match statement
                 .probes
                 .iter()
-                .filter_map(|p| {
-                    big_plan::plan(&p.table, &p.rows, &Stub)
-                        .ok()
-                        .map(|rows| Probed { probe: p, rows })
+                .map(|p| {
+                    big_plan::plan(&p.table, &p.rows, &Stub).map(|rows| Probed { probe: p, rows })
                 })
-                .collect();
+                .collect::<core::result::Result<Vec<_>, _>>()
+            {
+                Ok(probes) => probes,
+                Err(e) => return format!("did not resolve: {e}"),
+            };
             let answer = resolved_answer(statement.clone());
             big_sql::explain::explained(
                 mode,

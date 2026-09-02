@@ -25,11 +25,11 @@
 //! being fuzzed - if it is ever removed this target stops returning and starts crashing, which
 //! is the point.
 //!
-//! **A statement is four different things.** A query, an insert, a listing and a schema change
-//! leave by four different doors, and each carries structure the other three do not. So a
-//! successful translation is walked afterwards: printing it traverses the same tree every reader
-//! downstream will, and a value the parser can build but nothing else can look at fails here
-//! rather than in a request.
+//! **A statement is five different things.** A query, an insert, a listing and a schema change
+//! leave by four different doors, an `EXPLAIN` wraps whichever of them it was given, and each
+//! carries structure the others do not. So a successful translation is walked afterwards:
+//! printing it traverses the same tree every reader downstream will, and a value the parser can
+//! build but nothing else can look at fails here rather than in a request.
 //!
 //! `crates/big-sql/tests/gates.rs` runs the same contract over every prefix and one-byte cut of
 //! the test corpus, in the ordinary test suite. This one has no bound on its inputs.
@@ -124,19 +124,41 @@ fuzz_target!(|data: &[u8]| {
                 !matches!(*inner, big_sql::Sql::Explain { .. }),
                 "`{text}` nested an EXPLAIN the parser is supposed to refuse"
             );
-            let described = match &*inner {
-                big_sql::Sql::Ddl(d) => big_sql::explain::Explained::Ddl(d),
-                big_sql::Sql::Insert(i) => big_sql::explain::Explained::Insert(i),
-                big_sql::Sql::Show(s) => big_sql::explain::Explained::Show(s),
+            // The statement's own printer, taken alongside the wrapper that labels it.
+            //
+            // **Asserted on the part, not on what `explained` returns.** That function filters
+            // blank lines out itself, so a check downstream of the filter is a check of the
+            // filter and passes whatever the printers do. The rule that can actually be broken
+            // is this one - a printer that emitted a blank line would have it silently
+            // swallowed here and would truncate a corpus case in the middle, which reads as a
+            // passing test of half an answer.
+            let (described, part) = match &*inner {
+                big_sql::Sql::Ddl(d) => {
+                    (big_sql::explain::Explained::Ddl(d), big_sql::explain::ddl(d))
+                }
+                big_sql::Sql::Insert(i) => {
+                    (big_sql::explain::Explained::Insert(i), big_sql::explain::insert(i))
+                }
+                big_sql::Sql::Show(s) => {
+                    (big_sql::explain::Explained::Show(s), big_sql::explain::show(s))
+                }
                 // A query's half needs a schema to resolve, and this target links none. Its
                 // plans and shape are fuzzed through the `Sql::Query` arm above instead.
                 big_sql::Sql::Query(_) | big_sql::Sql::Explain { .. } => return,
             };
-            let printed = big_sql::explain::explained(mode, &described);
-            assert!(!printed.is_empty(), "`{text}` explained to nothing");
+            assert!(!part.is_empty(), "`{text}` explained to nothing");
             assert!(
-                !printed.lines().any(|l| l.trim().is_empty()),
+                !part.lines().any(|l| l.trim().is_empty()),
                 "`{text}` explained with a blank line, which truncates a corpus case"
+            );
+            // ...and the wrapper adds the label and loses nothing, which is the other half of
+            // what makes the filter above a no-op rather than an edit.
+            let printed = big_sql::explain::explained(mode, &described);
+            assert_eq!(
+                printed.lines().count(),
+                part.lines().count() + 1,
+                "`{text}` explained to something other than its own printer's output under a \
+                 label:\n{printed}"
             );
         }
     }

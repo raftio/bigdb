@@ -39,9 +39,13 @@ pub const COLUMN: &str = "explain";
 
 /// One row per line of what [`big_sql::explain::explained`] wrote.
 ///
-/// A blank line is dropped rather than emitted. That printer promises not to produce one - the
-/// test corpora end an expected block at the first blank line - and this is the second half of
-/// that promise, so a printer that ever breaks it truncates no case here.
+/// **The blank-line filter is deliberately redundant.** [`big_sql::explain::explained`] strips
+/// blank lines itself, so this one drops nothing today - it is not a check, and reading it as
+/// one is how a guarantee ends up believed rather than held. It stays because a blank row is
+/// the single defect this surface cannot show: the test corpora end an expected block at the
+/// first blank line, so one row of nothing would truncate a case rather than fail it. The
+/// assertion that the printers never produce one lives where it can still fail, over arbitrary
+/// input in `fuzz/fuzz_targets/parse_sql.rs`.
 pub fn result_set(mode: ExplainMode, what: &Explained<'_>) -> ResultSet {
     ResultSet {
         columns: vec![COLUMN.to_string()],

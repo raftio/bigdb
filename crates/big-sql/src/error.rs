@@ -136,6 +136,15 @@ pub enum Refused {
     Quantile,
     /// `EXPLAIN PLAN` or `EXPLAIN SHAPE` over a statement that is not a query.
     ExplainHalf,
+    /// `EXPLAIN`, asked of a surface that answers with plans rather than with rows.
+    ///
+    /// **Not a statement this engine refuses.** `Cluster::sql` answers one, and the corpus pins
+    /// every character of what it says. What is refused is the *question*: an explanation has no
+    /// plan to hand back, because the whole of what it asks for is that nothing runs.
+    ///
+    /// Raised in `big-api`, next to the three statements that resolve to no plan either, and so
+    /// not reachable by [`crate::translate`] - the same shape as [`Refused::ViewColumn`].
+    ExplainRows,
 }
 
 impl Refused {
@@ -149,7 +158,7 @@ impl Refused {
     /// Kept honest by [`Refused::rank`] below, whose exhaustive match will not compile until a
     /// new variant is named - and by a test asserting that every rank appears here exactly once,
     /// which is what catches naming one and forgetting to add it.
-    pub const ALL: [Self; 44] = [
+    pub const ALL: [Self; 45] = [
         Self::Joins,
         Self::OuterJoin,
         Self::JoinOn,
@@ -194,6 +203,7 @@ impl Refused {
         Self::ViewColumn,
         Self::ViewDepth,
         Self::ExplainHalf,
+        Self::ExplainRows,
     ];
 
     /// Where this refusal sits in [`Refused::ALL`], and the reason that list can be trusted.
@@ -249,6 +259,7 @@ impl Refused {
             Self::ViewColumn => 41,
             Self::ViewDepth => 42,
             Self::ExplainHalf => 43,
+            Self::ExplainRows => 44,
         }
     }
 
@@ -290,6 +301,7 @@ impl Refused {
             Self::Union => "sql_union",
             Self::Quantile => "sql_quantile_level",
             Self::ExplainHalf => "sql_explain_half",
+            Self::ExplainRows => "sql_explain_rows",
             Self::Subquery
             | Self::Having
             | Self::Window
@@ -554,6 +566,12 @@ impl Refused {
                  calls resolve to, and the columns and clauses its answer takes. A schema \
                  change, a write and a question about the catalog have one description and no \
                  halves, so `EXPLAIN` on its own is the whole of what there is to ask for"
+            }
+            Self::ExplainRows => {
+                "`EXPLAIN` is answered as rows - one line of the description per row, under a \
+                 column called `explain` - and this surface resolves a statement to plans \
+                 instead, of which an explanation has none. Nothing is wrong with the \
+                 statement: ask it of the surface that builds result sets"
             }
             Self::Quantile => {
                 "a quantile takes a level between 0 and 1 with at most three digits after the \
