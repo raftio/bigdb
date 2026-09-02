@@ -14,6 +14,11 @@ WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 COPY bench ./bench
+# Not built into this image, and copied anyway: `contrib/*` are workspace members, and cargo
+# loads every member's manifest before it decides which package to build. A member whose
+# directory is missing is a workspace that does not open, so leaving these out fails the build
+# below rather than making it smaller.
+COPY contrib ./contrib
 
 # `--locked` so the image is built from the lockfile in the repository and not from whatever
 # resolved today. A build that needs a newer dependency should fail here and be fixed in the

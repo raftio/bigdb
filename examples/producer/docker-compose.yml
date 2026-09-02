@@ -1,0 +1,76 @@
+# bigdb and one producer, on a network of their own.
+#
+#   ./run.sh
+#
+# The `big` service is `deploy/single/docker-compose.yml` with the comments removed - read that
+# one for why each argument is there. What this file adds is the second service, and the reason
+# this directory exists: something that writes.
+
+services:
+  big:
+    build:
+      context: ../..
+    # Loopback only. There is no TLS here; see deploy/readme.md before this is reachable from
+    # anywhere else.
+    #
+    # Overridable because `make start` in this repository publishes the same port, and doing the
+    # local walkthrough before the docker one is the obvious order to do them in. Nothing in
+    # run.sh needs this - the producer reaches the server over the compose network - so it is
+    # here only so you can point your own `bigctl` at it afterwards.
+    ports:
+      - "127.0.0.1:${BIG_PORT:-7654}:7654"
+    volumes:
+      - data:/data
+    # `configs` rather than the bind mount `deploy/single` uses, and the difference is worth
+    # knowing: a bind mount needs the daemon to be able to see this directory, which is true for
+    # a local daemon and false for a remote or rootless one - `docker context use` something over
+    # SSH and a mounted secrets directory arrives empty, with no error anywhere. A config is sent
+    # to the daemon, so this demo runs the same against whatever docker you have.
+    #
+    # `deploy/single` is right to mount instead: a real credential belongs in a file the
+    # deployment manages, not in the compose file. This one is neither real nor a secret.
+    configs:
+      - source: tokens
+        target: /etc/big/secrets/tokens
+    command:
+      - /data/big.db
+      - 0.0.0.0:7654
+      - --tokens
+      - /run/big/tokens
+      - --query-timeout
+      - "30"
+    stop_grace_period: 2s
+
+  producer:
+    build:
+      context: ../..
+      dockerfile: examples/producer/Dockerfile
+    # The image already knows how to answer whether it is up, so waiting is a line of yaml
+    # rather than a poll loop in the script.
+    depends_on:
+      big:
+        condition: service_healthy
+    environment:
+      # The token itself, not a path - see the note in examples/produce.rs. It is written here
+      # in the open because it is a demo credential for a daemon published on loopback, and
+      # pretending otherwise would teach the wrong lesson more effectively than saying so.
+      # `demo-writer` holds `write`, which is all an INSERT needs; DDL below runs as `demo-admin`.
+      BIG_MESSAGE_TOKEN: demo-writer
+    # Never started by `up`, which is for things that stay up. run.sh reaches it with
+    # `compose run --rm`, and that enables this profile on its own.
+    profiles: ["run"]
+
+volumes:
+  data:
+
+# Two tokens rather than one, because the server distinguishes them: `CREATE TABLE` is DDL and
+# needs `admin`, an `INSERT` needs `write`, and the producer above holds only the second. A demo
+# where everything is admin would not show that.
+#
+# The image's entrypoint copies this to mode 600 owned by the daemon's user before `big serve`
+# reads it, because `big serve` refuses a token file anyone else can read.
+configs:
+  tokens:
+    content: |
+      demo-admin  admin
+      demo-writer write
