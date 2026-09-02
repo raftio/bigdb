@@ -166,6 +166,15 @@ fn measures_of(
     for item in aggregates {
         let rows = rows_of(rows, item);
         let of = match &item.proj {
+            // The same instant in every row, which is what it is: a constant needs no plan and
+            // no group, so it costs a grouping nothing to carry.
+            Proj::Now { unix_seconds } => Of::Now { unix_seconds: *unix_seconds },
+            // A rounding is applied to values read back per record, and a grouped or joined
+            // answer holds none: what it carries per row is a key and the numbers folded under
+            // it. Refused rather than silently rounding something else.
+            Proj::TimeOf { .. } => {
+                return Err(SqlError::Refused { what: Refused::Shape, at: item.at })
+            }
             Proj::Count => {
                 Of::Group { plan: count_plan(calls, table, &rows, group)?, absent: Absent::Zero }
             }

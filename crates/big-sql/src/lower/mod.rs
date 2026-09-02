@@ -222,6 +222,10 @@ fn lower_one(select: &Select) -> Result<Statement> {
         match &item.proj {
             Proj::Star => stars.push(item),
             Proj::Column(name) => columns.push((item, name.clone())),
+            // The plan reads the column; the rounding rides on the item and is applied where
+            // the answer is written. So this belongs with the projections and not with the
+            // aggregates - it is one of them wearing a function.
+            Proj::TimeOf { field, .. } => columns.push((item, field.clone())),
             _ => aggregates.push(item),
         }
     }

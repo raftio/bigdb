@@ -38,7 +38,7 @@ pub mod schema;
 pub mod views;
 
 pub use error::{ApiError, Result};
-pub use result::{fixed, one_cell, result_set, Datum, ResultSet, Row};
+pub use result::{date_text, fixed, one_cell, result_set, timestamp_text, Datum, ResultSet, Row};
 pub use schema::{FieldInfo, TableInfo};
 pub use views::ViewInfo;
 
@@ -65,7 +65,7 @@ pub use big_plan::{Plan, Rows};
 pub use big_sql::{
     Absent, Answer, Ask, Cell, Columns, Cut, Format, GroupOrder, Having, JoinSide, Keying, Of,
     OrderBy, Pairing, Probe as SqlProbe, Refused, Selected, Shape, Statement as SqlStatement,
-    Threshold, Units,
+    Threshold, TimeOp, Units,
 };
 pub use big_sql::{
     Alter as SqlAlter, Authority, Column as SqlColumn, ColumnKind as SqlColumnKind, Ddl as SqlDdl,
@@ -256,6 +256,20 @@ pub enum Fact<'a> {
         record: RecordId,
         /// The value, sign included.
         value: i64,
+    },
+    /// A value for a float field.
+    ///
+    /// **Carried as `f64::to_bits`**, for the reason `Rows::CompareFloat` carries its threshold
+    /// that way: a fact is compared for equality across the write path and its tests, and
+    /// `PartialEq` on a float is not reflexive, so an `f64` here would cost this enum its `Eq`.
+    /// The bits are the same number, and the storage layer reads them back before it stores one.
+    Float {
+        /// Field name, resolved against the table named in the call.
+        field: &'a str,
+        /// Which record this fact is about.
+        record: RecordId,
+        /// `f64::to_bits` of the value. A NaN is refused on the way in, not here.
+        bits: u64,
     },
     /// A value for a set, mutex or time quantum field: a string that is interned to a row id.
     /// Longer than the engine's key limit is refused rather than truncated, because two keys
@@ -1126,6 +1140,9 @@ fn apply<'f, P: big_pager::PagerMut>(
         match fact {
             Fact::Int { record, value, .. } => w.set_int_at(&at[i].at, *record, *value)?,
             Fact::Signed { record, value, .. } => w.set_signed_at(&at[i].at, *record, *value)?,
+            Fact::Float { record, bits, .. } => {
+                w.set_float_at(&at[i].at, *record, f64::from_bits(*bits))?
+            }
             Fact::Bool { record, value, .. } => w.set_bool_at(&at[i].at, *record, *value)?,
             Fact::Key { record, value, .. } => {
                 // `copied()` ends the borrow of the cache before the miss goes on to write to
@@ -1157,6 +1174,7 @@ impl<'a> Fact<'a> {
         match self {
             Fact::Int { field, .. }
             | Fact::Signed { field, .. }
+            | Fact::Float { field, .. }
             | Fact::Bool { field, .. }
             | Fact::Key { field, .. }
             | Fact::Time { field, .. } => field,

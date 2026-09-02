@@ -587,7 +587,7 @@ than per row.
 
 ### The half it cannot
 
-Float columns, the scalar function catalogue, `CASE WHEN`, `CAST`, `argMin`/`stddev`/`corr`,
+The scalar function catalogue, `CASE WHEN`, `CAST`, `argMin`/`stddev`/`corr`,
 `INSERT … SELECT`, `CREATE DATABASE`, `CREATE VIEW`. Each of these now has a named refusal with
 its own reason, in place of a syntax error or a blanket "this surface writes no rows". The
 reasons are the same shape as the v3 ones: they are about the index rather than about time. There

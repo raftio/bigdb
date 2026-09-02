@@ -84,6 +84,10 @@ pub(super) fn ungrouped(
                                     table: table.to_string(),
                                     field: name.column.clone(),
                                 },
+                                apply: match &item.proj {
+                                    Proj::TimeOf { op, .. } => Some(*op),
+                                    _ => None,
+                                },
                             })
                             .collect(),
                     ),
@@ -186,7 +190,10 @@ pub(super) fn ungrouped(
                 });
                 Of::Probe { probe: probes.len() - 1 }
             }
-            Proj::Star | Proj::Column(_) => unreachable!("sorted into the other two buckets"),
+            Proj::Now { unix_seconds } => Of::Now { unix_seconds: *unix_seconds },
+            Proj::Star | Proj::Column(_) | Proj::TimeOf { .. } => {
+                unreachable!("sorted into the other two buckets")
+            }
         };
         measures.push((measure_of(item), of));
         cells.push(Cell { column: item.column(), of, units: units_of(table, &item.proj) });

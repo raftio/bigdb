@@ -31,6 +31,10 @@ impl Fake {
             (("tx", "price"), FieldClass::Integer { scale: 2 }),
             (("tx", "country"), FieldClass::Keyed(Keyed::Set)),
             (("tx", "active"), FieldClass::Boolean),
+            (("tx", "rate"), FieldClass::Float { bits: 64 }),
+            (("tx", "ratio"), FieldClass::Float { bits: 32 }),
+            (("tx", "day"), FieldClass::Temporal { unit: TimeUnit::Days }),
+            (("tx", "seen"), FieldClass::Temporal { unit: TimeUnit::Seconds }),
         ]))
     }
 }
@@ -228,4 +232,104 @@ mod depth {
         let args: Vec<String> = (0..2_000).map(|_| "All()".to_string()).collect();
         assert!(parse(&format!("Count(Union({}))", args.join(","))).is_ok());
     }
+}
+
+/// A float takes every numeric literal, including the negative fractional one no other class
+/// does, and the threshold reaches the plan unrounded: rounding it needs the field's width and
+/// the operator together, and only the storage layer has the first.
+#[test]
+fn a_float_comparison_carries_the_written_threshold() {
+    let Ok(Plan::Rows { rows: Rows::CompareFloat { field, op, bits }, .. }) =
+        planned("Row(rate > -12.50)")
+    else {
+        panic!("expected a float comparison");
+    };
+    assert_eq!(field, "rate");
+    assert_eq!(op, CmpOp::Gt);
+    assert_eq!(f64::from_bits(bits), -12.5);
+
+    // An integer literal is a perfectly good float bound.
+    assert!(matches!(
+        planned("Row(ratio <= 5)"),
+        Ok(Plan::Rows { rows: Rows::CompareFloat { .. }, .. })
+    ));
+}
+
+/// The refusal the lexer used to make, now made where the field is known.
+///
+/// `-12.50` is a legal literal - a float field holds it - so the lexer cannot refuse it any
+/// more. Against a decimal field there is still nowhere for it to go, and this is the arm that
+/// can tell.
+#[test]
+fn a_negative_decimal_is_refused_by_the_field_rather_than_by_the_lexer() {
+    assert!(matches!(planned("Row(price > -12.50)"), Err(PlanError::NegativeDecimal { .. })));
+    // The same literal against a float is simply a bound.
+    assert!(planned("Row(rate > -12.50)").is_ok());
+}
+
+/// A date is compared against a written date and comes out as the signed comparison it is: the
+/// stored value is a count from the epoch, so nothing below the planner needs a temporal case.
+#[test]
+fn a_date_comparison_becomes_a_signed_one() {
+    let Ok(Plan::Rows { rows: Rows::CompareSigned { field, op, value }, .. }) =
+        planned("Row(day >= \"2024-01-15\")")
+    else {
+        panic!("expected a signed comparison");
+    };
+    assert_eq!((field.as_str(), op, value), ("day", CmpOp::Ge, 19_737));
+
+    // Seconds, not days, for a timestamp - the unit is the whole of what tells them apart.
+    let Ok(Plan::Rows { rows: Rows::CompareSigned { value, .. }, .. }) =
+        planned("Row(seen >= \"2024-01-15 10:30:00\")")
+    else {
+        panic!("expected a signed comparison");
+    };
+    assert_eq!(value, 1_705_314_600);
+}
+
+/// A string that is not a date the field can hold is named as such, rather than being read as a
+/// key or rounded into one.
+#[test]
+fn a_date_that_is_not_one_is_refused_by_name() {
+    for text in [
+        "Row(day >= \"2024-02-30\")",
+        "Row(day >= \"yesterday\")",
+        // A time of day against a `DATE` is refused rather than truncated to midnight: dropping
+        // it would silently answer about a different instant from the one that was written.
+        "Row(day >= \"2024-01-15 10:30:00\")",
+    ] {
+        assert!(matches!(planned(text), Err(PlanError::BadDate { .. })), "{text}");
+    }
+    // A number is not a date either, and says so as an operator refusal rather than a bad one.
+    assert!(matches!(planned("Row(day >= 5)"), Err(PlanError::OperatorNotAllowed { .. })));
+}
+
+/// `min` and `max` are questions about an ordering, which a date has. `sum` is a question about
+/// addition, which it does not.
+#[test]
+fn a_date_orders_but_does_not_add() {
+    assert!(planned("Min(All(), field=\"day\")").is_ok());
+    assert!(planned("Max(All(), field=\"seen\")").is_ok());
+    assert!(matches!(
+        planned("Sum(All(), field=\"day\")"),
+        Err(PlanError::OperatorNotAllowed { .. })
+    ));
+}
+
+/// The two aggregate gates agree. They did not: a bare `Sum` over a signed field was answered
+/// and the same call inside a `GroupBy` was refused, because the two checks listed different
+/// classes. Both go through `aggregable` now, so this holds for every class at once.
+#[test]
+fn an_aggregate_is_allowed_the_same_way_bare_and_grouped() {
+    for field in ["amount", "price", "rate"] {
+        let bare = planned(&format!("Sum(All(), field=\"{field}\")"));
+        let grouped = planned(&format!(
+            "GroupBy(All(), field=\"country\", aggregate=Sum(field=\"{field}\"))"
+        ));
+        assert_eq!(bare.is_ok(), grouped.is_ok(), "{field} disagreed");
+        assert!(bare.is_ok(), "{field} should aggregate");
+    }
+    // And a class that aggregates neither way still refuses both.
+    assert!(planned("Sum(All(), field=\"country\")").is_err());
+    assert!(planned("GroupBy(All(), field=\"country\", aggregate=Sum(field=\"country\"))").is_err());
 }

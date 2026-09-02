@@ -29,7 +29,7 @@
 mod group;
 mod num;
 
-use crate::{Answer, Shape, Value};
+use crate::{Answer, Shape, TimeOp, Units, Value};
 use group::{grouped, joined, paired};
 use num::{int_of, number, scalar_cell, Num};
 
@@ -61,8 +61,17 @@ pub enum Datum {
         /// How many of its digits are after the point.
         scale: u8,
     },
-    /// The quotient an average is.
+    /// A value out of a float field, or the quotient an average is.
     Real(f64),
+    /// A civil date, as days since the Unix epoch.
+    ///
+    /// A value rather than a rendered string, for the reason given above: the three output
+    /// formats disagree about how a date is spelled - JSON quotes it, CSV does not - and agree
+    /// completely about what it is. Rendering it here would also make a date indistinguishable
+    /// from a row key that happens to look like one.
+    Date(i64),
+    /// An instant, as seconds since the Unix epoch. UTC, like every date in this engine.
+    Timestamp(i64),
     /// A row key, as the string it was interned from.
     Text(String),
     /// The list of keys a `topK` produced, which is what that function answers with.
@@ -71,10 +80,15 @@ pub enum Datum {
 
 impl Datum {
     /// One cell of a projected row, in the units its column is in.
-    fn projected(p: &big_exec::Projection, digits: u8) -> Self {
+    fn projected(p: &big_exec::Projection, units: &Units, apply: Option<TimeOp>) -> Self {
         match p {
             big_exec::Projection::Absent => Self::Null,
-            big_exec::Projection::Int(v) => Self::num(Some(Num::Int(*v)), digits),
+            big_exec::Projection::Int(v) => {
+                Self::num(Some(Num::Int(rounded(*v, units, apply))), units)
+            }
+            // Already decoded, because undoing the float transform needed the field's width and
+            // the executor was the last layer holding a catalog.
+            big_exec::Projection::Real(v) => Self::Real(*v),
             big_exec::Projection::Text(s) => Self::Text(s.clone()),
             big_exec::Projection::Texts(v) => Self::Keys(v.clone()),
         }
@@ -90,13 +104,21 @@ impl Datum {
     /// An average is already a quotient and already a float, so it is divided rather than
     /// pointed: `sum(price) / count(*)` over units is the answer in units, and the value it
     /// stands for is that over ten to the scale.
-    fn num(n: Option<Num>, digits: u8) -> Self {
-        match (n, digits) {
-            (None, _) => Datum::Null,
-            (Some(Num::Int(v)), 0) => Datum::Int(v),
-            (Some(Num::Int(units)), scale) => Datum::Dec { units, scale },
-            (Some(Num::Real(v)), 0) => Datum::Real(v),
-            (Some(Num::Real(v)), scale) => Datum::Real(v / 10f64.powi(i32::from(scale))),
+    fn num(n: Option<Num>, units: &Units) -> Self {
+        let Some(n) = n else { return Datum::Null };
+        match (n, units) {
+            // A count from the epoch, read back as the date it stands for. An `avg` over one is
+            // not a date and stays the number it is - which is also why `sum` over a date is
+            // refused at plan time rather than rendered into something here.
+            (Num::Int(v), Units::Date) => Datum::Date(v as i64),
+            (Num::Int(v), Units::Seconds) => Datum::Timestamp(v as i64),
+            (Num::Real(v), Units::Date | Units::Seconds) => Datum::Real(v),
+            (n, units) => match (n, units.digits()) {
+                (Num::Int(v), 0) => Datum::Int(v),
+                (Num::Int(units), scale) => Datum::Dec { units, scale },
+                (Num::Real(v), 0) => Datum::Real(v),
+                (Num::Real(v), scale) => Datum::Real(v / 10f64.powi(i32::from(scale))),
+            },
         }
     }
 
@@ -122,6 +144,39 @@ pub fn fixed(units: i128, scale: u8) -> String {
     let point = digits.len() - scale;
     let sign = if units < 0 { "-" } else { "" };
     format!("{sign}{}.{}", &digits[..point], &digits[point..])
+}
+
+/// A projected number with the rounding its column asked for already applied.
+///
+/// **Applied here, on the way out, and nowhere else.** The plan read the column it was going to
+/// read anyway; a rounding is arithmetic on the number that came back, so it costs nothing and
+/// it happens in the same place a decimal has its point put back. That is also why it can only
+/// ever be a projection: a `WHERE` runs over bitmaps, before any of these numbers exist.
+///
+/// The pair `(units, apply)` is unambiguous because [`Shape::resolve`] made it so - see
+/// `resolve_selected`. `units` is what the value is in *after* the rounding, so `ToDate` is the
+/// one case where the number arriving is in different units from the one leaving.
+fn rounded(v: i128, units: &Units, apply: Option<TimeOp>) -> i128 {
+    let Some(op) = apply else { return v };
+    let Ok(n) = i64::try_from(v) else { return v };
+    i128::from(match (op, units) {
+        (TimeOp::ToDate, _) => big_civil::to_days(n),
+        (TimeOp::Trunc(u), Units::Date) => big_civil::truncate_days(n, u),
+        (TimeOp::Trunc(u), _) => big_civil::truncate(n, u),
+    })
+}
+
+/// A day count, written the way a date is written. UTC, like every date in this engine.
+///
+/// Beside [`fixed`] because it is the same kind of thing: the last step, and the only one that
+/// knows what the number it is handed stands for.
+pub fn date_text(days: i64) -> String {
+    big_civil::format_date(days)
+}
+
+/// A second count, written the way a timestamp is written.
+pub fn timestamp_text(unix_seconds: i64) -> String {
+    big_civil::format_datetime(unix_seconds)
 }
 
 /// A result set: the columns a statement named, and the rows its answers came to.
@@ -199,7 +254,7 @@ fn rows_of(shape: &Shape, values: &[Value], probes_at: usize) -> Vec<Row> {
                 p.values
                     .iter()
                     .zip(columns.named())
-                    .map(|(v, c)| Datum::projected(v, c.units.digits()))
+                    .map(|(v, c)| Datum::projected(v, &c.units, c.apply))
                     .collect()
             })
             .collect(),

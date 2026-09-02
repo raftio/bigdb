@@ -143,7 +143,24 @@ POST /table/events/field/price?kind=decimal&scale=2
 | `int` | `TINYINT`, `SMALLINT`, `INT`, `BIGINT` | An unsigned integer, bit-sliced. | bit_depth (32), or `UINT(bits)` |
 | `signed` | `SIGNED`, `INT SIGNED`, `BIGINT SIGNED` | A signed integer, in the same planes under a bias. | bit_depth (32), or `SIGNED(bits)` |
 | `decimal` | `DECIMAL(p, s)`, `NUMERIC(p, s)` | An integer compared as a value with digits after the point. | scale (required), bit_depth |
-| `timequantum` | `TIMEQUANTUM`, `TIMESTAMP`, `DATETIME` | A key, plus a bitmap view per granularity, so a window reads only the days in it. | — |
+| `float32` | `FLOAT`, `REAL`, `FLOAT32` | Single precision, in 32 planes under an order-preserving bit transform. | — |
+| `float64` | `DOUBLE`, `DOUBLE PRECISION`, `FLOAT64` | Double precision, the same transform over 64 planes. | — |
+| `date` | `DATE` | Days since 1970-01-01, signed, written `'2024-01-15'`. | — |
+| `datetime` | `DATETIME`, `TIMESTAMP` | Seconds since 1970-01-01 UTC, written `'2024-01-15 10:30:00'`. | — |
+| `timequantum` | `TIMEQUANTUM` | A key, plus a bitmap view per granularity, so a window reads only the days in it. | — |
+
+A float orders, compares and takes `min`/`max` on the same fast path every bit-sliced field
+does — the encoding is monotonic, so a range scan needs no float code at all. **`sum` and `avg`
+over one are different**: the encoding is not affine, so a total cannot be counted off the bit
+planes and is folded from the values instead, at a cost proportional to the rows matched rather
+than to the field's width. Money still belongs in a `DECIMAL`, which stores an integer and never
+passes a value through a float.
+
+A `DATE` and a `DATETIME` are ordered values: `WHERE d >= '2024-01-01'`, `ORDER BY d` and
+`max(d)` all work, and `sum` over one is refused because the sum of two dates is not a date.
+There is no timezone and no sub-second precision. A `TIMEQUANTUM` is a different thing that used
+to share these names — a *keyed* field with a bitmap view per day, which answers `f = 'k'` and a
+window over it and nothing else.
 
 `bit_depth` is how many bits a value may occupy, and every plane is one more bitmap to intersect
 during a range query — a wider field is a slower one, so declare what the data needs rather than the

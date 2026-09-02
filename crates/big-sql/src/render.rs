@@ -66,6 +66,12 @@ fn column_type(column: &Column) -> String {
         ColumnKind::Mutex => "MUTEX".to_string(),
         ColumnKind::Bool => "BOOL".to_string(),
         ColumnKind::TimeQuantum => "TIMEQUANTUM".to_string(),
+        // No width in brackets: the two float kinds carry theirs in their names, and a
+        // `FLOAT32(32)` that read back would be a second spelling of one type.
+        ColumnKind::Float32 => "FLOAT32".to_string(),
+        ColumnKind::Float64 => "FLOAT64".to_string(),
+        ColumnKind::Date => "DATE".to_string(),
+        ColumnKind::DateTime => "DATETIME".to_string(),
         ColumnKind::Int => format!("UINT({})", column.bit_depth),
         ColumnKind::Signed => format!("SIGNED({})", column.bit_depth),
         ColumnKind::Decimal => {

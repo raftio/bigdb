@@ -96,16 +96,28 @@ fn every_type_name_maps_onto_a_field_kind() {
             ("e".to_string(), "int", 64, None),
         ]
     );
-    // Four spellings of a time quantum, because a column asked to answer about days is the same
-    // column whichever of the four names it was declared under.
+    // The temporal kinds are three things, not one. `TIMESTAMP` and `DATETIME` are the same
+    // scalar field; `DATE` is the same shape over days; a `TIMEQUANTUM` is the keyed field that
+    // is viewed by day, and is what the first three used to be.
     assert_eq!(
         columns("CREATE TABLE t (a BOOLEAN, b TIMESTAMP, c DATETIME, d DATE, e TIMEQUANTUM)"),
         [
             ("a".to_string(), "bool", 32, None),
-            ("b".to_string(), "timequantum", 32, None),
-            ("c".to_string(), "timequantum", 32, None),
-            ("d".to_string(), "timequantum", 32, None),
+            ("b".to_string(), "datetime", 64, None),
+            ("c".to_string(), "datetime", 64, None),
+            ("d".to_string(), "date", 32, None),
             ("e".to_string(), "timequantum", 32, None),
+        ]
+    );
+    // The float widths are in their names, and every SQL spelling lands on one of the two.
+    assert_eq!(
+        columns("CREATE TABLE t (a FLOAT, b REAL, c FLOAT32, d DOUBLE, e FLOAT64)"),
+        [
+            ("a".to_string(), "float32", 32, None),
+            ("b".to_string(), "float32", 32, None),
+            ("c".to_string(), "float32", 32, None),
+            ("d".to_string(), "float64", 64, None),
+            ("e".to_string(), "float64", 64, None),
         ]
     );
     // Case is not significant, here as everywhere else in this dialect.
@@ -171,8 +183,8 @@ fn the_sql_a_column_list_does_not_answer() {
     // A type this engine has nothing to store: no floats, no documents. `DATE` is *not* on this
     // list - it is a time quantum, alongside `TIMESTAMP` and `DATETIME`, and is checked below.
     for sql in [
-        "CREATE TABLE t (a FLOAT)",
-        "CREATE TABLE t (a DOUBLE)",
+        "CREATE TABLE t (a FLOAT(10, 2))",
+        "CREATE TABLE t (a DATETIME(3))",
         "CREATE TABLE t (a UUID)",
         "CREATE TABLE t (a JSON)",
         "CREATE TABLE t (a BLOB)",
@@ -329,7 +341,7 @@ fn the_alters_the_engine_cannot_make() {
     // which is the same answer every other change this surface does not make gets.
     assert_eq!(code("ALTER DATABASE d OWNER TO bob"), "sql_read_only");
     // A type name in an `ADD` is judged by the rule the column list is judged by.
-    assert_eq!(code("ALTER TABLE t ADD COLUMN a FLOAT"), "sql_unknown_column_type");
+    assert_eq!(code("ALTER TABLE t ADD COLUMN a BLOB"), "sql_unknown_column_type");
     assert_eq!(code("ALTER TABLE t ADD COLUMN a DECIMAL"), "sql_decimal_scale");
     assert_eq!(code("ALTER TABLE t ADD COLUMN a INT NOT NULL"), "sql_no_constraints");
     // An `ALTER` that changes nothing is not a statement.

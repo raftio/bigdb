@@ -61,6 +61,7 @@ mod rows_tag {
     pub const DIFFERENCE: u8 = 7;
     pub const NOT: u8 = 8;
     pub const ALL: u8 = 9;
+    pub const COMPARE_FLOAT: u8 = 10;
 }
 
 pub fn put_rows(out: &mut Vec<u8>, rows: &Rows) {
@@ -76,6 +77,15 @@ pub fn put_rows(out: &mut Vec<u8>, rows: &Rows) {
             put_str(out, field);
             put_cmp(out, *op);
             put_i64(out, *value);
+        }
+        // The threshold is already `f64::to_bits`, so this is bit-exact by construction: no
+        // decimal spelling to round-trip, and no rounding decision made anywhere but at the
+        // owner that knows the field's width.
+        Rows::CompareFloat { field, op, bits } => {
+            put_u8(out, rows_tag::COMPARE_FLOAT);
+            put_str(out, field);
+            put_cmp(out, *op);
+            put_u64(out, *bits);
         }
         Rows::Key { field, value } => {
             put_u8(out, rows_tag::KEY);
@@ -130,6 +140,9 @@ fn get_rows_at(r: &mut Reader<'_>, depth: usize) -> Result<Rows> {
         rows_tag::COMPARE => Rows::Compare { field: r.str()?, op: get_cmp(r)?, value: r.u64()? },
         rows_tag::COMPARE_SIGNED => {
             Rows::CompareSigned { field: r.str()?, op: get_cmp(r)?, value: r.i64()? }
+        }
+        rows_tag::COMPARE_FLOAT => {
+            Rows::CompareFloat { field: r.str()?, op: get_cmp(r)?, bits: r.u64()? }
         }
         rows_tag::KEY => Rows::Key { field: r.str()?, value: r.str()? },
         rows_tag::KEY_BETWEEN => Rows::KeyBetween {

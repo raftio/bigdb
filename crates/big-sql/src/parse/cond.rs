@@ -93,7 +93,18 @@ impl Parser<'_> {
     }
 
     pub(super) fn predicate(&mut self) -> Result<Cond> {
+        let at = self.at();
         let field = self.name("a column name")?;
+        // A scalar call where a column belongs. Caught by name so it is refused as what it is -
+        // a rounding asked for before there is anything to round - rather than as a `(` where a
+        // comparison was expected, which is true and tells nobody anything. `now()` is not on
+        // this list: it is a value, and `Parser::literal` has already read it as one.
+        if self.peek() == Some(&Tok::LParen)
+            && field.qualifier.is_none()
+            && self.scalar_name(&field.column)
+        {
+            return Err(self.refuse_at(Refused::ScalarFilter, at));
+        }
 
         if self.word_is("IS") {
             return Err(self.refuse(Refused::Null));

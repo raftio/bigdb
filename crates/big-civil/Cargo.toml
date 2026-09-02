@@ -1,0 +1,14 @@
+[package]
+name = "big-civil"
+description = "Civil calendar arithmetic and date literals: the one definition, for crates that cannot see each other"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "readme.md"
+
+# Nothing, and there is a reason beyond taste. This crate exists to be depended on from both
+# ends of the tree - by `big-engine`, which names time-quantum views, and by `big-plan`, which
+# has no dependencies of its own on purpose. A leaf with a dependency could not be that.
+[dependencies]

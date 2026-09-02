@@ -153,6 +153,8 @@ mod value_tag {
     pub const GROUPS: u8 = 6;
     pub const TABLE: u8 = 7;
     pub const PAIRS: u8 = 8;
+    pub const REAL_SUM: u8 = 9;
+    pub const REAL_EXTREME: u8 = 10;
 }
 
 pub fn put_value(out: &mut Vec<u8>, v: &Value) {
@@ -180,6 +182,17 @@ pub fn put_value(out: &mut Vec<u8>, v: &Value) {
         Value::SignedExtreme(x) => {
             put_u8(out, value_tag::SIGNED_EXTREME);
             put_opt_i64(out, *x);
+        }
+        // Sent as bits rather than as a decimal spelling, so a total does not change on its way
+        // between two nodes. The fold that produced it is not associative; the wire must not add
+        // a second reason for two runs to disagree.
+        Value::RealSum(n) => {
+            put_u8(out, value_tag::REAL_SUM);
+            put_u64(out, n.to_bits());
+        }
+        Value::RealExtreme(x) => {
+            put_u8(out, value_tag::REAL_EXTREME);
+            put_opt_u64(out, x.map(f64::to_bits));
         }
         Value::Groups(g) => {
             put_u8(out, value_tag::GROUPS);
@@ -219,6 +232,7 @@ mod projection_tag {
     pub const INT: u8 = 1;
     pub const TEXT: u8 = 2;
     pub const TEXTS: u8 = 3;
+    pub const REAL: u8 = 4;
 }
 
 fn put_projection(out: &mut Vec<u8>, p: &Projection) {
@@ -227,6 +241,11 @@ fn put_projection(out: &mut Vec<u8>, p: &Projection) {
         Projection::Int(v) => {
             put_u8(out, projection_tag::INT);
             put_i128(out, *v);
+        }
+        // Bits, so a projected value is the same number on both sides of the wire.
+        Projection::Real(v) => {
+            put_u8(out, projection_tag::REAL);
+            put_u64(out, v.to_bits());
         }
         Projection::Text(s) => {
             put_u8(out, projection_tag::TEXT);
@@ -246,6 +265,7 @@ fn get_projection(r: &mut Reader<'_>) -> Result<Projection> {
     Ok(match r.u8()? {
         projection_tag::ABSENT => Projection::Absent,
         projection_tag::INT => Projection::Int(r.i128()?),
+        projection_tag::REAL => Projection::Real(f64::from_bits(r.u64()?)),
         projection_tag::TEXT => Projection::Text(r.str()?),
         projection_tag::TEXTS => {
             let n = r.count()?;
@@ -285,6 +305,8 @@ fn get_value_at(r: &mut Reader<'_>, depth: usize) -> Result<Value> {
         value_tag::SIGNED_SUM => Value::SignedSum(r.i128()?),
         value_tag::EXTREME => Value::Extreme(r.opt_u64()?),
         value_tag::SIGNED_EXTREME => Value::SignedExtreme(r.opt_i64()?),
+        value_tag::REAL_SUM => Value::RealSum(f64::from_bits(r.u64()?)),
+        value_tag::REAL_EXTREME => Value::RealExtreme(r.opt_u64()?.map(f64::from_bits)),
         value_tag::GROUPS => {
             let n = r.count()?;
             let mut groups = Vec::with_capacity(n);

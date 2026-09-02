@@ -114,6 +114,12 @@ pub enum Refused {
     AlterEngine,
     /// A type name in a column list that names nothing this engine stores.
     ColumnType,
+    /// `date_trunc` given a boundary the calendar does not have, or one finer than the column.
+    TruncUnit,
+    /// An interval spelling of a rounding this dialect writes as `date_trunc`.
+    Interval,
+    /// A scalar call in a `WHERE`, where there are no values yet to apply it to.
+    ScalarFilter,
     /// A column constraint - `NOT NULL`, `PRIMARY KEY`, `DEFAULT` - which is a promise about
     /// rows, and there are no rows here to make it about.
     Constraint,
@@ -158,7 +164,7 @@ impl Refused {
     /// Kept honest by [`Refused::rank`] below, whose exhaustive match will not compile until a
     /// new variant is named - and by a test asserting that every rank appears here exactly once,
     /// which is what catches naming one and forgetting to add it.
-    pub const ALL: [Self; 45] = [
+    pub const ALL: [Self; 48] = [
         Self::Joins,
         Self::OuterJoin,
         Self::JoinOn,
@@ -189,6 +195,9 @@ impl Refused {
         Self::Rename,
         Self::AlterEngine,
         Self::ColumnType,
+        Self::TruncUnit,
+        Self::Interval,
+        Self::ScalarFilter,
         Self::Constraint,
         Self::DecimalScale,
         Self::BitDepth,
@@ -260,6 +269,9 @@ impl Refused {
             Self::ViewDepth => 42,
             Self::ExplainHalf => 43,
             Self::ExplainRows => 44,
+            Self::TruncUnit => 45,
+            Self::Interval => 46,
+            Self::ScalarFilter => 47,
         }
     }
 
@@ -293,6 +305,9 @@ impl Refused {
             Self::Rename => "sql_no_rename",
             Self::AlterEngine => "sql_no_alter_engine",
             Self::ColumnType => "sql_unknown_column_type",
+            Self::TruncUnit => "sql_bad_trunc_unit",
+            Self::Interval => "sql_unsupported",
+            Self::ScalarFilter => "sql_scalar_in_filter",
             Self::Constraint => "sql_no_constraints",
             Self::DecimalScale => "sql_decimal_scale",
             Self::BitDepth => "sql_bit_depth",
@@ -529,13 +544,36 @@ impl Refused {
                  is written for every fact, and the facts already written were written under \
                  the old one. Create a second table under the engine you want and copy into it"
             }
+            Self::TruncUnit => {
+                "`date_trunc` rounds a moment back to a boundary, and the boundary has to be \
+                 one the calendar has: year, quarter, month, week, day, hour, minute or second. \
+                 A `DATE` counts whole days, so nothing below a day means anything about one"
+            }
+            Self::Interval => {
+                "this dialect writes the rounding as `date_trunc('month', ts)` and not as an \
+                 interval: there is one spelling so that two of them cannot come to disagree \
+                 about what a month is"
+            }
+            Self::ScalarFilter => {
+                "`toDate` and `date_trunc` round a value on the way out, where a decimal has \
+                 its point put back - they read nothing the projection did not already read. A \
+                 `WHERE` runs before there are any values to round, over bitmaps rather than \
+                 over records, so a rounded column is not something it could test. Compare the \
+                 column itself instead: `date_trunc('month', ts) = '2024-01-01'` is \
+                 `ts >= '2024-01-01' AND ts < '2024-02-01'`, which is a range this engine \
+                 answers off the bit planes"
+            }
             Self::ColumnType => {
                 "a column takes one of `SET`, `MUTEX`, `BOOL`, `TIMEQUANTUM`, `SIGNED`, \
-                 `UINT(bits)`, `DECIMAL(precision, scale)`, or a SQL spelling of one of those: \
-                 `TEXT`, `VARCHAR`, `CHAR` and `STRING` are a set, `TINYINT`, `SMALLINT`, \
-                 `INT`, `INTEGER` and `BIGINT` are an unsigned integer of 8, 16, 32, 32 and 64 \
-                 bits, `BOOLEAN` is a bool, and `TIMESTAMP` and `DATETIME` are a time quantum. \
-                 There is nothing here a float, a date, a blob or a JSON document lands in"
+                 `UINT(bits)`, `DECIMAL(precision, scale)`, `FLOAT32`, `FLOAT64`, `DATE`, \
+                 `DATETIME`, or a SQL spelling of one of those: `TEXT`, `VARCHAR`, `CHAR` and \
+                 `STRING` are a set, `TINYINT`, `SMALLINT`, `INT`, `INTEGER` and `BIGINT` are \
+                 an unsigned integer of 8, 16, 32, 32 and 64 bits, `BOOLEAN` is a bool, \
+                 `FLOAT` and `REAL` are a `FLOAT32`, `DOUBLE` is a `FLOAT64`, and `TIMESTAMP` \
+                 is a `DATETIME`. None of them takes a width in brackets that its name does not \
+                 already carry: `FLOAT(10, 2)` is a `DECIMAL(10, 2)`, which keeps those digits \
+                 exactly where a float would not. There is nothing here a blob or a JSON \
+                 document lands in"
             }
             Self::Constraint => {
                 "a column list here declares fields and nothing else: there are no rows for \

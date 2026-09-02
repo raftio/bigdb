@@ -62,7 +62,7 @@ pub mod render;
 pub mod shape;
 pub mod show;
 
-pub use ast::{ExplainMode, Query, Select};
+pub use ast::{ExplainMode, Query, Select, TimeOp};
 pub use ddl::{Alter, Column, ColumnKind, Ddl, MAX_VIEW_DEPTH};
 pub use error::{Refused, Result, SqlError};
 pub use insert::{Insert, MAX_INSERT_ROWS, RECORD_COLUMN};

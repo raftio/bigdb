@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/big-civil",
     "crates/big-container",
     "crates/big-page",
     "crates/big-pager",

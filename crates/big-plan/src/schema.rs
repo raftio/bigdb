@@ -33,6 +33,23 @@ pub enum FieldClass {
     /// to make one decision differently: `-1` is a legal bound here and a mistake there, and a
     /// flag would let that decision be forgotten at a `match` arm that compiles either way.
     Signed,
+    /// The same comparisons, over a value that has a fractional part the field rounds to.
+    ///
+    /// `bits` is the field's precision - 32 or 64 - and the planner needs it for the one
+    /// decision a float makes differently from every other number: a threshold the field cannot
+    /// hold exactly has to be rounded in the direction that does not drop a record, and `= 3.14`
+    /// on a single-precision column answers nothing at all. See `big_db::float`.
+    ///
+    /// Kept apart from `Integer` rather than given it a flag for the reason [`Self::Signed`] is:
+    /// `sum` over one of these is a scan rather than a walk over bit planes, and a flag would
+    /// let that be forgotten at a `match` arm that compiles either way.
+    Float { bits: u8 },
+    /// Ordered like a number, written and read back as a date.
+    ///
+    /// The value stored is a count from the Unix epoch; `unit` says of what. Comparisons are
+    /// against a written date rather than a number, which is the whole reason this is not
+    /// [`Self::Signed`] - `'2024-01-01'` is a legal bound here and a mistake there.
+    Temporal { unit: TimeUnit },
     /// Compared against a string key for equality only.
     ///
     /// Carries which kind of keyed field it is, because two decisions depend on it and both
@@ -42,6 +59,52 @@ pub enum FieldClass {
     Keyed(Keyed),
     /// True or false.
     Boolean,
+}
+
+/// What a temporal field counts from the Unix epoch.
+///
+/// The two are one type rather than two field classes because every decision the planner makes
+/// about them is the same one; only the conversion from a written date differs, and that is
+/// arithmetic rather than a rule.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TimeUnit {
+    /// A `DATE`: whole days, so a written time of day is a value it cannot hold.
+    Days,
+    /// A `DATETIME`: seconds.
+    Seconds,
+}
+
+impl TimeUnit {
+    /// A written date as the number this field stores, or `None` when it is not a date at all.
+    ///
+    /// **The one conversion**, so that a bound in a `WHERE` and a value in an `INSERT` cannot
+    /// come to disagree about what `'2024-01-15'` is - which is the mistake the decimal path
+    /// already made once and fixed by having exactly one `to_units`.
+    pub fn to_count(self, written: &str) -> Option<i64> {
+        match self {
+            // A `DATE` takes only a date. Accepting `'2024-01-15 10:30:00'` and dropping the
+            // time would silently answer about midnight, and a value that does not read back as
+            // what was written is the bug this tree has already had once.
+            Self::Days => big_civil::parse_date(written),
+            Self::Seconds => big_civil::parse_datetime(written),
+        }
+    }
+
+    /// How a date for this field is written, for the refusal that has to say so.
+    pub fn format(self) -> &'static str {
+        match self {
+            Self::Days => "YYYY-MM-DD",
+            Self::Seconds => "YYYY-MM-DD HH:MM:SS",
+        }
+    }
+
+    /// The number this field stores, written back as the date it stands for.
+    pub fn to_written(self, count: i64) -> String {
+        match self {
+            Self::Days => big_civil::format_date(count),
+            Self::Seconds => big_civil::format_datetime(count),
+        }
+    }
 }
 
 /// Which kind of keyed field, for the two questions that turn on it.
@@ -120,7 +183,12 @@ pub fn expanded_columns(schema: &impl Schema, table: &str) -> Vec<String> {
         .fields(table)
         .into_iter()
         .filter(|f| match schema.field_class(table, f) {
-            Some(FieldClass::Integer { .. } | FieldClass::Signed) => true,
+            Some(
+                FieldClass::Integer { .. }
+                | FieldClass::Signed
+                | FieldClass::Float { .. }
+                | FieldClass::Temporal { .. },
+            ) => true,
             Some(FieldClass::Keyed(_) | FieldClass::Boolean) => stores_values,
             None => false,
         })

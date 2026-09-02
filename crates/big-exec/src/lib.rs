@@ -27,7 +27,7 @@
 use big_db::catalog::{Catalog, FieldKind};
 use big_db::{DbRead, Matches, RangeOp, RecordId, RowId};
 use big_pager::Pager;
-use big_plan::{CmpOp, FieldClass, Keyed, Plan, PlanError, Rows, Schema};
+use big_plan::{CmpOp, FieldClass, Keyed, Plan, PlanError, Rows, Schema, TimeUnit};
 
 pub mod error;
 pub use error::{ExecError, Result};
@@ -52,7 +52,10 @@ pub struct Group {
 /// **Renders additively.** An integer column still comes out as a JSON number and an absent cell
 /// still as `null`, so no client that could read a projection before can be broken by one. The
 /// two new shapes only appear where a projection used to be refused outright.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// **Not `Eq`.** A float cell holds an `f64` and `PartialEq` on one is not reflexive. Nothing in
+/// the tree needs the stronger bound - every use is an `assert_eq!` or a `match` - and a NaN
+/// cannot reach here anyway, because a float field refuses to store one.
+#[derive(Clone, Debug, PartialEq)]
 pub enum Projection {
     /// The record holds nothing in this column - not zero, and the same absence a `min` over
     /// nothing answers with.
@@ -63,6 +66,12 @@ pub enum Projection {
     /// can store. A decimal arrives in the units the field stores, exactly as a `Sum` over it
     /// does; nothing here rescales, because nothing here knows the scale.
     Int(i128),
+    /// A float column's value, already decoded.
+    ///
+    /// Decoded here rather than carried out as its stored bits, because undoing the transform
+    /// needs the field's declared width and this is the last layer that has a catalog. The same
+    /// reason `decode_int` undoes the sign bias here.
+    Real(f64),
     /// A keyed column holding one value - a mutex, or a set that happens to hold one.
     Text(String),
     /// A keyed column holding several. A set field is a set, so a record may hold any number.
@@ -84,7 +93,7 @@ impl Projection {
 }
 
 /// One record's stored values, in the order the projection asked for its columns.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Projected {
     /// Which record.
     pub record: RecordId,
@@ -120,6 +129,16 @@ pub enum Value {
     Extreme(Option<u64>),
     /// The same, over a signed field.
     SignedExtreme(Option<i64>),
+    /// A total over a float field, folded from the values rather than counted off the bit
+    /// planes - see `DbRead::sum_float_where` for why it cannot be the latter.
+    RealSum(f64),
+    /// `Min` and `Max` over a float field. Absent when nothing matched.
+    ///
+    /// A variant of its own rather than reusing `Extreme`: the stored numbers are ordered the
+    /// same way the values are, so a merge would be right either way, but decoding one needs the
+    /// field's declared width and this is the layer that has it. The same argument
+    /// `SignedExtreme` makes.
+    RealExtreme(Option<f64>),
     Groups(Vec<Group>),
     /// One group per combination of two keyed columns that any record holds both of.
     Pairs(Vec<Pair>),
@@ -213,6 +232,15 @@ impl Schema for CatalogSchema<'_> {
             FieldKind::SignedInt => FieldClass::Signed,
             // A negative scale would mean digits before the point, which nothing here writes.
             FieldKind::Decimal => FieldClass::Integer { scale: f.scale.max(0) as u8 },
+            // The width travels because the planner makes one decision with it that no other
+            // class needs: a threshold a single-precision field cannot hold exactly has to be
+            // rounded in the direction that keeps the records the comparison asked for.
+            FieldKind::Float32 => FieldClass::Float { bits: 32 },
+            FieldKind::Float64 => FieldClass::Float { bits: 64 },
+            // Stored as a biased integer, planned as a date: the unit is the whole of what
+            // separates the two, and it is what a written `'2024-01-15'` is converted against.
+            FieldKind::Date => FieldClass::Temporal { unit: TimeUnit::Days },
+            FieldKind::DateTime => FieldClass::Temporal { unit: TimeUnit::Seconds },
             FieldKind::Set => FieldClass::Keyed(Keyed::Set),
             FieldKind::Mutex => FieldClass::Keyed(Keyed::Mutex),
             FieldKind::TimeQuantum => FieldClass::Keyed(Keyed::Time),
@@ -351,25 +379,28 @@ pub fn execute<P: Pager + Sync>(db: &DbRead<'_, P>, plan: &Plan) -> Result<Value
 enum ColumnPlan {
     /// Out of the column segment. Available whenever the table keeps one, and the only way a
     /// keyed column can be read back at all.
-    Segment { keyed: bool, signed: bool },
+    Segment { keyed: bool, signed: bool, float: Option<u32> },
     /// Rebuilt from bit planes, one point read per plane. What every projection did before
     /// segments existed, and still what a bitmap-only table does.
-    Planes { signed: bool },
+    Planes { signed: bool, float: Option<u32> },
 }
 
 impl ColumnPlan {
     fn of<P: Pager + Sync>(db: &DbRead<'_, P>, table: &str, field: &str) -> Self {
         let signed = is_signed(db, table, field);
         let catalog = db.catalog();
-        let keyed = catalog
-            .lookup(table)
-            .and_then(|t| catalog.field(t.id, field))
-            .is_some_and(|f| f.kind.is_keyed());
+        let def = catalog.lookup(table).and_then(|t| catalog.field(t.id, field));
+        let keyed = def.is_some_and(|f| f.kind.is_keyed());
+        // The declared width, carried rather than looked up again per record: undoing the float
+        // transform needs it, and this whole type exists so that lookup happens once.
+        let float =
+            def.filter(|f| f.kind.is_float())
+                .map(|f| if f.bit_depth == 0 { 64 } else { f.bit_depth });
         let has_columns = catalog.lookup(table).is_some_and(|t| t.engine.has_columns());
         if has_columns {
-            Self::Segment { keyed, signed }
+            Self::Segment { keyed, signed, float }
         } else {
-            Self::Planes { signed }
+            Self::Planes { signed, float }
         }
     }
 
@@ -381,12 +412,12 @@ impl ColumnPlan {
         record: RecordId,
     ) -> Result<Projection> {
         match self {
-            Self::Planes { signed } => int_cell(db, table, field, record, signed),
-            Self::Segment { keyed, signed } => {
+            Self::Planes { signed, float } => int_cell(db, table, field, record, signed, float),
+            Self::Segment { keyed, signed, float } => {
                 let Some(cell) = db.column_cell(table, field, record)? else {
                     // The table claimed columns and then had none, which only a catalog changing
                     // underneath this read could produce. Falling back is the safe answer.
-                    return int_cell(db, table, field, record, signed);
+                    return int_cell(db, table, field, record, signed, float);
                 };
                 Ok(match cell {
                     big_db::Cell::Null => Projection::Absent,
@@ -396,6 +427,9 @@ impl ColumnPlan {
                             Some(name) => Projection::Text(name.to_string()),
                             None => Projection::Absent,
                         }
+                    }
+                    big_db::Cell::Value(v) if float.is_some() => {
+                        Projection::Real(big_db::float::decode(v, float.expect("some")))
                     }
                     big_db::Cell::Value(v) => {
                         Projection::Int(decode_int(v, signed, db, table, field))
@@ -428,7 +462,12 @@ fn int_cell<P: Pager + Sync>(
     field: &str,
     record: RecordId,
     signed: bool,
+    float: Option<u32>,
 ) -> Result<Projection> {
+    if let Some(bits) = float {
+        let v = db.get_int(table, field, record)?.map(|v| big_db::float::decode(v, bits));
+        return Ok(v.map_or(Projection::Absent, Projection::Real));
+    }
     let v = if signed {
         db.get_signed(table, field, record)?.map(i128::from)
     } else {
@@ -571,6 +610,14 @@ fn is_signed<P: Pager + Sync>(db: &DbRead<'_, P>, table: &str, field: &str) -> b
         .is_some_and(|f| f.kind.is_signed())
 }
 
+/// Whether an aggregate over this field is folded from values rather than from bit planes.
+fn is_float<P: Pager + Sync>(db: &DbRead<'_, P>, table: &str, field: &str) -> bool {
+    db.catalog()
+        .lookup(table)
+        .and_then(|t| db.catalog().field(t.id, field))
+        .is_some_and(|f| f.kind.is_float())
+}
+
 fn aggregate_over<P: Pager + Sync>(
     db: &DbRead<'_, P>,
     table: &str,
@@ -584,6 +631,19 @@ fn aggregate_over<P: Pager + Sync>(
         // where the value is stored and not of what is being asked of it. Doing it here means
         // there is exactly one place that knows a signed aggregate exists - a `Sum` reaching
         // storage has already been routed.
+        // A float is split off before the signed kinds for the same reason they are split off
+        // from the plain ones: what a total costs is a property of how the value is stored, and
+        // a float's is a fold over values rather than a walk over bit planes.
+        Plan::Sum { field, .. } if is_float(db, table, field) => {
+            Value::RealSum(db.sum_float_where(table, field, group)?)
+        }
+        Plan::Min { field, .. } if is_float(db, table, field) => {
+            Value::RealExtreme(db.min_float_where(table, field, group)?)
+        }
+        Plan::Max { field, .. } if is_float(db, table, field) => {
+            Value::RealExtreme(db.max_float_where(table, field, group)?)
+        }
+
         Plan::Sum { field, .. } if is_signed(db, table, field) => {
             Value::SignedSum(db.sum_signed_where(table, field, group)?)
         }
@@ -619,6 +679,11 @@ fn eval<P: Pager + Sync>(db: &DbRead<'_, P>, table: &str, rows: &Rows) -> Result
         Rows::Compare { field, op, value } => db.matching(table, field, range_op(*op), *value)?,
         Rows::CompareSigned { field, op, value } => {
             db.matching_signed(table, field, range_op(*op), *value)?
+        }
+        // The threshold travelled as bits so the plan could keep its `Eq`; this is the one place
+        // that reads it back, immediately, before anything is done with it.
+        Rows::CompareFloat { field, op, bits } => {
+            db.matching_float(table, field, range_op(*op), f64::from_bits(*bits))?
         }
         Rows::Key { field, value } => db.matching_key(table, field, value)?,
         Rows::KeyBetween { field, value, from, to } => {

@@ -14,7 +14,7 @@
 plan
 SELECT * FROM t
 ----
-Project t.(amount, price, balance, category, country, device, visit, active)
+Project t.(amount, price, balance, category, country, device, visit, active, rate, day, seen)
 └── all
 
 shape
@@ -28,18 +28,21 @@ Table
 ├── country
 ├── device
 ├── visit
-└── active
+├── active
+├── rate
+├── day units=date
+└── seen units=datetime
 
 plan
 SELECT * FROM t WHERE active = true
 ----
-Project t.(amount, price, balance, category, country, device, visit, active)
+Project t.(amount, price, balance, category, country, device, visit, active, rate, day, seen)
 └── active = true
 
 plan
 SELECT * FROM t WHERE country = 'GB' AND amount > 5
 ----
-Project t.(amount, price, balance, category, country, device, visit, active)
+Project t.(amount, price, balance, category, country, device, visit, active, rate, day, seen)
 └── intersect
     ├── country = 'GB'
     └── amount > 5
@@ -47,7 +50,7 @@ Project t.(amount, price, balance, category, country, device, visit, active)
 plan
 SELECT * FROM t LIMIT 10
 ----
-Project t.(amount, price, balance, category, country, device, visit, active) limit=10
+Project t.(amount, price, balance, category, country, device, visit, active, rate, day, seen) limit=10
 └── all
 
 shape
@@ -61,7 +64,10 @@ Table
 ├── country
 ├── device
 ├── visit
-└── active
+├── active
+├── rate
+├── day units=date
+└── seen units=datetime
 
 # `*` expands to the columns a projection could actually read, which is not always every column
 # the table has. `u` keeps no values, so its keyed and boolean columns have no read back from a
@@ -70,7 +76,7 @@ Table
 plan
 SELECT * FROM u
 ----
-Project u.(amount, price, balance)
+Project u.(amount, price, balance, rate, day, seen)
 └── all
 
 shape
@@ -79,7 +85,10 @@ SELECT * FROM u
 Table
 ├── amount
 ├── price scale=2
-└── balance
+├── balance
+├── rate
+├── day units=date
+└── seen units=datetime
 
 # Where nothing at all could be read - a table with no fields - the star falls back to record
 # ids, which is the answer it gave before it expanded to anything. The plan and the header fall
@@ -203,3 +212,54 @@ SELECT amount FROM t LIMIT 0
 ----
 Project t.(amount) limit=0
 └── all
+
+## `toDate` and `date_trunc`: a rounding applied where the answer is written.
+##
+## The plan is unchanged - it reads the column it was always going to read - and the whole of
+## what the function does shows up in the shape, as the `apply` on the column. That is the point
+## of them: they cost a projection nothing, because they are arithmetic on a number that had
+## already been read.
+
+plan
+SELECT toDate(seen) FROM t
+----
+Project t.(seen)
+└── all
+
+shape
+SELECT toDate(seen) FROM t
+----
+Table
+└── toDate units=date apply=toDate
+
+# The units change with `toDate` and not with `date_trunc`: the day an instant falls in is a
+# date, and a truncated timestamp is still a timestamp, at midnight or on the hour.
+shape
+SELECT date_trunc('month', seen) FROM t
+----
+Table
+└── date_trunc('month') units=datetime apply=date_trunc('month')
+
+# Over a column of whole days the rounding stays in days.
+shape
+SELECT date_trunc('quarter', day) FROM t
+----
+Table
+└── date_trunc('quarter') units=date apply=date_trunc('quarter')
+
+# `toDate` of a date has nothing to do, and says so as the identity truncation it is - which is
+# what keeps every combination of (units, apply) readable one way at the far end.
+shape
+SELECT toDate(day) FROM t
+----
+Table
+└── toDate units=date apply=date_trunc('day')
+
+# An alias names the column and the rounding still shows, which is the case the printer exists
+# for: without `apply` this would be indistinguishable from a bare `SELECT seen AS seen`.
+shape
+SELECT date_trunc('year', seen) AS seen, amount FROM t
+----
+Table
+├── seen units=datetime apply=date_trunc('year')
+└── amount

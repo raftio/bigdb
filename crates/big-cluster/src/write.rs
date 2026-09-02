@@ -256,7 +256,7 @@ impl<P: PagerMut + Sync> Cluster<P> {
             .map_err(|why| ClusterError::Wire { node: self.config.leader().name.clone(), why })
     }
 
-    /// The leader's own half of [`Cluster::allocate`].
+    /// The leader's own half of `Cluster::allocate`.
     ///
     /// Two terms, and both are needed. The first is one past the highest id **anywhere**, which
     /// is what keeps an allocation clear of ids written explicitly or through the import route -

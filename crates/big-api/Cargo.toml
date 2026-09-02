@@ -16,6 +16,7 @@ categories = ["database-implementations","data-structures"]
 unstable = []
 
 [dependencies]
+big-civil = { path = "../big-civil", version = "0.1.0" }
 big-db = { path = "../big-db", version = "0.1.0" }
 big-exec = { path = "../big-exec", version = "0.1.0" }
 # For `Api::execute`, which takes a plan a caller built rather than text this crate parses.

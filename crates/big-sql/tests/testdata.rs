@@ -40,7 +40,7 @@
 //!
 //! `BIG_REWRITE=1 cargo test -p big-sql --test testdata` regenerates every expected block.
 
-use big_plan::{FieldClass, Keyed, Plan, Schema};
+use big_plan::{FieldClass, Keyed, Plan, Schema, TimeUnit};
 use big_sql::{explain, Sql};
 use big_testfile::Case;
 
@@ -82,6 +82,9 @@ impl Schema for Stub {
             "device" => FieldClass::Keyed(Keyed::Mutex),
             "visit" => FieldClass::Keyed(Keyed::Time),
             "active" => FieldClass::Boolean,
+            "rate" => FieldClass::Float { bits: 64 },
+            "day" => FieldClass::Temporal { unit: TimeUnit::Days },
+            "seen" => FieldClass::Temporal { unit: TimeUnit::Seconds },
             _ => return None,
         })
     }
@@ -93,11 +96,14 @@ impl Schema for Stub {
         if !self.has_table(table) {
             return Vec::new();
         }
-        ["amount", "price", "balance", "category", "country", "device", "visit", "active"]
-            .iter()
-            .filter(|f| self.field_class(table, f).is_some())
-            .map(|f| (*f).to_string())
-            .collect()
+        [
+            "amount", "price", "balance", "category", "country", "device", "visit", "active",
+            "rate", "day", "seen",
+        ]
+        .iter()
+        .filter(|f| self.field_class(table, f).is_some())
+        .map(|f| (*f).to_string())
+        .collect()
     }
 
     /// `t` keeps its values and `u` does not, so that the refusal a projection meets over an

@@ -39,6 +39,9 @@ pub struct OwnedFact {
 pub enum FactValue {
     Int(u64),
     Signed(i64),
+    /// `f64::to_bits` of a float value, so a fact crosses the wire bit-exact rather than
+    /// through a decimal spelling that would have to round-trip.
+    Float(u64),
     Key(String),
     Bool(bool),
     /// A key with the moment it happened, for a time quantum field.
@@ -61,6 +64,9 @@ impl OwnedFact {
             }
             big_api::Fact::Signed { field, record, value } => {
                 (*field, *record, FactValue::Signed(*value))
+            }
+            big_api::Fact::Float { field, record, bits } => {
+                (*field, *record, FactValue::Float(*bits))
             }
             big_api::Fact::Bool { field, record, value } => {
                 (*field, *record, FactValue::Bool(*value))
@@ -85,6 +91,9 @@ impl OwnedFact {
             }
             FactValue::Signed(v) => {
                 big_api::Fact::Signed { field: &self.field, record: self.record, value: *v }
+            }
+            FactValue::Float(v) => {
+                big_api::Fact::Float { field: &self.field, record: self.record, bits: *v }
             }
             FactValue::Key(v) => {
                 big_api::Fact::Key { field: &self.field, record: self.record, value: v }
@@ -140,6 +149,12 @@ pub fn put_fact(out: &mut Vec<u8>, f: &OwnedFact) {
             put_str(out, value);
             put_i64(out, *unix_seconds);
         }
+        // Appended, never renumbered: an older peer answers `BadTag` on this rather than
+        // reading it as one of the tags it does know.
+        FactValue::Float(bits) => {
+            put_u8(out, 5);
+            put_u64(out, *bits);
+        }
     }
 }
 
@@ -152,6 +167,7 @@ pub fn get_fact(r: &mut Reader<'_>) -> Result<OwnedFact> {
         2 => FactValue::Key(r.str()?),
         3 => FactValue::Bool(r.bool()?),
         4 => FactValue::Time { value: r.str()?, unix_seconds: r.i64()? },
+        5 => FactValue::Float(r.u64()?),
         tag => return Err(WireError::BadTag { what: "fact", tag }),
     };
     Ok(OwnedFact { field, record, value })

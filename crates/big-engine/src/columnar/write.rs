@@ -160,7 +160,7 @@ impl ColumnWrite {
 /// One block, encoded into the leaf items a tree stores it as.
 ///
 /// Free rather than a method, and taking `base`, because a block lives in two places: a segment
-/// of its own, where `base` is zero, and inside a [`crate::part`], where every field of a shard
+/// of its own, where `base` is zero, and inside a `part`, where every field of a shard
 /// shares one tree and a field's keys start at its own offset. The encoding, the spill decision
 /// and the page arrangement are the same in both, so they are written once.
 ///

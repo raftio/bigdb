@@ -279,11 +279,15 @@ impl<'a> Parser<'a> {
             let units = format!("{whole}{frac}")
                 .parse::<u64>()
                 .map_err(|_| PlanError::NumberTooLarge { at: start })?;
-            // Decimals are stored in an unsigned bit-sliced index, so a negative one has
-            // nowhere to go. Refused here rather than at planning time because the reason is
-            // about the literal, not about which field it was compared against.
+            // A negative fractional number used to be refused here, because a decimal field is
+            // unsigned and there was nowhere else for one to go. A float field holds one
+            // perfectly well, and a lexer cannot see which kind of field a value is headed for -
+            // so the shape is read and the refusal moved to `to_units`, which knows.
             if negative {
-                return Err(PlanError::NegativeDecimal { at: start });
+                let units = i64::try_from(units)
+                    .map(|v| -v)
+                    .map_err(|_| PlanError::NumberTooLarge { at: start })?;
+                return Ok(Literal::Sdec { units, scale });
             }
             return Ok(Literal::Dec { units, scale });
         }

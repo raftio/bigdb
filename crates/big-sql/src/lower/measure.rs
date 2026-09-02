@@ -34,6 +34,11 @@ use big_plan::ast::Literal;
 /// A count is in records and a `topK` answers with keys, so neither has a field to be measured
 /// in. An average is a quotient of a sum in the field's units by a count, so it is in them too.
 pub(super) fn units_of(table: &str, proj: &Proj) -> Units {
+    // A moment, not a plain number. Without this the seconds it carries render as the count
+    // they are, which is the same mistake a decimal read back unscaled makes.
+    if let Proj::Now { .. } = proj {
+        return Units::Seconds;
+    }
     let Some(field) = field_measured(proj) else { return Units::PLAIN };
     // **The table, not the qualifier.** A qualifier may be an alias - `FROM tx AS t` makes
     // `t.amount` a column of `tx` - and what resolves a field is the name the catalog knows.
@@ -48,11 +53,15 @@ pub(super) fn field_measured(proj: &Proj) -> Option<&Name> {
         Proj::Agg { field, .. } | Proj::Avg(field) | Proj::Quantile { field, .. } => Some(field),
         // A count is in records, a `topK` answers with keys, a key is not a number, and a star
         // is record ids.
+        // `now()` measures nothing at all, and a rounded column is read back per record rather
+        // than folded - neither is a number a `HAVING` could name.
         Proj::Count
         | Proj::CountDistinct(_)
         | Proj::TopKeys { .. }
         | Proj::Star
-        | Proj::Column(_) => None,
+        | Proj::Column(_)
+        | Proj::Now { .. }
+        | Proj::TimeOf { .. } => None,
     }
 }
 

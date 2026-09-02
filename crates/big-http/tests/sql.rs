@@ -945,10 +945,17 @@ fn a_column_list_is_one_way_to_say_a_schema_and_not_the_only_one() {
 /// parsed and the first change goes out only after all of them are.
 #[test]
 fn a_column_list_is_judged_before_the_table_is_created() {
-    let addr = spawn(7);
+    let addr = spawn(8);
 
     for (sql, code) in [
-        ("CREATE TABLE t (a FLOAT)", "sql_unknown_column_type"),
+        // `FLOAT` used to be here. It is a column type now, so the case that stands for "a type
+        // this dialect has no field for" has to be one that really is: a blob has nowhere to go
+        // in a bit-sliced index, and no plan to acquire one.
+        ("CREATE TABLE t (a BLOB)", "sql_unknown_column_type"),
+        // A float with a decimal's brackets, which is the mistake worth keeping a case for: it
+        // parses everywhere else and means a fixed-point column, so reading it as a float would
+        // silently drop the precision it was asked to keep.
+        ("CREATE TABLE t (a FLOAT(10, 2))", "sql_unknown_column_type"),
         ("CREATE TABLE t (a INT NOT NULL)", "sql_no_constraints"),
         ("CREATE TABLE t (a DECIMAL)", "sql_decimal_scale"),
         ("CREATE TABLE t (a UINT(65))", "sql_bit_depth"),

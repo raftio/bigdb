@@ -238,9 +238,14 @@ fn number(s: &[u8], i: &mut usize) -> Result<Tok> {
     let scale = u8::try_from(frac.len()).map_err(|_| SqlError::NumberTooLarge { at })?;
 
     Ok(Tok::Num(match (negative, scale) {
-        // A negative decimal has nowhere to go: decimal fields are unsigned, and rounding it to
-        // an integer would answer a different question.
-        (true, s) if s > 0 => return Err(SqlError::NegativeDecimal { at }),
+        // A negative fractional number used to be refused here, because a decimal field is
+        // unsigned and there was nowhere else for one to go. A float field holds one perfectly
+        // well, and a lexer cannot see which kind of field a value is headed for - so the shape
+        // is read and the refusal moved to `big_plan::to_units`, which knows the field.
+        (true, scale) if scale > 0 => {
+            let units = i64::try_from(units).map_err(|_| SqlError::NumberTooLarge { at })?;
+            Literal::Sdec { units: -units, scale }
+        }
         (true, _) => {
             let v = i64::try_from(units).map_err(|_| SqlError::NumberTooLarge { at })?;
             Literal::Sint(-v)

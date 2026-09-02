@@ -48,26 +48,20 @@ pub struct DateTime {
     pub hour: u32,
 }
 
-/// Civil date from days since the Unix epoch. Hinnant's algorithm, valid for the whole range
-/// of an i64 day count, and it avoids pulling in a date library for four fields.
-pub fn civil_from_days(z: i64) -> (i64, u32, u32) {
-    let z = z + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097) as u64;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
-    (if m <= 2 { y + 1 } else { y }, m, d)
-}
+/// Civil date from days since the Unix epoch.
+///
+/// The algorithm moved to `big-civil` when dates became a column type: the same arithmetic
+/// reads `'2024-01-15'` in the planner, which cannot see this crate, and two copies of a
+/// calendar are two calendars. This is the name it has always had here.
+pub use big_civil::civil_from_days;
 
+/// The four fields a view name is built from.
+///
+/// Narrower than [`big_civil::Civil`] on purpose - an hour is the finest granularity a view has,
+/// so minutes and seconds would be two fields nothing here reads.
 pub fn decompose(unix_seconds: i64) -> DateTime {
-    let days = unix_seconds.div_euclid(86_400);
-    let secs = unix_seconds.rem_euclid(86_400);
-    let (year, month, day) = civil_from_days(days);
-    DateTime { year, month, day, hour: (secs / 3600) as u32 }
+    let t = big_civil::decompose(unix_seconds);
+    DateTime { year: t.year, month: t.month, day: t.day, hour: t.hour }
 }
 
 /// View suffixes a fact at `unix_seconds` must also be written into.

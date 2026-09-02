@@ -137,10 +137,12 @@ fn a_projection_carries_its_cut_in_the_plan() {
                 Selected {
                     column: "a".to_string(),
                     units: Units::Written { table: "t".to_string(), field: "amount".to_string() },
+                    apply: None,
                 },
                 Selected {
                     column: "price".to_string(),
                     units: Units::Written { table: "t".to_string(), field: "price".to_string() },
+                    apply: None,
                 },
             ]),
         }

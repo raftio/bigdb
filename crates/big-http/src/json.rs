@@ -141,6 +141,13 @@ pub fn value_paged(v: &Value, page: Page) -> String {
             Some(n) => format!("{{\"value\":{n}}}"),
             None => "{\"value\":null}".to_string(),
         },
+        // Through `real` for the reason every other float in this file is: a column that is
+        // sometimes `3` and sometimes `3.5` is a column a client has to sniff.
+        Value::RealSum(n) => format!("{{\"sum\":{}}}", real(*n)),
+        Value::RealExtreme(x) => match x {
+            Some(n) => format!("{{\"value\":{}}}", real(*n)),
+            None => "{\"value\":null}".to_string(),
+        },
         Value::Rows(m) => rows(m, page),
         // A pair grouping asked for in the query language. One object per pair, naming both
         // halves, because this route's answers name what they hold.
@@ -224,6 +231,11 @@ fn json_cell(d: &Datum) -> String {
         // every client parse a decimal out of text.
         Datum::Dec { units, scale } => big_api::fixed(*units, *scale),
         Datum::Real(v) => real(*v),
+        // A JSON **string**, unlike every other number here. An ISO date is a string in every
+        // schema anyone will point at this, and a bare count of days from 1970 is a number no
+        // reader can read.
+        Datum::Date(d) => string(&big_api::date_text(*d)),
+        Datum::Timestamp(t) => string(&big_api::timestamp_text(*t)),
         Datum::Text(s) => string(s),
         Datum::Keys(keys) => keys_cell(keys),
     }
@@ -236,6 +248,10 @@ fn separated_cell(d: &Datum) -> String {
         Datum::Int(v) => v.to_string(),
         Datum::Dec { units, scale } => big_api::fixed(*units, *scale),
         Datum::Real(v) => real(*v),
+        // Unquoted, which is what a spreadsheet and an `awk` script both want, and safe to leave
+        // bare because a date has no separator or control character in it.
+        Datum::Date(d) => big_api::date_text(*d),
+        Datum::Timestamp(t) => big_api::timestamp_text(*t),
         Datum::Text(s) => bare(s),
         // A list has no separated spelling, so it keeps its JSON one. A client reading `topK`
         // out of a CSV is reading one JSON array per cell, which is what it was before typed
@@ -286,6 +302,7 @@ fn projection(p: &big_api::Projection) -> String {
     match p {
         big_api::Projection::Absent => "null".to_string(),
         big_api::Projection::Int(v) => v.to_string(),
+        big_api::Projection::Real(v) => real(*v),
         big_api::Projection::Text(s) => string(s),
         big_api::Projection::Texts(v) => {
             let items: Vec<String> = v.iter().map(|s| string(s)).collect();

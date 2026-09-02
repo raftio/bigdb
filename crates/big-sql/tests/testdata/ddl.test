@@ -98,17 +98,35 @@ CREATE TABLE t (a BOOLEAN, b TIMESTAMP, c DATETIME)
 ----
 CreateTable t
 ├── a bool depth=32
-├── b timequantum depth=32
-└── c timequantum depth=32
+├── b datetime depth=64
+└── c datetime depth=64
 
-# `DATE` is the fourth spelling of a time quantum, not a kind of its own: a date column is asked
-# to answer about days, and a time quantum field is the one that is viewed by day.
+# `DATE` and `DATETIME` are scalar kinds of their own, and `TIMEQUANTUM` keeps its own spelling.
+# They used to be the same thing, and the split is what makes `WHERE d >= '2024-01-01'`,
+# `ORDER BY d` and `max(d)` askable: a time quantum is keyed, so it answers `f = 'k'` and a
+# window and nothing else. A date counts days from the epoch and a datetime counts seconds,
+# which is why their depths differ.
 ddl
-CREATE TABLE t (a DATE, b TIMESTAMP)
+CREATE TABLE t (a DATE, b TIMESTAMP, c TIMEQUANTUM)
 ----
 CreateTable t
-├── a timequantum depth=32
-└── b timequantum depth=32
+├── a date depth=32
+├── b datetime depth=64
+└── c timequantum depth=32
+
+# The widths are in the names, so `FLOAT` and `REAL` are the narrow one and `DOUBLE` the wide.
+# `DOUBLE PRECISION` is read rather than refused, for the reason `INT UNSIGNED` is: it is a word
+# that says what was already meant.
+ddl
+CREATE TABLE t (a FLOAT, b REAL, c FLOAT32, d DOUBLE, e FLOAT64, f DOUBLE PRECISION)
+----
+CreateTable t
+├── a float32 depth=32
+├── b float32 depth=32
+├── c float32 depth=32
+├── d float64 depth=64
+├── e float64 depth=64
+└── f float64 depth=64
 
 ddl
 CREATE TABLE t (a TEXT, b BIGINT, c BOOLEAN, d TIMESTAMP)
@@ -117,7 +135,7 @@ CreateTable t
 ├── a set depth=32
 ├── b int depth=64
 ├── c bool depth=32
-└── d timequantum depth=32
+└── d datetime depth=64
 
 # A decimal keeps its scale, which is what every value written to it is converted against.
 ddl
@@ -209,7 +227,22 @@ CREATE TABLE t (
     b SET,
     c UINT(64),
     d BOOL,
-    e TIMEQUANTUM
+    e DATETIME
+)
+
+# Every SQL spelling of a float and a date renders back as the native one, and reads back as the
+# same column. `REAL` and `DOUBLE PRECISION` have no width in brackets on the way out because
+# their names already carry it.
+render
+CREATE TABLE t (a FLOAT, b REAL, c DOUBLE, d DOUBLE PRECISION, e DATE, f TIMESTAMP)
+----
+CREATE TABLE t (
+    a FLOAT32,
+    b FLOAT32,
+    c FLOAT64,
+    d FLOAT64,
+    e DATE,
+    f DATETIME
 )
 
 render

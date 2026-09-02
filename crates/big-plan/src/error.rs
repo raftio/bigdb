@@ -80,6 +80,28 @@ pub enum PlanError {
         written: u8,
         scale: u8,
     },
+    /// `toDate` or `date_trunc` written over a column it says nothing about.
+    ///
+    /// Its own variant rather than a [`Self::BadDate`], because the mistake is the other way
+    /// round: there is nothing wrong with the value, and what does not fit is the call written
+    /// over the column.
+    BadRounding {
+        /// The call, as it was written.
+        call: String,
+        /// What it needed instead.
+        why: &'static str,
+    },
+    /// A date field compared against a string that is not a date it can hold.
+    ///
+    /// Carries what was written because every way of getting this wrong looks the same from the
+    /// outside - a typo, the wrong separator, a time of day against a `DATE`, the 30th of
+    /// February - and the written text is what tells them apart.
+    BadDate {
+        field: String,
+        written: String,
+        /// What the field would have accepted, e.g. `YYYY-MM-DD`.
+        want: &'static str,
+    },
 }
 
 impl core::fmt::Display for PlanError {
@@ -112,6 +134,10 @@ impl core::fmt::Display for PlanError {
             Self::TooPrecise { field, written, scale } => {
                 write!(f, "`{field}` stores {scale} decimal places, but the value has {written}")
             }
+            Self::BadRounding { call, why } => write!(f, "`{call}` needs {why}"),
+            Self::BadDate { field, written, want } => {
+                write!(f, "`{field}` takes a date written `{want}`, and `{written}` is not one")
+            }
         }
     }
 }
@@ -136,6 +162,8 @@ impl PlanError {
             Self::BadArgument { .. } => "bad_argument",
             Self::OperatorNotAllowed { .. } => "operator_not_allowed",
             Self::TooPrecise { .. } => "too_precise",
+            Self::BadDate { .. } => "bad_date",
+            Self::BadRounding { .. } => "bad_rounding",
         }
     }
 }

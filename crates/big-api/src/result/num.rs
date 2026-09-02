@@ -27,11 +27,11 @@ use crate::{Absent, Cell, Of, RowId, Value};
 /// Split from [`number`] because one cell is not a number: `topK` holds the list of keys a
 /// ranking produced, and a list is what ClickHouse's `topK` answers with too.
 pub(super) fn scalar_cell(c: &Cell, values: &[Value], probes_at: usize) -> Datum {
-    let digits = c.units.digits();
+    let units = &c.units;
     match c.of {
         // A search's answer sits after every call's, which is what `Answer::calls` records.
         Of::Probe { probe } => {
-            Datum::num(values.get(probes_at + probe).and_then(scalar_num), digits)
+            Datum::num(values.get(probes_at + probe).and_then(scalar_num), units)
         }
         Of::Keys { plan } => {
             Datum::Keys(
@@ -46,7 +46,7 @@ pub(super) fn scalar_cell(c: &Cell, values: &[Value], probes_at: usize) -> Datum
                     .collect(),
             )
         }
-        of => Datum::num(number(of, values, None), digits),
+        of => Datum::num(number(of, values, None), units),
     }
 }
 
@@ -64,6 +64,9 @@ pub(super) fn number(of: Of, values: &[Value], row: Option<RowId>) -> Option<Num
         // Reached only by a hand-built shape: `scalar_cell` reads a probe, because only it
         // knows where the searches' answers begin.
         Of::Probe { .. } => None,
+        // A constant, carried from the parser so that every row and every node reads the same
+        // instant. No plan is consulted because there is none to consult.
+        Of::Now { unix_seconds } => Some(Num::Int(i128::from(unix_seconds))),
         Of::Value { plan } => values.get(plan).and_then(scalar_num),
         // The counting step of `count(DISTINCT x)`, which happens here because here is after
         // the merge: a group that two nodes both hold is one group, and counting earlier would
@@ -113,6 +116,10 @@ pub(super) fn scalar_num(v: &Value) -> Option<Num> {
         Value::SignedSum(n) => Num::Int(*n),
         Value::Extreme(v) => Num::Int(i128::from((*v)?)),
         Value::SignedExtreme(v) => Num::Int(i128::from((*v)?)),
+        // Already a float, and already exact in the only sense available: the fold that made it
+        // is the one `sum_float_where` documents.
+        Value::RealSum(n) => Num::Real(*n),
+        Value::RealExtreme(v) => Num::Real((*v)?),
         Value::Groups(_) | Value::Rows(_) | Value::Table(_) | Value::Pairs(_) => return None,
     })
 }
