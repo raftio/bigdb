@@ -16,7 +16,7 @@
 
 //! The query parser, which is the one entry point in this engine a stranger reaches directly.
 //!
-//! `bigd` hands `parse` whatever arrived in a request body. So the contract is the same as the
+//! `big serve` hands `parse` whatever arrived in a request body. So the contract is the same as the
 //! page parser's - return `Result`, never panic - with one addition that a byte parser does not
 //! have to worry about: **this is recursive descent, so deeply nested input is a stack overflow
 //! rather than an error.** `Row(((((((...` is four bytes of grammar and a thousand bytes of

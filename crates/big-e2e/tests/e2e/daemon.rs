@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! `bigd`, started the way an operator starts it.
+//! `big serve`, started the way an operator starts it.
 //!
 //! **Every decision here happens before the first request.** The argument parser, the token
 //! file, the refusal to serve a public port with no authentication, the exclusive lock - none
@@ -25,25 +25,25 @@ use crate::common::*;
 fn no_arguments_is_a_usage_error_rather_than_a_default_database() {
     // Not "open ./data.big". A daemon that invents a path creates a file somewhere the operator
     // did not choose, and finds out later.
-    let run = run("bigd", &[]).expect(2);
+    let run = run("big", &["serve"]).expect(2);
 
     assert!(run.said("a database file is required"), "says what is missing: {}", run.err);
-    assert!(run.said("usage: bigd"), "and repeats the usage: {}", run.err);
+    assert!(run.said("usage: big serve"), "and repeats the usage: {}", run.err);
 }
 
 #[test]
 fn help_is_not_a_failure() {
-    // Usage to stdout and exit zero, so `bigd --help | less` works and a script does not treat
+    // Usage to stdout and exit zero, so `big serve --help | less` works and a script does not treat
     // it as an error. The split every tool here makes.
-    let run = run("bigd", &["--help"]).expect(0);
+    let run = run("big", &["serve", "--help"]).expect(0);
 
-    assert!(run.out.contains("usage: bigd"), "usage on stdout: {:?}", run.out);
+    assert!(run.out.contains("usage: big serve"), "usage on stdout: {:?}", run.out);
     assert!(run.err.is_empty(), "and nothing on stderr: {:?}", run.err);
 }
 
 #[test]
 fn an_unknown_option_names_the_option_it_did_not_know() {
-    let run = run("bigd", &["/tmp/nothing.big", "--wat"]).expect(2);
+    let run = run("big", &["serve", "/tmp/nothing.big", "--wat"]).expect(2);
 
     assert!(run.said("--wat"), "names the option: {}", run.err);
 }
@@ -51,14 +51,14 @@ fn an_unknown_option_names_the_option_it_did_not_know() {
 #[test]
 fn a_flag_without_its_value_says_which_flag() {
     // The difference between a usable error and "invalid arguments".
-    let run = run("bigd", &["/tmp/nothing.big", "--tokens"]).expect(2);
+    let run = run("big", &["serve", "/tmp/nothing.big", "--tokens"]).expect(2);
 
     assert!(run.said("--tokens needs a value"), "{}", run.err);
 }
 
 #[test]
 fn a_durability_that_is_not_one_of_the_three_is_refused_with_the_three() {
-    let run = run("bigd", &["/tmp/nothing.big", "--durability", "sometimes"]).expect(2);
+    let run = run("big", &["serve", "/tmp/nothing.big", "--durability", "sometimes"]).expect(2);
 
     assert!(run.said("full, barrier or none"), "lists what it takes: {}", run.err);
     assert!(run.said("sometimes"), "and repeats what it got: {}", run.err);
@@ -70,7 +70,7 @@ fn a_public_port_with_no_authentication_is_refused() {
     // from being an excuse is this: a port anyone can reach, with no token file, does not open.
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("data.big");
-    let run = run("bigd", &[&path.display().to_string(), "0.0.0.0:0"]).expect(2);
+    let run = run("big", &["serve", &path.display().to_string(), "0.0.0.0:0"]).expect(2);
 
     assert!(run.said("refusing to serve"), "{}", run.err);
     // All three ways out, because a refusal that does not say how to proceed is a wall.
@@ -101,8 +101,14 @@ fn a_token_file_anyone_can_read_is_refused() {
     let path = dir.path().join("data.big");
 
     let run = run(
-        "bigd",
-        &[&path.display().to_string(), "127.0.0.1:0", "--tokens", &tokens.display().to_string()],
+        "big",
+        &[
+            "serve",
+            &path.display().to_string(),
+            "127.0.0.1:0",
+            "--tokens",
+            &tokens.display().to_string(),
+        ],
     );
 
     assert_ne!(run.code, 0, "it does not start: {}", run.err);
@@ -119,9 +125,9 @@ fn a_daemon_with_tokens_says_how_many_it_loaded() {
     assert!(daemon.log().contains("2 tokens loaded"), "{}", daemon.log());
 
     // The probes stay open with authentication on, which is what makes this observable at all.
-    assert_eq!(daemon.bigc(&["health"]).code, 0);
+    assert_eq!(daemon.bigctl(&["health"]).code, 0);
     // And an unauthenticated request for data does not get through.
-    let refused = daemon.bigc(&["schema"]);
+    let refused = daemon.bigctl(&["schema"]);
     assert_ne!(refused.code, 0, "no token, no schema: {:?}", refused.out);
 }
 
@@ -131,12 +137,12 @@ fn a_second_daemon_on_the_same_file_is_refused_by_the_lock() {
     // startup rather than two of them writing to one file and finding out afterwards.
     let first = Daemon::start();
 
-    let second = run("bigd", &[&first.path.display().to_string(), "127.0.0.1:0"]);
+    let second = run("big", &["serve", &first.path.display().to_string(), "127.0.0.1:0"]);
 
     assert_ne!(second.code, 0, "the second daemon does not start: {}", second.err);
     assert!(second.said("could not open"), "and says which file: {}", second.err);
     // The first is untouched by the attempt.
-    assert_eq!(first.bigc(&["health"]).code, 0);
+    assert_eq!(first.bigctl(&["health"]).code, 0);
 }
 
 #[test]

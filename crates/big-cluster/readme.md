@@ -2,7 +2,7 @@
 
 Static shard ownership, the fan-out over it, and the wire it travels on.
 
-Above `big-api` and below `big-http`, which is the whole reason it is its own crate: the merge
+Above `big-embed` and below `big-http`, which is the whole reason it is its own crate: the merge
 has to live somewhere that has never heard of a socket handler and somewhere `big-db` has never
 heard of, and neither of those places existed.
 
@@ -16,7 +16,7 @@ Cluster::solo(api)                    // every shard, no peers, its own schema l
 Cluster::new(api, config, token)      // one node of a configured cluster
 ```
 
-`big-http`'s `Server` holds a `Cluster`, never an `Api`, so a `bigd` started without `--cluster`
+`big-http`'s `Server` holds a `Cluster`, never an `Api`, so a `big serve` started without `--cluster`
 runs every request through the same coordinator that a four-node deployment does. A second path
 for the un-clustered case would be the path nobody tests.
 

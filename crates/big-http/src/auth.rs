@@ -30,7 +30,7 @@
 //! **Comparison is constant time.** A token is compared byte for byte with no early exit, so
 //! the time taken does not reveal how much of a guess was right.
 
-use big_api::Authority;
+use big_embed::Authority;
 use std::io;
 use std::path::Path;
 
@@ -69,7 +69,7 @@ impl Role {
 /// What a statement demands, as what a credential has to hold.
 ///
 /// **The whole of what this crate knows about SQL.** Which statements write and which only read
-/// is [`big_api::Sql::authority`]'s to say, next to the variants it is about; this is the one
+/// is [`big_embed::Sql::authority`]'s to say, next to the variants it is about; this is the one
 /// line that turns that answer into the vocabulary of a token file. An edge deciding it by
 /// matching on the AST itself is how the rule ends up written twice and enforced once.
 impl From<Authority> for Role {
@@ -101,13 +101,13 @@ pub enum Outcome {
 /// The token table, and the decision of who may do what.
 ///
 /// `Default` is disabled, which is safe only because binding anywhere but loopback without a
-/// token file is refused by `bigd`. See its `--insecure-no-auth` flag for the deliberate
+/// token file is refused by `big serve`. See its `--insecure-no-auth` flag for the deliberate
 /// override.
 #[derive(Clone, Default)]
 pub struct Auth {
     /// `None` means authentication is switched off and every request is allowed. That is the
     /// default only because a loopback-only server is the default; binding anywhere else
-    /// without a token file is refused by `bigd`, not here.
+    /// without a token file is refused by `big serve`, not here.
     tokens: Option<Vec<(String, Role)>>,
 }
 

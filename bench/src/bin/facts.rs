@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The analytical corpus, written as `bigd` import lines.
+//! The analytical corpus, written as `big serve` import lines.
 //!
 //! **Why this exists.** Every measurement in this crate until now has called `big-db` as a
 //! library, which is the engine and is not the product: a load that arrives over the wire pays
@@ -22,17 +22,17 @@
 //! kept separate for that reason, and the missing column has always been `big` over HTTP.
 //!
 //! So this prints the same corpus the rest of the harness measures, in the format
-//! `POST /table/{t}/import` takes, and `bigi` sends it. Same records, same values, same
+//! `POST /table/{t}/import` takes, and `bigctl` sends it. Same records, same values, same
 //! permutation; the only difference is the road they travel.
 //!
 //! ```text
-//! facts 20000000 | bigi import t - --addr 127.0.0.1:7654
+//! facts 20000000 | bigctl import t - --addr 127.0.0.1:7654
 //! facts 20000000 --rows | curl --data-binary @- 'http://…/?query=INSERT INTO t FORMAT TSV'
 //! ```
 //!
 //! `--rows` is the same corpus one record per line instead of one fact per line, which is what
 //! a row store is loaded with. Nothing in this repo calls it: `scripts/bench server` measures
-//! `bigd` alone, because two engines loaded back to back on one box share a page cache and a
+//! `big serve` alone, because two engines loaded back to back on one box share a page cache and a
 //! disk queue and the second is measured through what the first left behind. It is kept for
 //! loading a rival by hand, on its own box, which is the only way that comparison is worth
 //! printing.

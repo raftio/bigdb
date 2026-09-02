@@ -77,7 +77,7 @@ pub enum Refused {
     /// `USE`, which asks a stateless surface to remember something between statements.
     ///
     /// Databases exist; a *session* does not. `POST /sql` answers one statement and keeps
-    /// nothing, so `USE` is the client's to hold - `bigc` does, and sends it as `?database=`.
+    /// nothing, so `USE` is the client's to hold - `bigctl` does, and sends it as `?database=`.
     SessionUse,
     /// `sales.orders.amount`: a column qualified by more than an alias.
     ThreePartName,
@@ -93,10 +93,10 @@ pub enum Refused {
     ViewBody,
     /// A statement naming a column its view does not expose.
     ///
-    /// Raised where a view is expanded, in `big-api`, because deciding it needs the stored
+    /// Raised where a view is expanded, in `big-embed`, because deciding it needs the stored
     /// statement. Not reachable by [`crate::translate`], which has no catalog.
     ViewColumn,
-    /// Views nested past [`crate::MAX_VIEW_DEPTH`]. Also raised in `big-api`.
+    /// Views nested past [`crate::MAX_VIEW_DEPTH`]. Also raised in `big-embed`.
     ViewDepth,
     /// `CASE WHEN`, `if`, `multiIf`, `coalesce` — choosing between two values per record.
     Case,
@@ -148,7 +148,7 @@ pub enum Refused {
     /// every character of what it says. What is refused is the *question*: an explanation has no
     /// plan to hand back, because the whole of what it asks for is that nothing runs.
     ///
-    /// Raised in `big-api`, next to the three statements that resolve to no plan either, and so
+    /// Raised in `big-embed`, next to the three statements that resolve to no plan either, and so
     /// not reachable by [`crate::translate`] - the same shape as [`Refused::ViewColumn`].
     ExplainRows,
 }
@@ -474,7 +474,7 @@ impl Refused {
                 "`USE` asks this surface to remember a database between statements, and it \
                  remembers nothing: one statement is one request, answered and forgotten. The \
                  database is per request - send `?database=sales`, or qualify the name as \
-                 `sales.orders`. `bigc` accepts `USE` and does exactly that for you"
+                 `sales.orders`. `bigctl` accepts `USE` and does exactly that for you"
             }
             Self::ThreePartName => {
                 "a column is qualified by an alias and nothing else, so `sales.orders.amount` \

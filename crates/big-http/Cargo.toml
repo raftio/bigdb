@@ -13,24 +13,24 @@ categories = ["database-implementations","web-programming::http-server"]
 # No web framework. The surface is a dozen routes and a JSON writer; pulling in an async
 # runtime for that would be a larger commitment than the whole engine has made so far.
 [dependencies]
-big-api = { path = "../big-api", version = "0.1.0" }
+big-embed.workspace = true
 # The coordinator. Every route goes through it, including on a node with no peers: a second
 # path for the un-clustered case would be the path nobody tests.
-big-cluster = { path = "../big-cluster", version = "0.1.0" }
-big-db = { path = "../big-db", version = "0.1.0" }
-big-exec = { path = "../big-exec", version = "0.1.0" }
-big-pager = { path = "../big-pager", version = "0.1.0" }
+big-cluster.workspace = true
+big-db.workspace = true
+big-exec.workspace = true
+big-pager.workspace = true
 # For `status`, and only for it. Turning an error into an HTTP status means matching on the
 # whole error tree, and the tree is the engine's - a crate lower down cannot do the mapping
 # without learning about HTTP, which is the one thing the layering is trying to prevent.
-big-engine = { path = "../big-engine", version = "0.1.0" }
-big-plan = { path = "../big-plan", version = "0.1.0" }
+big-engine.workspace = true
+big-plan.workspace = true
 # For the status a refused SQL statement deserves. `status.rs` is the one place that knows both
 # HTTP and the whole error tree, so it is the one place that has to name this error.
-big-sql = { path = "../big-sql", version = "0.1.0" }
+big-sql.workspace = true
 
 [dev-dependencies]
 # `auth` writes a token file and then checks its mode, and the cluster tests give a restarting
 # node somewhere to keep the state a restart may not lose.
 tempfile = "3"
-big-testfile = { path = "../big-testfile" }
+big-testfile.workspace = true

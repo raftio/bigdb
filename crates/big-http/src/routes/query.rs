@@ -69,7 +69,7 @@ pub(super) fn sql<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request) -> Respon
     };
     // `?database=sales` says which database an unqualified name in the statement means. A
     // property of the request rather than of the text, because this route answers one statement
-    // and remembers nothing - there is no session for a `USE` to leave one in. `bigc` holds a
+    // and remembers nothing - there is no session for a `USE` to leave one in. `bigctl` holds a
     // typed `USE` on the caller's behalf and sends it here.
     //
     // Built before the statement is classified because classifying needs it: a name resolves
@@ -99,7 +99,7 @@ pub(super) fn sql<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request) -> Respon
     // statement arrived. Without this a read-only token could create tables and write facts -
     // the same powers `POST /table/{t}` and `POST /table/{t}/import` demand their own roles for.
     //
-    // Which statements cost what is `big_api::Sql::authority`'s to say, not this route's: the
+    // Which statements cost what is `big_embed::Sql::authority`'s to say, not this route's: the
     // rule belongs next to the variants it is about, where a kind of statement added later
     // cannot be added without answering for it. Re-checking `read` against a route whose floor
     // is already `read` costs one constant-time comparison and removes the branch that used to
@@ -222,7 +222,7 @@ impl ParseError {
 ///
 /// A body is at most eight megabytes and a small one is over in microseconds, so fanning out
 /// unconditionally would charge every little write the price of spawning threads. Chosen from
-/// the profile rather than taste: parsing is a quarter of an import's CPU at the sizes `bigi`
+/// the profile rather than taste: parsing is a quarter of an import's CPU at the sizes `bigctl`
 /// sends, and nothing at the sizes a hand-written `curl` does.
 const PARALLEL_PARSE_MIN: usize = 256 * 1024;
 
@@ -370,14 +370,14 @@ fn parse_into<'a>(
             });
         };
         // **The schema's copy of the name, not this line's.** Identical strings, and that is the
-        // point: every fact naming `amount` now carries the same slice, so `big_api::apply`
+        // point: every fact naming `amount` now carries the same slice, so `big_embed::apply`
         // matches a fact to its resolved field by address instead of by `memcmp`. It also
         // outlives the line, which a borrowed fact wants anyway.
         let field = *name;
-        // **How a value is read is `big_api::fact`'s to decide, not this route's.** A SQL
+        // **How a value is read is `big_embed::fact`'s to decide, not this route's.** A SQL
         // `INSERT` writes the same facts into the same fields, and two implementations of "what
         // does `true` mean on a boolean field" would be two conventions in one table.
-        facts.push(match big_api::fact::from_text(field, info, record, value) {
+        facts.push(match big_embed::fact::from_text(field, info, record, value) {
             Ok(fact) => fact,
             Err(e) => {
                 return Err(ParseError {
@@ -540,7 +540,7 @@ mod parse_tests {
         }
     }
 
-    /// Every fact of one field carries the schema's own slice, which is what lets `big_api`
+    /// Every fact of one field carries the schema's own slice, which is what lets `big_embed`
     /// match a fact to its field by address. Same string either way - this is about *which*
     /// copy of it.
     #[test]

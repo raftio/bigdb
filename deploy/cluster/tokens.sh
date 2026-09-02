@@ -1,5 +1,5 @@
 #!/bin/sh
-# Writes the two token files the compose file mounts, with the modes `bigd` insists on.
+# Writes the two token files the compose file mounts, with the modes `big serve` insists on.
 #
 # Two files, and they are not the same thing. `tokens` is who may talk to a node and what they
 # may do. `peer.token` is the single credential a node presents when it talks to the others -

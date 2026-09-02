@@ -22,7 +22,7 @@
 //! Records below `SHARD_WIDTH` belong to `a` and everything above to `b`, so a batch that
 //! crosses that line is a batch that crosses machines.
 
-use big_api::Api;
+use big_embed::Api;
 use big_cluster::controller::Leases;
 use big_cluster::raft::{Forgetful, Timing};
 use big_cluster::{Cluster, ClusterFile};
@@ -626,7 +626,7 @@ fn a_new_key_is_refused_when_the_leader_is_unreachable() {
     let api = Api::in_memory().unwrap();
     // The schema exists locally: this test is about the row key, not about the table.
     api.create_table("tx").unwrap();
-    api.create_field("tx", "country", big_api::FieldKind::Set, 0).unwrap();
+    api.create_field("tx", "country", big_embed::FieldKind::Set, 0).unwrap();
     let cluster = Cluster::new(api, config, None, Box::new(Forgetful));
     let server = Server::bind_cluster(cluster, b, ServerConfig::default()).unwrap();
     std::thread::spawn(move || {

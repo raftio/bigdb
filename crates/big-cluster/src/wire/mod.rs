@@ -45,7 +45,7 @@ pub use plan::*;
 pub use request::*;
 pub use value::*;
 
-use big_api::{
+use big_embed::{
     ColumnCell, FieldKind, FragmentAddr, FragmentData, FragmentMeta, Granularity, Pair, Plan,
     Projected, Projection, RecordId, RowId, Rows, TableEngine, Value,
 };

@@ -9,7 +9,7 @@ repository.workspace = true
 readme = "readme.md"
 
 [dependencies]
-big-container = { path = "../big-container", version = "0.1.0" }
+big-container.workspace = true
 bytemuck = "1"
 crc32fast = "1"
 

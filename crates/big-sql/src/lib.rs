@@ -171,7 +171,7 @@ impl Sql {
 /// The database an unqualified name means when the request did not say.
 ///
 /// Kept here rather than imported from `big-db` because this crate links no storage: the two
-/// are checked against each other by a test in `big-api`, which sees both.
+/// are checked against each other by a test in `big-embed`, which sees both.
 pub const DEFAULT_DATABASE: &str = "default";
 
 /// Parses one statement and translates it, which is the whole of this crate's job.

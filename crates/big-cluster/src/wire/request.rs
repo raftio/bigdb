@@ -364,7 +364,7 @@ pub struct FragmentBody {
     pub addr: FragmentAddr,
     pub meta: FragmentMeta,
     /// Containers or cells, decided by which view the address names. See
-    /// [`big_api::FragmentData`].
+    /// [`big_embed::FragmentData`].
     pub data: FragmentData,
 }
 
@@ -533,7 +533,7 @@ impl KeysBody {
 /// lacked one would refuse a statement its peers answer - and which node a client reached would
 /// decide whether the statement worked. That is the class of failure this whole layer exists to
 /// prevent. Appended after the tables, which is the shape change [`crate::WIRE_VERSION`] `4` is.
-pub fn put_schema(out: &mut Vec<u8>, tables: &[big_api::TableInfo], views: &[big_api::ViewInfo]) {
+pub fn put_schema(out: &mut Vec<u8>, tables: &[big_embed::TableInfo], views: &[big_embed::ViewInfo]) {
     put_count(out, tables.len());
     for table in tables {
         // Qualified, so a repair recreates the table in the database the sender had it in.
@@ -563,7 +563,7 @@ pub fn put_schema(out: &mut Vec<u8>, tables: &[big_api::TableInfo], views: &[big
     }
 }
 
-pub fn get_schema(bytes: &[u8]) -> Result<(Vec<big_api::TableInfo>, Vec<big_api::ViewInfo>)> {
+pub fn get_schema(bytes: &[u8]) -> Result<(Vec<big_embed::TableInfo>, Vec<big_embed::ViewInfo>)> {
     let mut r = Reader::new(bytes);
     let n = r.count()?;
     let mut tables = Vec::with_capacity(n);
@@ -589,10 +589,10 @@ pub fn get_schema(bytes: &[u8]) -> Result<(Vec<big_api::TableInfo>, Vec<big_api:
                     granularity_of(c).ok_or(WireError::BadTag { what: "granularity", tag: c })?,
                 );
             }
-            fields.push(big_api::FieldInfo { name: field, kind, bit_depth, scale, granularity });
+            fields.push(big_embed::FieldInfo { name: field, kind, bit_depth, scale, granularity });
         }
         let r = big_db::TableRef::parse(&name);
-        tables.push(big_api::TableInfo {
+        tables.push(big_embed::TableInfo {
             database: r.database.to_string(),
             name: r.table.to_string(),
             engine,
@@ -605,7 +605,7 @@ pub fn get_schema(bytes: &[u8]) -> Result<(Vec<big_api::TableInfo>, Vec<big_api:
         let name = r.str()?;
         let text = r.str()?;
         let q = big_db::TableRef::parse(&name);
-        views.push(big_api::ViewInfo {
+        views.push(big_embed::ViewInfo {
             database: q.database.to_string(),
             name: q.table.to_string(),
             text,

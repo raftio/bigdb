@@ -8,7 +8,7 @@ undoing an import. Nothing here is a procedure that has only been reasoned about
 Build the tool once:
 
 ```sh
-cargo build --release -p big-db --bin big
+cargo build --release -p big-bin --bin big
 ```
 
 ---
@@ -31,7 +31,7 @@ transaction for its whole run, so writers keep committing and nothing stops. Thi
 to schedule.
 
 **Not served:** `big backup`. Every subcommand of `big` takes the file's exclusive lock,
-so it cannot open a file `bigd` is serving at all - which is why the online path had to be a
+so it cannot open a file `big serve` is serving at all - which is why the online path had to be a
 route rather than a second process.
 
 Backing up a live database from *outside* the daemon is still not supported, and never will be.
@@ -41,7 +41,7 @@ Backing up a live database from *outside* the daemon is still not supported, and
 ## Take a backup
 
 ```sh
-# While serving. Needs `bigd --backup-dir /backup` and an admin token.
+# While serving. Needs `big serve --backup-dir /backup` and an admin token.
 curl -X POST -H "Authorization: Bearer $TOKEN" \
   "http://127.0.0.1:7654/admin/backup?name=data-$(date +%F).big"
 # {"backup":"data-2026-08-30.big","txn_id":41,"pages":1873,"bytes":10403840}
@@ -58,7 +58,7 @@ big backup /var/lib/big/data.big /backup/data-$(date +%F).big
 - **In a cluster this is one node's file.** Back up every node, and understand what you have:
   each copy sits at that node's own transaction, so the set is not a cluster-wide snapshot. See
   [clustering](docs/clustering.md) for why that is not fixable here.
-- **The offline form requires the daemon to be stopped.** `big` takes the exclusive lock, and `bigd` holds it for as
+- **The offline form requires the daemon to be stopped.** `big` takes the exclusive lock, and `big serve` holds it for as
   long as it is serving. The claim that a backup is safe alongside a writer is about the walk,
   not about two processes: the copy holds a read transaction, which pins the reclaim horizon so
   a concurrent writer cannot reuse a page the walk still needs. That is what makes an *online*
@@ -96,12 +96,12 @@ structurally sound.
 ## Load a file
 
 `POST /import` is bounded at 8 MiB, so `curl --data-binary @facts.txt` works until the file is
-real and then answers `413 request_too_large`. `bigi` is the loader: it cuts the file into
+real and then answers `413 request_too_large`. `bigctl import` is the loader: it cuts the file into
 chunks of whole lines, sends them in order, and writes down the byte offset the server
 acknowledged.
 
 ```sh
-bigi import tx facts.txt --resume tx.ck
+bigctl import tx facts.txt --resume tx.ck
 ```
 
 - **An interrupted load resumes rather than restarts.** Run the same command again; it starts at
@@ -116,13 +116,13 @@ bigi import tx facts.txt --resume tx.ck
   one it was taken from.
 - **`--chunk-bytes` is the throughput knob**, because the server commits once per request.
   The default is 7 MiB against a ceiling of 8; raising it is worth measuring and lowering it is
-  worth doing only if something in front of `bigd` has a smaller idea of large.
-- **`missed` means a copy did not take the write.** `bigi` prints it once per copy and carries
-  on, because re-sending reaches the same copies. `bigc repair` is what closes it.
+  worth doing only if something in front of `big serve` has a smaller idea of large.
+- **`missed` means a copy did not take the write.** `bigctl` prints it once per copy and carries
+  on, because re-sending reaches the same copies. `bigctl repair` is what closes it.
 - One request is in flight at a time, on purpose: there is one writer, and a second request
   would queue behind the first while making the checkpoint meaningless.
 
-A CSV goes through `awk` first — `awk -F, '{print "country", NR, $3}' data.csv | bigi import tx -`
+A CSV goes through `awk` first — `awk -F, '{print "country", NR, $3}' data.csv | bigctl import tx -`
 — at the cost of `--resume`, which needs a file it can seek.
 
 ## Undo a wrong import
@@ -162,9 +162,9 @@ the work to a moment when nothing is stopped:
 ```sh
 curl -X POST -H "Authorization: Bearer $TOKEN" \
   "http://127.0.0.1:7654/admin/backup?name=compacted.big"   # online; the copy is compact
-systemctl stop bigd
+systemctl stop big
 mv /backup/compacted.big /var/lib/big/data.big
-systemctl start bigd
+systemctl start big
 ```
 
 A backup **is** a compact copy - the pages are allocated in walk order into a store with an
@@ -173,7 +173,7 @@ happen online is the *swap*: `read` hands back a page borrowed straight out of t
 replacing the file under a live mapping is exactly the dangling reference the pager's four mmap
 constraints exist to prevent. So the copy runs while serving and only the rename needs the stop.
 
-- **`compact` itself is offline.** It takes the exclusive lock, so stop `bigd` first. Running it against a served
+- **`compact` itself is offline.** It takes the exclusive lock, so stop `big serve` first. Running it against a served
   database fails with a lock error rather than doing anything behind the daemon's back.
 - Needs free space for a second copy of the *live data* alongside the original, briefly.
 - Writes `data.compacting`, then renames it over the original and fsyncs the directory. A
@@ -248,7 +248,7 @@ a file no daemon is serving.
    down in [architecture.md](architecture.md). This is reported distinctly from damage on
    purpose: both used to come out as "neither meta page is readable", and they call for
    opposite actions.
-3. `Locked` — another process holds it. `bigd` is probably still running.
+3. `Locked` — another process holds it. `big serve` is probably still running.
 4. "neither meta page is readable", or a checksum failure — restore the most recent backup. There is deliberately
    no repair tool: with no WAL there is no half-applied state that a repair could reason
    about, so a file that fails these checks is damaged by something outside the engine
@@ -270,10 +270,10 @@ Honest gaps, so nobody builds a procedure on top of something that does not exis
 ## Running the server
 
 ```sh
-bigd /var/lib/big/data.big 127.0.0.1:7654 --tokens /etc/big/tokens
+big serve /var/lib/big/data.big 127.0.0.1:7654 --tokens /etc/big/tokens
 ```
 
-Everything `bigd` takes:
+Everything `big serve` takes:
 
 | | Default | What it bounds |
 |---|---|---|
@@ -287,7 +287,7 @@ Everything `bigd` takes:
 | `--durability <level>` | `full` | What a commit promises. See below |
 | `BIG_LOG` | `info` | `off`, `error`, `warn`, `info`, `debug` |
 
-**`bigd` refuses to bind anywhere but loopback without `--tokens`.** That is not a warning that
+**`big serve` refuses to bind anywhere but loopback without `--tokens`.** That is not a warning that
 can be scrolled past — it exits `2`. Anyone who can reach the port can read and delete
 everything in the database, so the two safe shapes are: bind to loopback and put a proxy in
 front, or pass a token file. `--insecure-no-auth` exists for a port that genuinely is private,
@@ -296,30 +296,30 @@ and it is named so that it shows up in a `ps` listing and a review.
 ### The command line
 
 Every route below is reachable with `curl`, and every example in this document uses it — that is
-deliberate, because `curl` is on the box and proves the surface needs nothing else. `bigc` is the
+deliberate, because `curl` is on the box and proves the surface needs nothing else. `bigctl` is the
 same routes spelled for a shell, and is worth having when a person is typing rather than a script:
 
 ```sh
 export BIG_ADDR=127.0.0.1:7654           # or --addr
 export BIG_TOKEN=/etc/big/client-token   # or --token-file; mode 600, one token per file
 
-bigc schema
-bigc sql "SELECT country, count(*) FROM tx GROUP BY country"
-bigc query tx 'Count(Row(country="GB"))'
-bigc records tx --limit 1000             # the cursor is printed to stderr, not into the data
-bigc import tx facts.txt                 # or `-` for stdin
-bigc verify
-bigc shell                               # sql> by default, .lang pql to switch
+bigctl schema
+bigctl sql "SELECT country, count(*) FROM tx GROUP BY country"
+bigctl query tx 'Count(Row(country="GB"))'
+bigctl records tx --limit 1000           # the cursor is printed to stderr, not into the data
+bigctl import tx facts.txt               # or `-` for stdin; chunked and resumable
+bigctl verify
+bigctl shell                             # sql> by default, .lang pql to switch
 ```
 
 **Exit codes are the interface for a script**: `0` answered, `1` the server refused and the code
 is on stderr, `2` the command line was wrong, `3` nothing was listening. Output is aligned
-columns to a terminal and TSV to a pipe, so `bigc records tx | wc -l` does what it looks like;
+columns to a terminal and TSV to a pipe, so `bigctl records tx | wc -l` does what it looks like;
 `--format json` hands over the server's body untouched.
 
-`bigc` has no line editing. `rlwrap bigc shell` gives it history and arrow keys.
+`bigctl` has no line editing. `rlwrap bigctl shell` gives it history and arrow keys.
 
-There is **no offline mode** and no `--file`: `bigc` talks to a daemon, always. The offline half
+There is **no offline mode**: `bigctl` talks to a daemon, always. The offline half
 is `big` — backup, restore, compact, verify — and it takes the exclusive lock, so it is the tool
 for a database that is *not* being served.
 
@@ -378,7 +378,7 @@ and `not_pageable` rather than answered unpaged.
 `full` is the default and should stay the default. The other two exist for one caller: a bulk
 load whose source you still have, where losing the last second costs a re-run rather than data.
 Note that neither is reachable over HTTP - the level is set on the command line or through the
-embedding API, so `bigi` cannot relax it and a load that wants it relaxed is a daemon started
+embedding API, so `bigctl` cannot relax it and a load that wants it relaxed is a daemon started
 that way, or restarted after.
 
 | Level | Survives the process dying | Survives the machine dying | Survives power loss |
@@ -441,7 +441,7 @@ the refusal and stops nobody else.
 
 Tokens are stored in plaintext, deliberately. Hashing them would guard the *smaller* of two
 secrets: anyone who can read `/etc/big/tokens` can read `data.big` sitting next to it. What is
-enforced instead is that the file cannot be read by anyone else — `bigd` refuses to start
+enforced instead is that the file cannot be read by anyone else — `big serve` refuses to start
 against a token file that is group- or world-readable.
 
 ### TLS
@@ -468,7 +468,7 @@ question. Keeping it out is the same decision as having no web framework and no 
 
 ### More than one node
 
-`bigd --cluster /etc/big/cluster.toml --node a data.big 10.0.0.1:7654`
+`big serve --cluster /etc/big/cluster.toml --node a data.big 10.0.0.1:7654`
 
 ```toml
 # /etc/big/cluster.toml — the same file on every node
@@ -532,7 +532,7 @@ the one currently serving the range.** When that one stops answering, the nodes 
 themselves on another and the range keeps working - in about a second, not after somebody edits
 a file.
 
-**Three nodes minimum, once anything has a copy.** `bigd` refuses to start otherwise: failing
+**Three nodes minimum, once anything has a copy.** `big serve` refuses to start otherwise: failing
 over is a decision a majority has to agree on and a majority of two is two, so a cluster of two
 can never use its copy. A third node counts whether it is a third copy or another range's
 primary.
@@ -591,7 +591,7 @@ in the group already holds it.
 ### Containers
 
 Two compose files, in [deploy/](deploy/): [`single/`](deploy/single/) for one node and
-[`cluster/`](deploy/cluster/) for three. Same binary, same code path - `bigd` without
+[`cluster/`](deploy/cluster/) for three. Same binary, same code path - `big serve` without
 `--cluster` builds itself a cluster of one - so what differs is a config file and how many
 containers there are.
 
@@ -608,7 +608,7 @@ docker compose up -d
 curl -H "Authorization: Bearer $(cat secrets/peer.token)" localhost:7654/verify
 ```
 
-**A container's loopback is its own**, so the daemon binds `0.0.0.0` inside it - and `bigd`
+**A container's loopback is its own**, so the daemon binds `0.0.0.0` inside it - and `big serve`
 refuses to bind anywhere but loopback without a token file. That is why both files mount one.
 A bind mount carries the host's ownership and mode, which the image cannot predict, so the
 entrypoint reads the credentials as root, writes private copies owned by the daemon's user, and
@@ -625,7 +625,7 @@ looks like a missing token file, which is exactly what it is.
 two nodes pointed at one volume is two nodes fighting over a database only one of them can
 open.
 
-**Killing a container loses nothing.** `bigd` has no signal handler and does not need one: a
+**Killing a container loses nothing.** `big serve` has no signal handler and does not need one: a
 commit writes its pages, fsyncs, flips the meta page and fsyncs again. A process that dies
 leaves a file either before that flip or after it, with no state in between and nothing to
 replay - which is why `stop_grace_period` is two seconds rather than the default ten.
@@ -648,7 +648,7 @@ cannot tell which entry in the file it is, and says so rather than guessing.
 
 **One tenant per process.** Table names are a flat global namespace with no notion of an owner,
 and any credential that can read one table can read all of them — roles are about *verbs*, not
-about *rows*. An operator who needs isolation runs one `bigd` per tenant against one file per
+about *rows*. An operator who needs isolation runs one `big serve` per tenant against one file per
 tenant, which the exclusive file lock already pushes toward.
 
 This is a decision, not an oversight, and it is not a dead end: a tenant id would go into the
@@ -753,12 +753,12 @@ against the same `id`. When someone reports a `500`, ask for the `X-Request-Id`.
 
 ## The file will not open
 
-Every one of these is the exact text `bigd` or `big verify` prints. The remedy differs; read
+Every one of these is the exact text `big serve` or `big verify` prints. The remedy differs; read
 which one it is before doing anything.
 
 | It says | It means | Do |
 |---|---|---|
-| `another process holds this file` | A `bigd` or a `big` subcommand already has it | `fuser`/`lsof` the file. One process per file is a soundness requirement, not a policy |
+| `another process holds this file` | A `big serve` or a `big` subcommand already has it | `fuser`/`lsof` the file. One process per file is a soundness requirement, not a policy |
 | `neither meta page is readable; this file is damaged` | Both meta pages failed | **Restore from a backup.** There is no WAL, so there is nothing to replay and no repair to attempt |
 | `checksum mismatch: page stores 0x…` | A page's bytes are not what was written | Restore. The storage under it lied; check the disk before restoring onto the same one |
 | `file format version N, but this build reads … version M` | A file from another build | **Not damage.** Dump and reload with a tool built with both codecs. Never migrate in place |

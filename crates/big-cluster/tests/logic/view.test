@@ -1,6 +1,6 @@
 # A view, read against real records.
 #
-# `big-sql` pins the two statements and the body rule, and `big-api` pins the substitution
+# `big-sql` pins the two statements and the body rule, and `big-embed` pins the substitution
 # against the calls it produces. What is left is the only claim neither of those can make: that
 # a statement reading a view comes back with the same *rows* as the statement it stands for.
 #

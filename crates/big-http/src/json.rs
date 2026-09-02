@@ -17,7 +17,7 @@
 //! The whole output surface is four shapes, so a serialisation library would be a dependency
 //! carried for one file. Escaping is the part worth getting right, and it is one function.
 
-use big_api::{Datum, Format, ResultSet, TableInfo};
+use big_embed::{Datum, Format, ResultSet, TableInfo};
 use big_cluster::{RangeVerdict, RepairReport, WriteOutcome};
 use big_db::RecordId;
 use big_exec::{Group, Value};
@@ -229,13 +229,13 @@ fn json_cell(d: &Datum) -> String {
         Datum::Int(v) => v.to_string(),
         // A JSON number, not a string: `12.50` is what the value is, and quoting it would make
         // every client parse a decimal out of text.
-        Datum::Dec { units, scale } => big_api::fixed(*units, *scale),
+        Datum::Dec { units, scale } => big_embed::fixed(*units, *scale),
         Datum::Real(v) => real(*v),
         // A JSON **string**, unlike every other number here. An ISO date is a string in every
         // schema anyone will point at this, and a bare count of days from 1970 is a number no
         // reader can read.
-        Datum::Date(d) => string(&big_api::date_text(*d)),
-        Datum::Timestamp(t) => string(&big_api::timestamp_text(*t)),
+        Datum::Date(d) => string(&big_embed::date_text(*d)),
+        Datum::Timestamp(t) => string(&big_embed::timestamp_text(*t)),
         Datum::Text(s) => string(s),
         Datum::Keys(keys) => keys_cell(keys),
     }
@@ -246,12 +246,12 @@ fn separated_cell(d: &Datum) -> String {
     match d {
         Datum::Null => "null".to_string(),
         Datum::Int(v) => v.to_string(),
-        Datum::Dec { units, scale } => big_api::fixed(*units, *scale),
+        Datum::Dec { units, scale } => big_embed::fixed(*units, *scale),
         Datum::Real(v) => real(*v),
         // Unquoted, which is what a spreadsheet and an `awk` script both want, and safe to leave
         // bare because a date has no separator or control character in it.
-        Datum::Date(d) => big_api::date_text(*d),
-        Datum::Timestamp(t) => big_api::timestamp_text(*t),
+        Datum::Date(d) => big_embed::date_text(*d),
+        Datum::Timestamp(t) => big_embed::timestamp_text(*t),
         Datum::Text(s) => bare(s),
         // A list has no separated spelling, so it keeps its JSON one. A client reading `topK`
         // out of a CSV is reading one JSON array per cell, which is what it was before typed
@@ -298,13 +298,13 @@ fn real(v: f64) -> String {
 /// still as `null`, exactly as before segments existed - so no client that could read a
 /// projection can be broken by one. A string and an array only appear for a keyed column, which
 /// a projection used to refuse outright.
-fn projection(p: &big_api::Projection) -> String {
+fn projection(p: &big_embed::Projection) -> String {
     match p {
-        big_api::Projection::Absent => "null".to_string(),
-        big_api::Projection::Int(v) => v.to_string(),
-        big_api::Projection::Real(v) => real(*v),
-        big_api::Projection::Text(s) => string(s),
-        big_api::Projection::Texts(v) => {
+        big_embed::Projection::Absent => "null".to_string(),
+        big_embed::Projection::Int(v) => v.to_string(),
+        big_embed::Projection::Real(v) => real(*v),
+        big_embed::Projection::Text(s) => string(s),
+        big_embed::Projection::Texts(v) => {
             let items: Vec<String> = v.iter().map(|s| string(s)).collect();
             format!("[{}]", items.join(","))
         }
@@ -332,7 +332,7 @@ pub fn schema(tables: &[TableInfo]) -> String {
                     // field that has neither would carry two fields that mean nothing, and a
                     // reader would have to know which kinds to ignore them for.
                     let mut extra = String::new();
-                    if f.kind == big_api::FieldKind::Decimal {
+                    if f.kind == big_embed::FieldKind::Decimal {
                         // A decimal without its scale is an integer wearing a different name:
                         // `price > 5` means `> 500` on a field with two of them, and a client
                         // that cannot see the scale cannot know that.

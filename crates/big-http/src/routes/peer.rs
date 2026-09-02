@@ -83,12 +83,12 @@ pub(super) fn peer_import<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request) -
         Ok(r) => r,
         Err(e) => return unreadable(&e),
     };
-    let keys: Vec<big_api::KeyAssignment<'_>> = request
+    let keys: Vec<big_embed::KeyAssignment<'_>> = request
         .keys
         .iter()
-        .map(|a| big_api::KeyAssignment { field: &a.field, key: &a.key, row: a.row })
+        .map(|a| big_embed::KeyAssignment { field: &a.field, key: &a.key, row: a.row })
         .collect();
-    let facts: Vec<big_api::Fact<'_>> = request.facts.iter().map(OwnedFact::as_fact).collect();
+    let facts: Vec<big_embed::Fact<'_>> = request.facts.iter().map(OwnedFact::as_fact).collect();
     match ctx.api().import_with_keys(&request.table, &keys, &facts) {
         Ok(()) => Response::binary(wire::put_u64_body(facts.len() as u64)),
         Err(e) => Response::from_error(&e),
@@ -291,10 +291,10 @@ pub(super) fn peer_keys_put<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request)
         Ok(b) => b,
         Err(e) => return unreadable(&e),
     };
-    let keys: Vec<big_api::KeyAssignment<'_>> = body
+    let keys: Vec<big_embed::KeyAssignment<'_>> = body
         .keys
         .iter()
-        .map(|a| big_api::KeyAssignment { field: &a.field, key: &a.key, row: a.row })
+        .map(|a| big_embed::KeyAssignment { field: &a.field, key: &a.key, row: a.row })
         .collect();
     match ctx.api().assign_keys(&body.table, &keys) {
         Ok(()) => Response::binary(Vec::new()),

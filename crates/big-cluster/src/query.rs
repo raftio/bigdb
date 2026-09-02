@@ -19,7 +19,7 @@
 //! `asked_of_owners` - and the rewrite is one case, deliberately.
 
 use super::*;
-use big_api::{Format, ResultSet};
+use big_embed::{Format, ResultSet};
 
 /// One engine error, as the cluster reports one of its own node's.
 ///
@@ -44,7 +44,7 @@ impl<P: PagerMut + Sync> Cluster<P> {
     ///
     /// The edge needs the answer before it can decide what the request costs: `POST /sql` is
     /// authorised as `read`, and a schema change written in SQL needs `admin` - see
-    /// [`big_api::Sql::authority`]. Exposed here rather than having the edge parse for itself,
+    /// [`big_embed::Sql::authority`]. Exposed here rather than having the edge parse for itself,
     /// so that what decides the role and what decides the action are one definition.
     ///
     /// **`opts` rather than nothing, and the statement rather than a verdict.** The edge used to
@@ -54,7 +54,7 @@ impl<P: PagerMut + Sync> Cluster<P> {
     /// one that ran. Now there is one translation: this returns the `Sql` the edge authorises,
     /// and [`Cluster::run`] takes that same value. A statement cannot be authorised as one thing
     /// and executed as another because there is only one of it.
-    pub fn classify(&self, text: &str, opts: &QueryOptions) -> Result<big_api::Sql> {
+    pub fn classify(&self, text: &str, opts: &QueryOptions) -> Result<big_embed::Sql> {
         Ok(self.api.translate_in(text, opts.database())?)
     }
 
@@ -71,15 +71,15 @@ impl<P: PagerMut + Sync> Cluster<P> {
     /// name and the fields a statement names are resolved here before anything is applied. What
     /// is left to fail mid-way is a node going quiet, which is reported as a partial schema
     /// change naming what did land - the same report a field created on its own gets.
-    fn sql_ddl(&self, ddl: &big_api::SqlDdl) -> Result<(ResultSet, Format)> {
+    fn sql_ddl(&self, ddl: &big_embed::SqlDdl) -> Result<(ResultSet, Format)> {
         let (column, changed) = match ddl {
-            big_api::SqlDdl::CreateDatabase { name, if_not_exists } => {
+            big_embed::SqlDdl::CreateDatabase { name, if_not_exists } => {
                 ("database", self.sql_create_database(name, *if_not_exists)?)
             }
-            big_api::SqlDdl::DropDatabase { name, if_exists, cascade } => {
+            big_embed::SqlDdl::DropDatabase { name, if_exists, cascade } => {
                 ("dropped", self.sql_drop_database(name, *if_exists, *cascade)?)
             }
-            big_api::SqlDdl::CreateTable { database, table, engine, columns, if_not_exists } => (
+            big_embed::SqlDdl::CreateTable { database, table, engine, columns, if_not_exists } => (
                 "table",
                 self.sql_create_table(
                     &qualified(database, table),
@@ -88,22 +88,22 @@ impl<P: PagerMut + Sync> Cluster<P> {
                     *if_not_exists,
                 )?,
             ),
-            big_api::SqlDdl::AlterTable { database, table, changes } => {
+            big_embed::SqlDdl::AlterTable { database, table, changes } => {
                 ("fields", self.sql_alter_table(&qualified(database, table), changes)?)
             }
-            big_api::SqlDdl::DropTable { database, table, if_exists } => {
+            big_embed::SqlDdl::DropTable { database, table, if_exists } => {
                 ("dropped", self.sql_drop_table(&qualified(database, table), *if_exists)?)
             }
-            big_api::SqlDdl::CreateView { database, name, body, or_replace, if_not_exists } => (
+            big_embed::SqlDdl::CreateView { database, name, body, or_replace, if_not_exists } => (
                 "view",
                 self.create_view(&qualified(database, name), body, *or_replace, *if_not_exists)?
                     .into(),
             ),
-            big_api::SqlDdl::DropView { database, name, if_exists } => {
+            big_embed::SqlDdl::DropView { database, name, if_exists } => {
                 ("dropped", self.sql_drop_view(&qualified(database, name), *if_exists)?)
             }
         };
-        Ok((big_api::one_cell(column, big_api::Datum::Int(changed.into())), Format::default()))
+        Ok((big_embed::one_cell(column, big_embed::Datum::Int(changed.into())), Format::default()))
     }
 
     /// `CREATE TABLE`, answering with the table's id.
@@ -121,7 +121,7 @@ impl<P: PagerMut + Sync> Cluster<P> {
         &self,
         table: &str,
         engine: Option<&str>,
-        columns: &[big_api::SqlColumn],
+        columns: &[big_embed::SqlColumn],
         if_not_exists: bool,
     ) -> Result<u64> {
         if if_not_exists && self.schema().iter().any(|t| t.name == table) {
@@ -130,8 +130,8 @@ impl<P: PagerMut + Sync> Cluster<P> {
         // The engine list lives in one place, and it is not `big-sql`: that crate links no
         // storage and takes the name as written, so this is where a name nobody has is refused.
         let engine = match engine {
-            None => big_api::TableEngine::default(),
-            Some(name) => big_api::TableEngine::parse(name).ok_or_else(|| {
+            None => big_embed::TableEngine::default(),
+            Some(name) => big_embed::TableEngine::parse(name).ok_or_else(|| {
                 ClusterError::Local(big_db::DbError::UnknownEngineName(name.to_string()).into())
             })?,
         };
@@ -214,7 +214,7 @@ impl<P: PagerMut + Sync> Cluster<P> {
     /// whether each field named is or is not, and that is checked here against the schema
     /// before anything is created or dropped. Otherwise `ADD a, DROP nope` would create `a` and
     /// then fail, which is the half-applied statement a single round of checking avoids.
-    fn sql_alter_table(&self, table: &str, changes: &[big_api::SqlAlter]) -> Result<u64> {
+    fn sql_alter_table(&self, table: &str, changes: &[big_embed::SqlAlter]) -> Result<u64> {
         let info = self
             .schema()
             .into_iter()
@@ -228,7 +228,7 @@ impl<P: PagerMut + Sync> Cluster<P> {
             info.fields.iter().map(|f| f.name.clone()).collect();
         for change in changes {
             match change {
-                big_api::SqlAlter::Add(column) => {
+                big_embed::SqlAlter::Add(column) => {
                     if !fields.insert(column.name.clone()) {
                         return Err(local(big_db::DbError::FieldRedefined {
                             table: table.to_string(),
@@ -236,7 +236,7 @@ impl<P: PagerMut + Sync> Cluster<P> {
                         }));
                     }
                 }
-                big_api::SqlAlter::Drop(field) => {
+                big_embed::SqlAlter::Drop(field) => {
                     if !fields.remove(field) {
                         return Err(local(big_db::DbError::UnknownField {
                             table: table.to_string(),
@@ -249,8 +249,8 @@ impl<P: PagerMut + Sync> Cluster<P> {
 
         for change in changes {
             match change {
-                big_api::SqlAlter::Add(column) => self.create_column(table, column)?,
-                big_api::SqlAlter::Drop(field) => self.drop_field(table, field)? as u64,
+                big_embed::SqlAlter::Add(column) => self.create_column(table, column)?,
+                big_embed::SqlAlter::Drop(field) => self.drop_field(table, field)? as u64,
             };
         }
         Ok(changes.len() as u64)
@@ -258,24 +258,24 @@ impl<P: PagerMut + Sync> Cluster<P> {
 
     /// One column of a column list, as the field change it already is.
     ///
-    /// The kind comes from `big_api::introspect`, which owns that mapping in both directions -
+    /// The kind comes from `big_embed::introspect`, which owns that mapping in both directions -
     /// the other one is what `SHOW CREATE TABLE` writes a schema back out with. The three arms
     /// below are the three the field routes have, and they carry the same defaults: a decimal's
     /// scale is on the column because the parser refused one without it, and a time quantum
     /// takes the empty granularity that means the engine's default.
-    fn create_column(&self, table: &str, column: &big_api::SqlColumn) -> Result<u64> {
-        let kind = big_api::introspect::kind_of(column.kind);
+    fn create_column(&self, table: &str, column: &big_embed::SqlColumn) -> Result<u64> {
+        let kind = big_embed::introspect::kind_of(column.kind);
         match kind {
             // `unwrap_or(0)` is unreachable - the parser refuses `DECIMAL` with no scale - and
             // is here rather than an `expect` because a panic on the schema path would take a
             // node down over a statement a client wrote.
-            big_api::FieldKind::Decimal => self.create_decimal(
+            big_embed::FieldKind::Decimal => self.create_decimal(
                 table,
                 &column.name,
                 column.bit_depth,
                 column.scale.unwrap_or(0),
             ),
-            big_api::FieldKind::TimeQuantum => {
+            big_embed::FieldKind::TimeQuantum => {
                 self.create_time_quantum(table, &column.name, Vec::new())
             }
             _ => self.create_field(table, &column.name, kind, column.bit_depth),
@@ -304,7 +304,7 @@ impl<P: PagerMut + Sync> Cluster<P> {
     /// **Takes the statement, not the text.** The value handed in is the one the caller
     /// authorised, so nothing between the check and the work can re-read the bytes and reach a
     /// different conclusion about what they say.
-    pub fn run(&self, sql: big_api::Sql, opts: &QueryOptions) -> Result<(ResultSet, Format)> {
+    pub fn run(&self, sql: big_embed::Sql, opts: &QueryOptions) -> Result<(ResultSet, Format)> {
         // The five kinds go to different places: a query is planned here and fanned out to the
         // owners, a schema change goes to the leader and then everywhere, an insert goes to the
         // shards that own its records, and a listing goes nowhere at all. Deciding it here
@@ -312,14 +312,14 @@ impl<P: PagerMut + Sync> Cluster<P> {
         // whichever node the client happened to reach - which is the failure a schema leader
         // exists to prevent.
         let statement = match sql {
-            big_api::Sql::Ddl(ddl) => return self.sql_ddl(&ddl),
-            big_api::Sql::Insert(insert) => return self.sql_insert(&insert),
-            big_api::Sql::Show(show) => return self.sql_show(&show),
+            big_embed::Sql::Ddl(ddl) => return self.sql_ddl(&ddl),
+            big_embed::Sql::Insert(insert) => return self.sql_insert(&insert),
+            big_embed::Sql::Show(show) => return self.sql_show(&show),
             // `EXPLAIN` reaches none of the three above and none of the fan-out below: what the
             // statement is has already been decided by the time it gets here, and writing it
             // out is the whole of the work.
-            big_api::Sql::Explain { mode, inner } => return self.sql_explain(mode, *inner),
-            big_api::Sql::Query(s) => s,
+            big_embed::Sql::Explain { mode, inner } => return self.sql_explain(mode, *inner),
+            big_embed::Sql::Query(s) => s,
         };
         let (plans, probes, answer) = self.api.plan_statement(statement)?;
         // One fan-out and one merge per plan, each exactly the fan-out and merge that plan
@@ -328,23 +328,23 @@ impl<P: PagerMut + Sync> Cluster<P> {
         //
         // The timeout bounds the statement rather than each plan in it, which matters more here
         // than it does un-clustered: what is being held is a worker on every owner, not only on
-        // this node. See `big_api::remaining`.
+        // this node. See `big_embed::remaining`.
         let started = Instant::now();
         let mut values = Vec::with_capacity(plans.len());
         for plan in &plans {
-            values.push(self.execute(plan, &big_api::remaining(opts, started))?);
+            values.push(self.execute(plan, &big_embed::remaining(opts, started))?);
         }
         // Then the searches. Each step of one is an ordinary fan-out and merge, so a quantile
         // is exact across the cluster for the same reason it is exact on one node: what moves
         // the bound is the merged count, never a node's share of it.
         for probe in &probes {
-            values.push(big_api::run_probe(
+            values.push(big_embed::run_probe(
                 probe,
                 |t, c| self.api.plan_call(t, c).map_err(ClusterError::Local),
-                |p| self.execute(p, &big_api::remaining(opts, started)),
+                |p| self.execute(p, &big_embed::remaining(opts, started)),
             )?);
         }
-        Ok((big_api::result_set(&answer, &values), answer.format))
+        Ok((big_embed::result_set(&answer, &values), answer.format))
     }
 
     /// `EXPLAIN`: resolved as far as it would have to be to run, and then not run.
@@ -359,14 +359,14 @@ impl<P: PagerMut + Sync> Cluster<P> {
     /// Nothing past the planning happens on any path: no `execute`, no probe, no round trip.
     fn sql_explain(
         &self,
-        mode: big_api::ExplainMode,
-        inner: big_api::Sql,
+        mode: big_embed::ExplainMode,
+        inner: big_embed::Sql,
     ) -> Result<(ResultSet, Format)> {
         // Planned here, because a plan needs the catalog and the catalog is this side's. What
         // the plans then *say* is `big-sql`'s, which is why this function chooses no printer:
         // it resolves, and hands over.
         let (planned, format) = match inner {
-            big_api::Sql::Query(statement) => {
+            big_embed::Sql::Query(statement) => {
                 let (plans, probes, answer) = self.api.plan_statement(statement)?;
                 // A search's records are an ordinary call, resolved so the tree under it is the
                 // one the search would actually walk. Without this a statement that is only a
@@ -377,14 +377,14 @@ impl<P: PagerMut + Sync> Cluster<P> {
                     .map(|p| {
                         self.api
                             .plan_call(&p.table, &p.rows)
-                            .map(|rows| big_api::explain::Probed { probe: p, rows })
+                            .map(|rows| big_embed::explain::Probed { probe: p, rows })
                             .map_err(ClusterError::Local)
                     })
                     .collect::<Result<Vec<_>>>()?;
                 let format = answer.format;
-                let set = big_api::explain::result_set(
+                let set = big_embed::explain::result_set(
                     mode,
-                    &big_api::explain::Explained::Query {
+                    &big_embed::explain::Explained::Query {
                         plans: &plans,
                         probes: &probed,
                         answer: &answer,
@@ -393,24 +393,24 @@ impl<P: PagerMut + Sync> Cluster<P> {
                 (set, format)
             }
             // The three that need no schema, so nothing here is resolved for them at all.
-            big_api::Sql::Ddl(d) => (
-                big_api::explain::result_set(mode, &big_api::explain::Explained::Ddl(&d)),
+            big_embed::Sql::Ddl(d) => (
+                big_embed::explain::result_set(mode, &big_embed::explain::Explained::Ddl(&d)),
                 Format::default(),
             ),
-            big_api::Sql::Insert(i) => (
-                big_api::explain::result_set(mode, &big_api::explain::Explained::Insert(&i)),
+            big_embed::Sql::Insert(i) => (
+                big_embed::explain::result_set(mode, &big_embed::explain::Explained::Insert(&i)),
                 Format::default(),
             ),
-            big_api::Sql::Show(s) => (
-                big_api::explain::result_set(mode, &big_api::explain::Explained::Show(&s)),
+            big_embed::Sql::Show(s) => (
+                big_embed::explain::result_set(mode, &big_embed::explain::Explained::Show(&s)),
                 s.format,
             ),
             // The parser refuses a second `EXPLAIN`, so nothing constructs this. Reported rather
             // than asserted: a panic here would take a node down over a statement a client
             // wrote, and an unreachable state is worth exactly one error path.
-            big_api::Sql::Explain { .. } => {
-                return Err(ClusterError::Local(big_api::ApiError::Sql(
-                    big_api::SqlError::Syntax {
+            big_embed::Sql::Explain { .. } => {
+                return Err(ClusterError::Local(big_embed::ApiError::Sql(
+                    big_embed::SqlError::Syntax {
                         at: 0,
                         found: "EXPLAIN".to_string(),
                         want: "a statement to explain",
@@ -426,7 +426,7 @@ impl<P: PagerMut + Sync> Cluster<P> {
     /// **The whole batch is resolved against the schema before any of it is written**, which is
     /// what the import route does and for the same reason: a statement that turns out to name a
     /// field nobody has must not land halfway. What a value means is the field's kind to decide,
-    /// and `big_api::fact` is where both write paths ask - so `12.50` on a decimal of scale two
+    /// and `big_embed::fact` is where both write paths ask - so `12.50` on a decimal of scale two
     /// is the same 1250 units however it arrived.
     ///
     /// A statement that named no `id` column is given a run of ids by the schema leader, before
@@ -434,7 +434,7 @@ impl<P: PagerMut + Sync> Cluster<P> {
     /// what fails must fail while nothing has been written. The run is contiguous and taken in
     /// the order the rows were written, so `VALUES (…), (…)` reads back in the order it was
     /// typed.
-    fn sql_insert(&self, insert: &big_api::SqlInsert) -> Result<(ResultSet, Format)> {
+    fn sql_insert(&self, insert: &big_embed::SqlInsert) -> Result<(ResultSet, Format)> {
         // The qualified name, which is what every route below takes and what an error should
         // say back: `orders` is not the table that was not found, `sales.orders` is.
         let name = qualified(&insert.database, &insert.table);
@@ -447,7 +447,7 @@ impl<P: PagerMut + Sync> Cluster<P> {
 
         // Resolved once per column rather than once per value: a statement writing ten thousand
         // rows names the same handful of fields over and over. **The schema's copy of the name,
-        // not the statement's** - identical strings, so that `big_api::apply` matches a fact to
+        // not the statement's** - identical strings, so that `big_embed::apply` matches a fact to
         // its field by address rather than by `memcmp`, exactly as the import route arranges.
         let mut fields = Vec::with_capacity(insert.columns.len());
         for (i, column) in insert.columns.iter().enumerate() {
@@ -471,13 +471,13 @@ impl<P: PagerMut + Sync> Cluster<P> {
         for (n, row) in insert.rows.iter().enumerate() {
             let record = insert.record(row).unwrap_or(allocated + n as u64);
             for (info, (_, value)) in fields.iter().zip(insert.facts(row)) {
-                facts.push(big_api::fact::from_literal(&info.name, info, record, value).map_err(
+                facts.push(big_embed::fact::from_literal(&info.name, info, record, value).map_err(
                     |e| {
                         // The mapping is `fact`'s, not this function's: a value with more
                         // digits than its field keeps is the planner's own refusal, and it
                         // reads the same here as it does in a `WHERE`.
                         ClusterError::Local(
-                            e.into_error(&info.name, &big_api::fact::written(value)),
+                            e.into_error(&info.name, &big_embed::fact::written(value)),
                         )
                     },
                 )?);
@@ -494,31 +494,31 @@ impl<P: PagerMut + Sync> Cluster<P> {
         };
         let _ = outcome;
         Ok((
-            big_api::one_cell("inserted", big_api::Datum::Int(insert.rows.len() as i128)),
+            big_embed::one_cell("inserted", big_embed::Datum::Int(insert.rows.len() as i128)),
             Format::default(),
         ))
     }
 
     /// `DESCRIBE` and `SHOW`, answered out of this node's catalog - which is every node's.
-    fn sql_show(&self, show: &big_api::SqlShow) -> Result<(ResultSet, Format)> {
+    fn sql_show(&self, show: &big_embed::SqlShow) -> Result<(ResultSet, Format)> {
         let schema = self.schema();
         // This node's own views, for the same reason the schema is this node's own: a listing
         // is read out of the catalog every node holds, and a schema change reached all of them
         // before it was answered.
         let views = self.api.views();
         let set = match &show.what {
-            big_api::SqlShown::Columns { database, table } => {
-                big_api::introspect::describe(&schema, &views, &qualified(database, table))
+            big_embed::SqlShown::Columns { database, table } => {
+                big_embed::introspect::describe(&schema, &views, &qualified(database, table))
             }
-            big_api::SqlShown::Tables { database } => {
-                Ok(big_api::introspect::show_tables(&schema, &views, database.as_deref()))
+            big_embed::SqlShown::Tables { database } => {
+                Ok(big_embed::introspect::show_tables(&schema, &views, database.as_deref()))
             }
-            big_api::SqlShown::Views { database } => {
-                Ok(big_api::introspect::show_views(&views, database.as_deref()))
+            big_embed::SqlShown::Views { database } => {
+                Ok(big_embed::introspect::show_views(&views, database.as_deref()))
             }
-            big_api::SqlShown::Databases => Ok(big_api::introspect::show_databases(&schema)),
-            big_api::SqlShown::Create { database, table, view } => {
-                big_api::introspect::show_create(
+            big_embed::SqlShown::Databases => Ok(big_embed::introspect::show_databases(&schema)),
+            big_embed::SqlShown::Create { database, table, view } => {
+                big_embed::introspect::show_create(
                     &schema,
                     &views,
                     &qualified(database, table),

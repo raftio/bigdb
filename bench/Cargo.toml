@@ -10,18 +10,18 @@ repository.workspace = true
 publish = false
 
 [dependencies]
-big-db = { path = "../crates/big-db", version = "0.1.0" }
-big-pager = { path = "../crates/big-pager", version = "0.1.0", features = ["counting-pager"] }
-big-page = { path = "../crates/big-page", version = "0.1.0" }
-big-container = { path = "../crates/big-container", version = "0.1.0" }
+big-db.workspace = true
+big-pager = { workspace = true, features = ["counting-pager"] }
+big-page.workspace = true
+big-container.workspace = true
 # The analytical comparison asks `big` its questions in its own query language, the way every
 # rival is asked in SQL, so it needs the planner and executor rather than just the storage.
-big-exec = { path = "../crates/big-exec", version = "0.1.0" }
+big-exec.workspace = true
 # And the SQL surface, so the same six questions can be put to `big` as the same text every
 # rival is given. The two `big` columns that produces are the measurement of what a query
 # language costs, which is otherwise a thing everyone assumes and nobody has weighed.
-big-plan = { path = "../crates/big-plan", version = "0.1.0" }
-big-sql = { path = "../crates/big-sql", version = "0.1.0" }
+big-plan.workspace = true
+big-sql.workspace = true
 fjall = "2.11.2"
 heed = "0.22.1"
 redb = "2"

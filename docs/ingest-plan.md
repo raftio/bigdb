@@ -1,5 +1,14 @@
 # A batch loader
 
+> **Superseded in part.** This document argued for `bigi` as a fourth binary (Decision 1),
+> reasoning that a chunking loop inside `bigc` would force Rule 1 to be weakened. The binaries
+> were later consolidated and the loop now lives in `bigctl import`. Rule 1 was indeed
+> restated rather than dropped: *every subcommand is one request, except `import` and `delete`,
+> which are one file* - and `every_subcommand_reaches_a_route_that_exists` still enforces it,
+> now with standard input supplied so the two load rows actually send something. Decision 2's
+> rule is unchanged; it is simply a rule about a subcommand instead of about a binary. See
+> `architecture.md` and `docs/versioning.md`.
+
 `architecture.md` drew one box with a dashed outline: **ingest**, captioned *"no batch client —
 callers POST to /import themselves"*. This document plans `bigi`, the fourth binary, and like
 `docs/cli-plan.md` it spends most of its length on what that binary is **not** — because a
@@ -48,7 +57,7 @@ file. It still adds no vocabulary: it does not know what a field is, does not pa
 not consult the schema. A line is bytes on their way to the only thing that understands them,
 and a refusal comes back as the server's own code and sentence — the property `bigc` has, kept.
 
-**3. The only dependency is `big-cli`.** Not `big-api`, not `big-http`. `big-cli` has an empty
+**3. The only dependency is `big-cli`.** Not `big-embed`, not `big-http`. `big-cli` has an empty
 `[dependencies]` section, so depending on it leaves the dependency graph proving the same thing
 it proved before: **this binary cannot link the engine.** In exchange `bigi` reuses
 `big_cli::http::Client`, `big_cli::json::Failure`, `big_cli::read_token` and
@@ -61,7 +70,7 @@ know."* That reasoning is about a client that cannot know. This one can, and the
 the engine rather than in the client's care:
 
 ```rust
-Fact::Int  { .. } => w.set_int(..)      // crates/big-api/src/lib.rs
+Fact::Int  { .. } => w.set_int(..)      // crates/big-embed/src/lib.rs
 Fact::Key  { .. } => w.set_key(..)
 Fact::Bool { .. } => w.set_bool(..)
 ```
@@ -152,7 +161,7 @@ underneath it.
 
 `docs/performance-plan.md` measured `Db::ingest(capacity)` at 240× and `Db::bulk_load` at 19×,
 and says what they do: *"It does not make a commit cheaper; it makes commits rarer."* Both exist
-on `Db` — `crates/big-db/src/db.rs:212` and `:216` — and **nothing in `big-api`, `big-http` or
+on `Db` — `crates/big-db/src/db.rs:212` and `:216` — and **nothing in `big-embed`, `big-http` or
 `big-cluster` calls either.** The HTTP path is `Api::import`, which is a loop over facts and
 then `w.commit()`, once per request.
 

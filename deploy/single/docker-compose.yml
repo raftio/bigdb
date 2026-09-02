@@ -1,4 +1,4 @@
-# One node. What `bigd` is without --cluster: every shard, no peers, and the same coordinator
+# One node. What `big serve` is without --cluster: every shard, no peers, and the same coordinator
 # a four-machine deployment runs.
 #
 #   cd deploy/single
@@ -48,7 +48,7 @@ services:
     #   resources:
     #     limits:
     #       memory: 2g
-    # `bigd` has no signal handler, and it does not need one: the meta page flip is the only
+    # `big serve` has no signal handler, and it does not need one: the meta page flip is the only
     # atomic point in a commit, so a process that is killed outright leaves a file that is
     # either before that flip or after it. There is nothing to replay and nothing to lose, so
     # the default ten seconds is nine and a half more than this needs.

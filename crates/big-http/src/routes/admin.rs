@@ -27,8 +27,8 @@ pub(super) fn create_table<P: PagerMut + Sync>(
     // Absent means the default, not `bitmap`. A caller who says nothing wants the engine that
     // answers the widest range of questions well; a caller who wants the narrow one says so.
     let engine = match req.param("engine") {
-        None => big_api::TableEngine::default(),
-        Some(s) => match big_api::TableEngine::parse(&s) {
+        None => big_embed::TableEngine::default(),
+        Some(s) => match big_embed::TableEngine::parse(&s) {
             Some(e) => e,
             None => {
                 return Response::failure(

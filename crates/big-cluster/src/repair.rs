@@ -184,13 +184,13 @@ impl<P: PagerMut + Sync> Cluster<P> {
                     target,
                     &wire::FragmentBody {
                         addr: addr.clone(),
-                        meta: big_api::FragmentMeta::default(),
+                        meta: big_embed::FragmentMeta::default(),
                         // Emptied in whichever units this address stores, so that replacing a
                         // segment with "no containers" cannot be what frees it.
                         data: if addr.view.is_none() && addr.view_id == big_db::COLUMN_VIEW {
-                            big_api::FragmentData::Cells(Vec::new())
+                            big_embed::FragmentData::Cells(Vec::new())
                         } else {
-                            big_api::FragmentData::Containers(Vec::new())
+                            big_embed::FragmentData::Containers(Vec::new())
                         },
                     },
                 )?;
@@ -288,7 +288,7 @@ impl<P: PagerMut + Sync> Cluster<P> {
     pub(super) fn pull_schema(
         &self,
         node: usize,
-    ) -> Result<(Vec<big_api::TableInfo>, Vec<big_api::ViewInfo>)> {
+    ) -> Result<(Vec<big_embed::TableInfo>, Vec<big_embed::ViewInfo>)> {
         if node == self.config.this_index() {
             return Ok((self.api.schema(), self.api.views()));
         }
@@ -326,7 +326,7 @@ impl<P: PagerMut + Sync> Cluster<P> {
         &self,
         node: usize,
         table: &str,
-    ) -> Result<Vec<(big_api::FragmentAddr, u64)>> {
+    ) -> Result<Vec<(big_embed::FragmentAddr, u64)>> {
         if node == self.config.this_index() {
             return Ok(self.api.fragments(table)?);
         }
@@ -338,7 +338,7 @@ impl<P: PagerMut + Sync> Cluster<P> {
     pub(super) fn pull_fragment(
         &self,
         node: usize,
-        addr: &big_api::FragmentAddr,
+        addr: &big_embed::FragmentAddr,
     ) -> Result<wire::FragmentBody> {
         if node == self.config.this_index() {
             let (meta, data) = self.api.fragment(addr)?;

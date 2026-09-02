@@ -22,7 +22,7 @@
 //! [`config`], and how the row-key namespace stays the same on all of them, which is the schema
 //! leader below.
 //!
-//! **A [`Cluster`] with one node is not a special case.** `bigd` without `--cluster` builds
+//! **A [`Cluster`] with one node is not a special case.** `big serve` without `--cluster` builds
 //! one over `0..`, and every request takes the same path through this crate that it would take
 //! with four peers. A separate un-clustered path would be the one nobody tests.
 //!
@@ -76,7 +76,7 @@ pub use config::{ClusterConfig, ClusterFile, ConfigError, Node, ShardRange};
 pub use error::{ClusterError, Result};
 pub use wire::{Assignment, Ddl, FactValue, OwnedFact};
 
-use big_api::{Api, KeyAssignment, PagerMut, Plan, QueryOptions, RecordId, RowId, Value};
+use big_embed::{Api, KeyAssignment, PagerMut, Plan, QueryOptions, RecordId, RowId, Value};
 use client::{ClientError, Repeatable};
 use controller::{Controller, Leases};
 use merge::Merge;

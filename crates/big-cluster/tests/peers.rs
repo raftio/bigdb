@@ -23,7 +23,7 @@
 //! What this cannot claim is anything about sockets: pooling, keep-alive, or a deadline against
 //! a real clock. Those stay in `big-http/tests/cluster.rs`, over real ports, where they belong.
 
-use big_api::{Api, FieldKind, MemPager, QueryOptions, Value};
+use big_embed::{Api, FieldKind, MemPager, QueryOptions, Value};
 use big_cluster::client::{ClientError, PeerResponse, Peers, Repeatable};
 use big_cluster::{
     raft, wire, Cluster, ClusterConfig, ClusterError, ClusterFile, FactValue, OwnedFact,
@@ -51,7 +51,7 @@ shards = "64.."
 enum Reply {
     /// A count, encoded the way an owner encodes one.
     Count(u64),
-    /// A refusal with a status and a stable code, the way `bigd` writes one.
+    /// A refusal with a status and a stable code, the way `big serve` writes one.
     Refuse(u16, &'static str, &'static str),
     /// Nothing is listening.
     Unreachable,
@@ -223,7 +223,7 @@ fn a_query_this_node_answers_alone_asks_nobody() {
 
 #[test]
 fn a_cluster_of_one_runs_the_same_coordinator_and_asks_nobody() {
-    // `bigd` without --cluster is a cluster of one. A second path for the un-clustered case
+    // `big serve` without --cluster is a cluster of one. A second path for the un-clustered case
     // would be the path nobody tests, so this checks it is not a second path.
     let api = Api::in_memory().unwrap();
     api.create_table("tx").unwrap();

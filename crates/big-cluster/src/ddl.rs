@@ -39,7 +39,7 @@ impl<P: PagerMut + Sync> Cluster<P> {
     ///
     /// Every node's copy is the same because every schema change is applied everywhere, and
     /// the leader is the one that decides whether a change is legal at all.
-    pub fn schema(&self) -> Vec<big_api::TableInfo> {
+    pub fn schema(&self) -> Vec<big_embed::TableInfo> {
         self.api.schema()
     }
 
@@ -47,13 +47,13 @@ impl<P: PagerMut + Sync> Cluster<P> {
     ///
     /// This node's own, like [`Cluster::schema`]: a schema change reaches every node before it
     /// is answered, so a listing has no one to ask.
-    pub fn views(&self) -> Vec<big_api::ViewInfo> {
+    pub fn views(&self) -> Vec<big_embed::ViewInfo> {
         self.api.views()
     }
 
     /// Creates a table under the default engine.
     pub fn create_table(&self, table: &str) -> Result<u64> {
-        self.create_table_with(table, big_api::TableEngine::default())
+        self.create_table_with(table, big_embed::TableEngine::default())
     }
 
     /// The same, with the storage engine named.
@@ -61,7 +61,7 @@ impl<P: PagerMut + Sync> Cluster<P> {
     /// The engine is part of the change rather than each node's own decision: two copies of one
     /// table that stored different things would answer the same query at different costs, and a
     /// failover would change a query's cost without changing the query.
-    pub fn create_table_with(&self, table: &str, engine: big_api::TableEngine) -> Result<u64> {
+    pub fn create_table_with(&self, table: &str, engine: big_embed::TableEngine) -> Result<u64> {
         self.ddl(&Ddl::CreateTable { table: table.to_string(), engine })
     }
 
@@ -69,7 +69,7 @@ impl<P: PagerMut + Sync> Cluster<P> {
         &self,
         table: &str,
         field: &str,
-        kind: big_api::FieldKind,
+        kind: big_embed::FieldKind,
         bit_depth: u32,
     ) -> Result<u64> {
         self.ddl(&Ddl::CreateField {
@@ -99,7 +99,7 @@ impl<P: PagerMut + Sync> Cluster<P> {
         &self,
         table: &str,
         field: &str,
-        granularity: Vec<big_api::Granularity>,
+        granularity: Vec<big_embed::Granularity>,
     ) -> Result<u64> {
         self.ddl(&Ddl::CreateTimeQuantum {
             table: table.to_string(),
@@ -123,7 +123,7 @@ impl<P: PagerMut + Sync> Cluster<P> {
     /// form: a change already ruled legal. See [`Ddl::DropDatabase`].
     pub fn drop_database_if_empty(&self, name: &str, cascade: bool) -> Result<bool> {
         if name == big_db::DEFAULT_DATABASE_NAME {
-            return Err(ClusterError::Local(big_api::ApiError::Db(
+            return Err(ClusterError::Local(big_embed::ApiError::Db(
                 big_db::DbError::DropDefaultDatabase,
             )));
         }
@@ -132,7 +132,7 @@ impl<P: PagerMut + Sync> Cluster<P> {
         let held = self.schema().iter().filter(|t| t.database == name).count()
             + self.api.views().iter().filter(|v| v.database == name).count();
         if held > 0 && !cascade {
-            return Err(ClusterError::Local(big_api::ApiError::Db(
+            return Err(ClusterError::Local(big_embed::ApiError::Db(
                 big_db::DbError::DatabaseNotEmpty { database: name.to_string(), tables: held },
             )));
         }
@@ -160,7 +160,7 @@ impl<P: PagerMut + Sync> Cluster<P> {
                 return Ok(false);
             }
             if !or_replace {
-                return Err(ClusterError::Local(big_api::ApiError::Db(
+                return Err(ClusterError::Local(big_embed::ApiError::Db(
                     big_db::DbError::ViewRedefined(view.to_string()),
                 )));
             }
@@ -245,15 +245,15 @@ impl<P: PagerMut + Sync> Cluster<P> {
 }
 
 /// The change that creates one field exactly as another node has it.
-pub(super) fn create_field(table: &str, field: &big_api::FieldInfo) -> Ddl {
+pub(super) fn create_field(table: &str, field: &big_embed::FieldInfo) -> Ddl {
     match field.kind {
-        big_api::FieldKind::Decimal => Ddl::CreateDecimal {
+        big_embed::FieldKind::Decimal => Ddl::CreateDecimal {
             table: table.to_string(),
             field: field.name.clone(),
             bit_depth: field.bit_depth,
             scale: field.scale,
         },
-        big_api::FieldKind::TimeQuantum => Ddl::CreateTimeQuantum {
+        big_embed::FieldKind::TimeQuantum => Ddl::CreateTimeQuantum {
             table: table.to_string(),
             field: field.name.clone(),
             granularity: field.granularity.clone(),
@@ -272,7 +272,7 @@ pub(super) fn create_field(table: &str, field: &big_api::FieldInfo) -> Ddl {
 /// The same function on both sides of the wire: a coordinator calls it for its own node and
 /// the `/internal/ddl` handler calls it for a peer's. Two implementations would be two answers
 /// to what a schema change means.
-pub fn apply_ddl<P: PagerMut + Sync>(api: &Api<P>, op: &Ddl) -> big_api::Result<u64> {
+pub fn apply_ddl<P: PagerMut + Sync>(api: &Api<P>, op: &Ddl) -> big_embed::Result<u64> {
     Ok(match op {
         Ddl::CreateTable { table, engine } => api.create_table_with(table, *engine)? as u64,
         Ddl::CreateField { table, field, kind, bit_depth } => {

@@ -1,5 +1,14 @@
 # A client on the command line
 
+> **Superseded in part.** This document argued for `bigc` as a third binary (Decision 1). The
+> binaries were later consolidated: four became two, and the client is now `bigctl`, built from
+> `crates/big-bin` alongside `big`. Decision 1's *structural* half no longer holds - one package
+> ships both, so the client links the engine and the empty-`[dependencies]` guarantee is gone.
+> Its other half still does: `big`'s offline subcommands take the exclusive lock, which is why
+> `big serve` and `bigctl` are separate commands rather than one. Decision 2 is unchanged -
+> there is still no offline query mode. Read the rest as the reasoning that produced the
+> surface, not as a description of the build. See `architecture.md` and `docs/versioning.md`.
+
 `big` backs a file up, checks it and shrinks it. `bigd` serves one. Nothing in this repository
 *asks* a running database a question — that is `curl`, in the README and ten times in the
 runbook. This document plans the third binary, and spends most of its length on what that
@@ -22,11 +31,11 @@ a second engine with a worse test suite.
                         table (a tty) │ tsv (a pipe) │ json (verbatim)
 ```
 
-`big-cli` depends on **nothing** — not `big-api`, not `big-plan`, not `big-sql`, not `std`'s
+`big-cli` depends on **nothing** — not `big-embed`, not `big-plan`, not `big-sql`, not `std`'s
 async because there isn't one. That is not minimalism for its own sake: a client that cannot
 link the engine cannot accidentally grow an offline path, so
 [Rule 1](#rule-1--the-client-adds-no-vocabulary) is enforced by the dependency graph rather than
-by discipline. `big-http` and `big-api` appear as **dev**-dependencies only, so the tests drive
+by discipline. `big-http` and `big-embed` appear as **dev**-dependencies only, so the tests drive
 a real server in-process the way `crates/big-http/tests/sql.rs` already does.
 
 ## Four decisions, taken here

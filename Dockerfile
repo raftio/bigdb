@@ -21,10 +21,10 @@ COPY bench ./bench
 #
 # `big-bench` is excluded on purpose: it pulls in rival engines to measure against and is no
 # part of the product.
-# Both binaries: the daemon, and the tool that backs its file up. An image with no way to take
-# a backup is an image whose backups happen somewhere else, which is where backups go to be
-# forgotten.
-RUN cargo build --release --locked --bin bigd --bin big
+# Both binaries. `big` serves the file and backs it up - those were two executables until they
+# became two subcommands of one - and `bigctl` is the client, shipped because an image with no
+# client is an image you cannot ask anything of from inside.
+RUN cargo build --release --locked --bin big --bin bigctl
 
 FROM debian:bookworm-slim
 # `curl` is here for one reason: HEALTHCHECK needs a client, and this image ships a database
@@ -42,7 +42,7 @@ RUN apt-get update \
 # Not root. The database is one file and the daemon needs to write it and nothing else.
 #
 # `/run/big` is where the entrypoint stages credentials: a bind mount does not always carry
-# file modes - on Docker Desktop a `600` token file arrives as `0755` - and `bigd` refuses a
+# file modes - on Docker Desktop a `600` token file arrives as `0755` - and `big serve` refuses a
 # token file anyone else can read. A directory in the container's own filesystem has a real
 # mode, so the check passes without being weakened.
 RUN useradd --uid 1000 --create-home --shell /usr/sbin/nologin big \
@@ -50,12 +50,12 @@ RUN useradd --uid 1000 --create-home --shell /usr/sbin/nologin big \
  && chown big:big /data /run/big \
  && chmod 700 /run/big
 
-COPY --from=build /src/target/release/bigd /usr/local/bin/bigd
 COPY --from=build /src/target/release/big /usr/local/bin/big
+COPY --from=build /src/target/release/bigctl /usr/local/bin/bigctl
 COPY deploy/entrypoint.sh /usr/local/bin/big-entrypoint
 
 # **Root, and only until the entrypoint has read the credentials.** A bind-mounted token file
-# arrives with the host's ownership, which the image cannot predict and `bigd` will not ignore;
+# arrives with the host's ownership, which the image cannot predict and `big serve` will not ignore;
 # reading it as root and writing a private copy is what makes those two facts agree. The
 # entrypoint drops to `big` before the daemon starts and stays there - see deploy/entrypoint.sh,
 # which also handles being run unprivileged by a compose file that says so.
@@ -73,7 +73,11 @@ EXPOSE 7654
 HEALTHCHECK --interval=10s --timeout=2s --start-period=5s --retries=3 \
   CMD curl -fsS http://127.0.0.1:7654/health || exit 1
 
-# `0.0.0.0` because a container's loopback is its own. `bigd` refuses to bind anywhere but
+# `0.0.0.0` because a container's loopback is its own. `big serve` refuses to bind anywhere but
 # loopback without a token file, so the compose files mount one - see deploy/.
+#
+# The `serve` word is NOT here. The entrypoint puts it on, so that every `command:` in every
+# compose file stays a list of arguments rather than gaining a word each - and so that there is
+# one place to look when a container starts and exits two lines later.
 ENTRYPOINT ["/usr/local/bin/big-entrypoint"]
 CMD ["/data/big.db", "0.0.0.0:7654"]

@@ -1,6 +1,6 @@
 [package]
 name = "big-db"
-description = "Schema, catalog and the top-level big database handle"
+description = "Schema, catalog and the store handle over big's engines"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,13 +9,13 @@ repository.workspace = true
 readme = "readme.md"
 
 [dependencies]
-big-btree = { path = "../big-btree", version = "0.1.0" }
-big-engine = { path = "../big-engine", version = "0.1.0" }
-big-keys = { path = "../big-keys", version = "0.1.0" }
-big-pager = { path = "../big-pager", version = "0.1.0" }
+big-btree.workspace = true
+big-engine.workspace = true
+big-keys.workspace = true
+big-pager.workspace = true
 
 [dev-dependencies]
-big-exec = { path = "../big-exec", version = "0.1.0" }
-big-pager = { path = "../big-pager", version = "0.1.0", features = ["counting-pager"] }
+big-exec.workspace = true
+big-pager = { workspace = true, features = ["counting-pager"] }
 proptest = "1"
 tempfile = "3"

@@ -544,19 +544,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
 
 [[package]]
-name = "big-api"
-version = "0.1.0"
-dependencies = [
- "big-civil",
- "big-db",
- "big-exec",
- "big-pager",
- "big-plan",
- "big-sql",
- "tempfile",
-]
-
-[[package]]
 name = "big-bench"
 version = "0.1.0"
 dependencies = [
@@ -581,6 +568,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "big-bin"
+version = "0.1.0"
+dependencies = [
+ "big-cluster",
+ "big-db",
+ "big-embed",
+ "big-http",
+ "big-pager",
+ "tempfile",
+]
+
+[[package]]
 name = "big-btree"
 version = "0.1.0"
 dependencies = [
@@ -596,22 +595,12 @@ name = "big-civil"
 version = "0.1.0"
 
 [[package]]
-name = "big-cli"
-version = "0.1.0"
-dependencies = [
- "big-api",
- "big-db",
- "big-http",
- "big-pager",
-]
-
-[[package]]
 name = "big-cluster"
 version = "0.1.0"
 dependencies = [
- "big-api",
  "big-container",
  "big-db",
+ "big-embed",
  "big-engine",
  "big-exec",
  "big-pager",
@@ -652,6 +641,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "big-embed"
+version = "0.1.0"
+dependencies = [
+ "big-civil",
+ "big-db",
+ "big-exec",
+ "big-pager",
+ "big-plan",
+ "big-sql",
+ "tempfile",
+]
+
+[[package]]
 name = "big-engine"
 version = "0.1.0"
 dependencies = [
@@ -677,27 +679,15 @@ dependencies = [
 name = "big-http"
 version = "0.1.0"
 dependencies = [
- "big-api",
  "big-cluster",
  "big-db",
+ "big-embed",
  "big-engine",
  "big-exec",
  "big-pager",
  "big-plan",
  "big-sql",
  "big-testfile",
- "tempfile",
-]
-
-[[package]]
-name = "big-ingest"
-version = "0.1.0"
-dependencies = [
- "big-api",
- "big-cli",
- "big-db",
- "big-http",
- "big-pager",
  "tempfile",
 ]
 

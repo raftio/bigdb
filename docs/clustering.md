@@ -1,6 +1,6 @@
 # Clustering
 
-**Built.** `bigd --cluster cluster.toml` runs a node that owns a range of shards, plans queries
+**Built.** `big serve --cluster cluster.toml` runs a node that owns a range of shards, plans queries
 for the whole cluster, fans them out and merges what comes back. A range may be **replicated**,
 and a replicated range **fails over on its own**: the nodes agree among themselves on which copy
 serves it, and when that copy stops answering they agree on another one.
@@ -66,7 +66,7 @@ the storage layer, so the cluster layer inherits them rather than choosing:
 **A record id names its shard, and the client picks the record id.** `shard_of` is a shift —
 `record_id >> SHARD_WIDTH_EXPONENT` ([coords.rs:41](../crates/big-engine/src/coords.rs#L41)) —
 and every write path takes the record id from the caller: `Fact::Int { record, .. }` and its
-siblings in [big-api](../crates/big-api/src/lib.rs), one id per line in `POST /import`. Nothing
+siblings in [big-embed](../crates/big-embed/src/lib.rs), one id per line in `POST /import`. Nothing
 in the engine ever allocates a record id. So placement needs no coordination at all: by the time
 a fact arrives, the client has already chosen which node should hold it, without knowing that it
 did.
@@ -157,7 +157,7 @@ without a byte of data moving with it, because every node in a range's group alr
 
 ## Three roles, one binary
 
-`bigd` grew `--cluster <file>` and `--node <name>`, and nothing else. Every node runs the same
+`big serve` grew `--cluster <file>` and `--node <name>`, and nothing else. Every node runs the same
 binary and may play all three roles at once:
 
 - **Coordinator** — whichever node received the request. Plans the query, fans it out, merges.
@@ -178,7 +178,7 @@ it was told to bind; if that is not in the file either, it refuses to start and 
 `--node`. Two ways of answering "which of these am I", and both failing is a refusal rather than
 a guess.
 
-A single-node cluster is one node holding all three roles over `0..`, which is what `bigd`
+A single-node cluster is one node holding all three roles over `0..`, which is what `big serve`
 without `--cluster` builds for itself. That is deliberate, and it is enforced rather than
 intended: `Server` holds a `Cluster`, never an `Api`, so the un-clustered configuration is the
 general one with a peer count of zero. There is no second path for it to be the one nobody
@@ -384,7 +384,7 @@ to know which one to correct.
 counterpart needs; interning is a write because it commits, and a read token that could assign
 row ids would be a read token that can change what every other node means by a string. The
 token a node presents comes from `peer_token_file`, read with the same mode-600 check the
-inbound token file gets. A cluster with no tokens anywhere is allowed, and `bigd` says so on the
+inbound token file gets. A cluster with no tokens anywhere is allowed, and `big serve` says so on the
 way up, because refusing it here would refuse it only for clusters.
 
 **Every decoder there reads bytes it did not write.** A length is checked against what is left
@@ -488,7 +488,7 @@ The most important section on this page.
   easier ones.
 - **No cross-node atomicity**, as above — and not for want of a protocol. Two-phase commit
   needs a transaction held open across a network round trip, and this engine will not do that
-  for two reasons it already had: `big-api` exists so that a read or write transaction never
+  for two reasons it already had: `big-embed` exists so that a read or write transaction never
   outlives one call, and a node has a single writer, so a held-open write would block every
   other write to that node until a coordinator that may have died said otherwise. Building 2PC
   here means giving up the single-writer lock or the facade's rule, and both of those are load

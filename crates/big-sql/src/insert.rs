@@ -20,7 +20,7 @@
 //! intern on a set field and a mistake on an integer one, `12.50` is 1250 units on a decimal of
 //! scale 2, and `now@1750000000` is a key and a moment. Deciding any of that here would be this
 //! crate reading a schema, which is the one thing it does not do - so an `Insert` carries the
-//! literals exactly as written and `big_api::fact::from_literal` turns each into a fact
+//! literals exactly as written and `big_embed::fact::from_literal` turns each into a fact
 //! against the `FieldInfo` it is for. That is the same function `POST /table/{t}/import` reads
 //! its lines with, so the two write paths cannot come to disagree about what a value means.
 //!

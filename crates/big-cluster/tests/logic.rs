@@ -14,9 +14,9 @@
 
 //! SQL against a real database: statements that build a table, and the rows they answer with.
 //!
-//! # Why the corpus lives here and not in `big-api`
+//! # Why the corpus lives here and not in `big-embed`
 //!
-//! This is the first layer at which *a whole statement* runs. `big-api` plans and executes a
+//! This is the first layer at which *a whole statement* runs. `big-embed` plans and executes a
 //! query, but a `CREATE TABLE` becomes a schema change that goes to the leader and then
 //! everywhere, and an `INSERT` becomes facts routed to the shards that own their records - so
 //! the one function that takes any statement and answers with rows is `Cluster::sql`. A corpus
@@ -48,7 +48,7 @@
 
 use std::path::PathBuf;
 
-use big_api::{Api, Datum, MemPager, QueryOptions, ResultSet};
+use big_embed::{Api, Datum, MemPager, QueryOptions, ResultSet};
 use big_cluster::{Cluster, ClusterError};
 use big_testfile::Case;
 
@@ -154,12 +154,12 @@ fn datum(d: &Datum) -> String {
         // and a `sum` over none are different answers.
         Datum::Null => "NULL".to_string(),
         Datum::Int(v) => v.to_string(),
-        Datum::Dec { units, scale } => big_api::fixed(*units, *scale),
+        Datum::Dec { units, scale } => big_embed::fixed(*units, *scale),
         Datum::Real(v) => format!("{v}"),
         // Spelled the way every output format spells them, so a corpus answer and a client's
         // answer cannot come to disagree about what a date is.
-        Datum::Date(d) => big_api::date_text(*d),
-        Datum::Timestamp(t) => big_api::timestamp_text(*t),
+        Datum::Date(d) => big_embed::date_text(*d),
+        Datum::Timestamp(t) => big_embed::timestamp_text(*t),
         Datum::Text(s) => s.clone(),
         Datum::Keys(keys) => format!("[{}]", keys.join(", ")),
     }
@@ -179,7 +179,7 @@ fn same(db: &Cluster<MemPager>, sql: &str, pql: &str, sorted: bool) -> String {
     // Translated first, for the table alone. The case does not repeat it, so it cannot quietly
     // ask the other surface about a different one.
     let table_name = match api.translate(sql) {
-        Ok(big_api::Sql::Query(statement)) => match statement.tables()[..] {
+        Ok(big_embed::Sql::Query(statement)) => match statement.tables()[..] {
             [one] => one.to_string(),
             _ => return "reads more than one table, and this comparison takes one".to_string(),
         },
@@ -200,5 +200,5 @@ fn same(db: &Cluster<MemPager>, sql: &str, pql: &str, sorted: bool) -> String {
     if format!("{value:?}") != format!("{from_pql:?}") {
         return format!("THE TWO SURFACES DISAGREE\nfrom sql: {value:?}\nfrom pql: {from_pql:?}");
     }
-    table(&big_api::result_set(&answer, &from_sql), sorted)
+    table(&big_embed::result_set(&answer, &from_sql), sorted)
 }

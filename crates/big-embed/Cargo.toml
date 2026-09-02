@@ -1,0 +1,33 @@
+[package]
+name = "big-embed"
+description = "In-process facade for big: schema, ingest and queries with no server in between"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "readme.md"
+keywords = ["bitmap","index","database","embedded","roaring"]
+categories = ["database-implementations","data-structures"]
+
+[features]
+# Opts out of the semver guarantee: it exposes `Db` from an unpublished crate, so what it hands
+# back can change in any release. Nothing in this repository turns it on.
+unstable = []
+
+[dependencies]
+big-civil.workspace = true
+big-db.workspace = true
+big-exec.workspace = true
+# For `Api::execute`, which takes a plan a caller built rather than text this crate parses.
+# The coordinator needs it: a plan is what goes over the wire, so that two nodes cannot
+# disagree about what was asked.
+big-plan.workspace = true
+# The SQL surface, which is a translation into `big-plan`'s AST rather than an engine of its
+# own: this crate parses SQL exactly where it already parses the query language, and everything
+# below sees the same `Plan` either way.
+big-sql.workspace = true
+big-pager.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

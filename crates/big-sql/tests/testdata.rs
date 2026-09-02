@@ -22,7 +22,7 @@
 //!
 //! Nothing here runs a database. `translate` needs no schema and the [`Stub`] below is a trait
 //! impl of thirty lines, so a case in this corpus costs what a parser test costs. The corpus
-//! that runs against real data is `big-api`'s.
+//! that runs against real data is `big-embed`'s.
 //!
 //! # The directives
 //!
@@ -145,7 +145,7 @@ fn dispatch(case: &Case) -> String {
         }),
         // Exactly what a client gets back from `EXPLAIN`, line for line.
         //
-        // The rows it becomes are `big-api`'s, but every character of the text is this crate's -
+        // The rows it becomes are `big-embed`'s, but every character of the text is this crate's -
         // which is why the format is pinned here, at parser-test speed against `Stub`, rather
         // than only where a database is running.
         "explain" => with(sql, |s| match s {

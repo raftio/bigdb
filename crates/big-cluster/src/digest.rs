@@ -35,14 +35,14 @@
 //! file would report a difference on every pair of healthy nodes, which is the same as
 //! reporting nothing.
 
-use big_api::{Api, FieldKind, PagerMut, Plan, QueryOptions, Rows, Value};
+use big_embed::{Api, FieldKind, PagerMut, Plan, QueryOptions, Rows, Value};
 
 /// Every fact this node holds, as one number.
 ///
 /// Tables in name order, fields in name order, so that two nodes that were told about their
 /// schema in a different order still produce the same digest. Nothing here depends on a table
 /// or field *id*, which is each node's own numbering.
-pub fn digest<P: PagerMut + Sync>(api: &Api<P>) -> big_api::Result<u64> {
+pub fn digest<P: PagerMut + Sync>(api: &Api<P>) -> big_embed::Result<u64> {
     let mut h = Fnv::new();
     let mut tables = api.schema();
     tables.sort_by(|a, b| a.name.cmp(&b.name));
@@ -152,7 +152,7 @@ pub fn digest<P: PagerMut + Sync>(api: &Api<P>) -> big_api::Result<u64> {
     Ok(h.finish())
 }
 
-fn count<P: PagerMut + Sync>(api: &Api<P>, table: &str) -> big_api::Result<u64> {
+fn count<P: PagerMut + Sync>(api: &Api<P>, table: &str) -> big_embed::Result<u64> {
     let plan = Plan::Count { table: table.to_string(), rows: Rows::All };
     Ok(api.execute(&plan, &QueryOptions::default())?.as_count().unwrap_or(0))
 }

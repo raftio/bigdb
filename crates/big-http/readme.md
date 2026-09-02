@@ -2,12 +2,12 @@
 
 The smallest HTTP surface that makes the engine reachable from outside the process.
 
-Ships `bigd`, and a `Server` you can embed. No framework, no async runtime, no protocol beyond
+Ships `big serve`, and a `Server` you can embed. No framework, no async runtime, no protocol beyond
 HTTP/1.1 with a `Content-Length` body — deliberately the least server that could work, so that
 the decision to have one at all stays cheap to revisit.
 
 ```console
-$ bigd data.big 127.0.0.1:7654 --tokens tokens.txt
+$ big serve data.big 127.0.0.1:7654 --tokens tokens.txt
 $ curl -H 'Authorization: Bearer …' -d 'Count(Row(country="GB"))' \
       localhost:7654/table/tx/query
 ```
@@ -42,7 +42,7 @@ has no reason to speak to them; see [clustering](../../docs/clustering.md).
 ## Five decisions worth reading before you deploy it
 
 **Every route goes through the coordinator, even with one node.** `Server` holds a
-`big_cluster::Cluster`, never an `Api`, so `bigd` without `--cluster` is a cluster of one over
+`big_cluster::Cluster`, never an `Api`, so `big serve` without `--cluster` is a cluster of one over
 every shard. A second path for the un-clustered case would be the path nobody tests.
 
 **Keep-alive is opt-in.** A persistent connection holds a worker from the pool below, so a
@@ -61,11 +61,11 @@ answer; queueing it only moves the failure somewhere harder to see.**
 **Transport security is not here and is not going to be.** Termination belongs to a reverse proxy
 — see `runbook.md`. A TLS stack would be a larger dependency than the entire engine, and a
 hand-written one is out of the question. What *is* enforced is the half that keeps that from
-being an excuse: `bigd` **refuses to bind anywhere but loopback without a token file**, and
+being an excuse: `big serve` **refuses to bind anywhere but loopback without a token file**, and
 overriding that needs `--insecure-no-auth`, a flag that says what it is.
 
 **Tokens are a file, not a database.** One `token role` per line, roles `read` / `write` /
-`admin`, and the file must be mode `600` or `bigd` refuses to start.
+`admin`, and the file must be mode `600` or `big serve` refuses to start.
 
 ## Metrics
 
@@ -75,5 +75,9 @@ guess.
 
 ## Stability
 
-This crate and `big-api` are the published surface and carry a semver guarantee. See
+This crate and `big-embed` are the published surface and carry a semver guarantee. See
 `../../docs/versioning.md`.
+
+**`big-embed` is the same database without the socket.** If the code that queries big runs in
+the same process as the data, depend on that instead and skip the encoding, the request and the
+port. This crate is for when it does not.

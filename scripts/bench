@@ -56,7 +56,7 @@ Commands
                             `load` and `server` only answer "how long". Linux and perf only;
                             it says so rather than half-working. Keeps the raw perf.data
                             beside the report so it can be re-read with other options.
-  server [RECORDS] [SHARDS] Import over HTTP: starts bigd, drives it with bigi, and times the
+  server [RECORDS] [SHARDS] Import over HTTP: starts big serve, drives it with bigctl, and times the
                             whole road - line parse, batch, one commit per request, round trip.
                             Loads the identical records into ClickHouse beside it when one is
                             listening, with the page cache dropped between the two. Tears down
@@ -79,19 +79,19 @@ Commands
 Environment
   BENCH_RESULTS   Where reports are written. Default bench/results.
   BENCH_PEERS     Cargo features for `olap`. Default none. Use `olap-peers` for all of them.
-  BENCH_KEEP      Set to keep what `server` creates: the bigd data directory and the daemon
+  BENCH_KEEP      Set to keep what `server` creates: the daemon's data directory and the daemon
                   itself, so the corpus can be queried after the load. Off by default, because
                   otherwise every run leaves a database and a process behind on the box.
   BENCH_FOLLOW    Set to 0 to start a remote run and not watch it. Default 1.
   BENCH_ENGINE    Table engine `server` creates: bitmap, bitmap+columnar or columnar.
                   Default bitmap - the index and no column segments, which is half the write
                   path. Recorded in the report, because it changes what the number means.
-  BENCH_DURABILITY  What `server` starts bigd with: full, barrier or none. Default full.
-  BENCH_IN_FLIGHT Requests `bigi` keeps waiting on the server. Default 2 - `bigi`'s own -
+  BENCH_DURABILITY  What `server` starts the daemon with: full, barrier or none. Default full.
+  BENCH_IN_FLIGHT Requests `bigctl` keeps waiting on the server. Default 2 - `bigctl`'s own -
                   ceiling 8. The second lets the server parse one body while it commits the
                   last, worth about 1.6x; it does not make writes concurrent, and it changes
                   how much a resumed load repeats.
-  BENCH_CLICKHOUSE  Where `server` looks for a ClickHouse to load beside bigd. Default
+  BENCH_CLICKHOUSE  Where `server` looks for a ClickHouse to load beside big. Default
                   http://127.0.0.1:8123. Not reachable means the row is skipped and says so.
   BENCH_PROFILE_FREQ   Samples per second `profile` asks perf for. Default 299 - a prime, so
                   it cannot beat against anything periodic in the workload.
@@ -414,9 +414,8 @@ cmd_remote() {
     note "shipping the cross-built binaries"
     ssh -o BatchMode=yes "$host" "mkdir -p '$dir/target/release'"
     rsync -az --no-owner --no-group -e 'ssh -o BatchMode=yes' \
-      "$root/target/$BENCH_TARGET/release/bigd" \
-      "$root/target/$BENCH_TARGET/release/bigc" \
-      "$root/target/$BENCH_TARGET/release/bigi" \
+      "$root/target/$BENCH_TARGET/release/big" \
+      "$root/target/$BENCH_TARGET/release/bigctl" \
       "$root/target/$BENCH_TARGET/release/facts" \
       "$root/target/$BENCH_TARGET/release/profile_load" \
       "$host:$dir/target/release/"
@@ -479,7 +478,7 @@ cmd_remote_control() {
       ;;
     --status)
       ssh -o BatchMode=yes "$host" \
-        "pgrep -a 'cargo|rustc|profile_load|olap|report|perf|bigd|bigi' || echo '(nothing running)'; echo '--- last lines ---'; tail -5 '$log' 2>/dev/null || echo '(no log yet)'; true"
+        "pgrep -a 'cargo|rustc|profile_load|olap|report|perf|big|bigctl' || echo '(nothing running)'; echo '--- last lines ---'; tail -5 '$log' 2>/dev/null || echo '(no log yet)'; true"
       ;;
     --stop)
       note "stopping the run on $host"
@@ -495,11 +494,11 @@ cmd_remote_control() {
 # The server path, which is the one a user actually meets.
 #
 # **Why this is a different measurement from `load`, not a slower spelling of it.** `load` calls
-# `big-db` as a library. This starts `bigd`, hands `bigi` the same corpus and times the whole
+# `big-db` as a library. This starts `big serve`, hands `bigctl` the same corpus and times the whole
 # road: a line parsed per fact, a batch allocated, one commit per request, and a round trip for
 # each 7 MiB of it. Nothing in the in-process number reflects any of that.
 #
-# It measures `bigd` and nothing else. Putting a rival in the same run was tried and taken back
+# It measures `big` and nothing else. Putting a rival in the same run was tried and taken back
 # out: two engines loaded back to back on one box share a page cache and a disk queue, and the
 # second one is measured through whatever the first one left behind. A comparison worth printing
 # needs each side to get a cold box, which is a different command from this one.
@@ -526,7 +525,7 @@ cross_build() {
 
   note "cross-building for $BENCH_TARGET"
   cargo zigbuild --release --target "$BENCH_TARGET" \
-    --bin bigd --bin bigc --bin bigi --bin facts --bin profile_load >&2
+    --bin big --bin bigctl --bin facts --bin profile_load >&2
 }
 
 
@@ -558,7 +557,7 @@ cold_cache() {
 
 server_cleanup() {
   # First, and outside the `BENCH_KEEP` early return: keeping a database to query is a reason to
-  # leave `bigd` up, never a reason to leave a profiler attached to it. A `perf record` that
+  # leave the daemon up, never a reason to leave a profiler attached to it. A `perf record` that
   # outlives its run holds the samples in a buffer nobody will ever ask for and keeps writing.
   if [ -n "${BIGD_PERF_PID:-}" ]; then
     kill -INT "$BIGD_PERF_PID" 2>/dev/null || true
@@ -568,15 +567,15 @@ server_cleanup() {
 
   if [ -n "${BENCH_KEEP:-}" ]; then
     note "BENCH_KEEP: leaving ${BIGD_DATA:-the data directory} in place"
-    note "  bigd is still on ${BIGD_ADDR:-?} as pid ${BIGD_PID:-?}; kill it when you are done"
+    note "  big is still serving on ${BIGD_ADDR:-?} as pid ${BIGD_PID:-?}; kill it when you are done"
     return 0
   fi
 
-  if [ -n "${BIGD_PID:-}" ] && [ -n "${BIGD_ADDR:-}" ] && [ -x ./target/release/bigc ]; then
+  if [ -n "${BIGD_PID:-}" ] && [ -n "${BIGD_ADDR:-}" ] && [ -x ./target/release/bigctl ]; then
     note "dropping table t"
-    ./target/release/bigc drop table t --addr "$BIGD_ADDR" >/dev/null 2>&1 || true
+    ./target/release/bigctl drop table t --addr "$BIGD_ADDR" >/dev/null 2>&1 || true
   fi
-  # ClickHouse's copy does not go with a temporary directory the way bigd's does, so if this
+  # ClickHouse's copy does not go with a temporary directory the way big's does, so if this
   # line is missing the corpus stays on the box for ever. Two runs of twenty million and
   # nobody notices until the disk is full.
   if [ -n "${BENCH_CH_TABLE:-}" ]; then
@@ -593,7 +592,7 @@ server_cleanup() {
   return 0
 }
 
-# Starts a `bigd` with the benchmark schema on it, and arms the cleanup.
+# Starts a `big serve` with the benchmark schema on it, and arms the cleanup.
 #
 # **Shared by `server` and `profile` on purpose.** A profile of one daemon and a throughput
 # figure from a differently-configured one are two measurements of two programs, and the
@@ -606,8 +605,8 @@ server_cleanup() {
 # variable" instead of cleaning up. Where the cost is a daemon left holding an exclusive lock on
 # a file nobody deletes, that matters.
 server_up() {
-  # 7655, not bigd's own default of 7654. A box that runs this benchmark is a box likely to
-  # have a real `bigd` on it, and the two must never meet: the bench would refuse to start
+  # 7655, not `big serve`'s own default of 7654. A box that runs this benchmark is a box likely to
+  # have a real daemon on it, and the two must never meet: the bench would refuse to start
   # (see the guard below) or, worse on a machine without that guard, load twenty million
   # records into somebody's actual database and then drop the table.
   BIGD_ADDR="${BENCH_BIGD_ADDR:-127.0.0.1:7655}"
@@ -627,23 +626,23 @@ server_up() {
   # **Refuse a port somebody else is on, rather than measure them.**
   #
   # This is not hypothetical: an earlier run of this very command leaked a daemon, and the next
-  # run's `bigd` could not bind, so the health check below was answered by the *previous* build
+  # run's daemon could not bind, so the health check below was answered by the *previous* build
   # still holding the port. The bench then created its schema on a stranger, loaded a stranger,
   # and reported a number for a binary nobody had asked about. A health probe against an address
   # cannot tell you whose address it is.
-  if ./target/release/bigc health --addr "$BIGD_ADDR" >/dev/null 2>&1; then
+  if ./target/release/bigctl health --addr "$BIGD_ADDR" >/dev/null 2>&1; then
     red "something is already answering on $BIGD_ADDR - refusing to measure it"
-    red "  it is most likely a bigd left over from an earlier run:"
-    red "    pkill -f 'bigd .*$BIGD_ADDR'"
+    red "  it is most likely a big serve left over from an earlier run:"
+    red "    pkill -f 'big serve .*$BIGD_ADDR'"
     red "  or point this run elsewhere with BENCH_BIGD_ADDR=127.0.0.1:7656"
     exit 1
   fi
 
-  note "starting bigd on $BIGD_ADDR, durability=$BIGD_DURABILITY, data=$BIGD_DATA"
-  # Loopback with no --tokens: auth is disabled, which `bigd` allows only because it cannot be
+  note "starting big serve on $BIGD_ADDR, durability=$BIGD_DURABILITY, data=$BIGD_DATA"
+  # Loopback with no --tokens: auth is disabled, which `big serve` allows only because it cannot be
   # reached from anywhere else. Do not copy this line onto a public interface.
-  BIG_LOG="${BIG_LOG:-warn}" ./target/release/bigd "$BIGD_DATA/big.db" "$BIGD_ADDR" \
-    --durability "$BIGD_DURABILITY" > "$BIGD_DATA/bigd.log" 2>&1 &
+  BIG_LOG="${BIG_LOG:-warn}" ./target/release/big serve "$BIGD_DATA/big.db" "$BIGD_ADDR" \
+    --durability "$BIGD_DURABILITY" > "$BIGD_DATA/big serve.log" 2>&1 &
   BIGD_PID=$!
 
   local ready=""
@@ -651,26 +650,26 @@ server_up() {
     # The process first, the port second. If the daemon we started has exited there is no point
     # asking the address whether it is well - somebody else would answer.
     if ! kill -0 "$BIGD_PID" 2>/dev/null; then
-      red "bigd exited before it was ready:"
-      sed 's/^/  /' "$BIGD_DATA/bigd.log" >&2
+      red "big serve exited before it was ready:"
+      sed 's/^/  /' "$BIGD_DATA/big serve.log" >&2
       exit 1
     fi
-    if ./target/release/bigc health --addr "$BIGD_ADDR" >/dev/null 2>&1; then ready=yes; break; fi
+    if ./target/release/bigctl health --addr "$BIGD_ADDR" >/dev/null 2>&1; then ready=yes; break; fi
     sleep 0.2
   done
   if [ -z "$ready" ]; then
-    red "bigd did not come up on $BIGD_ADDR:"
-    sed 's/^/  /' "$BIGD_DATA/bigd.log" >&2
+    red "big serve did not come up on $BIGD_ADDR:"
+    sed 's/^/  /' "$BIGD_DATA/big serve.log" >&2
     exit 1
   fi
 
   note "creating the schema"
-  local bigc="./target/release/bigc --addr $BIGD_ADDR"
-  $bigc create table t --engine "$BIGD_ENGINE" >/dev/null
-  $bigc create field t amount --kind int --bit-depth 20 >/dev/null
-  $bigc create field t category --kind set >/dev/null
-  $bigc create field t country --kind set >/dev/null
-  $bigc create field t active --kind bool >/dev/null
+  local bigctl="./target/release/bigctl --addr $BIGD_ADDR"
+  $bigctl create table t --engine "$BIGD_ENGINE" >/dev/null
+  $bigctl create field t amount --kind int --bit-depth 20 >/dev/null
+  $bigctl create field t category --kind set >/dev/null
+  $bigctl create field t country --kind set >/dev/null
+  $bigctl create field t active --kind bool >/dev/null
 }
 
 cmd_server() {
@@ -679,12 +678,12 @@ cmd_server() {
   # Only the four binaries this needs. `-p big-bench` would additionally build `olap`, `report`
   # and three scratch profilers, which drag in the planner, the SQL front end and every rival
   # engine - minutes of compile on two vCPUs for code this command never calls.
-  build --bin bigd --bin bigc --bin bigi --bin facts
+  build --bin big --bin bigctl --bin facts
   server_up
   local addr="$BIGD_ADDR" data="$BIGD_DATA"
   local durability="$BIGD_DURABILITY" engine="$BIGD_ENGINE"
   local chunk="${BENCH_CHUNK:-7340032}"
-  # `bigi`'s own default, and it is two: one request in flight is a strictly alternating load
+  # `bigctl`'s own default, and it is two: one request in flight is a strictly alternating load
   # where each end waits for the other, and the second is worth about 1.6x. Kept in step with
   # `big_ingest::args::DEFAULT_IN_FLIGHT` rather than pinned here - a benchmark whose default
   # is not the product's default is measuring a configuration nobody runs.
@@ -712,26 +711,34 @@ cmd_server() {
     echo "## import over HTTP  ($records records x 4 facts, engine $engine)"
     echo
 
-    note "loading bigd" >&2
+    note "loading big serve" >&2
     cold_cache
     # **`--progress`, not `--no-progress`.** A twenty-million-record load is minutes of silence
     # otherwise, and silence from a benchmark is indistinguishable from a hang - which is
-    # exactly how the first one was read. `bigi` writes progress to stderr and its summary to
-    # stdout, so this goes to the log and leaves the parsing below untouched; not being a
-    # terminal, it writes plain lines rather than redrawing one.
+    # exactly how the first one was read. Not being a terminal, it writes plain lines rather
+    # than redrawing one.
     #
-    # `bigi` reports its own elapsed, which starts when the first byte is sent rather than when
+    # **stdout is the fact count; everything else is on stderr.** `bigctl import` prints what
+    # the server said on stdout, the way every other `bigctl` subcommand does, and what the
+    # loop itself did - lines, chunks, bytes, elapsed - on stderr beside the progress. So the
+    # numbers below are read from a copy of stderr, and `tee` is what keeps them *also* flowing
+    # into the log while the load is still running.
+    #
+    # `bigctl` reports its own elapsed, which starts when the first byte is sent rather than when
     # this shell got around to launching it.
-    local summary
-    summary=$(./target/release/facts "$records" "$shards" \
-      | ./target/release/bigi import t - --addr "$addr" --chunk-bytes "$chunk" \
-          --in-flight "$in_flight" --progress)
+    local noise
+    noise=$(mktemp)
+    ./target/release/facts "$records" "$shards" \
+      | ./target/release/bigctl import t - --addr "$addr" --chunk-bytes "$chunk" \
+          --in-flight "$in_flight" --progress \
+          2> >(tee "$noise" >&2) >/dev/null
     local secs chunks
-    secs=$(echo "$summary" | awk '/^elapsed/{print $2}')
-    chunks=$(echo "$summary" | awk '/^chunks/{print $2}')
+    secs=$(awk '/elapsed/{print $NF}' "$noise")
+    chunks=$(awk '/chunks/{print $NF}' "$noise")
+    rm -f "$noise"
 
     printf '%-14s %10ss  %14s facts/s  %12s records/s  %s requests\n' \
-      "bigd" "$secs" \
+      "big" "$secs" \
       "$(echo "$records $secs" | awk '{printf "%d", $1*4/$2}')" \
       "$(echo "$records $secs" | awk '{printf "%d", $1/$2}')" \
       "$chunks"
@@ -779,9 +786,9 @@ cmd_server() {
 # schema, same corpus, same chunking, through `server_up` - because a profile taken against a
 # differently-configured daemon cannot be laid beside a throughput number and read together.
 #
-# perf is attached to the *running* `bigd` by pid rather than launching it, for two reasons.
+# perf is attached to the *running* `big serve` by pid rather than launching it, for two reasons.
 # The startup and the schema DDL are not the thing being measured and would otherwise be
-# several percent of a short run; and the profile then covers exactly the window `bigi` is
+# several percent of a short run; and the profile then covers exactly the window `bigctl` is
 # sending in, which is the window the throughput line below describes.
 #
 # Self time, not cumulative (`--no-children`). Call graphs need frame pointers or DWARF unwinding
@@ -793,7 +800,7 @@ cmd_profile() {
   if [ "$(uname -s)" != "Linux" ]; then
     red "profile needs Linux perf; this is $(uname -s)."
     red "  On macOS use a sampling profiler that speaks Mach: samply, or Instruments."
-    red "    cargo install samply && samply record ./target/release/bigd ..."
+    red "    cargo install samply && samply record ./target/release/big serve ..."
     red "  Or run it where the numbers belong anyway:"
     red "    BENCH_HOST=<host> ./scripts/bench remote profile $records"
     exit 1
@@ -807,7 +814,7 @@ cmd_profile() {
   fi
 
   check_room "$records" 0
-  build --bin bigd --bin bigc --bin bigi --bin facts
+  build --bin big --bin bigctl --bin facts
   server_up
 
   local freq="${BENCH_PROFILE_FREQ:-299}"
@@ -826,7 +833,7 @@ cmd_profile() {
     echo "durability    $BIGD_DURABILITY"; echo "chunk-bytes   $chunk"; \
     echo "in-flight     $in_flight"; echo "frequency     $freq Hz"; echo; } > "$out"
 
-  note "recording bigd (pid $BIGD_PID) at ${freq}Hz"
+  note "recording big serve (pid $BIGD_PID) at ${freq}Hz"
   # No duration and no command: perf follows the pid until it is interrupted, which is what
   # makes the window exactly the load. `--` with a `sleep` was tried and is a ceiling nobody
   # can pick correctly - too short truncates a large run, too long makes every small one wait.
@@ -848,7 +855,7 @@ cmd_profile() {
   cold_cache
   local summary secs
   summary=$(./target/release/facts "$records" "$shards" \
-    | ./target/release/bigi import t - --addr "$BIGD_ADDR" --chunk-bytes "$chunk" \
+    | ./target/release/bigctl import t - --addr "$BIGD_ADDR" --chunk-bytes "$chunk" \
         --in-flight "$in_flight" --progress)
   secs=$(echo "$summary" | awk '/^elapsed/{print $2}')
 
@@ -870,7 +877,7 @@ cmd_profile() {
     # Printed with the profile rather than only by `server`, because a symbol table without the
     # speed it was taken at cannot be compared with the next one.
     printf '%-14s %10ss  %14s facts/s  %12s records/s\n' \
-      "bigd" "$secs" \
+      "big" "$secs" \
       "$(echo "$records $secs" | awk '{printf "%d", $1*4/$2}')" \
       "$(echo "$records $secs" | awk '{printf "%d", $1/$2}')"
     echo

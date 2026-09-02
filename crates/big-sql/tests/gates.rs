@@ -97,14 +97,14 @@ fn every_refusal_is_reached_by_a_statement_in_the_corpus() {
         ("sql_insert_too_large", "needs 10,001 tuples; covered in tests/translate/writes.rs"),
         // The two refusals a view is expanded into. `translate` holds no catalog - which is
         // what makes every test in this crate a parser test - so no statement here can reach a
-        // refusal that needs a stored `SELECT` to decide. They are raised in `big-api::views`
+        // refusal that needs a stored `SELECT` to decide. They are raised in `big-embed::views`
         // and covered where the catalog is.
-        ("sql_view_column", "needs a stored view; covered in big-api/tests/views.rs"),
-        ("sql_view_depth", "needs a stored view; covered in big-api/tests/views.rs"),
+        ("sql_view_column", "needs a stored view; covered in big-embed/tests/views.rs"),
+        ("sql_view_depth", "needs a stored view; covered in big-embed/tests/views.rs"),
         // The refusal a surface raises about itself rather than about the text. `translate`
         // accepts every `EXPLAIN` the dialect has - that is the whole point of the wrapper - so
         // no statement here can reach the one refusal that is about which surface was asked.
-        ("sql_explain_rows", "raised in big-api::plan_sql_in; covered in big-api/tests/sql.rs"),
+        ("sql_explain_rows", "raised in big-embed::plan_sql_in; covered in big-embed/tests/sql.rs"),
     ];
 
     let reached: BTreeSet<&str> = statements()

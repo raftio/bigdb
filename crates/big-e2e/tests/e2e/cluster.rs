@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Two `bigd` processes, two files, one query.
+//! Two `big serve` processes, two files, one query.
 //!
 //! **Ignored by default, and the reason is not that it is slow.** `big-http/tests/cluster.rs`
 //! already covers what the coordinator decides, in-process and in-memory, where a test can hold
@@ -59,9 +59,9 @@ fn pair(workspace: &Workspace) -> (Daemon, Daemon) {
 
 /// The schema, created once at the leader, which applies it everywhere.
 fn stock(a: &Daemon) {
-    a.bigc(&["create", "table", "tx"]).expect(0);
-    a.bigc(&["create", "field", "tx", "amount", "--kind", "int", "--bit-depth", "20"]).expect(0);
-    a.bigc(&["create", "field", "tx", "country", "--kind", "set"]).expect(0);
+    a.bigctl(&["create", "table", "tx"]).expect(0);
+    a.bigctl(&["create", "field", "tx", "amount", "--kind", "int", "--bit-depth", "20"]).expect(0);
+    a.bigctl(&["create", "field", "tx", "country", "--kind", "set"]).expect(0);
 }
 
 /// A record id in the first range, and one in the second.
@@ -79,7 +79,7 @@ fn a_query_is_merged_from_two_processes() {
     stock(&a);
 
     // Each fact lands on whichever node owns its record, whichever node was asked.
-    a.bigc_stdin(
+    a.bigctl_stdin(
         &["import", "tx", "-"],
         &format!("country {IN_A} GB\namount {IN_A} 100\ncountry {IN_B} US\namount {IN_B} 250\n"),
     )
@@ -87,7 +87,7 @@ fn a_query_is_merged_from_two_processes() {
 
     for (who, node) in [("a", &a), ("b", &b)] {
         let answer =
-            node.bigc(&["--format", "json", "sql", "SELECT count(*), sum(amount) FROM tx"]);
+            node.bigctl(&["--format", "json", "sql", "SELECT count(*), sum(amount) FROM tx"]);
         let answer = answer.expect(0);
         assert!(answer.out.contains("[2,350]"), "{who} merged both owners' shares: {}", answer.out);
     }
@@ -103,11 +103,11 @@ fn an_owner_that_is_gone_fails_the_query_naming_its_range() {
     let workspace = Workspace::new();
     let (a, b) = pair(&workspace);
     stock(&a);
-    a.bigc_stdin(&["import", "tx", "-"], &format!("country {IN_B} US\n")).expect(0);
+    a.bigctl_stdin(&["import", "tx", "-"], &format!("country {IN_B} US\n")).expect(0);
 
     b.stop();
 
-    let run = a.bigc(&["sql", "SELECT count(*) FROM tx"]);
+    let run = a.bigctl(&["sql", "SELECT count(*) FROM tx"]);
 
     assert_ne!(run.code, 0, "it refuses rather than answering: {:?}", run.out);
     assert!(run.said("64.."), "and names the range: {}{}", run.out, run.err);
@@ -122,12 +122,12 @@ fn each_node_reports_its_own_shards_and_ignores_its_peers() {
     let workspace = Workspace::new();
     let (a, b) = pair(&workspace);
 
-    let ready_a = a.bigc(&["--format", "json", "ready"]).expect(0);
+    let ready_a = a.bigctl(&["--format", "json", "ready"]).expect(0);
     assert!(ready_a.out.contains("\"a\""), "names itself: {}", ready_a.out);
     assert!(ready_a.out.contains("0..64"), "and its own range: {}", ready_a.out);
 
     b.stop();
-    let still = a.bigc(&["ready"]);
+    let still = a.bigctl(&["ready"]);
     assert_eq!(still.code, 0, "and stays ready without its peer: {}", still.err);
 }
 
@@ -139,10 +139,10 @@ fn a_schema_change_reaches_every_node() {
     stock(&a);
 
     // Asked of the node that is not the schema leader, so the answer had to travel.
-    let schema = b.bigc(&["--format", "json", "schema"]).expect(0);
+    let schema = b.bigctl(&["--format", "json", "schema"]).expect(0);
     assert!(schema.out.contains("country"), "the follower has it: {}", schema.out);
 
-    a.bigc(&["drop", "field", "tx", "country"]).expect(0);
-    let after = b.bigc(&["--format", "json", "schema"]).expect(0);
+    a.bigctl(&["drop", "field", "tx", "country"]).expect(0);
+    let after = b.bigctl(&["--format", "json", "schema"]).expect(0);
     assert!(!after.out.contains("country"), "and the drop reached it too: {}", after.out);
 }

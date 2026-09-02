@@ -155,7 +155,7 @@ fn header(n: u64, q: Questions) {
     );
     println!(
         "\nEvery engine here answers from **one node**: one process, one file, no shard fan-out, \
-         no merge and no network. `bigd --cluster` is not started at any point. The peers are \
+         no merge and no network. `big serve --cluster` is not started at any point. The peers are \
          single-node too - DuckDB and DataFusion in-process, ClickHouse one server over loopback \
          - so the comparison is not distorted by it, but no number below says anything about a \
          cluster: a fanned-out query pays a plan encode, a round trip per owner and a merge, and \

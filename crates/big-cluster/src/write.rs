@@ -50,7 +50,7 @@ impl<P: PagerMut + Sync> Cluster<P> {
     pub fn import_borrowed(
         &self,
         table: &str,
-        facts: &[big_api::Fact<'_>],
+        facts: &[big_embed::Fact<'_>],
     ) -> Result<WriteOutcome> {
         debug_assert!(self.writes_alone(), "import_borrowed on a node with peers");
         if !self.writes_alone() {
@@ -65,7 +65,7 @@ impl<P: PagerMut + Sync> Cluster<P> {
         // transaction they have always been. Splitting them would pay for an agreement with
         // nobody to agree with: two commits, four fsyncs, for a batch one node writes alone.
         if self.config.owns_everything() {
-            let borrowed: Vec<big_api::Fact<'_>> = facts.iter().map(OwnedFact::as_fact).collect();
+            let borrowed: Vec<big_embed::Fact<'_>> = facts.iter().map(OwnedFact::as_fact).collect();
             self.api.import(table, &borrowed)?;
             return Ok(WriteOutcome { count: facts.len() as u64, missed: Vec::new() });
         }
@@ -119,7 +119,7 @@ impl<P: PagerMut + Sync> Cluster<P> {
                 .iter()
                 .map(|a| KeyAssignment { field: &a.field, key: &a.key, row: a.row })
                 .collect();
-            let facts: Vec<big_api::Fact<'_>> =
+            let facts: Vec<big_embed::Fact<'_>> =
                 share.iter().map(|f| OwnedFact::as_fact(f)).collect();
             return self
                 .api
@@ -277,7 +277,7 @@ impl<P: PagerMut + Sync> Cluster<P> {
 
     /// One past the highest record id any node holds for a table.
     ///
-    /// One shard's work per node - see `big_api::Api::max_record` - and one round trip per
+    /// One shard's work per node - see `big_embed::Api::max_record` - and one round trip per
     /// statement that allocates, rather than per row. Zero for a table nobody has written to.
     pub(super) fn next_record(&self, table: &str) -> Result<RecordId> {
         let body = wire::TableRequest { table: table.to_string() }.encode();

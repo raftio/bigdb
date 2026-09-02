@@ -23,7 +23,7 @@
 // Each test binary uses its own subset, and an unused helper in one of them is not a defect.
 #![allow(dead_code)]
 
-use big_api::Api;
+use big_embed::Api;
 use big_http::Server;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};

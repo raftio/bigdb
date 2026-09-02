@@ -9,9 +9,9 @@ repository.workspace = true
 readme = "readme.md"
 
 [dependencies]
-big-db = { path = "../big-db", version = "0.1.0" }
-big-plan = { path = "../big-plan", version = "0.1.0" }
-big-pager = { path = "../big-pager", version = "0.1.0" }
+big-db.workspace = true
+big-plan.workspace = true
+big-pager.workspace = true
 
 [dev-dependencies]
 proptest = "1"

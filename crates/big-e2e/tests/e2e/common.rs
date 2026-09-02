@@ -15,7 +15,7 @@
 //! Finding the binaries, starting one, and stopping it however the test ends.
 //!
 //! **The daemon is a child process, so the interesting part is the failure path.** A test that
-//! asserts and unwinds must not leave a `bigd` holding a port and a file lock, and a test
+//! asserts and unwinds must not leave a `big serve` holding a port and a file lock, and a test
 //! waiting for something that will never happen must fail rather than hang. Both are handled
 //! here once: `Daemon` kills and reaps on `Drop`, and every wait has a deadline that fails with
 //! a sentence rather than expiring silently.
@@ -31,13 +31,16 @@ use std::time::{Duration, Instant};
 
 /// How long anything here waits before calling it a failure.
 ///
-/// Generous, because a cold `bigd` on a loaded machine can take a moment, and short enough that
+/// Generous, because a cold `big serve` on a loaded machine can take a moment, and short enough that
 /// a test that will never pass says so rather than holding the suite.
 const PATIENCE: Duration = Duration::from_secs(20);
 
 /// Which package builds which binary.
-const BINARIES: &[(&str, &str)] =
-    &[("bigd", "big-http"), ("bigc", "big-cli"), ("bigi", "big-ingest"), ("big", "big-db")];
+///
+/// Two, from one package, where there were four from four. `big-bin` is the only crate in the
+/// workspace with a `[[bin]]`, so this table is short by construction now rather than by
+/// upkeep.
+const BINARIES: &[(&str, &str)] = &[("big", "big-bin"), ("bigctl", "big-bin")];
 
 /// The directory this test executable was built into, which is where the binaries land.
 ///
@@ -187,7 +190,7 @@ impl Workspace {
     }
 }
 
-/// A running `bigd`, killed and reaped whenever the test ends.
+/// A running `big serve`, killed and reaped whenever the test ends.
 ///
 /// Owns no directory. A test that only needs a daemon uses [`Daemon::start`], which keeps a
 /// workspace alive alongside it; a test that outlives its daemon makes the [`Workspace`] first.
@@ -217,23 +220,23 @@ impl Daemon {
 
     /// One try at starting, retrying on a port that turned out not to be free.
     ///
-    /// A port handed out by `free_port` can be taken by something else before `bigd` binds it.
+    /// A port handed out by `free_port` can be taken by something else before `big serve` binds it.
     /// That is nobody's fault and would otherwise be a flaky test in every module here, so it is
-    /// handled once. `left` runs out rather than looping, because a `bigd` that cannot start for
+    /// handled once. `left` runs out rather than looping, because a `big serve` that cannot start for
     /// a *different* reason must fail rather than spin.
     fn spawn(path: PathBuf, log: PathBuf, flags: &[&str], left: u32) -> Self {
         let addr: SocketAddr = format!("127.0.0.1:{}", free_port()).parse().expect("loopback");
-        let mut args = vec![path.display().to_string(), addr.to_string()];
+        let mut args = vec!["serve".to_string(), path.display().to_string(), addr.to_string()];
         args.extend(flags.iter().map(|f| (*f).to_string()));
         // Into a file rather than a pipe: a pipe nobody drains fills up and stops the daemon,
         // and this one has to keep running for as long as the test does.
         let sink = std::fs::File::create(&log).expect("a log file");
-        let child = Command::new(bin("bigd"))
+        let child = Command::new(bin("big"))
             .args(&args)
             .stdout(Stdio::null())
             .stderr(Stdio::from(sink))
             .spawn()
-            .expect("bigd starts");
+            .expect("big serve starts");
 
         let mut daemon = Daemon { child, addr, path: path.clone(), log: log.clone(), own: None };
         if daemon.wait_until_healthy() {
@@ -241,7 +244,7 @@ impl Daemon {
         }
         assert!(
             left > 1,
-            "bigd never became healthy on any port tried; its log said:\n{}",
+            "big serve never became healthy on any port tried; its log said:\n{}",
             daemon.log()
         );
         drop(daemon); // Killed and reaped here, before the port is asked for again.
@@ -251,20 +254,20 @@ impl Daemon {
     /// A daemon at an address the caller chose, which must be free.
     fn at(path: PathBuf, log: PathBuf, addr: &str, flags: &[&str]) -> Self {
         let parsed: SocketAddr = addr.parse().expect("host:port");
-        let mut args = vec![path.display().to_string(), addr.to_string()];
+        let mut args = vec!["serve".to_string(), path.display().to_string(), addr.to_string()];
         args.extend(flags.iter().map(|f| (*f).to_string()));
         let sink = std::fs::File::create(&log).expect("a log file");
-        let child = Command::new(bin("bigd"))
+        let child = Command::new(bin("big"))
             .args(&args)
             .stdout(Stdio::null())
             .stderr(Stdio::from(sink))
             .spawn()
-            .expect("bigd starts");
+            .expect("big serve starts");
 
         let mut daemon = Daemon { child, addr: parsed, path, log, own: None };
         assert!(
             daemon.wait_until_healthy(),
-            "bigd never became healthy on {addr}; its log said:\n{}",
+            "big serve never became healthy on {addr}; its log said:\n{}",
             daemon.log()
         );
         daemon
@@ -298,25 +301,21 @@ impl Daemon {
         ["--addr".to_string(), self.addr.to_string()]
     }
 
-    /// One `bigc` subcommand against this daemon.
-    pub fn bigc(&self, args: &[&str]) -> Run {
-        self.bigc_stdin(args, "")
+    /// One `bigctl` subcommand against this daemon.
+    ///
+    /// One helper where there were two. A load used to be a different binary, so it needed its
+    /// own; now `import` is a subcommand like `schema` is, and a test that loads a file says so
+    /// in its arguments rather than in which method it called.
+    pub fn bigctl(&self, args: &[&str]) -> Run {
+        self.bigctl_stdin(args, "")
     }
 
     /// The same, with something on standard input.
-    pub fn bigc_stdin(&self, args: &[&str], stdin: &str) -> Run {
+    pub fn bigctl_stdin(&self, args: &[&str], stdin: &str) -> Run {
         let [flag, addr] = self.addr_args();
         let mut all = vec![flag.as_str(), addr.as_str()];
         all.extend_from_slice(args);
-        run_with_stdin("bigc", &all, stdin)
-    }
-
-    /// One `bigi` load against this daemon.
-    pub fn bigi(&self, args: &[&str]) -> Run {
-        let [flag, addr] = self.addr_args();
-        let mut all = vec![flag.as_str(), addr.as_str()];
-        all.extend_from_slice(args);
-        run("bigi", &all)
+        run_with_stdin("bigctl", &all, stdin)
     }
 
     /// A bare `GET`, for the two routes that are never authenticated.

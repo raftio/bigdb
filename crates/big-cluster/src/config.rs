@@ -581,7 +581,7 @@ impl ClusterConfig {
     /// nobody to disagree with.
     ///
     /// Not a special case - it is the general one with a peer count of zero, which is the
-    /// point. If `bigd` without `--cluster` took a different path through the coordinator,
+    /// point. If `big serve` without `--cluster` took a different path through the coordinator,
     /// that path would be the one nobody tests.
     pub fn solo(addr: &str) -> Self {
         Self {
