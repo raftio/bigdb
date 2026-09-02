@@ -16,18 +16,18 @@ categories = ["database-implementations","data-structures"]
 unstable = []
 
 [dependencies]
-big-civil = { path = "../big-civil", version = "0.1.0" }
-big-db = { path = "../big-db", version = "0.1.0" }
-big-exec = { path = "../big-exec", version = "0.1.0" }
+big-civil.workspace = true
+big-db.workspace = true
+big-exec.workspace = true
 # For `Api::execute`, which takes a plan a caller built rather than text this crate parses.
 # The coordinator needs it: a plan is what goes over the wire, so that two nodes cannot
 # disagree about what was asked.
-big-plan = { path = "../big-plan", version = "0.1.0" }
+big-plan.workspace = true
 # The SQL surface, which is a translation into `big-plan`'s AST rather than an engine of its
 # own: this crate parses SQL exactly where it already parses the query language, and everything
 # below sees the same `Plan` either way.
-big-sql = { path = "../big-sql", version = "0.1.0" }
-big-pager = { path = "../big-pager", version = "0.1.0" }
+big-sql.workspace = true
+big-pager.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

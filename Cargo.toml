@@ -30,7 +30,29 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.88"
 license = "Apache-2.0"
-repository = "https://github.com/9bany/big"
+repository = "https://github.com/raftio/bigdb"
+
+# Every internal crate named once. The version here is the one a release has to move, rather
+# than the same string repeated on thirty dependency lines where one can be missed. Paths
+# resolve from the workspace root, which is why `bench` no longer needs its own spelling of the
+# same dependency.
+[workspace.dependencies]
+big-btree = { path = "crates/big-btree", version = "0.1.0" }
+big-civil = { path = "crates/big-civil", version = "0.1.0" }
+big-cluster = { path = "crates/big-cluster", version = "0.1.0" }
+big-container = { path = "crates/big-container", version = "0.1.0" }
+big-db = { path = "crates/big-db", version = "0.1.0" }
+big-embed = { path = "crates/big-embed", version = "0.1.0" }
+big-engine = { path = "crates/big-engine", version = "0.1.0" }
+big-exec = { path = "crates/big-exec", version = "0.1.0" }
+big-http = { path = "crates/big-http", version = "0.1.0" }
+big-keys = { path = "crates/big-keys", version = "0.1.0" }
+big-page = { path = "crates/big-page", version = "0.1.0" }
+big-pager = { path = "crates/big-pager", version = "0.1.0" }
+big-plan = { path = "crates/big-plan", version = "0.1.0" }
+big-sql = { path = "crates/big-sql", version = "0.1.0" }
+# No version: `publish = false`, so it can only ever be reached by path.
+big-testfile = { path = "crates/big-testfile" }
 
 [profile.release]
 opt-level = 3

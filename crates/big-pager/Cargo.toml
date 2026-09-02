@@ -9,7 +9,7 @@ repository.workspace = true
 readme = "readme.md"
 
 [dependencies]
-big-page = { path = "../big-page", version = "0.1.0" }
+big-page.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

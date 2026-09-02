@@ -12,7 +12,7 @@ readme = "readme.md"
 # tests is a planner nobody tests. `big-civil` is calendar arithmetic and nothing else - no
 # files, no pages, no engine - and the planner needs it to know what `'2024-01-15'` is.
 [dependencies]
-big-civil = { path = "../big-civil", version = "0.1.0" }
+big-civil.workspace = true
 
 [dev-dependencies]
 proptest = "1"

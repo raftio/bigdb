@@ -128,8 +128,8 @@ rival engines to measure against, and `big-e2e` and `big-testfile`, which exist 
 1. Write the release notes. There is no `CHANGELOG.md` yet: nothing has been released, so
    every entry one could hold would describe the first release rather than a change to it.
    Whoever cuts that release writes it then, out of the git log.
-2. `workspace.package.version` in the root `Cargo.toml`, and the `version` on every path
-   dependency that names it.
+2. `workspace.package.version` in the root `Cargo.toml`, and the `version` on each entry in
+   `[workspace.dependencies]` beside it. Those are the only two places a version is written.
 3. CI green, including `fmt`, `clippy`, `docs`, `msrv` and the crash tests.
 4. `cargo publish` in the order above.
 5. Tag `v<version>`.

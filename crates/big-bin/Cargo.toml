@@ -22,11 +22,11 @@ categories = ["database","command-line-utilities"]
 # future `use big_sql` in `bigctl`. What is left is the rule written down here and in
 # `architecture.md`: the client sends bytes and prints what comes back. It parses no SQL.
 [dependencies]
-big-embed = { path = "../big-embed", version = "0.1.0" }
-big-cluster = { path = "../big-cluster", version = "0.1.0" }
-big-db = { path = "../big-db", version = "0.1.0" }
-big-http = { path = "../big-http", version = "0.1.0" }
-big-pager = { path = "../big-pager", version = "0.1.0" }
+big-embed.workspace = true
+big-cluster.workspace = true
+big-db.workspace = true
+big-http.workspace = true
+big-pager.workspace = true
 
 [dev-dependencies]
 # The client tests drive a real server in-process on a loopback port rather than a mock,

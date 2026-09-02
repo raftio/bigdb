@@ -11,8 +11,8 @@ readme = "readme.md"
 # One dependency, and it is the AST this crate writes into. Nothing here links a pager, so a
 # translation test costs what a parser test costs.
 [dependencies]
-big-civil = { path = "../big-civil", version = "0.1.0" }
-big-plan = { path = "../big-plan", version = "0.1.0" }
+big-civil.workspace = true
+big-plan.workspace = true
 
 [dev-dependencies]
-big-testfile = { path = "../big-testfile" }
+big-testfile.workspace = true

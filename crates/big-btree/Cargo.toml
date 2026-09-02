@@ -9,11 +9,11 @@ repository.workspace = true
 readme = "readme.md"
 
 [dependencies]
-big-container = { path = "../big-container", version = "0.1.0" }
-big-page = { path = "../big-page", version = "0.1.0" }
-big-pager = { path = "../big-pager", version = "0.1.0" }
+big-container.workspace = true
+big-page.workspace = true
+big-pager.workspace = true
 bytemuck = "1"
 
 [dev-dependencies]
-big-pager = { path = "../big-pager", version = "0.1.0", features = ["counting-pager"] }
+big-pager = { workspace = true, features = ["counting-pager"] }
 proptest = "1"

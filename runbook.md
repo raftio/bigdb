@@ -8,7 +8,7 @@ undoing an import. Nothing here is a procedure that has only been reasoned about
 Build the tool once:
 
 ```sh
-cargo build --release -p big-db --bin big
+cargo build --release -p big-bin --bin big
 ```
 
 ---
