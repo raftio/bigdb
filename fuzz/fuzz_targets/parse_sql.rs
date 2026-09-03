@@ -90,9 +90,21 @@ fuzz_target!(|data: &[u8]| {
         // assumption that it did.
         big_sql::Sql::Insert(i) => {
             assert!(i.id_at.is_none_or(|at| at < i.columns.len()));
-            for row in &i.rows {
+            for row in i.values() {
                 assert_eq!(row.len(), i.columns.len(), "a ragged tuple in `{text}`");
                 let _ = i.record(row);
+            }
+            // The other source: values read by a query. The three rules the parser promises
+            // about that form, none of which the type holds - as many selected columns as the
+            // statement names, no id column, since the form always allocates, and a source
+            // table that is not the target, which is the read that would feed its own write.
+            if let Some(select) = i.select() {
+                assert_eq!(select.items.len(), i.columns.len(), "a mismatched width in `{text}`");
+                assert!(i.id_at.is_none(), "an id column read from a query in `{text}`");
+                assert!(
+                    select.from.table != i.table || select.from.database != i.database,
+                    "a statement that reads what it writes in `{text}`"
+                );
             }
             assert!(!big_sql::explain::insert(&i).is_empty());
         }
