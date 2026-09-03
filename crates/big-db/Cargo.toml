@@ -13,6 +13,10 @@ big-btree.workspace = true
 big-engine.workspace = true
 big-keys.workspace = true
 big-pager.workspace = true
+# Roles and grants. Held in the catalog and encoded into the same record chain the schema uses,
+# the way row keys are - but what a privilege *means* is not this crate's, so the model and the
+# decision live in a crate that links no storage and that `big-sql` can see too.
+big-rbac.workspace = true
 
 [dev-dependencies]
 big-exec.workspace = true

@@ -50,6 +50,7 @@
 
 #![deny(unsafe_code)]
 
+pub mod acl;
 pub mod ast;
 pub mod ddl;
 pub mod error;
@@ -63,7 +64,11 @@ pub mod scalar;
 pub mod shape;
 pub mod show;
 
+pub use acl::{Acl, AclObject};
 pub use ast::{ExplainMode, Query, Select};
+// The privilege vocabulary, re-exported so a caller reading `Sql::demands` can name what it
+// hands back without depending on `big-rbac` directly.
+pub use big_rbac::{Demand, Object, ObjectRef, Privilege, Privileges};
 pub use ddl::{Alter, Column, ColumnKind, Ddl, MAX_VIEW_DEPTH};
 pub use error::{Refused, Result, SqlError};
 pub use insert::{Insert, MAX_INSERT_ROWS, RECORD_COLUMN};
@@ -78,20 +83,21 @@ pub use show::{Show, Shown};
 
 /// One statement, translated.
 ///
-/// Five variants because they are five different things downstream, and the differences are not
+/// Six variants because they are six different things downstream, and the differences are not
 /// cosmetic:
 ///
-/// | | what it is | what it costs the caller |
+/// | | what it is | what it demands |
 /// |---|---|---|
-/// | `Query` | calls a planner resolves and a coordinator fans out | a read |
-/// | `Insert` | literals for the layer that holds a schema to turn into facts | a write |
-/// | `Show` | a question the catalog already holds the answer to | a read |
-/// | `Ddl` | a change decided at one node and applied everywhere | an admin |
-/// | `Explain` | a description of one of the four above, run nowhere | whatever it wraps |
+/// | `Query` | calls a planner resolves and a coordinator fans out | `SELECT` on each table read |
+/// | `Insert` | literals for the layer that holds a schema to turn into facts | `INSERT`, and `SELECT` when the values come from a query |
+/// | `Show` | a question the catalog already holds the answer to | `SELECT` on the object named, or nothing for a listing |
+/// | `Ddl` | a change decided at one node and applied everywhere | `CREATE`, `ALTER` or `DROP` on what it names |
+/// | `Acl` | a change to who may do what, replicated the same way | `ROLES` on the server |
+/// | `Explain` | a description of one of the five above, run nowhere | whatever it wraps |
 ///
 /// That last column is why this is an enum rather than a `Statement` with more fields, and it is
-/// [`Sql::authority`] rather than prose: a caller asks the statement what it costs instead of
-/// writing a sixth match over these variants, and a further kind of statement cannot be added
+/// [`Sql::demands`] rather than prose: a caller asks the statement what it needs instead of
+/// writing a seventh match over these variants, and a further kind of statement cannot be added
 /// without that one match failing to compile.
 // The variants are far apart in size, and boxing the large one would be the wrong trade: a
 // `Sql` exists once per statement and is destructured immediately, so the allocation would be
@@ -105,12 +111,17 @@ pub enum Sql {
     Insert(Insert),
     Show(Show),
     Ddl(Ddl),
+    /// `GRANT`, `REVOKE`, `CREATE ROLE`, `DROP ROLE`.
+    ///
+    /// Nothing is lowered: an ACL statement names no column and reads no table, so there is no
+    /// plan to make. It arrives at the executor as it was written.
+    Acl(Acl),
     /// `EXPLAIN <statement>`: what the statement would do, having done none of it.
     ///
-    /// **A wrapper rather than a fifth kind of work.** The four above say what a statement
+    /// **A wrapper rather than a sixth kind of work.** The five above say what a statement
     /// does; this one does none of it - no plan is run, no fact is written, no schema is
-    /// changed. What it *costs the caller* is a separate question, and the answer is not "a
-    /// read": see [`Sql::authority`], which looks inside.
+    /// changed. What it *demands of the caller* is a separate question, and the answer is not
+    /// "a read": see [`Sql::demands`], which looks inside.
     Explain {
         /// Which half was asked for.
         mode: ExplainMode,
@@ -119,55 +130,138 @@ pub enum Sql {
     },
 }
 
-/// What a statement demands of whoever sent it.
-///
-/// **The last column of [`Sql`]'s table, as code rather than as prose.** That column was a
-/// promise two other crates were each keeping by hand - the HTTP edge turned a statement into
-/// the role a token needs, the un-clustered door turned one into a refusal - and two
-/// hand-written copies of one rule are one rule plus the day they disagree. It lives here, in
-/// the file where a variant can be added, so adding one fails to compile in exactly one place.
-///
-/// Deliberately *not* `big-http`'s `Role`. This says what a statement is; a role says what a
-/// credential holds. They happen to map one to one, and that mapping is the edge's to write -
-/// there is no reason for a dialect crate to learn how a token file is spelled.
-///
-/// Ordered, weakest first: an authority contains the ones below it, which is what lets an edge
-/// compare one against the floor its route already checked.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
-pub enum Authority {
-    /// Reads what is already there: a `SELECT`, a `DESCRIBE`, a `SHOW`.
-    Read,
-    /// Writes facts, and changes no schema.
-    Write,
-    /// Changes the schema.
-    Admin,
-}
-
 impl Sql {
-    /// What this statement demands of whoever sent it.
+    /// Every privilege this statement needs, on every object it needs one for.
     ///
-    /// **`EXPLAIN` inherits rather than reading as a read.** It runs nothing, so on the letter
-    /// of it an `EXPLAIN CREATE TABLE` is harmless - today it renders a parse tree the caller
-    /// already holds and reads no catalog at all. The rule is here anyway, because the
-    /// alternative decides an authority from a *wrapper keyword* rather than from what the
-    /// statement is about, and that is the shape that goes wrong the first time an explained
-    /// statement has to read something to say anything useful. An authority says which class of
-    /// statement a credential may name, not only which it may run - and this way round it fails
-    /// closed. It is also what ClickHouse does, whose `EXPLAIN` checks the access the explained
-    /// query would have needed rather than a permission of its own.
+    /// **An `AND`, never an `OR`.** A join over two tables needs `Select` on both, and holding it
+    /// on one is not most of the way to being allowed. The caller checks all of them or refuses.
     ///
-    /// The recursion terminates because the parser refuses `EXPLAIN EXPLAIN`, and would still
-    /// terminate on a nesting some other build wrote: each step unwraps one `Box`.
+    /// Deliberately here, next to the variants, rather than at the edge that enforces it: an
+    /// edge deciding what a statement costs by matching on the AST is how the rule ends up
+    /// written twice and enforced once. The match below is exhaustive, so a statement kind added
+    /// later cannot be added without answering for what it demands.
+    ///
+    /// Borrowed from the statement rather than owned, because a demand is made and answered
+    /// within one statement and never stored - owning the names would allocate twice per table
+    /// on the path that runs once per query.
+    ///
+    /// **What a listing does not demand.** `SHOW DATABASES` and `SHOW TABLES` demand nothing:
+    /// they answer with names, the route floor has already established that the caller is
+    /// somebody, and filtering a listing down to what the reader may query is a feature this
+    /// surface does not have yet. When it does, it belongs here. `SHOW GRANTS FOR <role>` is the
+    /// exception, because reading somebody else's privileges is an administrative act.
+    ///
+    /// The recursion through `EXPLAIN` terminates because the parser refuses `EXPLAIN EXPLAIN`,
+    /// and would still terminate on a nesting some other build wrote: each step unwraps one
+    /// `Box`.
     #[must_use]
-    pub fn authority(&self) -> Authority {
+    pub fn demands(&self) -> Vec<Demand<'_>> {
+        let mut out = Vec::new();
+        self.collect_demands(&mut out);
+        // The same table named twice is one demand: `gates.rs` compares an `EXPLAIN` against the
+        // statement it wraps, so the order and the repeats have to be a property of the
+        // statement rather than of how the walk happened to run.
+        out.dedup();
+        out
+    }
+
+    fn collect_demands<'a>(&'a self, out: &mut Vec<Demand<'a>>) {
         match self {
-            Self::Ddl(_) => Authority::Admin,
-            Self::Insert(_) => Authority::Write,
-            Self::Explain { inner, .. } => inner.authority(),
-            // A `SELECT` and a `DESCRIBE` both read, which is the floor every surface starts at.
-            Self::Query(_) | Self::Show(_) => Authority::Read,
+            Self::Query(statement) => {
+                for table in statement.tables() {
+                    out.push(Demand::new(Privilege::Select, object_of(table)));
+                }
+            }
+            Self::Insert(insert) => {
+                out.push(Demand::new(
+                    Privilege::Insert,
+                    table_ref(insert.database.as_deref(), &insert.table),
+                ));
+                // `INSERT ... SELECT` reads before it writes, and the read is a read: without
+                // this the refusal would land after the coordinator had already taken a run of
+                // record ids from the leader.
+                if let insert::Source::Select(select) = &insert.source {
+                    out.push(Demand::new(
+                        Privilege::Select,
+                        table_ref(select.from.database.as_deref(), &select.from.table),
+                    ));
+                    for join in &select.joins {
+                        out.push(Demand::new(
+                            Privilege::Select,
+                            table_ref(join.source.database.as_deref(), &join.source.table),
+                        ));
+                    }
+                }
+            }
+            Self::Show(show) => match &show.what {
+                Shown::Columns { database, table } | Shown::Create { database, table, .. } => {
+                    out.push(Demand::new(Privilege::Select, table_ref(database.as_deref(), table)));
+                }
+                // Listings of names. See the note above.
+                Shown::Tables { .. } | Shown::Views { .. } | Shown::Databases => {}
+                // Somebody else's privileges is an administrative question; your own is not.
+                Shown::Grants { role: Some(_) } | Shown::Roles => {
+                    out.push(Demand::server(Privilege::Roles));
+                }
+                Shown::Grants { role: None } => {}
+            },
+            Self::Ddl(ddl) => out.push(ddl_demand(ddl)),
+            // Every form of it administers roles, which is one privilege held on the server or
+            // nowhere - see `Privilege::Roles` for why it does not divide by database.
+            Self::Acl(_) => out.push(Demand::server(Privilege::Roles)),
+            // Inherited rather than read as a read. `EXPLAIN` runs nothing, but an authority
+            // decided from a *wrapper keyword* rather than from what the statement is about is
+            // the shape that goes wrong the first time an explained statement has to read
+            // something to say anything useful. This way round it fails closed, and it is what
+            // ClickHouse does.
+            Self::Explain { inner, .. } => inner.collect_demands(out),
         }
     }
+}
+
+/// The object a `Ddl` is about, and the privilege it needs over it.
+fn ddl_demand(ddl: &Ddl) -> Demand<'_> {
+    match ddl {
+        // A database is not *in* a database, so creating or dropping one is about the server.
+        Ddl::CreateDatabase { .. } => Demand::server(Privilege::Create),
+        Ddl::DropDatabase { .. } => Demand::server(Privilege::Drop),
+        // Creating is granted a level up from the thing created: there is no table yet to hold
+        // the privilege, so it is held over the database that will hold the table.
+        Ddl::CreateTable { database, .. } | Ddl::CreateView { database, .. } => {
+            Demand::new(Privilege::Create, database_ref(database.as_deref()))
+        }
+        Ddl::AlterTable { database, table, .. } => {
+            Demand::new(Privilege::Alter, table_ref(database.as_deref(), table))
+        }
+        Ddl::DropTable { database, table, .. } => {
+            Demand::new(Privilege::Drop, table_ref(database.as_deref(), table))
+        }
+        Ddl::DropView { database, name, .. } => {
+            Demand::new(Privilege::Drop, table_ref(database.as_deref(), name))
+        }
+    }
+}
+
+/// A `db.table` or bare `table` string, as the object it names.
+///
+/// Split on the first `.`, which is safe because `Refused::ThreePartName` means there is at most
+/// one and because a name holding a `.` is refused by the catalog on the way in.
+fn object_of(qualified: &str) -> ObjectRef<'_> {
+    match qualified.split_once('.') {
+        Some((database, table)) => ObjectRef::Table { database, table },
+        None => ObjectRef::Table { database: DEFAULT_DATABASE, table: qualified },
+    }
+}
+
+/// A table whose database may not have been filled in, which means the request was against the
+/// default one - `qualify` returns early in exactly that case.
+fn table_ref<'a>(database: Option<&'a str>, table: &'a str) -> ObjectRef<'a> {
+    ObjectRef::Table { database: database.unwrap_or(DEFAULT_DATABASE), table }
+}
+
+/// A whole database, whose name may not have been filled in for the same reason.
+fn database_ref(database: Option<&str>) -> ObjectRef<'_> {
+    ObjectRef::Database(database.unwrap_or(DEFAULT_DATABASE))
 }
 
 /// The database an unqualified name means when the request did not say.
@@ -233,6 +327,7 @@ pub fn qualify(parsed: &mut Parsed, database: &str) {
         }
         Parsed::Show(s) => s.what.fill_database(database),
         Parsed::Ddl(d) => d.fill_database(database),
+        Parsed::Acl(a) => a.fill_database(database),
         // The names an `EXPLAIN` describes are the inner statement's, and they mean what they
         // would have meant had it been run - so this is the same walk, one level down.
         Parsed::Explain { inner, .. } => qualify(inner, database),
@@ -249,6 +344,7 @@ pub fn finish(parsed: Parsed) -> Result<Sql> {
         Parsed::Insert(i) => Sql::Insert(i),
         Parsed::Show(s) => Sql::Show(s),
         Parsed::Ddl(d) => Sql::Ddl(d),
+        Parsed::Acl(a) => Sql::Acl(a),
         // Lowered exactly as it would have been unwrapped, so what is described is what would
         // have run - including the refusals. `EXPLAIN` of a statement this engine will not
         // answer fails with that statement's own refusal, which is the useful answer.

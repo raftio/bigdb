@@ -84,11 +84,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "big-rbac"
+version = "0.1.0"
+
+[[package]]
 name = "big-sql"
 version = "0.1.0"
 dependencies = [
  "big-civil",
  "big-plan",
+ "big-rbac",
 ]
 
 [[package]]

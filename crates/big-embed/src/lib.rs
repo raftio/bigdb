@@ -72,9 +72,10 @@ pub use big_sql::{
     Statement as SqlStatement, Threshold, Units,
 };
 pub use big_sql::{
-    Alter as SqlAlter, Authority, Column as SqlColumn, ColumnKind as SqlColumnKind, Ddl as SqlDdl,
-    ExplainMode, Insert as SqlInsert, Query as SqlQuery, Select as SqlSelect, Show as SqlShow,
-    Shown as SqlShown, Sql, SqlError, RECORD_COLUMN,
+    Acl as SqlAcl, AclObject as SqlAclObject, Alter as SqlAlter, Column as SqlColumn,
+    ColumnKind as SqlColumnKind, Ddl as SqlDdl, ExplainMode, Insert as SqlInsert,
+    Query as SqlQuery, Select as SqlSelect, Show as SqlShow, Shown as SqlShown, Sql, SqlError,
+    RECORD_COLUMN,
 };
 
 use big_db::{At, Db};
@@ -719,6 +720,196 @@ impl<P: PagerMut + Sync> Api<P> {
         introspect::show_databases(&self.schema())
     }
 
+    /// Makes a role. **`Ok(false)` means nothing changed** - it was already there.
+    ///
+    /// Roles are administered here rather than in `big-db` on purpose. What a role *is* belongs
+    /// to `big-rbac`, and where one is *kept* to the catalog's record chain; a third statement of
+    /// the same rule in the storage crate would be a third place for it to drift. What this layer
+    /// adds is the two things only it can: the name rule every catalog record is held to, and a
+    /// transaction to commit the change in.
+    pub fn create_role(&self, name: &str) -> Result<bool> {
+        big_db::catalog::check_name(name)?;
+        Ok(self.db.transact(|c| {
+            let before = c.rbac.role(name).is_some();
+            c.rbac.intern_role(name)?;
+            Ok(!before)
+        })?)
+    }
+
+    /// Removes a role and every grant it held. **`Ok(false)` means there was no such role.**
+    ///
+    /// One transaction, so there is no window in which the role is gone and its privileges are
+    /// still answerable. A users file naming it is not consulted - it cannot be, from here - so
+    /// whoever held it now holds a name that resolves to nothing, which is no privileges at all
+    /// and is the fail-closed direction.
+    pub fn drop_role(&self, name: &str) -> Result<bool> {
+        Ok(self.db.transact(|c| Ok(c.rbac.drop_role(name)?))?)
+    }
+
+    /// Every role, in name order. What `SHOW ROLES` lists.
+    ///
+    /// [`big_rbac::SUPERUSER`] is prepended rather than stored, the way `default` is prepended to
+    /// a listing of databases: it is true before anything is written, so a reload that had to
+    /// decide whether to put it back is a reload that could get it wrong.
+    pub fn roles(&self) -> Vec<String> {
+        let mut out = vec![big_rbac::SUPERUSER.to_string()];
+        out.extend(self.db.catalog().rbac.roles().map(|r| r.name));
+        out
+    }
+
+    /// What one role has been granted, as names rather than ids. What `SHOW GRANTS` lists.
+    ///
+    /// Each entry is the database and table the grant is about - `None` meaning "every" at that
+    /// level - and the privileges this build can name. A bit stored by a newer build is left out:
+    /// it is kept on disk, but it is not this build's to describe.
+    pub fn grants_of(
+        &self,
+        role: &str,
+    ) -> Vec<(Option<String>, Option<String>, Vec<&'static str>)> {
+        let catalog = self.db.catalog();
+        let Some(id) = catalog.rbac.role(role) else { return Vec::new() };
+        catalog
+            .rbac
+            .of(id)
+            .map(|(key, privileges)| {
+                let database = (key.database != big_rbac::ANY_DATABASE)
+                    .then(|| catalog.database_name(key.database).map(str::to_string))
+                    .flatten();
+                let table = (key.table != big_rbac::ANY_TABLE)
+                    .then(|| catalog.table_by_id(key.table).map(|t| t.name.clone()))
+                    .flatten();
+                (database, table, privileges.named().map(big_rbac::Privilege::as_str).collect())
+            })
+            .collect()
+    }
+
+    /// Whether `who` may do what `demand` asks.
+    ///
+    /// **The decision, and the reason it lives at this layer.** It needs two things that are only
+    /// together here: the grants, which are in the catalog, and the names in the demand, which
+    /// come from a statement. Resolving one against the other is a handful of map lookups over
+    /// integers and no I/O - which matters, because this runs once per demand per statement on a
+    /// path where re-authenticating would cost a second argon2 hash.
+    ///
+    /// Fails closed at every step. A role the catalog does not have holds nothing; an object that
+    /// does not exist cannot be granted on, so nothing reaches it either.
+    pub fn allows(&self, who: &big_rbac::Who, demand: big_rbac::Demand<'_>) -> bool {
+        use big_rbac::{ObjectRef, Who, ANY_DATABASE, ANY_TABLE};
+        match who {
+            // Auth is off, or the caller is a peer applying something already ruled on.
+            Who::Trusted => return true,
+            _ if who.is_superuser() => return true,
+            Who::Role(_) => {}
+        }
+        let Who::Role(role) = who else { return true };
+        let catalog = self.db.catalog();
+        let Some(role) = catalog.rbac.role(role) else { return false };
+        // **A name that resolves to nothing widens rather than refusing.** A grant is filed under
+        // the id of an object that exists, so a table nobody has created cannot have one of its
+        // own - but a role holding `sales.*` holds it over every table in `sales`, including the
+        // one somebody just mistyped. Narrowing to the level that *does* resolve is what lets
+        // that caller get the honest `404` instead of a `403` about a privilege they have.
+        //
+        // It leaks nothing: a caller without the wider grant is refused either way, and learns
+        // only that they were refused - which they already knew.
+        let (database, table) = match demand.on {
+            ObjectRef::Server => (ANY_DATABASE, ANY_TABLE),
+            ObjectRef::Database(name) => match catalog.database(name) {
+                Some(id) => (id, ANY_TABLE),
+                None => (ANY_DATABASE, ANY_TABLE),
+            },
+            ObjectRef::Table { database, table } => match catalog.database(database) {
+                None => (ANY_DATABASE, ANY_TABLE),
+                Some(database) => match catalog.table(database, table) {
+                    Some(t) => (database, t.id),
+                    None => (database, ANY_TABLE),
+                },
+            },
+        };
+        catalog.rbac.allows(role, demand.privilege, database, table)
+    }
+
+    /// What one role holds on exactly this object, with no widening applied.
+    ///
+    /// The raw stored mask, which is what a `GRANT` has to read before it can compute the mask to
+    /// store: the union across levels is the *decision*'s business, and adding a privilege to the
+    /// union rather than to the entry would write a grant nobody asked for.
+    pub fn granted(&self, role: &str, object: &big_rbac::Object) -> Result<big_rbac::Privileges> {
+        use big_rbac::{GrantKey, Object, ANY_DATABASE, ANY_TABLE};
+        let catalog = self.db.catalog();
+        let Some(role) = catalog.rbac.role(role) else { return Ok(big_rbac::Privileges::empty()) };
+        let key = match object {
+            Object::Server => GrantKey { role, database: ANY_DATABASE, table: ANY_TABLE },
+            Object::Database(name) => {
+                let Some(d) = catalog.database(name) else {
+                    return Err(big_db::DbError::UnknownDatabase(name.clone()).into());
+                };
+                GrantKey { role, database: d, table: ANY_TABLE }
+            }
+            Object::Table { database, table } => {
+                let Some(d) = catalog.database(database) else {
+                    return Err(big_db::DbError::UnknownDatabase(database.clone()).into());
+                };
+                let Some(t) = catalog.table(d, table) else {
+                    return Err(big_db::DbError::UnknownTable(table.clone()).into());
+                };
+                GrantKey { role, database: d, table: t.id }
+            }
+        };
+        Ok(catalog.rbac.get(key))
+    }
+
+    /// Sets one role's privileges on one object to exactly `privileges`.
+    ///
+    /// **Absolute rather than a change to what is there**, which is what makes a grant safe to
+    /// replicate: `GRANT` and `REVOKE` each read the current mask and compute the result once, so
+    /// what travels to another node is the answer rather than the arithmetic. See
+    /// [`big_rbac::Grants::set`].
+    ///
+    /// `None` for `database` means every database; `None` for `table` every table in the database
+    /// named. Both halves must already exist - a grant on a table nobody has created has no id to
+    /// hang on, and inventing one would resurrect the moment somebody used that name.
+    pub fn set_grant(
+        &self,
+        role: &str,
+        database: Option<&str>,
+        table: Option<&str>,
+        privileges: big_rbac::Privileges,
+    ) -> Result<()> {
+        use big_rbac::{GrantKey, RbacError, ANY_DATABASE, ANY_TABLE, SUPERUSER};
+        if role == SUPERUSER {
+            return Err(big_db::DbError::from(RbacError::ReservedRole(role.to_string())).into());
+        }
+        Ok(self.db.transact(|c| {
+            let role_id =
+                c.rbac.role(role).ok_or_else(|| RbacError::UnknownRole(role.to_string()))?;
+            let database_id = match database {
+                None => ANY_DATABASE,
+                Some(name) => c
+                    .database(name)
+                    .ok_or_else(|| big_db::DbError::UnknownDatabase(name.to_string()))?,
+            };
+            let table_id = match table {
+                None => ANY_TABLE,
+                // A table is only nameable inside a database, so `ON *.tbl` is not a shape a
+                // caller is allowed to have built.
+                Some(name) if database_id == ANY_DATABASE => {
+                    return Err(big_db::DbError::UnknownTable(name.to_string()))
+                }
+                Some(name) => {
+                    c.table(database_id, name)
+                        .ok_or_else(|| big_db::DbError::UnknownTable(name.to_string()))?
+                        .id
+                }
+            };
+            c.rbac.set(
+                GrantKey { role: role_id, database: database_id, table: table_id },
+                privileges,
+            )?;
+            Ok(())
+        })?)
+    }
+
     /// Stores a `SELECT` under a name. **`Ok(false)` means nothing changed** - the name already
     /// held this exact statement.
     ///
@@ -904,12 +1095,13 @@ impl<P: PagerMut + Sync> Api<P> {
             // change goes to the leader, an insert goes to the shard owners, and a listing is
             // already in this node's catalog. Reachable only through the un-clustered path; a
             // coordinator classifies first - see `Api::translate`.
-            big_sql::Sql::Ddl(_) | big_sql::Sql::Insert(_) | big_sql::Sql::Show(_) => {
-                Err(ApiError::Sql(big_sql::SqlError::Refused {
-                    what: big_sql::Refused::Write,
-                    at: 0,
-                }))
-            }
+            big_sql::Sql::Ddl(_)
+            | big_sql::Sql::Insert(_)
+            | big_sql::Sql::Show(_)
+            | big_sql::Sql::Acl(_) => Err(ApiError::Sql(big_sql::SqlError::Refused {
+                what: big_sql::Refused::Write,
+                at: 0,
+            })),
             // ...and an `EXPLAIN`, which is a statement *about* a statement: there is no plan
             // for this to answer with, because the whole of what it asks for is that nothing
             // runs. The surface that answers one is `Cluster::sql`, which builds rows.

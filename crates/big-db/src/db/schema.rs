@@ -22,6 +22,23 @@
 use super::*;
 
 impl<P: PagerMut> Db<P> {
+    /// Runs one transaction against the catalog, committing only if the closure succeeds.
+    ///
+    /// **The escape hatch for catalog objects this crate deliberately has no verbs for.** Roles
+    /// and grants are the case it exists for: where they are kept is this crate's, and what they
+    /// *mean* is `big-rbac`'s, so the layer that administers them is above both and still needs
+    /// the one thing only this crate can give it - a write that commits at the meta page flip
+    /// like every other schema change.
+    ///
+    /// An `Err` from the closure drops the write without committing, which is how every other
+    /// transaction here is abandoned: there is no rollback because nothing was written.
+    pub fn transact<T>(&self, f: impl FnOnce(&mut Catalog) -> Result<T>) -> Result<T> {
+        let mut w = self.write();
+        let out = f(&mut w.catalog)?;
+        w.commit()?;
+        Ok(out)
+    }
+
     /// Schema changes are ordinary transactions; there is no separate DDL path.
     ///
     /// Takes the default engine. See [`Db::create_table_with`] to choose one, and

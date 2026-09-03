@@ -84,6 +84,12 @@ pub enum Parsed {
     Insert(Insert),
     Show(Show),
     Ddl(crate::ddl::Ddl),
+    /// `GRANT`, `REVOKE`, `CREATE ROLE`, `DROP ROLE`: who may do what.
+    ///
+    /// Its own variant rather than a `Ddl`, because the two answer to different privileges and
+    /// travel differently: a schema change is about an object, and this is about the rules over
+    /// every object. Folding them together would make `Sql::demands` unable to tell them apart.
+    Acl(crate::acl::Acl),
     /// `EXPLAIN <statement>`: describe what the statement would do, and do none of it.
     ///
     /// **One variant that wraps every kind, rather than a flag on each.** A statement kind added
@@ -183,21 +189,49 @@ fn statement(p: &mut Parser<'_>, explainable: bool) -> Result<Parsed> {
         // surface that grew `CREATE INDEX` by accident would be a surface nobody chose.
         "CREATE" => {
             p.i += 1;
+            // A role is not a schema object, so it forks before the object words do. `USER` is
+            // refused right beside it, because the two look alike and only one of them is a
+            // thing this surface has - see `Refused::CreateUser`.
+            if p.eat_word("ROLE") {
+                return p.create_role().map(Parsed::Acl);
+            }
+            if p.word_is("USER") {
+                return Err(p.refuse(Refused::CreateUser));
+            }
             return p.create_table().map(Parsed::Ddl);
         }
         // `ALTER TABLE` adds and drops fields, which is the whole of what the engine below can
         // do to one.
         "ALTER" => {
             p.i += 1;
+            if p.word_is("USER") || p.word_is("ROLE") {
+                return Err(p.refuse(Refused::CreateUser));
+            }
             return p.alter_table().map(Parsed::Ddl);
         }
         "DROP" => {
             p.i += 1;
+            if p.eat_word("ROLE") {
+                return p.drop_role().map(Parsed::Acl);
+            }
+            if p.word_is("USER") {
+                return Err(p.refuse(Refused::CreateUser));
+            }
             return p.drop_table().map(Parsed::Ddl);
         }
         "INSERT" => {
             p.i += 1;
             return p.insert().map(Parsed::Insert);
+        }
+        // Neither is a schema change and neither reads a table, so both rule on their own
+        // leading word rather than on a second one.
+        "GRANT" => {
+            p.i += 1;
+            return p.grant().map(Parsed::Acl);
+        }
+        "REVOKE" => {
+            p.i += 1;
+            return p.revoke().map(Parsed::Acl);
         }
         "DESCRIBE" | "DESC" | "SHOW" => return p.show().map(Parsed::Show),
         // `DELETE FROM` has its own sentence: what it asks for exists, as record ids sent to
@@ -405,6 +439,15 @@ impl Parser<'_> {
         }
     }
 
+    /// Nothing may follow. What every statement with a fixed shape ends with, so that trailing
+    /// text is a syntax error rather than silently ignored.
+    pub(super) fn end_of_statement(&mut self) -> Result<()> {
+        if self.peek().is_some() {
+            return Err(self.syntax("the end of the statement"));
+        }
+        Ok(())
+    }
+
     pub(super) fn eat(&mut self, tok: &Tok) -> bool {
         if self.peek() == Some(tok) {
             self.i += 1;
@@ -558,6 +601,7 @@ impl Parser<'_> {
     }
 }
 
+mod acl;
 mod alter;
 mod cond;
 mod create;

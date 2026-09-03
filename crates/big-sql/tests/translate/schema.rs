@@ -333,8 +333,9 @@ fn the_alters_the_engine_cannot_make() {
     ] {
         assert_eq!(code(sql), "sql_no_constraints", "{sql}");
     }
-    // Everything an `ALTER` is not.
-    assert_eq!(code("ALTER USER bob SET PASSWORD 'x'"), "sql_read_only");
+    // Everything an `ALTER` is not. A user is not refused as "this surface does not write" any
+    // more: people are not stored here at all, and the sentence that says so is the useful one.
+    assert_eq!(code("ALTER USER bob SET PASSWORD 'x'"), "sql_no_users");
     // A database is not a level this catalog has, which is a different sentence from "this
     // surface does not write".
     // A database carries a name and nothing else, so there is nothing about one to alter -

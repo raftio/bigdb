@@ -54,10 +54,25 @@ pub mod kind {
     /// boundary falls wherever it falls, including mid-character, which is why the bytes are
     /// joined before they are validated as UTF-8 rather than one record at a time.
     pub const SAVED_QUERY_TEXT: u8 = 9;
+    /// A named set of privileges: id and name, laid out exactly as a database record is.
+    ///
+    /// The privileges themselves are not here. A role holds them on *objects*, and how many
+    /// objects is not known when the role is made, so each one is its own [`GRANT`] - the same
+    /// shape a table takes, where the columns are records of their own rather than a list
+    /// crammed into the header.
+    pub const ROLE: u8 = 10;
+    /// One role's privileges on one object: role id, database id, table id, and a bitset.
+    ///
+    /// **The only catalog record with no name in it.** Every id it carries was interned by the
+    /// records above, so a grant is four words and stops well short of the name field. Keying
+    /// by id rather than by name is what makes a grant vanish with the table it is about: ids
+    /// are never reissued, so a table dropped and recreated under the same name gets a new id
+    /// and cannot inherit the privileges the old one carried.
+    pub const GRANT: u8 = 11;
 }
 
 /// Every kind, so adding one without checking it against the others is not possible.
-pub const ALL_KINDS: [u8; 9] = [
+pub const ALL_KINDS: [u8; 11] = [
     kind::TABLE,
     kind::FIELD,
     kind::VIEW,
@@ -67,6 +82,8 @@ pub const ALL_KINDS: [u8; 9] = [
     kind::DATABASE,
     kind::SAVED_QUERY,
     kind::SAVED_QUERY_TEXT,
+    kind::ROLE,
+    kind::GRANT,
 ];
 
 // Distinctness, checked at compile time. Two crates allocate out of this space and cannot see

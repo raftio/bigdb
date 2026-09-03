@@ -124,7 +124,7 @@ use ops::*;
 use peer::*;
 use query::*;
 
-use crate::auth::{Auth, Credential, Identity, Outcome, Principal, Role};
+use crate::auth::{Auth, Credential, Identity, Outcome, Principal};
 use crate::metrics::ServerMetrics;
 use crate::{json, Request, Response};
 use big_cluster::wire::{self, OwnedFact};
@@ -132,6 +132,7 @@ use big_cluster::{Cluster, ClusterError};
 use big_db::catalog::FieldKind;
 use big_embed::{Api, Fact, FieldInfo, QueryOptions};
 use big_pager::PagerMut;
+use big_rbac::{Demand, ObjectRef, Privilege};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
@@ -173,13 +174,22 @@ pub struct Ctx<'a, P: PagerMut> {
 /// Three kinds rather than an `Option<Role>`, because a peer is not a very privileged person -
 /// it is a different kind of caller. See `Target::guard` for why that distinction is the one
 /// that shrinks the blast radius of a leaked node key.
+///
+/// **Borrows the route's captured names**, because a privilege here is about an object and the
+/// object is in the path: `DELETE /table/sales.orders` needs `DROP` on `sales.orders` and not on
+/// anything else. The static table this used to be could only name a role.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Guard {
+enum Guard<'a> {
     /// Never authenticated: `/health` and `/ready`, which have to answer while the database is
     /// unhealthy - exactly when a credential check might not.
     Open,
-    /// A person holding at least this role.
-    User(Role),
+    /// A credential that resolves, and nothing more.
+    ///
+    /// For the two routes where the privilege is not the route's to know: `POST /sql`, whose
+    /// statement says what it needs, and `GET /schema`, which answers with names.
+    Authenticated,
+    /// A person holding one privilege on one object.
+    Needs(Privilege, ObjectRef<'a>),
     /// Another node of this cluster, proven by its client certificate during the handshake.
     Node,
 }
@@ -237,7 +247,7 @@ enum Target<'a> {
     Backup,
 }
 
-impl Target<'_> {
+impl<'a> Target<'a> {
     /// Whether this route is one node talking to another.
     ///
     /// The two stamps below are checked for exactly these, because they are the only requests
@@ -280,25 +290,47 @@ impl Target<'_> {
     /// The read/write/admin distinctions that used to separate the peer routes from each other
     /// are gone with it. They only ever meant something while a peer presented the same *kind*
     /// of credential a person did.
-    fn guard(&self) -> Guard {
+    fn guard(&self) -> Guard<'a> {
+        // A table segment may be `sales.orders` or a bare `orders`; the bare form means the
+        // request's database, which `refuse` fills in because only it can see `?database=`.
+        let table = |t: &'a str| match t.split_once('.') {
+            Some((database, table)) => ObjectRef::Table { database, table },
+            None => ObjectRef::Table { database: "", table: t },
+        };
+        // What holds a table is what a `CREATE` is granted over: there is no table yet for the
+        // privilege to hang on, so it hangs on the database that will hold it.
+        let holder = |t: &'a str| match t.split_once('.') {
+            Some((database, _)) => ObjectRef::Database(database),
+            None => ObjectRef::Database(""),
+        };
         match self {
             Self::Health | Self::Ready => Guard::Open,
-            Self::Metrics
-            | Self::Schema
-            | Self::Query(_)
-            | Self::Sql
-            | Self::Records(_)
-            | Self::Verify => Guard::User(Role::Read),
-            Self::Import(_) | Self::DeleteRecords(_) => Guard::User(Role::Write),
-            Self::CreateTable(_)
-            | Self::CreateField(..)
-            | Self::DropTable(_)
-            | Self::DropField(..)
-            // A database is a schema change like any other. The powers have to move together:
-            // a weaker one that could drop a database would be a way round the stronger one
-            // that guards dropping the tables in it.
-            | Self::CreateDatabase(_)
-            | Self::DropDatabase(_) => Guard::User(Role::Admin),
+            // The statement says what it needs - see `Sql::demands` - and it cannot be known
+            // before the body is read. This is the floor, and the floor is "somebody".
+            Self::Sql => Guard::Authenticated,
+            // A listing of names, which is what every JDBC driver opens with. Filtering it down
+            // to what the reader may query is a feature this surface does not have yet; when it
+            // does, it belongs beside `Sql::demands` rather than here.
+            Self::Schema => Guard::Authenticated,
+            // About the process rather than about data, so it is one server-wide privilege
+            // rather than a role that also happened to read tables.
+            Self::Metrics | Self::Verify | Self::Repair | Self::Backup => {
+                Guard::Needs(Privilege::Operate, ObjectRef::Server)
+            }
+            Self::Query(t) | Self::Records(t) => Guard::Needs(Privilege::Select, table(t)),
+            Self::Import(t) => Guard::Needs(Privilege::Insert, table(t)),
+            // Deleting records is not inserting them: a credential that may add facts is not
+            // obviously one that may remove them, and the REST surface is where the two come
+            // apart, because SQL has no `DELETE`.
+            Self::DeleteRecords(t) => Guard::Needs(Privilege::Delete, table(t)),
+            Self::CreateTable(t) => Guard::Needs(Privilege::Create, holder(t)),
+            Self::CreateField(t, _) => Guard::Needs(Privilege::Alter, table(t)),
+            Self::DropTable(t) => Guard::Needs(Privilege::Drop, table(t)),
+            Self::DropField(t, _) => Guard::Needs(Privilege::Alter, table(t)),
+            // A database is not in a database, so both are about the server - the same answer
+            // `Sql::demands` gives `CREATE DATABASE`, and for the same reason.
+            Self::CreateDatabase(_) => Guard::Needs(Privilege::Create, ObjectRef::Server),
+            Self::DropDatabase(_) => Guard::Needs(Privilege::Drop, ObjectRef::Server),
 
             // Every one of these is a peer, and being a peer is the whole requirement. What
             // proves it is a client certificate this node's peer CA signed, checked during the
@@ -321,10 +353,6 @@ impl Target<'_> {
             | Self::PeerFragmentPut
             | Self::PeerKeysPut
             | Self::PeerRepaired => Guard::Node,
-            // `POST /repair` is the public one, asked for by an operator rather than by a node,
-            // so it stays a role. It is `admin` because a repair copies fragments between nodes.
-            Self::Repair => Guard::User(Role::Admin),
-            Self::Backup => Guard::User(Role::Admin),
         }
     }
 }
@@ -497,24 +525,6 @@ pub fn dispatch<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request) -> Answered
     Answered { response, who }
 }
 
-/// The same check, for a route whose static role is only a floor.
-///
-/// `POST /sql` is authorised as `read` because that is what almost every statement needs, and
-/// the check runs before the body is decoded. A statement that changes the schema needs more,
-/// and this is how it asks - see `routes::query::sql`.
-///
-/// **Takes the principal, not the request.** Under bearer tokens this re-ran the whole check and
-/// the comment here said it cost one constant-time comparison, which was true. Under argon2 it
-/// would cost a second fifty-millisecond hash on every single `POST /sql` - so the principal is
-/// resolved once by [`refuse`] and compared against here. This function does no verification and
-/// must never grow any.
-pub(super) fn require(principal: &Principal, needed: Role) -> Option<Response> {
-    match principal.holds(needed) {
-        Ok(()) => None,
-        Err(held) => Some(forbidden(principal, held, needed)),
-    }
-}
-
 /// Who this request is, or the response explaining why it is nobody.
 ///
 /// Returns the principal rather than a yes, which is what lets the per-statement check above be
@@ -524,24 +534,22 @@ pub(super) fn require(principal: &Principal, needed: Role) -> Option<Response> {
 /// boxing it would add an allocation to the path that is already answering "no" - to save moving
 /// bytes that are about to be written to a socket anyway.
 #[allow(clippy::result_large_err)]
-fn refuse<P: PagerMut + Sync>(
+fn refuse<'a, P: PagerMut + Sync>(
     ctx: &Ctx<'_, P>,
-    req: &Request,
-    guard: Guard,
+    req: &'a Request,
+    guard: Guard<'a>,
 ) -> Result<Principal, Response> {
-    let needed = match guard {
-        // Never authenticated, and never even looked at: the probes have to answer while the
-        // database is unhealthy, which is exactly when a credential check might not.
-        Guard::Open => return Ok(Principal::Anonymous),
-        Guard::User(role) => role,
-        // A peer route. `Role::Read` is passed only because `authorize` takes one; what decides
-        // this is the identity, checked immediately below.
-        Guard::Node => Role::Read,
-    };
+    // Never authenticated, and never even looked at: the probes have to answer while the
+    // database is unhealthy, which is exactly when a credential check might not.
+    if guard == Guard::Open {
+        return Ok(Principal::Anonymous);
+    }
 
     let presented = req.basic();
     let credential = presented.as_ref().map(|b| big_http_credential(b));
-    let principal = match ctx.auth.authorize(ctx.identity, credential, needed) {
+    // **Once.** Whatever the guard turns out to want, the argon2 verification happens here and
+    // nowhere else - a second one would cost fifty milliseconds on a path that runs per request.
+    let principal = match ctx.auth.authorize(ctx.identity, credential) {
         Outcome::Allowed(p) => p,
         Outcome::Unauthenticated => {
             return Err(Response::failure(
@@ -553,18 +561,6 @@ fn refuse<P: PagerMut + Sync>(
             // every HTTP client library looks for it. `charset` is RFC 7617 and tells a client
             // to encode the credential as UTF-8 rather than latin-1.
             .with_header("WWW-Authenticate", "Basic realm=\"big\", charset=\"UTF-8\""));
-        }
-        Outcome::Forbidden { held, needed } => {
-            return Err(Response::failure(
-                403,
-                "forbidden",
-                &format!(
-                    "user `{}` is `{}`; this route needs `{}`",
-                    presented.as_ref().map_or("-", |b| b.user.as_str()),
-                    held.as_str(),
-                    needed.as_str()
-                ),
-            ))
         }
         // Not a 401. A 401 tells a client to stop and fix its credentials; this one was never
         // looked at, and retrying is exactly the right thing to do.
@@ -590,31 +586,49 @@ fn refuse<P: PagerMut + Sync>(
             "this route is reachable only by another node of this cluster, which proves itself \
              with a client certificate rather than with a password",
         )),
-        Guard::User(_) if principal.is_node() => Err(Response::failure(
+        Guard::Needs(..) | Guard::Authenticated if principal.is_node() => Err(Response::failure(
             403,
             "not_a_user",
             "this route is reachable only by a person; a node certificate grants no role",
         )),
+        // The privilege the route itself demands. A statement's own demands are checked further
+        // in, by `Cluster::run`, against the same resolver - this is the half that can be
+        // decided from the path alone, and it is the only half the REST routes have.
+        Guard::Needs(privilege, on) => {
+            // A bare table name means the request's database, which only this layer can see.
+            let asked = req.param("database");
+            let database = asked.as_deref().unwrap_or(big_db::DEFAULT_DATABASE_NAME);
+            let on = match on {
+                ObjectRef::Table { database: "", table } => ObjectRef::Table { database, table },
+                ObjectRef::Database("") => ObjectRef::Database(database),
+                other => other,
+            };
+            if ctx.api().allows(&principal.who(), Demand::new(privilege, on)) {
+                Ok(principal)
+            } else {
+                Err(forbidden(&principal, privilege, on))
+            }
+        }
         _ => Ok(principal),
     }
 }
 
-/// The `403` a principal that does not reach far enough gets.
+/// The `403` a principal that does not hold what was needed gets.
 ///
-/// Names the user as well as the two roles. That is new, and it is the right call: a `403` is
-/// only ever seen by somebody who has already authenticated, so there is nothing here they did
-/// not already know - and an operator with two credentials in their shell history needs to be
-/// told which one they just used.
-fn forbidden(principal: &Principal, held: Role, needed: Role) -> Response {
+/// Names the user as well as the privilege and the object. That is deliberate: a `403` is only
+/// ever seen by somebody who has already authenticated, so there is nothing here they did not
+/// already know - and an operator with two credentials in their shell history needs to be told
+/// which one they just used.
+fn forbidden(principal: &Principal, privilege: Privilege, on: ObjectRef<'_>) -> Response {
+    let where_ = match on {
+        ObjectRef::Server => "the server".to_string(),
+        ObjectRef::Database(d) => format!("`{d}`"),
+        ObjectRef::Table { database, table } => format!("`{database}.{table}`"),
+    };
     Response::failure(
         403,
         "forbidden",
-        &format!(
-            "user `{}` is `{}`; this needs `{}`",
-            principal.display(),
-            held.as_str(),
-            needed.as_str()
-        ),
+        &format!("user `{}` does not hold {} on {where_}", principal.display(), privilege.as_str()),
     )
 }
 

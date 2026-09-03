@@ -22,6 +22,9 @@ tls = ["big-tls/tls"]
 # runtime for that would be a larger commitment than the whole engine has made so far.
 [dependencies]
 big-embed.workspace = true
+# For the status a refused role maps to. `DbError::Rbac` delegates, so this crate has to be
+# able to name the refusals it is delegating to.
+big-rbac.workspace = true
 # The socket, plain or TLS, and the identity a client certificate proved. With `tls` off this
 # is a `TcpStream` behind one `match` and brings nothing with it.
 big-tls.workspace = true

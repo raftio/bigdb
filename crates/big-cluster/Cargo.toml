@@ -19,6 +19,8 @@ tls = ["big-tls/tls"]
 # The socket a peer is reached over, plain or TLS. Forwarded, not turned on: `big-bin` decides.
 big-tls.workspace = true
 big-embed.workspace = true
+# The privilege mask a `SetGrant` carries over the wire.
+big-rbac.workspace = true
 big-container.workspace = true
 big-db.workspace = true
 big-exec.workspace = true

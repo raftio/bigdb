@@ -66,6 +66,16 @@ pub enum Shown {
     /// The question every JDBC driver and BI tool opens with, which is most of why a database
     /// level exists at all - a client cannot draw a table tree without it.
     Databases,
+    /// `SHOW ROLES`: one row per role.
+    ///
+    /// The reserved `superuser` is in the listing because it is true, not because it is stored -
+    /// the same way `default` appears in `SHOW DATABASES` without a record behind it.
+    Roles,
+    /// `SHOW GRANTS [FOR <role>]`: one row per object a role has been granted anything on.
+    ///
+    /// `None` means the caller's own role, which is the only form that needs no privilege:
+    /// reading what you yourself hold tells you nothing you could not find out by trying.
+    Grants { role: Option<String> },
     /// `SHOW CREATE [TABLE | VIEW] t`: one row, holding the statement that would recreate it.
     Create {
         database: Option<String>,
@@ -91,7 +101,9 @@ impl Shown {
             Self::Tables { database: d } | Self::Views { database: d } => {
                 d.get_or_insert_with(|| database.to_string());
             }
-            Self::Databases => {}
+            // Neither is about one database: a role is server-wide, which is what lets one
+            // grant reach across two of them.
+            Self::Databases | Self::Roles | Self::Grants { .. } => {}
         }
     }
 }

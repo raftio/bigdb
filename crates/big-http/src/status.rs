@@ -86,6 +86,12 @@ pub fn status_of(e: &ApiError) -> u16 {
         // The client wrote a value its field cannot hold, which is the same 400 an import line
         // with the same mistake gets.
         ApiError::Value(_) => 400,
+        // **`403`, and it shadows the `404` a missing table would have got.** The privilege is
+        // checked before anything is planned, so a caller who may not read a database and typos
+        // a table name in it is told they may not read it rather than that it is not there.
+        // That is correct: answering `404` would make this surface a way to ask which tables
+        // exist, for somebody with no privilege to know.
+        ApiError::Denied(_) => 403,
     }
 }
 
@@ -148,6 +154,15 @@ fn db(e: &DbError) -> u16 {
         // A view is a name a `FROM` resolves, so a missing one is a missing resource for the
         // same reason a missing table is - and distinguishable by its code, not its status.
         DbError::UnknownTable(_) | DbError::UnknownDatabase(_) | DbError::UnknownView(_) => 404,
+
+        // Roles and grants. A role that resolves to nothing is `404` for the reason a table is,
+        // and deliberately not `403`: this is a statement failing to find what it named, not a
+        // caller being refused what they asked for. The rest are the "state has to change"
+        // shape the `409` block below is about - the reserved role, and the two ceilings.
+        DbError::Rbac(e) => match e {
+            big_rbac::RbacError::UnknownRole(_) => 404,
+            _ => 409,
+        },
         // A field is named in a body far more often than in a path - `/import` and `/query`
         // both do - so the error-derived answer is `422`. The two routes that *do* put a
         // field in the URI (`POST` and `DELETE` on `/table/{t}/field/{f}`) answer `404`

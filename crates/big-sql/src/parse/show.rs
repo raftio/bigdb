@@ -80,9 +80,21 @@ impl Parser<'_> {
             let (database, table) = self.table_ref("a table or view name")?;
             return Ok(Shown::Create { database, table, view });
         }
-        // `SHOW INDEX`, `SHOW GRANTS`, `SHOW PROCESSLIST`: each is a surface of its own, and
-        // none of them is one this statement can grow by accident.
-        Err(self.syntax("TABLES, VIEWS, DATABASES, COLUMNS FROM a table, or CREATE TABLE"))
+        if self.eat_word("ROLES") {
+            return Ok(Shown::Roles);
+        }
+        if self.eat_word("GRANTS") {
+            // `FOR` names somebody else's role; without it the question is about the caller's
+            // own, which is the only form that needs no privilege to ask.
+            let role =
+                if self.eat_word("FOR") { Some(self.bare_ident("a role name")?) } else { None };
+            return Ok(Shown::Grants { role });
+        }
+        // `SHOW INDEX`, `SHOW PROCESSLIST`: each is a surface of its own, and neither is one
+        // this statement can grow by accident.
+        Err(self.syntax(
+            "TABLES, VIEWS, DATABASES, ROLES, GRANTS, COLUMNS FROM a table, or CREATE TABLE",
+        ))
     }
 
     /// The trailing `FORMAT <name>`, or the default.

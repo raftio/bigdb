@@ -41,7 +41,7 @@ Backing up a live database from *outside* the daemon is still not supported, and
 ## Take a backup
 
 ```sh
-# While serving. Needs `big serve --backup-dir /backup` and an `admin` user.
+# While serving. Needs `big serve --backup-dir /backup` and `OPERATE` on `*.*`.
 curl -X POST -u "$USER:$PASSWORD" \
   "http://127.0.0.1:7654/admin/backup?name=data-$(date +%F).big"
 # {"backup":"data-2026-08-30.big","txn_id":41,"pages":1873,"bytes":10403840}
@@ -430,19 +430,24 @@ tightening flushes everything written under the looser setting *before* it takes
 ### Users
 
 One `username role hash` per line; `#` starts a comment. The file is written by `big passwd` and
-by nothing else — there is deliberately no route that writes it, because one would let an `admin`
-credential rewrite the credential file over the network.
+by nothing else — there is deliberately no route that writes it, because one would let a
+privileged credential rewrite the credential file over the network.
+
+**The role is a name, not a rank.** What it may do is a set of grants in the catalog, made with
+`GRANT`. This file only says which role somebody holds; a name the catalog does not have is no
+privileges at all, which is the safe direction and the reason the server still starts.
 
 ```
 # /etc/big/users  — chmod 600
-ops        admin  $argon2id$v=19$m=19456,t=2,p=1$…   # schema changes, drops
-loader     write  $argon2id$v=19$m=19456,t=2,p=1$…   # /import and /delete
-dashboard  read   $argon2id$v=19$m=19456,t=2,p=1$…   # /query, /sql, /schema, /metrics
+ops        admin      $argon2id$v=19$m=19456,t=2,p=1$…
+loader     loader     $argon2id$v=19$m=19456,t=2,p=1$…
+dashboard  analyst    $argon2id$v=19$m=19456,t=2,p=1$…
+recovery   superuser  $argon2id$v=19$m=19456,t=2,p=1$…   # holds everything; see below
 ```
 
 ```sh
 big passwd /etc/big/users set ops --role admin   # asks for the password twice, echoes neither
-big passwd /etc/big/users role ops write         # change a role, leave the password alone
+big passwd /etc/big/users role ops analyst       # change a role, leave the password alone
 big passwd /etc/big/users delete ops
 big passwd /etc/big/users list                   # names and roles, never a hash
 ```
@@ -451,18 +456,93 @@ The password is never a flag and never an environment variable: an argument is v
 and in shell history. When standard input is not a terminal one line is read from it, which is
 the only non-tty path and is there so a provisioning script can pipe one in.
 
+**⚠️ Changing a role here needs a restart.** The users file is read once, at startup. Privileges
+themselves are live — a `GRANT` or a `REVOKE` applies to the next statement, cluster-wide — so it
+is only the line saying *which* role somebody holds that waits.
+
+### Roles and grants
+
+Roles live in the catalog, so they replicate through the same fan-out a `CREATE TABLE` takes and
+a backup carries them with the schema they are about.
+
+```sql
+CREATE ROLE analyst;
+GRANT SELECT ON sales.* TO analyst;          -- every table in one database
+GRANT SELECT, INSERT ON sales.orders TO loader;  -- one table
+GRANT ALL ON *.* TO admin;                   -- everything, including making roles
+REVOKE INSERT ON sales.orders FROM loader;
+SHOW ROLES;
+SHOW GRANTS FOR analyst;
+DROP ROLE analyst;
+```
+
+Seven privileges, granted on `*.*`, `db.*` or `db.table`:
+
+| | what it covers | grantable on |
+|---|---|---|
+| `SELECT` | reading rows, and `DESCRIBE`/`SHOW CREATE` of the object | all three |
+| `INSERT` | writing rows | all three |
+| `DELETE` | `POST /table/{t}/delete` | all three |
+| `CREATE` | making a database, table, view or column | `*.*`, `db.*` |
+| `DROP` | removing one | all three |
+| `ALTER` | adding or dropping a column | all three |
+| `ROLES` | `CREATE ROLE`, `DROP ROLE`, `GRANT`, `REVOKE` | `*.*` only |
+
+`OPERATE` is an eighth, held on `*.*` only, and guards `/metrics`, `/verify`, `/repair` and
+`/admin/backup` — `GRANT OPERATE ON *.* TO ops` grants exactly those four, and nothing about SQL.
+No statement ever demands it, so denying it produces no query-side refusal, only a `403` on the
+routes it guards.
+
+Grants are **additive and never subtract**: what a role holds on a table is the union of its
+grants at `*.*`, at that database, and at that table. `REVOKE` removes a grant rather than adding
+a denial, which is what keeps the answer independent of the order the levels are consulted in.
+
+**`superuser` holds everything and is never stored.** It exists before anything is written, cannot
+be created, dropped, or granted to, and is the only way out of an empty catalog: making the first
+role needs a privilege, and only this role has one already. Keep exactly one credential holding
+it, and treat it the way you treat a root password.
+
+**On the day this feature lands, every existing users file names roles no catalog has**, so every
+credential holds nothing. The recovery is:
+
+```sh
+big passwd /etc/big/users role recovery superuser   # before restarting
+# restart, then:
+bigctl --user recovery sql "CREATE ROLE admin"
+bigctl --user recovery sql "GRANT ALL ON *.* TO admin"
+```
+
+There are ceilings: **64 roles** and **256 grants** across all of them. The catalog is re-encoded
+on every commit that dirties it — including ones that only wrote data, because fragment metadata
+shares the chain — so an unbounded set of grants would make every import pay for them. Grants are
+dense enough that this is a great deal of policy: a role with the run of a database is one entry,
+not one per table.
+
 | Route | Who |
 |---|---|
 | `GET /health`, `GET /ready` | **nobody, ever** |
-| `GET /metrics`, `GET /schema`, `POST /table/{t}/query`, `POST /sql`, `GET /table/{t}/records` | a `read` user |
-| `POST /table/{t}/import`, `POST /table/{t}/delete` | a `write` user |
-| `POST`/`DELETE` on tables and fields | an `admin` user |
+| `POST /sql` | anybody who authenticates; the *statement* then says what it needs |
+| `GET /schema` | anybody who authenticates — it answers with names |
+| `GET /metrics`, `GET /verify`, `POST /repair`, `POST /admin/backup` | `OPERATE` on `*.*` |
+| `POST /table/{t}/query`, `GET /table/{t}/records` | `SELECT` on that table |
+| `POST /table/{t}/import` | `INSERT` on that table |
+| `POST /table/{t}/delete` | `DELETE` on that table |
+| `POST /table/{t}` | `CREATE` on the database holding it |
+| `DELETE /table/{t}` | `DROP` on that table |
+| `POST`/`DELETE` on a field | `ALTER` on that table |
+| `POST`/`DELETE` on a database | `CREATE`/`DROP` on `*.*` |
 | `/internal/*` | **another node**, proven by its client certificate — not a user, however privileged |
 
-Give the metrics scraper its own `read` user rather than an `admin` one. A missing or unknown
-credential is `401`; a known one that does not reach far enough is `403`, and the body names the
-user, the role it holds and the role it needed — hiding that stops a legitimate operator from
+Give the metrics scraper a role holding `OPERATE` and nothing else. A missing or unknown
+credential is `401`; a credential that does not hold what was needed is `403`, and the body names
+the user, the privilege and the object — hiding that stops a legitimate operator from
 understanding the refusal and stops nobody else.
+
+**A `403` can shadow a `404`.** The privilege is checked before anything is planned, so a caller
+who may not read a database and mistypes a table in it is told they may not read it rather than
+that it is not there. That is deliberate: answering `404` would make the surface a way to ask
+which tables exist. Where the caller *does* hold the privilege, a mistyped name still answers
+`404` as it always did.
 
 Credentials are hashed with argon2id, which the file this replaced did not do. That is not a
 change of mind about the old reasoning — a token in a plaintext file really was the smaller of
@@ -476,7 +556,9 @@ is the point of a password hash and it is an operational number. Three things ke
 
 - a verified credential is cached for **60 seconds** from when it was verified, so a busy client
   pays once a minute rather than once a request. The window is absolute, never extended by use,
-  so a `big passwd delete` takes effect within a minute without a restart.
+  so a `big passwd delete` takes effect within a minute without a restart. What is cached is
+  **which line of the users file the password matched**, not what that role may do — so a `GRANT`
+  or a `REVOKE` is never stale, and the window is about passwords only.
 - failures are **never** cached, so every wrong password pays — which is also the rate limit.
 - at most `--workers / 4` verifications run at once. Past that a request waits up to a second and
   is then refused with `503 busy_authenticating`, which is a retry, not a `401`.

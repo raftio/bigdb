@@ -22,7 +22,7 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use big_sql::{Authority, Ddl, Refused, Sql};
+use big_sql::{Ddl, Privilege, Refused, Sql};
 
 /// Every statement in the corpus, whatever directive it was written under.
 ///
@@ -216,50 +216,91 @@ fn explain_wraps_every_statement_unchanged() {
     }
 }
 
-/// **What a statement costs agrees with the keyword it opens with.**
+/// **What a statement demands agrees with the keyword it opens with.**
 ///
-/// Checked against the leading word *on purpose*, which is the one derivation
-/// [`Sql::authority`] refuses to use: it reads the parse tree, this reads the text, and a test
-/// that re-implemented the match it is checking would pass whatever that match said. Held over
-/// the corpus so a statement added to a file is a statement this covers.
+/// Checked against the leading word *on purpose*, which is the one derivation [`Sql::demands`]
+/// refuses to use: it reads the parse tree, this reads the text, and a test that re-implemented
+/// the match it is checking would pass whatever that match said. Held over the corpus so a
+/// statement added to a file is a statement this covers.
+///
+/// The claim is about the *strongest* privilege demanded, because that is what the leading word
+/// can predict: which objects it is over is the statement's business and is checked nowhere but
+/// in the resolver.
 #[test]
-fn what_a_statement_costs_agrees_with_the_word_it_opens_with() {
+fn what_a_statement_demands_agrees_with_the_word_it_opens_with() {
     for (path, line, sql) in statements() {
         let Ok(parsed) = big_sql::translate(&sql) else { continue };
         let mut words = sql.split_whitespace();
         // `EXPLAIN` and the half it may name are skipped rather than judged: what an explanation
-        // costs is the *next* word's business, which is the claim the test below is about.
+        // demands is the *next* word's business, which is the claim the test below is about.
         let mut word = words.next().unwrap_or_default().to_uppercase();
         while matches!(word.as_str(), "EXPLAIN" | "PLAN" | "SHAPE") {
             word = words.next().unwrap_or_default().to_uppercase();
         }
-        let expected = match word.as_str() {
-            "CREATE" | "ALTER" | "DROP" => Authority::Admin,
-            "INSERT" => Authority::Write,
-            // `WITH` binds constants for a `SELECT`; the rest read what is already there.
-            "SELECT" | "WITH" | "DESCRIBE" | "DESC" | "SHOW" => Authority::Read,
-            other => panic!("{}:{line}: no expected authority for `{other}`", path.display()),
+        let demanded: Vec<Privilege> = parsed.demands().iter().map(|d| d.privilege).collect();
+        let ok = match word.as_str() {
+            "CREATE" => {
+                demanded.contains(&Privilege::Create) || demanded.contains(&Privilege::Roles)
+            }
+            "ALTER" => demanded.contains(&Privilege::Alter),
+            "DROP" => demanded.contains(&Privilege::Drop) || demanded.contains(&Privilege::Roles),
+            // A write, and a read too when the values come from a query.
+            "INSERT" => demanded.contains(&Privilege::Insert),
+            "GRANT" | "REVOKE" => demanded == [Privilege::Roles],
+            // `WITH` binds constants for a `SELECT`; the rest read what is already there. A
+            // listing of names demands nothing at all - see `Sql::demands`.
+            "SELECT" | "WITH" | "DESCRIBE" | "DESC" | "SHOW" => {
+                demanded.iter().all(|p| matches!(p, Privilege::Select | Privilege::Roles))
+            }
+            other => panic!("{}:{line}: nothing expected for `{other}`", path.display()),
         };
-        assert_eq!(
-            parsed.authority(),
-            expected,
-            "{}:{line}: `{word}` statement demands the wrong authority\n  {sql}",
-            path.display()
-        );
+        assert!(ok, "{}:{line}: `{word}` statement demands {demanded:?}\n  {sql}", path.display());
     }
 }
 
-/// **`EXPLAIN X` costs exactly what `X` costs.**
+/// **A statement never demands a privilege on an object it does not name.**
 ///
-/// The load-bearing half of [`Sql::authority`], and the reason it looks inside the wrapper: an
-/// explanation that read as a plain read would let a `read` token name a schema change, which is
-/// the class of statement its credential says it may not name. ClickHouse decides it the same
-/// way - its `EXPLAIN` checks the access the explained query would have needed.
+/// The half that matters once a privilege is about an object rather than a level: a `SELECT`
+/// from `sales.orders` that demanded anything on `ops.ledger` would be a fence around the wrong
+/// table, and no amount of correct comparison downstream would notice.
+#[test]
+fn every_demand_names_something_the_statement_wrote() {
+    for (path, line, sql) in statements() {
+        let Ok(parsed) = big_sql::translate(&sql) else { continue };
+        let lowered = sql.to_lowercase();
+        for demand in parsed.demands() {
+            let named = match demand.on {
+                // `*.*` is not written in most statements that demand it - `CREATE DATABASE`
+                // demands it because a database is not inside one - so there is nothing to find.
+                big_sql::ObjectRef::Server => continue,
+                big_sql::ObjectRef::Database(d) => d.to_string(),
+                big_sql::ObjectRef::Table { table, .. } => table.to_string(),
+            };
+            // The default database is filled in rather than written, so it is not in the text.
+            if named == big_sql::DEFAULT_DATABASE {
+                continue;
+            }
+            assert!(
+                lowered.contains(&named.to_lowercase()),
+                "{}:{line}: demands {} on `{named}`, which the statement never names\n  {sql}",
+                path.display(),
+                demand.privilege.as_str()
+            );
+        }
+    }
+}
+
+/// **`EXPLAIN X` demands exactly what `X` demands.**
+///
+/// The load-bearing half of [`Sql::demands`], and the reason it looks inside the wrapper: an
+/// explanation that read as a plain read would let a credential name a schema change it may not
+/// make. ClickHouse decides it the same way - its `EXPLAIN` checks the access the explained
+/// query would have needed.
 ///
 /// Held over the whole corpus rather than over a handful of statements, so the rule covers every
 /// kind of statement anybody ever writes a case for, including ones added after this.
 #[test]
-fn explaining_a_statement_costs_what_the_statement_costs() {
+fn explaining_a_statement_demands_what_the_statement_demands() {
     for (path, line, sql) in statements() {
         // Already an `EXPLAIN`; wrapping one again is the nesting the parser refuses.
         if sql.trim_start().get(..7).is_some_and(|w| w.eq_ignore_ascii_case("EXPLAIN")) {
@@ -271,9 +312,9 @@ fn explaining_a_statement_costs_what_the_statement_costs() {
             continue;
         };
         assert_eq!(
-            explained.authority(),
-            bare.authority(),
-            "{}:{line}: EXPLAIN changed what the statement costs\n  {sql}",
+            explained.demands(),
+            bare.demands(),
+            "{}:{line}: EXPLAIN changed what the statement demands\n  {sql}",
             path.display()
         );
     }

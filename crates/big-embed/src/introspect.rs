@@ -189,6 +189,39 @@ pub fn show_databases(tables: &[TableInfo]) -> ResultSet {
     }
 }
 
+/// `SHOW ROLES`: one row per role.
+///
+/// The reserved role is prepended rather than stored, exactly as `default` appears in
+/// `show_databases` above without a record behind it - see [`big_rbac::SUPERUSER`].
+pub fn show_roles(roles: &[String]) -> ResultSet {
+    ResultSet {
+        columns: vec!["name".to_string()],
+        rows: roles.iter().map(|r| vec![Datum::Text(r.clone())]).collect(),
+    }
+}
+
+/// `SHOW GRANTS [FOR r]`: one row per object the role has been granted anything on.
+///
+/// An empty answer is the honest one for a role that holds nothing, and for a role that does not
+/// exist. Telling those apart would make this statement a way to ask whether a role exists, which
+/// is a question somebody who cannot administer roles has no business getting an answer to.
+pub fn show_grants(grants: &[(Option<String>, Option<String>, Vec<&'static str>)]) -> ResultSet {
+    ResultSet {
+        columns: ["object", "privileges"].map(str::to_string).to_vec(),
+        rows: grants
+            .iter()
+            .map(|(database, table, privileges)| {
+                let object = match (database, table) {
+                    (None, _) => "*.*".to_string(),
+                    (Some(d), None) => format!("{d}.*"),
+                    (Some(d), Some(t)) => format!("{d}.{t}"),
+                };
+                vec![Datum::Text(object), Datum::Text(privileges.join(", "))]
+            })
+            .collect(),
+    }
+}
+
 /// `SHOW CREATE TABLE t`: one row holding the statement that would recreate it.
 ///
 /// Rendered by `big-sql`, which owns the mapping between a type name and a field kind in both

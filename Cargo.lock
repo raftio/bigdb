@@ -626,6 +626,7 @@ dependencies = [
  "big-exec",
  "big-pager",
  "big-plan",
+ "big-rbac",
  "big-testfile",
  "big-tls",
  "bytemuck",
@@ -651,6 +652,7 @@ dependencies = [
  "big-exec",
  "big-keys",
  "big-pager",
+ "big-rbac",
  "proptest",
  "tempfile",
 ]
@@ -671,6 +673,7 @@ dependencies = [
  "big-exec",
  "big-pager",
  "big-plan",
+ "big-rbac",
  "big-sql",
  "tempfile",
 ]
@@ -709,6 +712,7 @@ dependencies = [
  "big-exec",
  "big-pager",
  "big-plan",
+ "big-rbac",
  "big-sql",
  "big-testfile",
  "big-tls",
@@ -774,11 +778,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "big-rbac"
+version = "0.1.0"
+
+[[package]]
 name = "big-sql"
 version = "0.1.0"
 dependencies = [
  "big-civil",
  "big-plan",
+ "big-rbac",
  "big-testfile",
 ]
 

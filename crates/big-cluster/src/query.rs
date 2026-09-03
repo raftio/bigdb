@@ -42,10 +42,11 @@ impl<P: PagerMut + Sync> Cluster<P> {
 
     /// What this text is, resolved against the request but run nowhere.
     ///
-    /// The edge needs the answer before it can decide what the request costs: `POST /sql` is
-    /// authorised as `read`, and a schema change written in SQL needs `admin` - see
-    /// [`big_embed::Sql::authority`]. Exposed here rather than having the edge parse for itself,
-    /// so that what decides the role and what decides the action are one definition.
+    /// The edge needs the value before it can decide what the request costs: the route's guard is
+    /// a floor, and which privileges a statement actually needs - on which objects - is
+    /// [`big_embed::Sql::demands`]'s to say, next to the variants it is about. Exposed here rather
+    /// than having the edge parse for itself, so that what decides the privilege and what decides
+    /// the action are one definition.
     ///
     /// **`opts` rather than nothing, and the statement rather than a verdict.** The edge used to
     /// classify against the default database and then hand the *text* back for [`Cluster::sql`]
@@ -287,8 +288,13 @@ impl<P: PagerMut + Sync> Cluster<P> {
     /// [`Cluster::classify`] then [`Cluster::run`], which is what a caller with no reason to
     /// look at the statement in between wants. An edge that authorises the statement first
     /// calls the two halves itself and passes the same value to both.
-    pub fn sql(&self, text: &str, opts: &QueryOptions) -> Result<(ResultSet, Format)> {
-        self.run(self.classify(text, opts)?, opts)
+    pub fn sql(
+        &self,
+        text: &str,
+        who: &big_rbac::Who,
+        opts: &QueryOptions,
+    ) -> Result<(ResultSet, Format)> {
+        self.run(self.classify(text, opts)?, who, opts)
     }
 
     /// An already-classified statement, run wherever it has to run, answered as rows.
@@ -304,7 +310,34 @@ impl<P: PagerMut + Sync> Cluster<P> {
     /// **Takes the statement, not the text.** The value handed in is the one the caller
     /// authorised, so nothing between the check and the work can re-read the bytes and reach a
     /// different conclusion about what they say.
-    pub fn run(&self, sql: big_embed::Sql, opts: &QueryOptions) -> Result<(ResultSet, Format)> {
+    pub fn run(
+        &self,
+        sql: big_embed::Sql,
+        who: &big_rbac::Who,
+        opts: &QueryOptions,
+    ) -> Result<(ResultSet, Format)> {
+        // **Every demand, before any of the work.** The statement says what it needs next to the
+        // variants it is about; this asks whether the caller holds all of it. A pure lookup over
+        // integers against the catalog already in memory - it must never grow an I/O, because it
+        // runs once per statement on the path where re-authenticating would cost a second argon2
+        // hash.
+        //
+        // Ahead of the fan-out rather than inside it, so a refused statement reaches no peer and
+        // takes no record ids from the leader.
+        for demand in sql.demands() {
+            if !self.api.allows(who, demand) {
+                return Err(ClusterError::Local(big_embed::ApiError::Denied(Box::new(
+                    big_rbac::Denied {
+                        role: match who {
+                            big_rbac::Who::Role(r) => Some(r.clone()),
+                            big_rbac::Who::Trusted => None,
+                        },
+                        privilege: demand.privilege,
+                        on: demand.on.to_owned(),
+                    },
+                ))));
+            }
+        }
         // The five kinds go to different places: a query is planned here and fanned out to the
         // owners, a schema change goes to the leader and then everywhere, an insert goes to the
         // shards that own its records, and a listing goes nowhere at all. Deciding it here
@@ -314,7 +347,11 @@ impl<P: PagerMut + Sync> Cluster<P> {
         let statement = match sql {
             big_embed::Sql::Ddl(ddl) => return self.sql_ddl(&ddl),
             big_embed::Sql::Insert(insert) => return self.sql_insert(&insert, opts),
-            big_embed::Sql::Show(show) => return self.sql_show(&show),
+            big_embed::Sql::Show(show) => return self.sql_show(&show, who),
+            // Replicated through the same leader-then-fan-out a schema change takes, because a
+            // grant that reached two nodes of three is an intermittent refusal - which is the
+            // failure nobody notices.
+            big_embed::Sql::Acl(acl) => return self.sql_acl(&acl),
             // `EXPLAIN` reaches none of the three above and none of the fan-out below: what the
             // statement is has already been decided by the time it gets here, and writing it
             // out is the whole of the work.
@@ -427,6 +464,10 @@ impl<P: PagerMut + Sync> Cluster<P> {
             // The three that need no schema, so nothing here is resolved for them at all.
             big_embed::Sql::Ddl(d) => (
                 big_embed::explain::result_set(mode, &big_embed::explain::Explained::Ddl(&d)),
+                Format::default(),
+            ),
+            big_embed::Sql::Acl(a) => (
+                big_embed::explain::result_set(mode, &big_embed::explain::Explained::Acl(&a)),
                 Format::default(),
             ),
             big_embed::Sql::Insert(i) => (
@@ -586,7 +627,9 @@ impl<P: PagerMut + Sync> Cluster<P> {
         // client wrote.
         let statement = big_embed::lower(&query)
             .map_err(|e| ClusterError::Local(big_embed::ApiError::Sql(e)))?;
-        let (set, _) = self.run(big_embed::Sql::Query(statement), opts)?;
+        // Trusted: the outer statement's demands covered this table before any of this ran, and
+        // asking again here would refuse a read the caller was already allowed to make.
+        let (set, _) = self.run(big_embed::Sql::Query(statement), &big_rbac::Who::Trusted, opts)?;
 
         let mut out = Vec::with_capacity(set.rows.len());
         for row in &set.rows {
@@ -614,7 +657,74 @@ impl<P: PagerMut + Sync> Cluster<P> {
     }
 
     /// `DESCRIBE` and `SHOW`, answered out of this node's catalog - which is every node's.
-    fn sql_show(&self, show: &big_embed::SqlShow) -> Result<(ResultSet, Format)> {
+    /// `GRANT`, `REVOKE`, `CREATE ROLE`, `DROP ROLE`.
+    ///
+    /// **The resulting mask is computed here, at the coordinator, and the answer is what
+    /// travels.** A peer applying a delta would have to read its own grants to know what the
+    /// result should be, and two nodes reading two states is how they end up disagreeing about
+    /// who may do what. See `wire::Ddl::SetGrant`.
+    ///
+    /// ⚠️ A partial failure matters more here than for a schema change. A `REVOKE` that reached
+    /// two nodes of three leaves the privilege live on the third, which in a load-balanced pool
+    /// is an intermittent success where a refusal was wanted - the failure mode nobody notices.
+    /// `ClusterError::Partial` names the nodes; a revoke reported partial must be re-run until
+    /// it is not.
+    fn sql_acl(&self, acl: &big_embed::SqlAcl) -> Result<(ResultSet, Format)> {
+        let (column, changed) = match acl {
+            big_embed::SqlAcl::CreateRole { name, if_not_exists } => {
+                if *if_not_exists && self.api.roles().iter().any(|r| r == name) {
+                    ("role", 0u64)
+                } else {
+                    ("role", self.ddl(&Ddl::CreateRole { role: name.clone() })?)
+                }
+            }
+            big_embed::SqlAcl::DropRole { name, if_exists } => {
+                if *if_exists && !self.api.roles().iter().any(|r| r == name) {
+                    ("dropped", 0)
+                } else {
+                    ("dropped", self.ddl(&Ddl::DropRole { role: name.clone() })?)
+                }
+            }
+            big_embed::SqlAcl::Grant { privileges, on, role } => {
+                ("granted", self.set_grant(role, on, *privileges, true)?)
+            }
+            big_embed::SqlAcl::Revoke { privileges, on, role } => {
+                ("revoked", self.set_grant(role, on, *privileges, false)?)
+            }
+        };
+        Ok((big_embed::one_cell(column, big_embed::Datum::Int(changed.into())), Format::default()))
+    }
+
+    /// Reads what the role holds on the object, applies the change, and sends the result.
+    ///
+    /// `add` is the difference between `GRANT` and `REVOKE`, and it is the only one: both end in
+    /// one absolute mask, so neither can be applied twice to a different effect.
+    fn set_grant(
+        &self,
+        role: &str,
+        on: &big_embed::SqlAclObject,
+        privileges: big_rbac::Privileges,
+        add: bool,
+    ) -> Result<u64> {
+        let object = on.resolved();
+        let (database, table) = match &object {
+            big_rbac::Object::Server => (String::new(), String::new()),
+            big_rbac::Object::Database(d) => (d.clone(), String::new()),
+            big_rbac::Object::Table { database, table } => (database.clone(), table.clone()),
+        };
+        let held = self.api.granted(role, &object).map_err(ClusterError::Local)?;
+        let result = if add { held.union(privileges) } else { held.minus(privileges) };
+        if result == held {
+            return Ok(0);
+        }
+        self.ddl(&Ddl::SetGrant { role: role.to_string(), database, table, privileges: result.0 })
+    }
+
+    fn sql_show(
+        &self,
+        show: &big_embed::SqlShow,
+        who: &big_rbac::Who,
+    ) -> Result<(ResultSet, Format)> {
         let schema = self.schema();
         // This node's own views, for the same reason the schema is this node's own: a listing
         // is read out of the catalog every node holds, and a schema change reached all of them
@@ -631,6 +741,21 @@ impl<P: PagerMut + Sync> Cluster<P> {
                 Ok(big_embed::introspect::show_views(&views, database.as_deref()))
             }
             big_embed::SqlShown::Databases => Ok(big_embed::introspect::show_databases(&schema)),
+            big_embed::SqlShown::Roles => Ok(big_embed::introspect::show_roles(&self.api.roles())),
+            // A bare `SHOW GRANTS` is about the caller's own role, which is why it needs no
+            // privilege: reading what you hold tells you nothing you could not find out by
+            // trying. A `Trusted` caller holds everything and has no role to name, so it gets
+            // the empty answer rather than a guess.
+            big_embed::SqlShown::Grants { role } => {
+                let named = match (role, who) {
+                    (Some(r), _) => Some(r.clone()),
+                    (None, big_rbac::Who::Role(r)) => Some(r.clone()),
+                    (None, big_rbac::Who::Trusted) => None,
+                };
+                Ok(big_embed::introspect::show_grants(
+                    &named.map(|r| self.api.grants_of(&r)).unwrap_or_default(),
+                ))
+            }
             big_embed::SqlShown::Create { database, table, view } => {
                 big_embed::introspect::show_create(
                     &schema,

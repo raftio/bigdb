@@ -40,7 +40,6 @@
 //! above - the fan-out between nodes never pays for a hash. See [`crate::routes`] for why that
 //! makes a peer a different kind of caller rather than a very privileged person.
 
-use big_embed::Authority;
 use std::io;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -49,54 +48,31 @@ use std::time::{Duration, Instant};
 
 pub use big_tls::Identity;
 
-/// What a credential is allowed to do. Ordered: each role contains the ones below it.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
-pub enum Role {
-    /// Read the schema and run queries.
-    Read = 0,
-    /// The above, plus writing and deleting records.
-    Write = 1,
-    /// The above, plus creating and dropping schema, and reading metrics.
-    Admin = 2,
-}
-
-impl Role {
-    /// The name used in the users file and in log lines. The same spelling in both, so a grep
-    /// for a role in the log finds the line in the file that granted it.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Read => "read",
-            Self::Write => "write",
-            Self::Admin => "admin",
-        }
-    }
-
-    /// Parses a role by the name the users file spells it with.
-    pub fn parse(s: &str) -> Option<Self> {
-        Some(match s {
-            "read" => Self::Read,
-            "write" => Self::Write,
-            "admin" => Self::Admin,
-            _ => return None,
-        })
-    }
-}
-
-/// What a statement demands, as what a credential has to hold.
+/// The rule a role name in the users file is held to.
 ///
-/// **The whole of what this crate knows about SQL.** Which statements write and which only read
-/// is [`big_embed::Sql::authority`]'s to say, next to the variants it is about; this is the one
-/// line that turns that answer into the vocabulary of a users file. An edge deciding it by
-/// matching on the AST itself is how the rule ends up written twice and enforced once.
-impl From<Authority> for Role {
-    fn from(authority: Authority) -> Self {
-        match authority {
-            Authority::Read => Self::Read,
-            Authority::Write => Self::Write,
-            Authority::Admin => Self::Admin,
-        }
+/// The same rule a catalog record's name is held to, because that is where the role it points at
+/// is stored - but stated here as well, because this file is read before any database is open and
+/// so cannot ask. `big_db::catalog::check_name` is the other half; neither may drift from the
+/// other.
+///
+/// No `:` for RFC 7617's reason, no `.` because that is the separator in a qualified name, and a
+/// ceiling because a catalog record is a fixed width.
+pub fn check_rolename(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("a role name is empty".to_string());
     }
+    if name.len() > MAX_ROLE_LEN {
+        return Err(format!("`{name}` is longer than {MAX_ROLE_LEN} bytes"));
+    }
+    if let Some(bad) = name.chars().find(|c| !c.is_ascii_graphic() || *c == '.' || *c == ':') {
+        return Err(format!("`{name}` holds `{bad}`, which a role name may not"));
+    }
+    Ok(())
 }
+
+/// The longest role name a catalog record can hold - `big_db::catalog::MAX_NAME_LEN`, spelled
+/// here because this crate reads a users file before it opens a database.
+const MAX_ROLE_LEN: usize = 104;
 
 /// What a request presented in its `Authorization` header.
 ///
@@ -127,8 +103,13 @@ pub enum Principal {
     User {
         /// The name from the users file.
         name: String,
-        /// What that name may do.
-        role: Role,
+        /// The third column of that line: a role the catalog may or may not have.
+        ///
+        /// The name is all this crate knows. What the role may *do* is a set of grants in the
+        /// catalog, read at the statement rather than here - so a `GRANT` takes effect on the
+        /// next statement with nothing reloaded, and a name the catalog does not have holds
+        /// nothing at all.
+        role: String,
     },
     /// Another node of this cluster, proven by its client certificate during the handshake.
     ///
@@ -143,20 +124,20 @@ pub enum Principal {
 }
 
 impl Principal {
-    /// Whether this principal reaches `needed`. A comparison, never a verification.
+    /// Who this is, in the vocabulary the engine decides with.
     ///
-    /// `Err` carries what is held, so the caller can say both halves in a `403` - a message that
-    /// names only what was required leaves the reader guessing what they have.
-    pub fn holds(&self, needed: Role) -> Result<(), Role> {
+    /// The whole of the bridge between a credential and a privilege, and it is a handover rather
+    /// than a decision: what the role may do is looked up against the catalog by whoever runs the
+    /// statement.
+    pub fn who(&self) -> big_rbac::Who {
         match self {
-            // Auth is off, so everything is allowed - the existing contract, unchanged.
-            Self::Anonymous => Ok(()),
-            Self::User { role, .. } if *role >= needed => Ok(()),
-            Self::User { role, .. } => Err(*role),
-            // A node reaching a route that wants a role. Refused with the lowest role, because
-            // there is no true answer: a certificate does not grant one. See `routes::Guard`,
-            // where a peer is kept off these routes in the first place.
-            Self::Node { .. } => Err(Role::Read),
+            Self::User { role, .. } => big_rbac::Who::Role(role.clone()),
+            // Auth off allows everything - the existing contract, unchanged.
+            Self::Anonymous => big_rbac::Who::Trusted,
+            // A peer applying a change the leader already ruled on. It reaches no route that
+            // takes a statement, so this arm exists to make a future variant a compile error
+            // rather than a silent default.
+            Self::Node { .. } => big_rbac::Who::Trusted,
         }
     }
 
@@ -182,13 +163,6 @@ pub enum Outcome {
     Allowed(Principal),
     /// No credential, or one this server does not know. `401`.
     Unauthenticated,
-    /// A known credential that does not reach far enough. `403`.
-    Forbidden {
-        /// What the presented credential grants.
-        held: Role,
-        /// What the route required.
-        needed: Role,
-    },
     /// Every verification slot is busy. `503`, with a `Retry-After`.
     ///
     /// Its own variant rather than a `401`, because they mean opposite things to a client: a
@@ -222,7 +196,10 @@ struct Users {
 struct User {
     name: String,
     phc: String,
-    role: Role,
+    /// The third column, verbatim. Not resolved here: the catalog that holds the role is not
+    /// open when this file is read, and a name it does not have is no privileges rather than a
+    /// startup failure - a failure on a role somebody is about to create is a lockout.
+    role: String,
 }
 
 /// Redacted on purpose. A derived `Debug` would put every hash into whatever printed it - a
@@ -300,9 +277,7 @@ impl Auth {
                 return Err(bad(n, "expected `username role hash`".to_string()));
             };
             check_username(name).map_err(|e| bad(n, e))?;
-            let Some(role) = Role::parse(role) else {
-                return Err(bad(n, format!("`{role}` is not a role; use read, write or admin")));
-            };
+            check_rolename(role).map_err(|e| bad(n, e))?;
             // Parsed here so that the request path never has to decide what an unparseable hash
             // means. A file that would refuse everybody at runtime is refused at startup.
             hash::check(phc).map_err(|e| bad(n, e))?;
@@ -312,7 +287,11 @@ impl Auth {
             if let Some(first) = entries.iter().position(|u| u.name == name) {
                 return Err(bad(n, format!("`{name}` is already on line {}", first + 1)));
             }
-            entries.push(User { name: name.to_string(), phc: phc.to_string(), role });
+            entries.push(User {
+                name: name.to_string(),
+                phc: phc.to_string(),
+                role: role.to_string(),
+            });
         }
 
         if entries.is_empty() {
@@ -360,12 +339,7 @@ impl Auth {
     /// 4. The cache, which is what keeps a busy client from paying per request.
     /// 5. The throttle, which bounds how many verifications run at once.
     /// 6. Exactly one argon2 verification.
-    pub fn authorize(
-        &self,
-        identity: &Identity,
-        presented: Option<Credential<'_>>,
-        needed: Role,
-    ) -> Outcome {
+    pub fn authorize(&self, identity: &Identity, presented: Option<Credential<'_>>) -> Outcome {
         if let Identity::Node(name) = identity {
             return Outcome::Allowed(Principal::Node { name: name.clone() });
         }
@@ -373,8 +347,12 @@ impl Auth {
         let Some(presented) = presented else { return Outcome::Unauthenticated };
 
         let key = users.cache.key(presented.user, presented.password);
-        if let Some(role) = users.cache.get(&key, (users.now)()) {
-            return decide(presented.user, role, needed);
+        if let Some(entry) = users.cache.get(&key, (users.now)()) {
+            // The **entry**, not the role: verification proved that this password matches that
+            // line, and nothing more. The role is read from the line now, so a role name changed
+            // in the file is not stale for the life of a cache entry - though see the note on
+            // `Cache::TTL`, because nothing reloads the file either.
+            return Outcome::Allowed(users.principal(entry as usize));
         }
 
         // **The name is compared against every entry with no early exit**, because a name is
@@ -382,24 +360,24 @@ impl Auth {
         // learn. The password is then verified exactly *once* - against the entry that matched,
         // or against the decoy when none did. Verifying against every entry, which is what the
         // token table used to do, would be N hashes per request: not a defence, an amplifier.
-        let mut found: Option<&User> = None;
-        for u in &users.entries {
+        let mut found: Option<usize> = None;
+        for (i, u) in users.entries.iter().enumerate() {
             if constant_time_eq(u.name.as_bytes(), presented.user.as_bytes()) {
-                found = Some(u);
+                found = Some(i);
             }
         }
 
         let Some(_permit) = users.throttle.acquire() else { return Outcome::Overloaded };
-        let phc = found.map_or(users.decoy.as_str(), |u| u.phc.as_str());
+        let phc = found.map_or(users.decoy.as_str(), |i| users.entries[i].phc.as_str());
         let verified = hash::verify(phc, presented.password);
 
         match (found, verified) {
-            (Some(u), true) => {
+            (Some(i), true) => {
                 // Only successes are remembered. Caching a failure would turn an offline
                 // dictionary attack into an online one at the speed of a hash table, and the
                 // cost of a wrong password *is* the rate limit.
-                users.cache.put(key, u.role, (users.now)());
-                decide(presented.user, u.role, needed)
+                users.cache.put(key, i as u32, (users.now)());
+                Outcome::Allowed(users.principal(i))
             }
             _ => Outcome::Unauthenticated,
         }
@@ -429,12 +407,15 @@ impl Auth {
     }
 }
 
-/// Turns a role that was found into the verdict for the role that was wanted.
-fn decide(name: &str, held: Role, needed: Role) -> Outcome {
-    if held >= needed {
-        Outcome::Allowed(Principal::User { name: name.to_string(), role: held })
-    } else {
-        Outcome::Forbidden { held, needed }
+impl Users {
+    /// The principal one entry stands for.
+    ///
+    /// Read from the entry every time rather than remembered alongside the cached verification,
+    /// because the two answer different questions: the cache says this password still matches
+    /// this line, and the line says what role that is.
+    fn principal(&self, entry: usize) -> Principal {
+        let u = &self.entries[entry];
+        Principal::User { name: u.name.clone(), role: u.role.clone() }
     }
 }
 
@@ -489,7 +470,12 @@ const TTL: Duration = Duration::from_secs(60);
 #[derive(Clone, Copy)]
 struct Slot {
     key: [u8; 16],
-    role: Role,
+    /// Which line of the users file the password matched.
+    ///
+    /// **The entry, not the role.** Verification proved that this password matches that line and
+    /// nothing more; the role is a derived answer, and caching a derived answer is what would
+    /// make the TTL below a rule about privileges rather than about passwords.
+    entry: u32,
     /// `None` is an empty slot. Also what an expired one is reset to.
     at: Option<Instant>,
 }
@@ -513,7 +499,7 @@ struct Cache {
 
 impl Cache {
     fn new() -> Self {
-        let empty = Slot { key: [0; 16], role: Role::Read, at: None };
+        let empty = Slot { key: [0; 16], entry: 0, at: None };
         Self {
             shards: std::array::from_fn(|_| Mutex::new([empty; SLOTS])),
             key: hash::random_bytes(),
@@ -540,17 +526,17 @@ impl Cache {
         (key[0] as usize % SHARDS, key[1] as usize % SLOTS)
     }
 
-    fn get(&self, key: &[u8; 16], now: Instant) -> Option<Role> {
+    fn get(&self, key: &[u8; 16], now: Instant) -> Option<u32> {
         let (shard, slot) = self.slot(key);
         let mut slots = self.shards[shard].lock().expect("no panic holds this lock");
-        let entry = &mut slots[slot];
-        let fresh = entry.at.is_some_and(|at| now.duration_since(at) < TTL);
-        if fresh && constant_time_eq(&entry.key, key) {
+        let held = &mut slots[slot];
+        let fresh = held.at.is_some_and(|at| now.duration_since(at) < TTL);
+        if fresh && constant_time_eq(&held.key, key) {
             self.hits.fetch_add(1, Ordering::Relaxed);
-            return Some(entry.role);
+            return Some(held.entry);
         }
         if !fresh {
-            *entry = Slot { key: [0; 16], role: Role::Read, at: None };
+            *held = Slot { key: [0; 16], entry: 0, at: None };
         }
         self.misses.fetch_add(1, Ordering::Relaxed);
         None
@@ -560,10 +546,10 @@ impl Cache {
     ///
     /// A collision costs one legitimate user one argon2 verification, which is the correct thing
     /// to lose: the alternative is bookkeeping under a lock that every request takes.
-    fn put(&self, key: [u8; 16], role: Role, now: Instant) {
+    fn put(&self, key: [u8; 16], entry: u32, now: Instant) {
         let (shard, slot) = self.slot(&key);
         let mut slots = self.shards[shard].lock().expect("no panic holds this lock");
-        slots[slot] = Slot { key, role, at: Some(now) };
+        slots[slot] = Slot { key, entry, at: Some(now) };
     }
 }
 
@@ -771,49 +757,52 @@ mod tests {
     #[test]
     fn disabled_allows_everything() {
         let a = Auth::disabled();
-        assert_eq!(
-            a.authorize(&Identity::None, None, Role::Admin),
-            Outcome::Allowed(Principal::Anonymous)
-        );
+        assert_eq!(a.authorize(&Identity::None, None), Outcome::Allowed(Principal::Anonymous));
         assert!(!a.is_enabled());
     }
 
+    /// The role is carried as the **name** the file gave it, not resolved to anything here.
+    /// What it may do is a set of grants in a catalog this crate cannot see.
     #[test]
-    fn a_role_contains_the_ones_below_it() {
-        let a = users(&[("alice", "admin", "pw"), ("bob", "read", "pw")]);
-        for needed in [Role::Read, Role::Write, Role::Admin] {
-            assert!(matches!(
-                a.authorize(&Identity::None, cred("alice", "pw"), needed),
-                Outcome::Allowed(Principal::User { role: Role::Admin, .. })
-            ));
-        }
+    fn a_credential_carries_the_role_name_it_was_given() {
+        let a = users(&[("alice", "admin", "pw"), ("bob", "analyst", "pw")]);
         assert!(matches!(
-            a.authorize(&Identity::None, cred("bob", "pw"), Role::Read),
-            Outcome::Allowed(Principal::User { role: Role::Read, .. })
+            a.authorize(&Identity::None, cred("alice", "pw")),
+            Outcome::Allowed(Principal::User { ref role, .. }) if role == "admin"
+        ));
+        assert!(matches!(
+            a.authorize(&Identity::None, cred("bob", "pw")),
+            Outcome::Allowed(Principal::User { ref role, .. }) if role == "analyst"
         ));
     }
 
+    /// A name no catalog has is not a startup failure and not a refusal here: it resolves to
+    /// nothing when a statement asks, which is every privilege withheld. A failure at startup
+    /// on a role somebody is about to create is a lockout.
     #[test]
-    fn a_short_role_is_forbidden_not_unauthenticated() {
-        let a = users(&[("bob", "read", "pw")]);
-        assert_eq!(
-            a.authorize(&Identity::None, cred("bob", "pw"), Role::Write),
-            Outcome::Forbidden { held: Role::Read, needed: Role::Write },
-            "a known credential that does not reach far enough is a 403, not a 401 - retrying \
-             with the same password will never work and the client should be told so"
-        );
+    fn a_role_this_server_has_never_heard_of_still_authenticates() {
+        let a = users(&[("bob", "not-a-role-yet", "pw")]);
+        let Outcome::Allowed(p) = a.authorize(&Identity::None, cred("bob", "pw")) else {
+            panic!("the password is right, so the credential resolves")
+        };
+        assert_eq!(p.who(), big_rbac::Who::Role("not-a-role-yet".to_string()));
+    }
+
+    /// Authentication off is allow-all, which the engine sees as `Trusted` - the existing
+    /// contract, unchanged by roles becoming names.
+    #[test]
+    fn auth_off_and_a_peer_both_hand_the_engine_trust() {
+        assert_eq!(Principal::Anonymous.who(), big_rbac::Who::Trusted);
+        assert_eq!(Principal::Node { name: "b".to_string() }.who(), big_rbac::Who::Trusted);
     }
 
     #[test]
     fn an_unknown_user_or_a_wrong_password_is_unauthenticated() {
         let a = users(&[("bob", "read", "pw")]);
-        assert_eq!(a.authorize(&Identity::None, None, Role::Read), Outcome::Unauthenticated);
+        assert_eq!(a.authorize(&Identity::None, None), Outcome::Unauthenticated);
+        assert_eq!(a.authorize(&Identity::None, cred("nobody", "pw")), Outcome::Unauthenticated);
         assert_eq!(
-            a.authorize(&Identity::None, cred("nobody", "pw"), Role::Read),
-            Outcome::Unauthenticated
-        );
-        assert_eq!(
-            a.authorize(&Identity::None, cred("bob", "wrong"), Role::Read),
+            a.authorize(&Identity::None, cred("bob", "wrong")),
             Outcome::Unauthenticated,
             "and the two are not distinguishable from the outside"
         );
@@ -826,7 +815,7 @@ mod tests {
         // is really about cannot be asserted on a shared CI machine without flaking.
         let a = users(&[("bob", "read", "pw")]);
         let (before, _, _) = a.counters();
-        let _ = a.authorize(&Identity::None, cred("nobody-at-all", "pw"), Role::Read);
+        let _ = a.authorize(&Identity::None, cred("nobody-at-all", "pw"));
         let (after, _, _) = a.counters();
         assert_eq!(after, before + 1, "an unknown username still paid for a hash");
     }
@@ -840,7 +829,7 @@ mod tests {
         let (before, _, _) = a.counters();
         let node = Identity::Node("node-a".to_string());
         assert_eq!(
-            a.authorize(&node, None, Role::Admin),
+            a.authorize(&node, None),
             Outcome::Allowed(Principal::Node { name: "node-a".to_string() })
         );
         let (after, _, _) = a.counters();
@@ -850,13 +839,10 @@ mod tests {
     #[test]
     fn a_cached_verification_does_not_hash_again() {
         let a = users(&[("bob", "read", "pw")]);
-        let _ = a.authorize(&Identity::None, cred("bob", "pw"), Role::Read);
+        let _ = a.authorize(&Identity::None, cred("bob", "pw"));
         let (after_first, _, _) = a.counters();
         for _ in 0..5 {
-            assert!(matches!(
-                a.authorize(&Identity::None, cred("bob", "pw"), Role::Read),
-                Outcome::Allowed(_)
-            ));
+            assert!(matches!(a.authorize(&Identity::None, cred("bob", "pw")), Outcome::Allowed(_)));
         }
         let (after_rest, hits, _) = a.counters();
         assert_eq!(after_rest, after_first, "five more requests, no more hashing");
@@ -870,7 +856,7 @@ mod tests {
         let a = users(&[("bob", "read", "pw")]);
         for _ in 0..3 {
             assert_eq!(
-                a.authorize(&Identity::None, cred("bob", "wrong"), Role::Read),
+                a.authorize(&Identity::None, cred("bob", "wrong")),
                 Outcome::Unauthenticated
             );
         }
@@ -894,14 +880,14 @@ mod tests {
 
         OFFSET.store(0, Ordering::Relaxed);
         let a = users(&[("bob", "read", "pw")]).with_clock(clock);
-        let _ = a.authorize(&Identity::None, cred("bob", "pw"), Role::Read);
+        let _ = a.authorize(&Identity::None, cred("bob", "pw"));
         let (first, _, _) = a.counters();
 
-        let _ = a.authorize(&Identity::None, cred("bob", "pw"), Role::Read);
+        let _ = a.authorize(&Identity::None, cred("bob", "pw"));
         assert_eq!(a.counters().0, first, "still inside the window");
 
         OFFSET.store(61, Ordering::Relaxed);
-        let _ = a.authorize(&Identity::None, cred("bob", "pw"), Role::Read);
+        let _ = a.authorize(&Identity::None, cred("bob", "pw"));
         assert_eq!(a.counters().0, first + 1, "past the window, it hashes again");
     }
 
@@ -912,13 +898,15 @@ mod tests {
         // other - which is the worst bug this file could have.
         let a = users(&[("ab", "admin", "c"), ("a", "read", "bc")]);
         assert!(matches!(
-            a.authorize(&Identity::None, cred("ab", "c"), Role::Admin),
-            Outcome::Allowed(Principal::User { role: Role::Admin, .. })
+            a.authorize(&Identity::None, cred("ab", "c")),
+            Outcome::Allowed(Principal::User { ref role, .. }) if role == "admin"
         ));
-        assert_eq!(
-            a.authorize(&Identity::None, cred("a", "bc"), Role::Admin),
-            Outcome::Forbidden { held: Role::Read, needed: Role::Admin },
-            "the second user is still only `read`"
+        assert!(
+            matches!(
+                a.authorize(&Identity::None, cred("a", "bc")),
+                Outcome::Allowed(Principal::User { ref role, .. }) if role == "read"
+            ),
+            "the second user resolves as themselves, not as the first"
         );
     }
 
@@ -931,10 +919,7 @@ mod tests {
         );
         let a = Auth::parse(&text, "test").unwrap();
         assert_eq!(a.len(), 2);
-        assert!(matches!(
-            a.authorize(&Identity::None, cred("bob", "pw"), Role::Read),
-            Outcome::Allowed(_)
-        ));
+        assert!(matches!(a.authorize(&Identity::None, cred("bob", "pw")), Outcome::Allowed(_)));
     }
 
     #[test]
@@ -953,11 +938,34 @@ mod tests {
         assert!(e.to_string().contains("already on line 1"), "{e}");
     }
 
+    /// **A role this server has never heard of is not a startup failure, on purpose.**
+    ///
+    /// The catalog that holds roles is not open when this file is read, and a name it does not
+    /// have is no privileges at all rather than a broken server. Refusing here would also mean
+    /// refusing to start over a role somebody is one `CREATE ROLE` away from making - which is
+    /// exactly the state a locked-out operator is in, and exactly when the server has to start.
+    ///
+    /// `superuser` included: it is the reserved name the whole recovery path goes through, so a
+    /// users file naming it has to load.
     #[test]
-    fn an_unknown_role_is_refused_by_name() {
-        let text = format!("bob superuser {}\n", phc("pw"));
+    fn a_role_the_catalog_may_not_have_still_loads() {
+        for role in ["superuser", "analyst", "not-made-yet"] {
+            let text = format!("bob {role} {}\n", phc("pw"));
+            Auth::parse(&text, "test").unwrap_or_else(|e| panic!("`{role}` should load, got {e}"));
+        }
+    }
+
+    /// What *is* refused is a name no catalog record could hold, because that one can never
+    /// resolve to anything however many roles are created later.
+    #[test]
+    fn a_role_name_no_record_could_hold_is_refused() {
+        let text = format!("bob a.b {}\n", phc("pw"));
         let e = Auth::parse(&text, "test").unwrap_err();
-        assert!(e.to_string().contains("superuser"), "{e}");
+        assert!(e.to_string().contains('.'), "{e}");
+
+        let text = format!("bob {} {}\n", "x".repeat(200), phc("pw"));
+        let e = Auth::parse(&text, "test").unwrap_err();
+        assert!(e.to_string().contains("longer than"), "{e}");
     }
 
     #[test]
@@ -1010,11 +1018,7 @@ mod tests {
         assert!(!hash::verify(&phc, "Correct horse battery staple"));
         let a = Auth::parse(&format!("alice admin {phc}\n"), "test").unwrap();
         assert!(matches!(
-            a.authorize(
-                &Identity::None,
-                cred("alice", "correct horse battery staple"),
-                Role::Admin
-            ),
+            a.authorize(&Identity::None, cred("alice", "correct horse battery staple")),
             Outcome::Allowed(_)
         ));
     }
@@ -1033,12 +1037,9 @@ mod tests {
         // failed, and the server would stop authenticating anybody after four bad passwords.
         let a = users(&[("bob", "read", "pw")]);
         for _ in 0..20 {
-            let _ = a.authorize(&Identity::None, cred("bob", "wrong"), Role::Read);
+            let _ = a.authorize(&Identity::None, cred("bob", "wrong"));
         }
         assert_eq!(a.counters().2, 0, "nothing was refused for want of a slot");
-        assert!(matches!(
-            a.authorize(&Identity::None, cred("bob", "pw"), Role::Read),
-            Outcome::Allowed(_)
-        ));
+        assert!(matches!(a.authorize(&Identity::None, cred("bob", "pw")), Outcome::Allowed(_)));
     }
 }

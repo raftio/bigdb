@@ -32,6 +32,7 @@
 //! differently from one that pointed at the right one, which is the property that makes this
 //! usable as an expected answer.
 
+use crate::acl::Acl;
 use crate::ast::ExplainMode;
 use crate::ddl::{Alter, Column, Ddl};
 use crate::insert::Insert;
@@ -43,6 +44,7 @@ use crate::shape::{
 };
 use crate::show::{Show, Shown};
 use big_plan::{Literal, Plan};
+use big_rbac::Privileges as big_sql_privileges;
 
 /// One search, with the records it walks already resolved.
 ///
@@ -79,6 +81,8 @@ pub enum Explained<'a> {
     Insert(&'a Insert),
     /// A question about the catalog.
     Show(&'a Show),
+    /// A change to who may do what, which is already wholly in the parse tree.
+    Acl(&'a Acl),
 }
 
 /// A statement, written out instead of run. No trailing newline, and **no blank line anywhere**.
@@ -141,6 +145,10 @@ pub fn explained(mode: ExplainMode, what: &Explained<'_>) -> String {
         Explained::Show(s) => {
             out.push("show".to_string());
             out.push(show(s));
+        }
+        Explained::Acl(a) => {
+            out.push("acl".to_string());
+            out.push(acl(a));
         }
     }
     out.join("\n").lines().filter(|l| !l.trim().is_empty()).collect::<Vec<_>>().join("\n")
@@ -590,6 +598,11 @@ pub fn show(show: &Show) -> String {
             None => "Views".to_string(),
         },
         Shown::Databases => "Databases".to_string(),
+        Shown::Roles => "Roles".to_string(),
+        Shown::Grants { role } => match role {
+            Some(r) => format!("Grants {r}"),
+            None => "Grants".to_string(),
+        },
         Shown::Create { database, table, view } => {
             format!("Create {}{}", qualified(database, table), if *view { " view" } else { "" })
         }
@@ -597,6 +610,39 @@ pub fn show(show: &Show) -> String {
     match show.format {
         f if f == Format::default() => what,
         f => format!("{what} format={}", format_name(f)),
+    }
+}
+
+/// A change to who may do what.
+///
+/// The privileges are printed in the order [`big_rbac::Privilege::ALL`] declares rather than the
+/// order they were typed, so that `GRANT INSERT, SELECT` and `GRANT SELECT, INSERT` - which are
+/// the same grant - describe identically.
+pub fn acl(acl: &Acl) -> String {
+    match acl {
+        Acl::CreateRole { name, if_not_exists } => {
+            format!("CreateRole {name}{}", if *if_not_exists { " if_not_exists" } else { "" })
+        }
+        Acl::DropRole { name, if_exists } => {
+            format!("DropRole {name}{}", if *if_exists { " if_exists" } else { "" })
+        }
+        Acl::Grant { privileges, on, role } => {
+            format!("Grant {} on {} to {role}", privilege_list(*privileges), on.written())
+        }
+        Acl::Revoke { privileges, on, role } => {
+            format!("Revoke {} on {} from {role}", privilege_list(*privileges), on.written())
+        }
+    }
+}
+
+/// The privileges a grant carries, comma-separated. A bit this build cannot name is left out: it
+/// is stored faithfully, but it is not this build's to describe.
+fn privilege_list(privileges: big_sql_privileges) -> String {
+    let named: Vec<&str> = privileges.named().map(big_rbac::Privilege::as_str).collect();
+    if named.is_empty() {
+        "nothing".to_string()
+    } else {
+        named.join(", ")
     }
 }
 

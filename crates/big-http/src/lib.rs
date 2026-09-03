@@ -52,7 +52,7 @@ pub mod routes;
 pub mod status;
 mod watchdog;
 
-pub use auth::{Auth, Role};
+pub use auth::Auth;
 pub use request::Request;
 pub use response::{reason_for, Response};
 

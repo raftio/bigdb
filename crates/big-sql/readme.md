@@ -244,7 +244,7 @@ run against a table somebody has since altered.
 `SHOW CREATE TABLE t` answers with the statement that recreates the table, rendered by
 [`render::create_table`], which is the inverse of the parser's own type table and lives beside it
 so the two cannot drift. All three read the catalog every node already holds: no plan, no
-fan-out, and a `read` token is enough.
+fan-out, and `SELECT` on the table is enough.
 
 Each kind of statement is a variant of [`Sql`], and that is also how the edge decides what a
 statement costs: a schema change needs `admin`, an `INSERT` needs `write`, and a `SELECT` or a
