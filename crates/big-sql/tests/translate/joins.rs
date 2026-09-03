@@ -205,3 +205,68 @@ fn a_where_on_an_optional_side_makes_it_required_again() {
         vec![true, false]
     );
 }
+
+/// **A join on the other table's record id lowers to a statement with no join in it.**
+///
+/// That is the claim worth pinning, and it is stronger than "it answers": the shape is not a
+/// `Shape::Join` at all, there is one call rather than one per table, and no per-key product is
+/// computed anywhere. A foreign key join multiplies nothing - each record has at most one
+/// partner - so what is left after the fold is an ordinary single-table statement over a
+/// narrower set.
+#[test]
+fn a_join_on_a_record_id_is_not_a_join_once_it_has_been_lowered() {
+    let s = translate(
+        "SELECT count(*) FROM t o JOIN u s ON o.amount = s._record_id WHERE s.category = 'GB'",
+    )
+    .unwrap();
+
+    assert_eq!(s.calls.len(), 1, "one table is read, not two");
+    assert_eq!(s.tables(), vec!["t"]);
+    assert!(!matches!(s.answer.shape, Shape::Join { .. }), "the join is gone, not answered");
+}
+
+/// The grouping a star join cannot do, and the reason it can be done here.
+///
+/// A star join groups **both** tables by the key it pairs on, so the only `GROUP BY` it can
+/// answer is that key. A folded one has no pairing left: the grouping is over whatever column
+/// the one remaining table has.
+#[test]
+fn a_folded_join_groups_by_a_column_that_is_not_the_join_key() {
+    let s = translate(
+        "SELECT o.country, count(*) FROM t o JOIN u s ON o.amount = s._record_id \
+         GROUP BY o.country",
+    )
+    .unwrap();
+
+    assert_eq!(s.calls.len(), 1);
+    assert!(!matches!(s.answer.shape, Shape::Join { .. }));
+}
+
+/// A `LEFT JOIN` on a record id narrows nothing, so it lowers to the statement without it.
+#[test]
+fn a_left_join_on_a_record_id_lowers_to_the_unjoined_statement() {
+    let left = translate("SELECT count(*) FROM t o LEFT JOIN u s ON o.amount = s._record_id");
+    let bare = translate("SELECT count(*) FROM t o");
+    assert_eq!(left.unwrap().calls, bare.unwrap().calls);
+}
+
+/// Every name outside the `ON` and the `WHERE` has to be about a table still in scope.
+///
+/// **Checked rather than left to the planner**, because two tables may declare the same column
+/// name: `sum(s.amount)` folded into `sum(amount)` over the outer table would be a wrong number
+/// rather than an unknown field, and nothing in the answer could reveal it.
+#[test]
+fn a_folded_join_refuses_a_name_about_the_table_it_folded() {
+    for sql in [
+        "SELECT sum(s.amount) FROM t o JOIN u s ON o.amount = s._record_id",
+        "SELECT s.category, count(*) FROM t o JOIN u s ON o.amount = s._record_id GROUP BY s.category",
+        "SELECT count(*) FROM t o JOIN u s ON o.amount = s._record_id ORDER BY s.category",
+    ] {
+        assert_eq!(code(sql), "sql_unsupported", "{sql}");
+    }
+    // `RIGHT` and `FULL` ask for records of the folded table that the outer one does not name.
+    assert_eq!(
+        code("SELECT count(*) FROM t o RIGHT JOIN u s ON o.amount = s._record_id"),
+        "sql_no_outer_joins"
+    );
+}

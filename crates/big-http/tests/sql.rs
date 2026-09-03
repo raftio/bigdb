@@ -1537,3 +1537,145 @@ fn a_semi_join_refuses_a_set_too_large_to_expand_and_an_explain_of_one() {
     assert_eq!(status, 400, "{body}");
     assert!(body.contains("sql_explain_set"), "{body}");
 }
+
+/// A join on the other table's record id, which folds into a `WHERE` and stops being a join.
+///
+/// **A foreign key join multiplies nothing, and that is the whole difference.** The column holds
+/// record ids, so each order has at most one shop - where a star join has to group both sides
+/// and multiply per key, this narrows `orders` by a set and then answers an ordinary
+/// single-table statement over it. Which is why the `GROUP BY` at the end works at all: a star
+/// join can only group by the key it pairs on, and this one groups by anything the outer table
+/// has.
+///
+/// `shops` 1 and 2 are `GB`, 3 and 4 are `US`. Order 5 points at shop 9, which does not exist -
+/// so it is in no inner join and in every `LEFT` one, which is what tells the two apart.
+#[test]
+fn a_join_on_a_record_id_folds_into_a_semi_join_over_the_outer_table() {
+    let addr = spawn(15);
+    assert_eq!(send(addr, "POST", "/table/shops", "").0, 200);
+    assert_eq!(send(addr, "POST", "/table/shops/field/country?kind=set", "").0, 200);
+    assert_eq!(send(addr, "POST", "/table/orders", "").0, 200);
+    assert_eq!(send(addr, "POST", "/table/orders/field/shop_id?kind=int&bit_depth=32", "").0, 200);
+    assert_eq!(send(addr, "POST", "/table/orders/field/amount?kind=int&bit_depth=32", "").0, 200);
+    assert_eq!(send(addr, "POST", "/table/orders/field/channel?kind=set", "").0, 200);
+
+    assert_eq!(
+        send(
+            addr,
+            "POST",
+            "/table/shops/import",
+            "country 1 GB\ncountry 2 GB\ncountry 3 US\ncountry 4 US\n",
+        )
+        .0,
+        200
+    );
+    assert_eq!(
+        send(
+            addr,
+            "POST",
+            "/table/orders/import",
+            "shop_id 1 1\namount 1 100\nchannel 1 web\n\
+             shop_id 2 1\namount 2 200\nchannel 2 app\n\
+             shop_id 3 3\namount 3 300\nchannel 3 web\n\
+             shop_id 4 4\namount 4 400\nchannel 4 web\n\
+             shop_id 5 9\namount 5 500\nchannel 5 app\n",
+        )
+        .0,
+        200
+    );
+
+    // The inner join: four of the five orders name a shop that exists.
+    let (status, body) = send(
+        addr,
+        "POST",
+        "/sql",
+        "SELECT count(*) FROM orders o JOIN shops s ON o.shop_id = s._record_id",
+    );
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body, r#"{"columns":["count"],"rows":[[4]]}"#);
+
+    // A predicate about the joined table goes inside the set it narrows by.
+    let (_, body) = send(
+        addr,
+        "POST",
+        "/sql",
+        "SELECT count(*) FROM orders o JOIN shops s ON o.shop_id = s._record_id \
+         WHERE s.country = 'GB'",
+    );
+    assert_eq!(body, r#"{"columns":["count"],"rows":[[2]]}"#);
+
+    let (_, body) = send(
+        addr,
+        "POST",
+        "/sql",
+        "SELECT sum(o.amount) FROM orders o JOIN shops s ON o.shop_id = s._record_id \
+         WHERE s.country = 'US'",
+    );
+    assert_eq!(body, r#"{"columns":["sum"],"rows":[[700]]}"#);
+
+    // **A `LEFT JOIN` on a record id narrows nothing**: the one partner an order could have had
+    // contributes one row either way, so order 5 is a row of it and the answer is every order.
+    let (_, body) = send(
+        addr,
+        "POST",
+        "/sql",
+        "SELECT count(*) FROM orders o LEFT JOIN shops s ON o.shop_id = s._record_id",
+    );
+    assert_eq!(body, r#"{"columns":["count"],"rows":[[5]]}"#);
+
+    // **The grouping a star join cannot do.** `channel` is not the join key and belongs to
+    // neither side of the pairing - it is simply a column of the table that is left once the
+    // join has folded. `web` is orders 1, 3 and 4; `app` is order 2, because order 5 names no
+    // shop that exists.
+    let (_, body) = send(
+        addr,
+        "POST",
+        "/sql",
+        "SELECT o.channel, count(*) FROM orders o JOIN shops s ON o.shop_id = s._record_id \
+         GROUP BY o.channel",
+    );
+    assert_eq!(body, r#"{"columns":["channel","count"],"rows":[["app",1],["web",3]]}"#);
+}
+
+/// What a folded join refuses, and both refusals are about the table that is no longer there.
+#[test]
+fn a_folded_join_refuses_a_number_and_a_grouping_about_the_table_it_folded() {
+    let addr = spawn(8);
+    assert_eq!(send(addr, "POST", "/table/shops", "").0, 200);
+    assert_eq!(send(addr, "POST", "/table/shops/field/country?kind=set", "").0, 200);
+    assert_eq!(send(addr, "POST", "/table/shops/field/staff?kind=int&bit_depth=16", "").0, 200);
+    assert_eq!(send(addr, "POST", "/table/orders", "").0, 200);
+    assert_eq!(send(addr, "POST", "/table/orders/field/shop_id?kind=int&bit_depth=32", "").0, 200);
+
+    // **A total over the folded table would have to repeat per matching record**, which is the
+    // per-key arithmetic a star join does and a set does not carry.
+    let (status, body) = send(
+        addr,
+        "POST",
+        "/sql",
+        "SELECT sum(s.staff) FROM orders o JOIN shops s ON o.shop_id = s._record_id",
+    );
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("sql_unsupported"), "{body}");
+
+    // The same for a grouping: `country` is a column of a table this statement no longer has.
+    let (status, body) = send(
+        addr,
+        "POST",
+        "/sql",
+        "SELECT count(*) FROM orders o JOIN shops s ON o.shop_id = s._record_id \
+         GROUP BY s.country",
+    );
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("sql_unsupported"), "{body}");
+
+    // `RIGHT` and `FULL` ask for shops that no order names, and `orders` is the only table left.
+    let (status, body) = send(
+        addr,
+        "POST",
+        "/sql",
+        "SELECT count(*) FROM orders o RIGHT JOIN shops s ON o.shop_id = s._record_id",
+    );
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("sql_no_outer_joins"), "{body}");
+}

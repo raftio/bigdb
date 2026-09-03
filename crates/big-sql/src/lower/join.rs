@@ -598,3 +598,194 @@ fn both(a: Option<Cond>, b: Option<Cond>) -> Option<Cond> {
         (None, None) => None,
     }
 }
+
+/// `FROM a JOIN b ON a.fk = b._record_id`, folded into a semi-join over `a` alone.
+///
+/// **This is the join a foreign key is, and it is not a star.** The column holds record ids of
+/// the other table, so each of `a`'s records has at most *one* partner - which means the join
+/// multiplies nothing. Every aggregate over `a` is the aggregate it would have been over a
+/// narrower set of `a`'s records, and the narrowing is exactly the semi-join
+/// [`crate::ast::Cond::InRecords`] already answers.
+///
+/// So this is a rewrite rather than a shape: the statement that comes out has no join in it at
+/// all, and is lowered by whichever ordinary path its `GROUP BY` calls for. Nothing here is a
+/// new kind of answer - which is why a `GROUP BY` over the folded statement works, where a star
+/// join can only group by its key.
+///
+/// Returns `None` when no join names the other table's record id, which is the star join and is
+/// answered where it always was.
+pub(super) fn fold_record_joins(select: &Select) -> Result<Option<Select>> {
+    let scope = Scope::of(select);
+    // Which joins fold, and the outer column each one narrows on.
+    let folded: Vec<(usize, Name)> = select
+        .joins
+        .iter()
+        .enumerate()
+        .filter_map(|(n, join)| record_key(join, &scope, n + 1).map(|f| (n, f)))
+        .collect();
+    if folded.is_empty() {
+        return Ok(None);
+    }
+    scope.distinct_labels(&select.joins)?;
+
+    // The `WHERE`, split by the table each term names - the same split a star join makes, and
+    // for the same reason: a term naming two tables can be narrowed to neither.
+    let mut conds = match &select.filter {
+        None => vec![None; scope.sources.len()],
+        Some(cond) => split(cond, &scope, 0, scope.sources.len())?,
+    };
+
+    let mut out = select.clone();
+    let mut extra: Option<Cond> = None;
+    for (n, field) in &folded {
+        let side = n + 1;
+        let join = &select.joins[*n];
+        // **A `LEFT JOIN` on a record id narrows nothing.** Every record of `a` is a row of it,
+        // matched or not, because the one partner it could have had contributes one either way.
+        // So the term is simply not added - and a `WHERE` about `b` has already made the side
+        // required, which is what puts the term back.
+        let optional = matches!(join.kind, JoinKind::Left) && conds[side].is_none();
+        match join.kind {
+            JoinKind::Inner | JoinKind::Left => {}
+            // Both ask for records of `b` that no record of `a` names, and `a` is the only
+            // table left once this has folded - there is nothing for those rows to be.
+            JoinKind::Right | JoinKind::Full => {
+                return Err(SqlError::Refused { what: Refused::OuterJoin, at: join.at })
+            }
+        }
+        if optional {
+            continue;
+        }
+        let term = Cond::InRecords {
+            field: field.clone(),
+            table: join.source.clone(),
+            filter: conds[side].take().map(Box::new),
+            at: join.at,
+        };
+        extra = Some(match extra.take() {
+            None => term,
+            Some(had) => Cond::And(Box::new(had), Box::new(term)),
+        });
+    }
+
+    // Every name outside the `ON` and the folded `WHERE` has to be about a table still in
+    // scope. **Checked rather than left to the planner**, because two tables may declare the
+    // same column name - and `sum(s.amount)` folded into `sum(amount)` over `a` would then be a
+    // wrong number rather than an unknown field.
+    for (n, _) in &folded {
+        let label = select.joins[*n].source.label();
+        if let Some(at) = names_outside(select)
+            .into_iter()
+            .find(|(n, _)| n.qualifier.as_deref() == Some(label))
+            .map(|(_, at)| at)
+        {
+            return Err(SqlError::Refused { what: Refused::JoinShape, at });
+        }
+    }
+
+    // What is left of the joins is the star, if there was one beside these.
+    let mut kept = Vec::new();
+    for (n, join) in select.joins.iter().enumerate() {
+        if !folded.iter().any(|(f, _)| *f == n) {
+            kept.push(join.clone());
+        }
+    }
+    // A star join beside a folded one would have to be split across two shapes: the folded part
+    // is a set and the star is per-key arithmetic over it, which is a third thing.
+    if !kept.is_empty() {
+        return Err(SqlError::Refused { what: Refused::Joins, at: kept[0].at });
+    }
+    out.joins = Vec::new();
+
+    // The terms that were about tables still in scope, put back the way `both` puts a
+    // conjunction back together.
+    let mut rest: Option<Cond> = None;
+    for cond in conds.into_iter().flatten() {
+        rest = both(rest, Some(cond));
+    }
+    out.filter = both(rest, extra);
+    Ok(Some(out))
+}
+
+/// The outer column a join narrows on, when its `ON` names the joined-in table's record id.
+///
+/// `ON a.fk = b._record_id` and `ON b._record_id = a.fk` are the same join written two ways, so
+/// both sides are tried. A record id on a table *already* in scope is not this: it would ask
+/// which of `b`'s records name one of `a`'s, which is the join the other way round and has no
+/// column on `b` to be about.
+fn record_key(join: &Join, scope: &Scope<'_>, new: Side) -> Option<Name> {
+    let is_id = |n: &Name| {
+        n.column == crate::insert::RECORD_COLUMN
+            && n.qualifier.as_deref() == Some(scope.sources[new].label())
+    };
+    let outer = |n: &Name| {
+        let side = scope.side(n, join.at).ok()?;
+        (side < new && n.column != crate::insert::RECORD_COLUMN).then(|| n.clone())
+    };
+    match (is_id(&join.left), is_id(&join.right)) {
+        (true, false) => outer(&join.right),
+        (false, true) => outer(&join.left),
+        _ => None,
+    }
+}
+
+/// Every column name the statement carries outside its `ON` clauses and its `WHERE`.
+///
+/// The select list, the `GROUP BY`, the `ORDER BY` and the `HAVING` - each with the offset to
+/// refuse at. Exhaustive over the four, because a name this misses is a qualifier nothing
+/// checks and a column resolved against the wrong table.
+fn names_outside(select: &Select) -> Vec<(&Name, usize)> {
+    let mut out = Vec::new();
+    for item in &select.items {
+        proj_names(&item.proj, item.at, &mut out);
+    }
+    for name in &select.group_by {
+        out.push((name, select.items.first().map_or(0, |i| i.at)));
+    }
+    if let Some(order) = &select.order_by {
+        match &order.key {
+            OrderKey::Agg { field, .. } | OrderKey::Avg(field) | OrderKey::Name(field) => {
+                out.push((field, order.at))
+            }
+            OrderKey::Count => {}
+        }
+    }
+    if let Some(having) = &select.having {
+        having_names(having, &mut out);
+    }
+    out
+}
+
+fn proj_names<'a>(proj: &'a Proj, at: usize, out: &mut Vec<(&'a Name, usize)>) {
+    match proj {
+        Proj::Column(n) | Proj::CountDistinct(n) | Proj::Avg(n) => out.push((n, at)),
+        Proj::Agg { field, .. } | Proj::Quantile { field, .. } | Proj::TopKeys { field, .. } => {
+            out.push((field, at))
+        }
+        Proj::Scalar { inner, .. } => proj_names(inner, at, out),
+        Proj::Star | Proj::Count | Proj::Now { .. } => {}
+    }
+}
+
+fn having_names<'a>(having: &'a crate::ast::Having, out: &mut Vec<(&'a Name, usize)>) {
+    use crate::ast::Having as H;
+    match having {
+        H::And(a, b) | H::Or(a, b) => {
+            having_names(a, out);
+            having_names(b, out);
+        }
+        H::Not(a) => having_names(a, out),
+        H::Cmp { left, right, at, .. } => {
+            for operand in [left, right] {
+                if let crate::ast::HavingOperand::Agg(agg) = operand {
+                    match agg {
+                        HavingAgg::Agg { field, .. } | HavingAgg::Avg(field) => {
+                            out.push((field, *at))
+                        }
+                        HavingAgg::Count => {}
+                    }
+                }
+            }
+        }
+    }
+}

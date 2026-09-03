@@ -208,6 +208,13 @@ fn branch_at(select: &Select) -> usize {
 
 /// Translates one `SELECT`.
 fn lower_one(select: &Select) -> Result<Statement> {
+    // **A join on the other table's record id is not a join here, it is a `WHERE`.** Folded
+    // before anything else looks at the statement, because what comes out has no join in it and
+    // is lowered by whichever ordinary path its `GROUP BY` calls for. The fold removes every
+    // one it recognises, so the second pass finds none and this recurses exactly once.
+    if let Some(folded) = join::fold_record_joins(select)? {
+        return lower_one(&folded);
+    }
     let rows = match &select.filter {
         Some(cond) => rows(cond),
         None => call("All", vec![]),
