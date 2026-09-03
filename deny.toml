@@ -60,6 +60,16 @@ confidence-threshold = 0.9
 # how its own users build it, which is the one thing this benchmark must not do.
 multiple-versions = "warn"
 wildcards = "deny"
+# **The ban is on a wildcard reaching a *published* crate**, where `*` means "whatever the
+# registry has today" and an audit is a statement about nothing. A path dependency on a crate in
+# this repository is the opposite case: it resolves to the source sitting next to it, and there
+# is no version to pin because there is no registry entry to pin to - `big-testfile`,
+# `big-message` and `big-message-redis` are all `publish = false`, which the workspace manifest
+# says in as many words.
+#
+# So the four this rule was failing on were the four it was never about. This is cargo-deny's own
+# exemption for that case, and it leaves the ban in force everywhere it means something.
+allow-wildcard-paths = true
 
 [sources]
 unknown-registry = "deny"
