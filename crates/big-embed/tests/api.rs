@@ -14,8 +14,8 @@
 
 //! The facade end to end, including through a real file.
 
-use big_embed::*;
 use big_db::catalog::FieldKind;
+use big_embed::*;
 use big_exec::Value;
 
 fn stocked() -> Api<big_pager::MemPager> {

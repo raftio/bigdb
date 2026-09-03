@@ -43,8 +43,8 @@
 mod common;
 use common::{send, spawn};
 
-use big_embed::{Api, MemPager, QueryOptions};
 use big_cluster::{Cluster, ClusterError};
+use big_embed::{Api, MemPager, QueryOptions};
 use big_testfile::Case;
 
 #[test]

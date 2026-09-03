@@ -19,9 +19,9 @@
 //! test against a fixture would keep passing after they disagreed. Every assertion below went
 //! through `Server::bind`, a loopback port, and `big_bin::client::run` - the same function `main` calls.
 
-use big_embed::Api;
 use big_bin::{exit, Io};
 use big_db::catalog::FieldKind;
+use big_embed::Api;
 use big_http::{Auth, Server, ServerConfig};
 use std::net::SocketAddr;
 

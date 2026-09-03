@@ -22,8 +22,8 @@
 //! a rewritten parse tree. That is the thing that has to be right: a view is only correct if
 //! `FROM v` asks the engine exactly what writing the substitution by hand would have asked.
 
-use big_embed::{Api, Sql};
 use big_db::FieldKind;
+use big_embed::{Api, Sql};
 use big_pager::MemPager;
 
 /// `tx` with four fields, a view over it, and a view over that.

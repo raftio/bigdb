@@ -23,11 +23,11 @@
 //! What this cannot claim is anything about sockets: pooling, keep-alive, or a deadline against
 //! a real clock. Those stay in `big-http/tests/cluster.rs`, over real ports, where they belong.
 
-use big_embed::{Api, FieldKind, MemPager, QueryOptions, Value};
 use big_cluster::client::{ClientError, PeerResponse, Peers, Repeatable};
 use big_cluster::{
     raft, wire, Cluster, ClusterConfig, ClusterError, ClusterFile, FactValue, OwnedFact,
 };
+use big_embed::{Api, FieldKind, MemPager, QueryOptions, Value};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;

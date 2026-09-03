@@ -42,8 +42,8 @@
 
 use std::sync::OnceLock;
 
-use big_embed::{Api, FieldKind, MemPager, QueryOptions, Value};
 use big_cluster::Cluster;
+use big_embed::{Api, FieldKind, MemPager, QueryOptions, Value};
 use proptest::prelude::*;
 
 /// The columns the generator writes predicates about: one of every class the planner

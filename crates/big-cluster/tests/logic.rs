@@ -48,8 +48,8 @@
 
 use std::path::PathBuf;
 
-use big_embed::{Api, Datum, MemPager, QueryOptions, ResultSet};
 use big_cluster::{Cluster, ClusterError};
+use big_embed::{Api, Datum, MemPager, QueryOptions, ResultSet};
 use big_testfile::Case;
 
 #[test]

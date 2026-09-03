@@ -153,7 +153,7 @@ impl Scalar {
     ///
     /// A bare column parses through the same path as an expression, and an identity carried as
     /// an expression would make every projection look like one to the layers below. This is
-    /// what lets the parser hand back a plain [`crate::Proj::Column`] instead.
+    /// what lets the parser hand back a plain [`crate::ast::Proj::Column`] instead.
     pub fn is_identity(&self) -> bool {
         matches!(self, Self::Value)
     }

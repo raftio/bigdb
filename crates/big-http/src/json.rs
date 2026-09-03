@@ -17,9 +17,9 @@
 //! The whole output surface is four shapes, so a serialisation library would be a dependency
 //! carried for one file. Escaping is the part worth getting right, and it is one function.
 
-use big_embed::{Datum, Format, ResultSet, TableInfo};
 use big_cluster::{RangeVerdict, RepairReport, WriteOutcome};
 use big_db::RecordId;
+use big_embed::{Datum, Format, ResultSet, TableInfo};
 use big_exec::{Group, Value};
 
 /// Escapes a string into a JSON string literal, including the quotes.

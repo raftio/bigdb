@@ -533,7 +533,11 @@ impl KeysBody {
 /// lacked one would refuse a statement its peers answer - and which node a client reached would
 /// decide whether the statement worked. That is the class of failure this whole layer exists to
 /// prevent. Appended after the tables, which is the shape change [`crate::WIRE_VERSION`] `4` is.
-pub fn put_schema(out: &mut Vec<u8>, tables: &[big_embed::TableInfo], views: &[big_embed::ViewInfo]) {
+pub fn put_schema(
+    out: &mut Vec<u8>,
+    tables: &[big_embed::TableInfo],
+    views: &[big_embed::ViewInfo],
+) {
     put_count(out, tables.len());
     for table in tables {
         // Qualified, so a repair recreates the table in the database the sender had it in.
