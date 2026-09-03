@@ -50,17 +50,23 @@ impl<'db, P: Pager + Sync> DbRead<'db, P> {
     /// defensible: if there is an index, use it; otherwise scan.**
     ///
     /// **The index is not always the cheaper path, and this rule knowingly ignores that.** A
-    /// bit-sliced index costs one read per bit plane whatever the predicate selects; a narrow
-    /// column packs small enough to sit inside its leaf cells and costs almost nothing. Measured
-    /// in `tests/engines.rs`, one `Eq` over five thousand records of a 13-bit column: sixteen
-    /// page reads through the index, one through the segment.
+    /// bit-sliced index costs one read per bit plane whatever the predicate selects; a segment
+    /// costs one read per handful of blocks and does not care how wide the values are. Measured
+    /// across both dimensions in `tests/engines.rs` -
+    /// `what_an_index_and_a_scan_each_cost_across_width_and_size` - and the answer is not close:
+    /// over one `Eq`, the scan reads fewer pages at **every** width and size in that matrix, by
+    /// three times at the near end and thirty at the far one.
     ///
-    /// It is left alone anyway, because choosing per query needs a cost model, and a cost model
-    /// needs statistics this engine does not keep - so the version that could be written today
-    /// would be guessing. A rule that guesses is worse than a rule that is simple: the simple one
-    /// is predictable, and the guessing one is a performance cliff nobody can see coming. The
-    /// figures are written down so that whoever does build the cost model starts from a
-    /// measurement rather than from this paragraph.
+    /// So the reason this rule survives is not that it is usually right. It is that the number
+    /// which decides where the two paths cross - **how many records a fragment holds** - is not
+    /// in the catalog, and putting it there is a format change rather than a new record kind:
+    /// `FragmentMeta` is stored, and the policy for changing a stored type is dump and reload.
+    /// Until that is paid for, choosing per query would be guessing, and a rule that guesses is
+    /// a performance cliff nobody can see coming where this one is merely predictable.
+    ///
+    /// The matrix is written down so that whoever pays for it starts from a measurement rather
+    /// than from this paragraph, and so that a change in either path shows up as a diff there
+    /// rather than as a slower query nobody attributes.
     ///
     /// What is *not* left to this rule: a projection always reads columns where they exist, and
     /// that decision lives in `big_exec::ColumnPlan` rather than here. It is not a cost

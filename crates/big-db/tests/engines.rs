@@ -418,3 +418,135 @@ fn a_scan_is_refused_while_it_runs_rather_than_after() {
     // groups held before the refusal would be far past this.
     assert!(read.spent_bytes() < 4096 * 8, "spent {} bytes before refusing", read.spent_bytes());
 }
+
+/// The measurement a cost model would be built from, across the two things that decide it.
+///
+/// **This is deliberately not a cost model.** The routing rule - `DbRead::scans` - is "if there
+/// is an index, use it", and the reason it is not "use the cheaper one" is written where it
+/// lives: choosing per query needs statistics this engine does not keep, so the version that
+/// could be written today would be guessing, and a rule that guesses is a performance cliff
+/// nobody can see coming. What that paragraph asks for is a measurement to start from. This is
+/// it, and it is one test rather than one number so that the *shape* of the trade is visible
+/// instead of a single point on it.
+///
+/// Two things move: how wide the values are, which is what an index charges for - one read per
+/// bit plane, whatever the predicate selects - and how many records there are, which is what a
+/// scan charges for. Nothing here varies selectivity, because neither path is sensitive to it:
+/// the index reads every plane to answer any predicate, and the scan decodes every block in
+/// range to answer any predicate.
+///
+/// **Read the numbers, not this sentence.** What they said when this was written:
+///
+/// - The index is roughly `bits + 1` pages and barely moves with the record count; the extra
+///   reads at fifty thousand are the tree getting one level deeper, not the predicate costing
+///   more.
+/// - The scan is flat in the width and grows with the records, at about one page per four
+///   thousand of them.
+/// - **The scan is cheaper in every cell of this matrix** - by three times at the near end and
+///   thirty at the far one. The routing rule takes the index in all nine.
+///
+/// Extended past the last row, the two meet somewhere around fifty thousand records for an
+/// eight-bit column and past a hundred and fifty thousand for a thirty-two-bit one - which is
+/// *inside* one shard, since a shard holds about a million records. So the crossover is real and
+/// reachable, and which side of it a fragment sits on is decided by **how many records that
+/// fragment holds** - the one number this measurement says a cost model would need and the
+/// catalog does not keep.
+///
+/// That number is not free: `FragmentMeta` is stored, so a field added to it is a format change
+/// rather than a new catalog record kind, and the policy for one of those is dump and reload.
+/// Which is the honest reason the routing rule is still the simple one, and a better reason than
+/// the one it used to give.
+#[test]
+fn what_an_index_and_a_scan_each_cost_across_width_and_size() {
+    use big_pager::{CountingPager, MemPager};
+
+    /// One measurement: the pages read to answer one `Eq` over this shape of data.
+    fn reads(engine: TableEngine, bits: u32, records: u64) -> u64 {
+        let d = Db::open(CountingPager::new(MemPager::new())).unwrap();
+        d.create_table_with("tx", engine).unwrap();
+        d.create_field("tx", "amount", FieldKind::Int, 64).unwrap();
+        let ceiling = 1u64 << bits;
+        let mut w = d.write();
+        for r in 0..records {
+            // **The first record carries the largest value the width allows**, which fixes two
+            // things at once: the fragment's depth becomes `bits` whatever the record count is -
+            // so width and size vary independently - and the predicate below has something to
+            // match. Without it a wide column over few records has a shallow fragment and a zone
+            // map that skips every one of them, and the measurement is of a query that read
+            // nothing.
+            let value = if r == 0 { ceiling - 1 } else { r % ceiling };
+            w.set_int("tx", "amount", r, value).unwrap();
+        }
+        w.commit().unwrap();
+
+        let before = d.store().pager().counts().reads;
+        d.read().matching("tx", "amount", RangeOp::Eq, ceiling - 1).unwrap();
+        d.store().pager().counts().reads - before
+    }
+
+    let widths = [8u32, 16, 32];
+    let sizes = [1_000u64, 10_000, 50_000];
+    let mut table = Vec::new();
+    for bits in widths {
+        for records in sizes {
+            table.push((
+                bits,
+                records,
+                reads(TableEngine::Bitmap, bits, records),
+                reads(TableEngine::Columnar, bits, records),
+            ));
+        }
+    }
+
+    let printed = table
+        .iter()
+        .map(|(b, r, index, scan)| {
+            format!("  {b:>2} bits, {r:>6} records: index {index:>4}, scan {scan:>4}")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // **The claims are about the shape rather than the values.** A cost model would rely on
+    // these and not on any particular number: the index charges for the width, the scan charges
+    // for the records.
+    for (bits, records, index, scan) in &table {
+        let _ = records;
+        assert!(*index > 0 && *scan > 0, "\n{printed}\n");
+        // An index charges for the width, so a wider column never reads fewer pages than a
+        // narrower one over the same data.
+        if *bits > 8 {
+            let narrower = table
+                .iter()
+                .find(|(b, r, _, _)| *b == bits / 2 && r == records)
+                .expect("every width has a half in this matrix");
+            assert!(*index >= narrower.2, "index got cheaper as the column got wider\n{printed}\n");
+        }
+    }
+    // A scan charges for the records, so the largest table never reads fewer pages than the
+    // smallest at the same width.
+    for bits in widths {
+        let at = |r: u64| table.iter().find(|(b, rec, _, _)| *b == bits && *rec == r).unwrap().3;
+        assert!(at(50_000) >= at(1_000), "a scan got cheaper as the table grew\n{printed}\n");
+    }
+
+    // Recorded so the numbers are readable without running anything, and so that a change in
+    // either path shows up here as a diff rather than as a slower query nobody attributes.
+    let summary: Vec<(u32, u64, u64, u64)> = table.clone();
+    assert_eq!(
+        summary,
+        vec![
+            (8, 1_000, 9, 1),
+            (8, 10_000, 12, 3),
+            (8, 50_000, 14, 10),
+            (16, 1_000, 17, 1),
+            (16, 10_000, 20, 3),
+            (16, 50_000, 22, 11),
+            (32, 1_000, 33, 2),
+            (32, 10_000, 36, 4),
+            (32, 50_000, 38, 12),
+        ],
+        "\npages read for one `Eq`:\n{printed}\n\n\
+         Recorded rather than ranked - see this test's comment. Update the list if this is a \
+         deliberate change, and read the new shape before changing the routing rule."
+    );
+}
