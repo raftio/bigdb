@@ -197,8 +197,8 @@ FROM/JOIN → PREWHERE → WHERE → GROUP BY → HAVING → WINDOW → QUALIFY
 
 | Mệnh đề | P | Ghi chú |
 |---|---|---|
-| `SELECT`, `FROM`, `WHERE`, `LIMIT` | P0 | |
-| `GROUP BY` + aggregate | P0 | |
+| `SELECT`, `FROM`, `WHERE`, `LIMIT` | P0 | ✅ xong. `PREWHERE` cũng nhận và gộp thẳng vào `WHERE`: ở đây nó chọn đúng tập mà `WHERE` chọn, vì không có hàng nào để đọc trước — một câu port từ ClickHouse chạy chứ không gãy vì một từ không đổi gì. `LIMIT ... WITH TIES` cũng có |
+| `GROUP BY` + aggregate | P0 | ✅ xong, **tới 4 cột**, và trên hai loại cột chứ không phải một. Cột keyed thì group bằng cách đi hết từ điển; cột `DATE`/`DATETIME` **không có từ điển**, nên `GROUP BY date_trunc('month', ts)` là một plan riêng: bucket lấy từ *lịch*, mỗi bucket là một range trên mặt phẳng bit. Bucket rỗng không phải một nhóm, và record không có giá trị thì **không nằm trong bucket nào** — nên tổng các count ở đây là số record *có* giá trị, không phải `count(*)`. Trần là **số lượt đi**, kiểm ở đầu mỗi tầng: frontier sau tầng một chính là số lượt của tầng hai, nên một ngân sách chặn luôn cả tích |
 | `ORDER BY` | P0 | ✅ xong trên grouped **và** trên projection. Trên projection cái giá là thật và đã nói rõ: sort phải thấy mọi hàng trước khi biết mười hàng nào sống, nên `LIMIT` rời khỏi plan và câu lệnh đọc mọi record khớp `WHERE`. Chặn bởi đúng trần `max_records` mà mọi phép đọc không giới hạn khác chịu. `NULL` xếp cuối ở cả hai chiều |
 | `HAVING` | P0 | ✅ xong, **có hay không có `GROUP BY`**. Không nằm trong plan: ngưỡng kiểm ở coordinator sau merge, vì một tổng dưới ngưỡng ở một node có thể vượt khi cộng đủ. Chỉ được gọi tên con số mà select list đã hỏi |
 | CTE (`WITH`) không đệ quy | P1 | |
@@ -277,7 +277,7 @@ func() OVER (
 | Integer | `Int8/16/32/64`, `UInt*` | P0 | ✅ xong (`TINYINT`…`BIGINT`, `UINT(n)`, `SIGNED(n)`); 128 bit thì không — một giá trị bit-sliced dừng ở 64 |
 | Decimal | `Decimal(p,s)` | P0 | ✅ xong. Lưu dạng số nguyên có scale, không đi qua float ở bất kỳ đâu |
 | Float | `Float32/64` | P0 | ✅ xong (`FLOAT`/`REAL`/`FLOAT32`, `DOUBLE`/`FLOAT64`). Lưu dưới một phép biến đổi bit giữ nguyên thứ tự, nên `WHERE`, `min`, `max` và zone map chạy y như mọi field bit-sliced. **`sum`/`avg` phải quét**: phép mã hoá không affine nên không cộng được theo mặt phẳng bit. Tiền vẫn dùng `DECIMAL(p,s)` — float không tròn số |
-| String | `String`, `FixedString(n)`, `LowCardinality(String)` | P0 | ✅ `TEXT/VARCHAR/CHAR/STRING` → `Set`; `FixedString` thì không — key lưu nguyên, không có gì để cắt hay đệm |
+| String | `String`, `FixedString(n)`, `LowCardinality(String)` | P0 | ✅ `TEXT/VARCHAR/CHAR/STRING` → `Set`, và `LowCardinality(String)` cũng vậy: đó đúng là thứ một `SET` vốn đã là, một key intern một lần và một bitmap cho mỗi key. Chỉ trên chuỗi — `LowCardinality(Int64)` bị từ chối, vì một con số là mặt phẳng bit và không có từ điển nào để mà "ít giá trị". `FixedString` thì không — key lưu nguyên, không có gì để cắt hay đệm |
 | Bool | `Bool` | P0 | ✅ xong |
 | Date/Time | `Date`, `DateTime`, `DateTime64(p, tz)` | P0 | ✅ `DATE` (số ngày) và `DATETIME`/`TIMESTAMP` (số giây) là kiểu vô hướng có thứ tự: `WHERE d >= '2024-01-01'`, `ORDER BY`, `min`/`max` đều hỏi được. `TIMEQUANTUM` vẫn là field keyed theo view ngày, và giờ là tên riêng của nó — trước đây cả bốn cách viết đều là time quantum. Không timezone, không `DateTime64(p)`; `sum` bị từ chối vì tổng hai ngày không phải một ngày |
 | Nullable | `Nullable(T)` | P1 | |
@@ -299,19 +299,19 @@ func() OVER (
 |---|---|---|---|
 | Aggregate cơ bản | `count, sum, avg, min, max` | P0 | ✅ xong |
 | ~~Aggregate cần xem lại giá trị~~ | `any, argMin, argMax, stddev*, var*, corr` | ✗ | **Không phải P0, và không phải việc chưa làm.** Cả năm cần xem lại giá trị từng record đối chiếu một tổng đang chạy; engine giữ bit ở `(row, record)` chứ không giữ giá trị để xem lại, và `stddev`/`var`/`corr` còn cần tổng bình phương mà mặt phẳng bit không cộng được. `argMin(a, b)` viết được bằng `SELECT a, b FROM t ORDER BY b LIMIT 1` — cùng câu trả lời, và nói rõ nó tốn gì. Phải kể cả `b` trong select list, vì `ORDER BY` chỉ được gọi tên cột mà projection đã đọc |
-| Conditional agg | `sumIf, countIf, avgIf` / `FILTER (WHERE ...)` | P1 | |
+| Conditional agg | `sumIf, countIf, avgIf` / `FILTER (WHERE ...)` | P1 | ✅ xong (khai thiếu ở bản trước) |
 | Distinct | `count(DISTINCT x)`, `uniqExact` | P0 | ✅ xong, và **exact** — `uniq`, `uniqExact`, `uniqCombined`, `uniqHLL12` và `uniqTheta` đều nhận và đều trả về con số đúng, vì cardinality của bitmap không cần sketch |
 | **Approx distinct** | `uniq, uniqHLL12, approx_count_distinct, DISTINCTCOUNTBITMAP` | P1 | |
-| Quantile | `quantile, quantileTDigest, median, percentile_approx` | P1 | |
-| Top-K | `topK, topKWeighted, TOPN` | P1 | |
+| Quantile | `quantile, quantileTDigest, median, percentile_approx` | P1 | ✅ `quantile`, `quantileExact`, `median` — và **exact**, như `count(DISTINCT)` |
+| Top-K | `topK, topKWeighted, TOPN` | P1 | ✅ `topK` xong |
 | Aggregate state | `-State` / `-Merge` combinator, `HLL_UNION_AGG`, `BITMAP_UNION` | P2 | |
 | Array | `arrayMap/Filter/Sum/Join/Sort/Distinct`, `has`, `arrayExists` | P2 | |
 | Higher-order lambda | `arrayMap(x -> x*2, arr)` | P2 | |
-| String | `substring, splitByChar, like, ilike, match, position, concat` | P0 | ✅ một phần: `substring, position, concat, lower, upper, length, trim, reverse, startsWith, endsWith, splitByChar` chạy ở tầng render trên giá trị đã đọc. `like/ilike` ✅ nhưng ở `WHERE` chứ không phải ở đây — xem §13. `match`/regex thì chưa |
+| String | `substring, splitByChar, like, ilike, match, position, concat` | P0 | ✅ một phần: `substring, position, concat, lower, upper, length, trim, reverse, startsWith, endsWith, splitByChar` chạy ở tầng render trên giá trị đã đọc. `like/ilike` ✅ nhưng ở `WHERE` chứ không phải ở đây — xem §13. `match`/regex thì chưa. `lower`/`upper` trong `WHERE` vẫn bị từ chối, và đó là câu trả lời đúng: các key khớp `'gb'` nằm rải rác trong từ điển chứ không gom thành một range |
 | Regex | `match, extract, replaceRegexpAll` | P1 | |
-| Date/time | `now, toDate, date_trunc, date_diff, date_add, toStartOfInterval, formatDateTime` | P0 | ✅ trừ `toStartOfInterval`, vốn bị từ chối *theo tên* để chỉ sang `date_trunc` — một cách viết cho một phép, để hai cách không bao giờ bất đồng về việc một tháng là gì. `date_diff`/`date_add` đếm trên lịch: thêm một tháng vào ngày 31 rơi vào ngày cuối tháng tới, không trượt sang tháng sau |
+| Date/time | `now, toDate, date_trunc, date_diff, date_add, toStartOfInterval, formatDateTime` | P0 | ✅ trừ `toStartOfInterval`, vốn bị từ chối *theo tên* để chỉ sang `date_trunc` — một cách viết cho một phép, để hai cách không bao giờ bất đồng về việc một tháng là gì. `date_diff`/`date_add` đếm trên lịch: thêm một tháng vào ngày 31 rơi vào ngày cuối tháng tới, không trượt sang tháng sau. **`date_trunc`/`toDate`/`toYear` trong `WHERE` giờ được trả lời**, không phải bằng cách chạy mà bằng cách *đảo lại*: mọi giá trị có tháng là tháng Một chính là mọi giá trị trong `[2024-01-01, 2024-02-01)`, và một range là phép đọc mặt phẳng bit vốn đã có. Biên tính trên *chuỗi ngày đã viết*, nên một phép viết lại đúng cho cả `DATE` lẫn `DATETIME` mà không cần schema |
 | Time-series | `runningDifference, neighbor, sequenceMatch, windowFunnel, retention` | P2 | |
-| Math / bit | `abs, round, floor, log, pow, bitAnd, bitShiftLeft` | P0 | ✅ xong. `round` trên `DECIMAL` là dịch dấu chấm rồi làm tròn nửa ra xa số 0 — không đi qua float, nên tiền vẫn tròn |
+| Math / bit | `abs, round, floor, log, pow, bitAnd, bitShiftLeft` | P0 | ✅ xong. `round` trên `DECIMAL` là dịch dấu chấm rồi làm tròn nửa ra xa số 0 — không đi qua float, nên tiền vẫn tròn. `round`/`floor`/`ceil` trong `WHERE` cũng được đảo thành range, nhưng **ở `big-plan` chứ không ở parser**: `round(x,2) > 5` là `x >= 5.01` trên `DECIMAL(10,2)`, `x >= 6` trên `INT` và `x > 5` trên `SIGNED` — biên phụ thuộc scale, nên tầng biết scale mới tính được. `abs` thì không: nó gộp hai đoạn của một cột có dấu vào một câu trả lời |
 | Type conv | `cast, toInt64, toString, parseDateTimeBestEffort` | P0 | ✅ `CAST(x AS T)`, `toInt64/toUInt64/toInt32/toFloat64/toString`. `toDateTime` vẫn từ chối: nới một số đếm ngày thành một thời điểm phải bịa ra giờ trong ngày |
 | Conditional | `if, multiIf, CASE WHEN, coalesce, nullIf` | P0 | ✅ xong, cả `ifNull`. Năm cách viết vào **một** cây `Case` — dạng ngắn `CASE <expr> WHEN <val>` bị từ chối để không có cây thứ hai phải giữ đồng bộ |
 | Hash | `cityHash64, xxHash64, sipHash64, murmurHash3` | P1 | |
@@ -410,6 +410,10 @@ CREATE RESOURCE GROUP / WORKLOAD GROUP ...;      -- multi-tenant isolation
 | `count(*)` | popcount | O(container), có cache |
 | `count(DISTINCT f)` | số row khác rỗng | O(rows) — exact |
 | `GROUP BY f` | iterate rows của `f`, intersect với filter | O(cardinality × container) |
+| `GROUP BY date_trunc(u, ts)` | min/max lấy khoảng, mỗi bucket là một BSI range | O(số bucket × bit_depth × container) |
+| `GROUP BY a, b, c` | đi cây: mỗi tổ hợp của các tầng trước là một lượt qua tầng sau | O(số lượt × chi phí một grouping) |
+| `WHERE date_trunc(u, ts) = d` | đảo lại thành range `[d, d+1u)` | như một range viết tay |
+| `WHERE round(x, k) > v` | đảo lại thành range, biên tính ở scale của field | như một range viết tay |
 | `sum(i) WHERE ...` | BSI sum | O(bit_depth × container) |
 | `TOP N f` | ranked cache của field | O(cache_size) |
 | `LEFT SEMI JOIN` trên field chung | `Intersect` | rất rẻ |
@@ -438,6 +442,7 @@ Nguyên tắc: mọi predicate quy được về Union/Intersect/Difference thì
 | **M1.6 — view** ✅ | CREATE/DROP VIEW (lọc + chiếu trên một bảng), view lồng view, `SHOW VIEWS`, `SHOW CREATE VIEW`, `DESCRIBE v`, view trong `SHOW TABLES` | Đưa được một lát cắt hẹp của bảng cho người khác mà không copy dữ liệu |
 | **M2 — hữu ích** ✅ | `GROUP BY` + count/sum, BSI range, `count(DISTINCT)`, `ORDER BY`, `LIMIT`, INSERT SELECT | Thay được một dashboard thật |
 | **M2.5 — biểu thức** ✅ | Biểu thức vô hướng trong select list (số học, string, `CASE`, cast, date), `LIKE`/`ILIKE` trong `WHERE` | Không phải viết lại truy vấn ở tầng ứng dụng nữa |
+| **M2.6 — chiều thời gian** ✅ | `GROUP BY date_trunc(...)`, `GROUP BY` tới 4 cột, key cạnh bucket, phép làm tròn trong `WHERE`, `LowCardinality(String)` | "Đếm theo tháng" và "theo nước, theo tháng" — hai chiều của mọi dashboard |
 | **M3 — tin được** | DELETE/UPDATE theo predicate, TTL, `EXPLAIN`, `system.*`, SET limits, KILL | Dám cho người khác dùng |
 | **M4 — cạnh tranh** | JOIN (semi/anti trước), window function, ROLLUP/CUBE, bitmap function expose ra SQL, MV | So được với Doris ở use case đếm tập hợp |
 | **M5 — quy mô** | Phân tán theo shard, resource group, time travel, external catalog | |
@@ -455,3 +460,39 @@ Thứ nên **hoãn** vì đắt bất thường: full outer join, JSON type, `MO
 không rẻ đi, chỉ là cái giá đã được nói ra thay vì giấu. Một `ORDER BY` trên projection biến
 `LIMIT` từ *giới hạn số record đọc* thành *lát cắt sau khi sắp* — cùng một câu lệnh, đọc mười
 record hay đọc hết, khác nhau ở một mệnh đề. Đó là thứ nên biết trước khi viết nó vào dashboard.
+
+---
+
+## 15. Những trần còn lại, và vì sao chúng ở đó
+
+Không phải việc chưa làm. Mỗi cái dưới đây là một quyết định, ghi ra để không ai phải đọc code
+mới biết:
+
+**`GROUP BY` dừng ở 4 cột.** Trần thật là *số lượt đi*, kiểm ở đầu mỗi tầng — bốn là để arity của
+câu trả lời còn nằm gọn trong một byte, và để một câu kể tên hai mươi cột bị từ chối ngay ở chữ
+chứ không phải sau khi đã dựng xong frontier.
+
+**`GROUP BY` chỉ nhận cột, hoặc `date_trunc` của một cột.** Hai thứ đó là hai thứ có plan.
+`GROUP BY lower(country)` sẽ dán nhãn lại các giá trị mà không gộp chúng — một dòng cho mỗi giá
+trị đã lưu, tất cả in ra dưới một cái tên. Kiểu `Grouping` chính là lời từ chối: nếu để lọt một
+biểu thức bất kỳ vào đây thì câu hỏi "cái nào có plan" bị đẩy xuống lowering thành một danh sách
+ai đó phải bảo trì.
+
+**Select list và `GROUP BY` phải mô tả *cùng một* tập giá trị.** `SELECT ts ... GROUP BY
+date_trunc('month', ts)` và `SELECT date_trunc('day', ts) ... GROUP BY date_trunc('month', ts)`
+đều bị từ chối. Cả hai *trông như* đã tổng hợp mà không phải, và client không thấy được khác biệt.
+
+**Scalar trong `WHERE` chỉ nhận hàm đảo được.** `date_trunc`, `toDate`, `toYear`, `round`,
+`floor`, `ceil` — mỗi cái không giảm, nên tập giá trị cho ra một câu trả lời là *liền nhau*, tức
+là một range. `lower` và `abs` thì không: câu trả lời của chúng nằm rải rác, và không có range nào
+để viết lại thành.
+
+**Một phép làm tròn so với giá trị nó không bao giờ sinh ra thì bị từ chối, không trả về rỗng.**
+`date_trunc('month', ts) = '2024-01-15'` — không tháng nào bắt đầu ngày 15. Engine khác trả về
+không dòng nào; ở đây từ chối, vì dialect này **không có bind parameter**, nên giá trị đó do người
+gõ ra chứ không phải do thay thế — và một câu trả lời rỗng cho một lỗi gõ thì đọc y như một bảng
+không có gì trong tháng đó.
+
+**Bucket rỗng không phải một nhóm, và record không có giá trị không nằm trong bucket nào.** Cái
+thứ hai là chỗ dễ hiểu sai nhất về grouping theo lịch: tổng các count là số record *có* giá trị,
+không phải `count(*)`. Có một property test sinh vị từ để giữ đúng điều đó.

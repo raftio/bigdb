@@ -669,7 +669,7 @@ pub struct JoinSide {
 /// How a side of a join is keyed, and the plan that says so.
 ///
 /// One enum rather than a plan and a separate arity, because the arity *is* which plan variant
-/// answered: no axis is a `Count`, one is a `Distinct`, and two would be a `GroupByPair`.
+/// answered: no axis is a `Count`, one is a `Distinct`, and two or more are a `GroupByTuple`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Keying {
     /// One axis of the join's key space: a `Distinct` over that column.

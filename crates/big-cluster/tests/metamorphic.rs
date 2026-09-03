@@ -60,6 +60,8 @@ struct Rec {
     balance: i64,
     country: &'static str,
     active: bool,
+    /// A day count, so a calendar grouping has something to cut up.
+    day: i64,
 }
 
 /// Two hundred records with no pattern anybody would write a query for, and no randomness
@@ -74,6 +76,9 @@ fn rows() -> Vec<Rec> {
             balance: (id as i64 * 41) % 201 - 100,
             country: COUNTRIES[(id % 4) as usize],
             active: id % 3 != 0,
+            // Spread over about seven months from the start of 2024, so a month grouping has
+            // several buckets and every one of them holds records.
+            day: big_civil::days_from_civil(2024, 1, 1) + (id as i64 * 7) % 200,
         })
         .collect()
 }
@@ -90,6 +95,7 @@ fn db() -> &'static Cluster<MemPager> {
         api.create_field("t", "balance", FieldKind::SignedInt, 16).unwrap();
         api.create_field("t", "country", FieldKind::Set, 0).unwrap();
         api.create_field("t", "active", FieldKind::Bool, 0).unwrap();
+        api.create_field("t", "d", FieldKind::Date, 32).unwrap();
         for r in rows() {
             api.import(
                 "t",
@@ -99,6 +105,7 @@ fn db() -> &'static Cluster<MemPager> {
                     big_embed::Fact::Signed { field: "balance", record: r.id, value: r.balance },
                     big_embed::Fact::Key { field: "country", record: r.id, value: r.country },
                     big_embed::Fact::Bool { field: "active", record: r.id, value: r.active },
+                    big_embed::Fact::Signed { field: "d", record: r.id, value: r.day },
                 ],
             )
             .unwrap();
@@ -306,6 +313,76 @@ proptest! {
         let with = count(Some(&format!("({x}) AND ({y})")));
         let without = count(Some(&format!("({x}) AND NOT ({y})")));
         prop_assert_eq!(with + without, count(Some(&x)), "\n  a: {}\n  b: {}\n", x, y);
+    }
+
+    /// **A calendar grouping is a partition too**, and this is the property most likely to catch
+    /// the walk cutting at the wrong place: the buckets are disjoint and cover every value, so
+    /// their counts sum to the records the predicate selected. Every record here holds a date, so
+    /// that total is the plain count - a record holding none would be in no bucket and this would
+    /// be the wrong assertion, which is worth saying out loud because it is the easy mistake.
+    #[test]
+    fn the_buckets_of_a_predicate_sum_to_its_count(p in pred()) {
+        let clause = p.sql();
+        let sql = format!(
+            "SELECT date_trunc('month', d), count(*) FROM t WHERE {clause} \
+             GROUP BY date_trunc('month', d)"
+        );
+        let (set, _) = db().sql(&sql, &big_rbac::Who::Trusted, &QueryOptions::default()).unwrap();
+        let total: i128 = set
+            .rows
+            .iter()
+            .map(|r| match r[1] {
+                big_embed::Datum::Int(n) => n,
+                ref other => panic!("a bucket counted {other:?}"),
+            })
+            .sum();
+        prop_assert_eq!(total, i128::from(count(Some(&clause))), "\n  where: {}\n", clause);
+    }
+
+    /// A coarser boundary's buckets are exactly the unions of a finer one's, which is the
+    /// strongest check available on the calendar walk: it compares the engine against itself at
+    /// two granularities rather than against a number written by hand.
+    #[test]
+    fn a_year_s_buckets_are_its_months_added_up(p in pred()) {
+        let clause = p.sql();
+        let total = |unit: &str| -> i128 {
+            let sql = format!(
+                "SELECT date_trunc('{unit}', d), count(*) FROM t WHERE {clause} \
+                 GROUP BY date_trunc('{unit}', d)"
+            );
+            let (set, _) =
+                db().sql(&sql, &big_rbac::Who::Trusted, &QueryOptions::default()).unwrap();
+            set.rows
+                .iter()
+                .map(|r| match r[1] {
+                    big_embed::Datum::Int(n) => n,
+                    ref other => panic!("a bucket counted {other:?}"),
+                })
+                .sum()
+        };
+        prop_assert_eq!(total("year"), total("month"), "\n  where: {}\n", clause);
+        prop_assert_eq!(total("month"), total("day"), "\n  where: {}\n", clause);
+    }
+
+    /// The combinations of two columns partition the records the same way one column's groups do,
+    /// which is what says the tree walk lost nothing on the way down.
+    #[test]
+    fn the_combinations_of_two_columns_sum_to_the_count(p in pred()) {
+        let clause = p.sql();
+        let sql = format!(
+            "SELECT country, date_trunc('month', d), count(*) FROM t WHERE {clause} \
+             GROUP BY country, date_trunc('month', d)"
+        );
+        let (set, _) = db().sql(&sql, &big_rbac::Who::Trusted, &QueryOptions::default()).unwrap();
+        let total: i128 = set
+            .rows
+            .iter()
+            .map(|r| match r[2] {
+                big_embed::Datum::Int(n) => n,
+                ref other => panic!("a combination counted {other:?}"),
+            })
+            .sum();
+        prop_assert_eq!(total, i128::from(count(Some(&clause))), "\n  where: {}\n", clause);
     }
 
     /// The groups of a keyed column are a partition too: every record holds exactly one country

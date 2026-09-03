@@ -208,11 +208,11 @@ pub enum Plan {
         /// The calendar boundary the buckets fall on.
         unit: big_civil::Unit,
         /// How many buckets the column's values may span. Never absent, and part of the plan for
-        /// the reason [`Plan::GroupByPair::left_max`] is: the number of them is what this costs,
-        /// and a cut applied to the answer would be a cut applied after paying for it.
+        /// the reason [`Plan::GroupByTuple`]'s `max_passes` is: the number of them is what this
+        /// costs, and a cut applied to the answer would be a cut applied after paying for it.
         ///
         /// Counted per node. Each walks its own values' range, so a coordinator can hold up to
-        /// one bound's worth per owner - the same semantics `left_max` already has.
+        /// one bound's worth per owner - the same semantics `max_passes` has.
         max_buckets: usize,
         /// What each bucket carries, planned against a placeholder bitmap exactly as a
         /// [`Plan::GroupBy`]'s aggregate is.

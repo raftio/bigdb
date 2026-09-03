@@ -377,7 +377,7 @@ pub fn execute<P: Pager + Sync>(db: &DbRead<'_, P>, plan: &Plan) -> Result<Value
         // so checking the frontier's size at the top of each level bounds the product as well as
         // the first column - the frontier after the first level *is* the pass count for the
         // second. One budget genuinely suffices, and for two levels it is exactly what
-        // `GroupByPair`'s `left_max` already checked.
+        // the pair grouping's own bound already checked before this generalised.
         Plan::GroupByTuple { rows, levels, aggregate, max_passes, .. } => {
             let matched = eval(db, table, rows)?;
             let (last, outer) = levels.split_last().expect("a tuple grouping has two or more");
