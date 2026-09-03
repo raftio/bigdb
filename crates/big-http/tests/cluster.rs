@@ -1484,7 +1484,7 @@ fn a_top_n_widens_its_bound_until_a_group_hidden_on_every_node_can_be_seen() {
 
     let mut facts = String::new();
     let mut id = 1;
-    let mut put = |facts: &mut String, id: &mut u64, key: &str, base: u64, times: usize| {
+    let put = |facts: &mut String, id: &mut u64, key: &str, base: u64, times: usize| {
         for _ in 0..times {
             facts.push_str(&format!("country {} {key}\n", base + *id));
             *id += 1;
