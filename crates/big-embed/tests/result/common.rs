@@ -19,8 +19,8 @@
 //! used to be reachable only through a socket.
 
 use big_embed::{
-    Answer, Cell, Container, Format, Group, Matches, Of, Pair, RowSet, Selected, Shape, Units,
-    Value,
+    Answer, Cell, Container, Format, Group, GroupAt, Matches, Of, Pair, RowSet, Selected, Shape,
+    Units, Value,
 };
 
 /// A statement's answer, in the default format and with no searches.
@@ -40,7 +40,7 @@ pub fn cell(column: &str, of: Of) -> Cell {
 
 /// One group: a row id, the key it was interned from, and its number.
 pub fn group(row: u64, key: Option<&str>, value: Value) -> Group {
-    Group { row, key: key.map(str::to_string), value: Box::new(value) }
+    Group { at: GroupAt::Row(row), key: key.map(str::to_string), value: Box::new(value) }
 }
 
 /// One pair of groups, which is what `GROUP BY a, b` answers with.

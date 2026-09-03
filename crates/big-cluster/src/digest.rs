@@ -35,7 +35,7 @@
 //! file would report a difference on every pair of healthy nodes, which is the same as
 //! reporting nothing.
 
-use big_embed::{Api, FieldKind, PagerMut, Plan, QueryOptions, Rows, Value};
+use big_embed::{Api, FieldKind, GroupAt, PagerMut, Plan, QueryOptions, Rows, Value};
 
 /// Every fact this node holds, as one number.
 ///
@@ -69,12 +69,16 @@ pub fn digest<P: PagerMut + Sync>(api: &Api<P>) -> big_embed::Result<u64> {
                         },
                         &QueryOptions::default(),
                     )?;
-                    // Sorted by row rather than by key, because a row id means the same thing
-                    // on every node and is cheaper to compare than the string it came from.
+                    // Sorted by identity rather than by key, because a row id means the same
+                    // thing on every node and is cheaper to compare than the string it came
+                    // from. Only a keyed field is digested here, so every group is a `Row`.
                     if let Value::Groups(mut g) = groups {
-                        g.sort_by_key(|g| g.row);
+                        g.sort_by_key(|g| g.at);
                         for group in g {
-                            h.u64(group.row);
+                            h.u64(match group.at {
+                                GroupAt::Row(row) => row,
+                                GroupAt::Bucket { start, .. } => start as u64,
+                            });
                             h.u64(match *group.value {
                                 Value::Count(n) => n,
                                 _ => 0,

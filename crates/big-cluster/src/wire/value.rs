@@ -279,14 +279,56 @@ fn get_projection(r: &mut Reader<'_>) -> Result<Projection> {
     })
 }
 
+/// How a group says which one it is.
+///
+/// Tagged rather than written as a bare number, because the two kinds of identity are not
+/// interchangeable: a row id means nothing without the dictionary that issued it, and a bucket
+/// means the same thing on every node without one. A reader that took either as the other would
+/// fold two different groups together and report a number nobody could trace.
+mod group_tag {
+    pub const ROW: u8 = 0;
+    pub const BUCKET: u8 = 1;
+}
+
+mod unit_tag {
+    pub const DAYS: u8 = 0;
+    pub const SECONDS: u8 = 1;
+}
+
 fn put_group(out: &mut Vec<u8>, g: &Group) {
-    put_u64(out, g.row);
+    match g.at {
+        GroupAt::Row(row) => {
+            out.push(group_tag::ROW);
+            put_u64(out, row);
+        }
+        GroupAt::Bucket { start, unit } => {
+            out.push(group_tag::BUCKET);
+            put_u64(out, start as u64);
+            out.push(match unit {
+                TimeUnit::Days => unit_tag::DAYS,
+                TimeUnit::Seconds => unit_tag::SECONDS,
+            });
+        }
+    }
     put_opt_str(out, g.key.as_deref());
     put_value(out, &g.value);
 }
 
 fn get_group(r: &mut Reader<'_>, depth: usize) -> Result<Group> {
-    Ok(Group { row: r.u64()?, key: r.opt_str()?, value: Box::new(get_value_at(r, depth + 1)?) })
+    let at = match r.u8()? {
+        group_tag::ROW => GroupAt::Row(r.u64()?),
+        group_tag::BUCKET => {
+            let start = r.u64()? as i64;
+            let unit = match r.u8()? {
+                unit_tag::DAYS => TimeUnit::Days,
+                unit_tag::SECONDS => TimeUnit::Seconds,
+                tag => return Err(WireError::BadTag { what: "a bucket's unit", tag }),
+            };
+            GroupAt::Bucket { start, unit }
+        }
+        tag => return Err(WireError::BadTag { what: "a group's identity", tag }),
+    };
+    Ok(Group { at, key: r.opt_str()?, value: Box::new(get_value_at(r, depth + 1)?) })
 }
 
 pub fn get_value(r: &mut Reader<'_>) -> Result<Value> {

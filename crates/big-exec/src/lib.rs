@@ -32,11 +32,38 @@ use big_plan::{CmpOp, FieldClass, Keyed, Plan, PlanError, Rows, Schema, TimeUnit
 pub mod error;
 pub use error::{ExecError, Result};
 
-/// One group of a `Distinct`, `TopN` or `GroupBy`.
+/// What a group is one of.
+///
+/// **The identity, and only the identity.** The label sits beside it in [`Group`] rather than
+/// inside it, because two nodes' contributions to one group are folded on this - and a node that
+/// was never told a key must not thereby become a different group.
+///
+/// Its own type rather than a bare `RowId` so that a bucket and a row cannot be confused at a
+/// `match` arm that would compile either way. They are addressed quite differently: a row id is
+/// handed out once for the whole cluster and means nothing without the dictionary that issued
+/// it, while a bucket is a pure function of the value and needs no issuer at all.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub enum GroupAt {
+    /// A row of a keyed field's dictionary.
+    Row(RowId),
+    /// A calendar bucket of a bit-sliced temporal field: the first moment in it, in the units the
+    /// field stores - days for a `DATE`, seconds for a `DATETIME`.
+    ///
+    /// **Needs no issuer, which is what lets a grouping exist over a field with no dictionary.**
+    /// Two nodes that saw different halves of one month compute the same number for it, so the
+    /// coordinator's merge folds them together without anybody having coordinated. Ordered by
+    /// `start`, so buckets arrive in calendar order even before a key is attached.
+    Bucket { start: i64, unit: TimeUnit },
+}
+
+/// One group of a `Distinct`, `TopN`, `GroupBy` or `GroupByBucket`.
 #[derive(Clone, Debug)]
 pub struct Group {
-    pub row: RowId,
+    pub at: GroupAt,
     /// The string the row was interned from, when the field has one.
+    ///
+    /// Always `None` for a [`GroupAt::Bucket`]: what a bucket is called is derivable from `at`
+    /// and its unit, and storing it too would be two spellings of one fact that can disagree.
     pub key: Option<String>,
     /// What was measured about this group. A `Value` rather than a number so a group can carry
     /// a count, a sum, or eventually another grouping, without this type changing again.
@@ -298,7 +325,7 @@ pub fn execute<P: Pager + Sync>(db: &DbRead<'_, P>, plan: &Plan) -> Result<Value
             let mut out = Vec::with_capacity(groups.len());
             for (row, hits) in groups {
                 out.push(Group {
-                    row,
+                    at: GroupAt::Row(row),
                     key: db.row_key(table, field, row).map(str::to_string),
                     value: Box::new(aggregate_over(db, table, aggregate, &hits)?),
                 });
@@ -328,7 +355,7 @@ pub fn execute<P: Pager + Sync>(db: &DbRead<'_, P>, plan: &Plan) -> Result<Value
             let mut out = Vec::new();
             for (row, hits) in outer {
                 let left_group = Group {
-                    row,
+                    at: GroupAt::Row(row),
                     key: db.row_key(table, left, row).map(str::to_string),
                     // The left half carries no number of its own: the pair's number is the
                     // right half's, measured over the records both hold.
@@ -338,7 +365,7 @@ pub fn execute<P: Pager + Sync>(db: &DbRead<'_, P>, plan: &Plan) -> Result<Value
                     out.push(Pair {
                         left: left_group.clone(),
                         right: Group {
-                            row: inner,
+                            at: GroupAt::Row(inner),
                             key: db.row_key(table, right, inner).map(str::to_string),
                             value: Box::new(aggregate_over(db, table, aggregate, &both)?),
                         },
@@ -520,8 +547,8 @@ pub fn sort_pairs(pairs: &mut [Pair]) {
 }
 
 /// A group's place in key order: named groups by name, unnamed after them by row.
-fn key_order(g: &Group) -> (bool, Option<&str>, RowId) {
-    (g.key.is_none(), g.key.as_deref(), g.row)
+fn key_order(g: &Group) -> (bool, Option<&str>, GroupAt) {
+    (g.key.is_none(), g.key.as_deref(), g.at)
 }
 
 /// Merges two nodes' projected rows into one page.
@@ -554,7 +581,7 @@ pub fn merge_projected(
 pub fn rank_top_n(groups: &mut Vec<Group>, n: usize) {
     groups.sort_by(|a, b| {
         let (an, bn) = (count_of(a), count_of(b));
-        bn.cmp(&an).then_with(|| a.key.cmp(&b.key)).then(a.row.cmp(&b.row))
+        bn.cmp(&an).then_with(|| a.key.cmp(&b.key)).then(a.at.cmp(&b.at))
     });
     groups.truncate(n);
 }
@@ -581,7 +608,7 @@ fn label<P: Pager + Sync>(
     let mut out: Vec<Group> = rows
         .into_iter()
         .map(|(row, n)| Group {
-            row,
+            at: GroupAt::Row(row),
             key: db.row_key(table, field, row).map(str::to_string),
             value: Box::new(measure(n)),
         })
@@ -599,7 +626,7 @@ pub fn sort_by_key(groups: &mut [Group]) {
         (Some(x), Some(y)) => x.cmp(y),
         (Some(_), None) => core::cmp::Ordering::Less,
         (None, Some(_)) => core::cmp::Ordering::Greater,
-        (None, None) => a.row.cmp(&b.row),
+        (None, None) => a.at.cmp(&b.at),
     });
 }
 

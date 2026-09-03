@@ -30,7 +30,7 @@
 //! two ways depending on how many nodes were asked.
 
 use crate::error::{ClusterError, Result};
-use big_embed::{Plan, RowId, Value};
+use big_embed::{GroupAt, Plan, Value};
 use big_exec::Group;
 use std::collections::BTreeMap;
 
@@ -43,7 +43,7 @@ pub struct Merge<'a> {
     acc: Option<Value>,
     /// Set only for the grouping plans. Kept beside `acc` rather than inside it so that a
     /// half-merged group list is never mistakable for an answer.
-    groups: Option<BTreeMap<RowId, Group>>,
+    groups: Option<BTreeMap<GroupAt, Group>>,
 }
 
 impl<'a> Merge<'a> {
@@ -62,7 +62,7 @@ impl<'a> Merge<'a> {
             };
             let aggregate = group_aggregate(self.plan);
             for g in incoming {
-                match groups.get_mut(&g.row) {
+                match groups.get_mut(&g.at) {
                     Some(held) => {
                         let merged = combine(aggregate, node, (*held.value).clone(), *g.value)?;
                         *held.value = merged;
@@ -74,7 +74,7 @@ impl<'a> Merge<'a> {
                         }
                     }
                     None => {
-                        groups.insert(g.row, g);
+                        groups.insert(g.at, g);
                     }
                 }
             }
@@ -112,11 +112,11 @@ fn merge_pairs(
     a: Vec<big_embed::Pair>,
     b: Vec<big_embed::Pair>,
 ) -> Result<Vec<big_embed::Pair>> {
-    let mut held: BTreeMap<(RowId, RowId), big_embed::Pair> = BTreeMap::new();
+    let mut held: BTreeMap<(GroupAt, GroupAt), big_embed::Pair> = BTreeMap::new();
     for p in a.into_iter().chain(b) {
-        match held.get_mut(&(p.left.row, p.right.row)) {
+        match held.get_mut(&(p.left.at, p.right.at)) {
             None => {
-                held.insert((p.left.row, p.right.row), p);
+                held.insert((p.left.at, p.right.at), p);
             }
             Some(there) => {
                 let merged =

@@ -21,7 +21,7 @@
 
 use super::{Datum, Row};
 use crate::{
-    Absent, Cell, Cut, Group, GroupOrder, Having, JoinSide, Of, OrderBy, Pair, Pairing, RowId,
+    Absent, Cell, Cut, Group, GroupAt, GroupOrder, Having, JoinSide, Of, OrderBy, Pair, Pairing,
     Value,
 };
 
@@ -51,12 +51,12 @@ pub(super) fn grouped(
     // Every row any plan produced, in the first plan's order. The plans are grouped on the same
     // field over the same records, so the tail is normally empty - it exists so that a plan
     // that did answer about a group cannot have its number dropped because another did not.
-    let mut rows: Vec<RowId> = Vec::new();
+    let mut rows: Vec<GroupAt> = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for groups in &of_each {
         for g in *groups {
-            if seen.insert(g.row) {
-                rows.push(g.row);
+            if seen.insert(g.at) {
+                rows.push(g.at);
             }
         }
     }
@@ -74,7 +74,7 @@ pub(super) fn grouped(
     // only one that is right here. A limit applied before the predicate would count rows the
     // predicate is about to drop, and an offset applied before the sort would skip into a list
     // nobody asked for.
-    let mut kept: Vec<RowId> = rows
+    let mut kept: Vec<GroupAt> = rows
         .into_iter()
         .filter(|row| match having {
             Some(h) => h.holds(&|of| int_of(number(of, values, Some(*row)))),
@@ -89,7 +89,7 @@ pub(super) fn grouped(
     // `WITH TIES` keeps every further row the ordering cannot tell apart from the last one
     // inside the limit. Without an ordering there is nothing to tie on, which the parser
     // refuses - so `false` here is unreachable rather than a silent "no ties".
-    let ties = |a: &RowId, b: &RowId| match order {
+    let ties = |a: &GroupAt, b: &GroupAt| match order {
         None => false,
         Some(o) => match o.by {
             OrderBy::Key => key_order(&of_each, *a) == key_order(&of_each, *b),
@@ -140,25 +140,25 @@ pub(super) fn paired(
     // Every pair any of this shape's plans produced, in key order. Several plans arise the same
     // way they do for a grouping - one aggregate apiece - and they describe the same pairs
     // unless a `FILTER` narrowed one of them.
-    let mut rows: Vec<(RowId, RowId)> = Vec::new();
+    let mut rows: Vec<(GroupAt, GroupAt)> = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for pairs in &of_each {
         for p in *pairs {
-            if seen.insert((p.left.row, p.right.row)) {
-                rows.push((p.left.row, p.right.row));
+            if seen.insert((p.left.at, p.right.at)) {
+                rows.push((p.left.at, p.right.at));
             }
         }
     }
     rows.sort_by_key(|r| pair_order(&of_each, *r));
 
-    let number = |of: Of, row: (RowId, RowId)| -> Option<Num> {
+    let number = |of: Of, row: (GroupAt, GroupAt)| -> Option<Num> {
         match of {
             Of::Group { plan, absent } => {
                 let found = values
                     .get(plan)?
                     .as_pairs()?
                     .iter()
-                    .find(|p| (p.left.row, p.right.row) == row)
+                    .find(|p| (p.left.at, p.right.at) == row)
                     .and_then(|p| scalar_num(&p.right.value));
                 match found {
                     Some(n) => Some(n),
@@ -172,7 +172,7 @@ pub(super) fn paired(
         }
     };
 
-    let mut kept: Vec<(RowId, RowId)> = rows
+    let mut kept: Vec<(GroupAt, GroupAt)> = rows
         .into_iter()
         .filter(|row| match having {
             Some(h) => h.holds(&|of| int_of(number(of, *row))),
@@ -198,7 +198,7 @@ pub(super) fn paired(
         });
     }
 
-    let ties = |a: &(RowId, RowId), b: &(RowId, RowId)| match order {
+    let ties = |a: &(GroupAt, GroupAt), b: &(GroupAt, GroupAt)| match order {
         None => false,
         Some(o) => match o.by {
             OrderBy::Key => pair_order(&of_each, *a) == pair_order(&of_each, *b),
@@ -210,7 +210,7 @@ pub(super) fn paired(
         .into_iter()
         .map(|row| {
             let found =
-                of_each.iter().find_map(|ps| ps.iter().find(|p| (p.left.row, p.right.row) == row));
+                of_each.iter().find_map(|ps| ps.iter().find(|p| (p.left.at, p.right.at) == row));
             cells
                 .iter()
                 .map(|c| {
@@ -235,9 +235,9 @@ pub(super) fn paired(
 /// A pair's place in key order: by the left key, then the right, unnamed after named.
 fn pair_order<'a>(
     of_each: &[&'a [Pair]],
-    row: (RowId, RowId),
-) -> (bool, Option<&'a str>, RowId, bool, Option<&'a str>, RowId) {
-    let found = of_each.iter().find_map(|ps| ps.iter().find(|p| (p.left.row, p.right.row) == row));
+    row: (GroupAt, GroupAt),
+) -> (bool, Option<&'a str>, GroupAt, bool, Option<&'a str>, GroupAt) {
+    let found = of_each.iter().find_map(|ps| ps.iter().find(|p| (p.left.at, p.right.at) == row));
     let (l, r) = match found {
         Some(p) => (p.left.key.as_deref(), p.right.key.as_deref()),
         None => (None, None),
@@ -595,11 +595,11 @@ fn as_i128(n: Num) -> i128 {
 ///
 /// Any of them will do: a row id means the same value everywhere, and the key is the string
 /// that row was interned from.
-fn find<'a>(of_each: &[&'a [Group]], row: RowId) -> Option<&'a Group> {
-    of_each.iter().find_map(|groups| groups.iter().find(|g| g.row == row))
+fn find<'a>(of_each: &[&'a [Group]], row: GroupAt) -> Option<&'a Group> {
+    of_each.iter().find_map(|groups| groups.iter().find(|g| g.at == row))
 }
 
-fn sort_rows(rows: &mut [RowId], order: GroupOrder, of_each: &[&[Group]], values: &[Value]) {
+fn sort_rows(rows: &mut [GroupAt], order: GroupOrder, of_each: &[&[Group]], values: &[Value]) {
     rows.sort_by(|a, b| {
         // **The tie-break is always the key, ascending**, whichever half is being sorted on.
         // Groups arrive from the executor in key order, but a sort is not required to be stable
@@ -628,7 +628,7 @@ fn sort_rows(rows: &mut [RowId], order: GroupOrder, of_each: &[&[Group]], values
 /// that disagreed with the order groups arrive in would reshuffle an answer that was already
 /// correct. The leading flag is what puts unnamed groups last - `Option` orders `None` first,
 /// and this order is `Some` first.
-fn key_order<'a>(of_each: &[&'a [Group]], row: RowId) -> (bool, Option<&'a str>, RowId) {
+fn key_order<'a>(of_each: &[&'a [Group]], row: GroupAt) -> (bool, Option<&'a str>, GroupAt) {
     let key = find(of_each, row).and_then(|g| g.key.as_deref());
     (key.is_none(), key, row)
 }

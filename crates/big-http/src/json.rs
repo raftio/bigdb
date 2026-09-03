@@ -19,7 +19,7 @@
 
 use big_cluster::{RangeVerdict, RepairReport, WriteOutcome};
 use big_db::RecordId;
-use big_embed::{Datum, Format, ResultSet, TableInfo};
+use big_embed::{Datum, Format, GroupAt, ResultSet, TableInfo, TimeUnit};
 use big_exec::{Group, Value};
 
 /// Escapes a string into a JSON string literal, including the quotes.
@@ -312,11 +312,24 @@ fn projection(p: &big_embed::Projection) -> String {
 }
 
 fn group(g: &Group) -> String {
-    let key = match &g.key {
-        Some(k) => string(k),
-        None => "null".to_string(),
+    // **A bucket names itself.** A row id is meaningless without the dictionary that issued it,
+    // so a keyed group carries the string beside it and this route hands back both. A calendar
+    // bucket has no dictionary and needs none: the moment it starts *is* its name, so it is
+    // written out as the date it stands for rather than as a number a reader would have to know
+    // the unit of to interpret.
+    let (key, row) = match g.at {
+        GroupAt::Row(row) => {
+            (g.key.as_deref().map_or_else(|| "null".to_string(), string), row.to_string())
+        }
+        GroupAt::Bucket { start, unit } => (
+            string(&match unit {
+                TimeUnit::Days => big_civil::format_date(start),
+                TimeUnit::Seconds => big_civil::format_datetime(start),
+            }),
+            start.to_string(),
+        ),
     };
-    format!("{{\"key\":{key},\"row\":{},\"value\":{}}}", g.row, value(&g.value))
+    format!("{{\"key\":{key},\"row\":{row},\"value\":{}}}", value(&g.value))
 }
 
 /// The schema snapshot as JSON: tables, each with its fields, kinds and bit depths.

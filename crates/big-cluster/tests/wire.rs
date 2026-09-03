@@ -22,7 +22,7 @@
 use big_cluster::wire::{self, Assignment, FactValue, OwnedFact, WireError};
 use big_container::Container;
 use big_db::Matches;
-use big_embed::{Plan, Rows, Value};
+use big_embed::{GroupAt, Plan, Rows, TimeUnit, Value};
 use big_engine::bitmap::RowSet;
 use big_exec::Group;
 use big_plan::CmpOp;
@@ -98,8 +98,25 @@ fn every_shape_of_answer_survives() {
         Value::Extreme(Some(7)),
         Value::SignedExtreme(Some(-7)),
         Value::Groups(vec![
-            Group { row: 1, key: Some("GB".to_string()), value: Box::new(Value::Count(3)) },
-            Group { row: 2, key: None, value: Box::new(Value::Sum(9)) },
+            Group {
+                at: GroupAt::Row(1),
+                key: Some("GB".to_string()),
+                value: Box::new(Value::Count(3)),
+            },
+            Group { at: GroupAt::Row(2), key: None, value: Box::new(Value::Sum(9)) },
+            // A calendar bucket, which is the other kind of identity a group can have. Both
+            // units, and a moment before the epoch: the start is signed, and a bucket that
+            // travelled as an unsigned number would come back in 2554.
+            Group {
+                at: GroupAt::Bucket { start: 19723, unit: TimeUnit::Days },
+                key: None,
+                value: Box::new(Value::Count(4)),
+            },
+            Group {
+                at: GroupAt::Bucket { start: -86_400, unit: TimeUnit::Seconds },
+                key: None,
+                value: Box::new(Value::Count(5)),
+            },
         ]),
     ];
     for case in cases {

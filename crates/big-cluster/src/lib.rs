@@ -111,7 +111,12 @@ use std::time::{Duration, Instant};
 /// bump is still made: the exchange's new section is a shape change, and a mixed-version
 /// cluster where half the nodes silently lack a view is a cluster answering two different
 /// questions depending on which node a client reaches.
-pub const WIRE_VERSION: u32 = 4;
+/// `5` since a group says which kind of thing it is one of. A grouping over a calendar bucket
+/// identifies its groups by the moment they start rather than by a dictionary row, so the
+/// encoding of a group gained a tag byte in front of the number. A `4` node reading a `5`
+/// message would take that tag as the top of a row id - a misread rather than a refusal, which
+/// is exactly what a version bump exists to prevent.
+pub const WIRE_VERSION: u32 = 5;
 
 /// The header carrying [`WIRE_VERSION`].
 pub const WIRE_HEADER: &str = "x-big-wire";

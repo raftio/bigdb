@@ -19,7 +19,7 @@
 //! `asked_of_owners` - and the rewrite is one case, deliberately.
 
 use super::*;
-use big_embed::{Format, ResultSet};
+use big_embed::{Format, GroupAt, ResultSet};
 
 /// One engine error, as the cluster reports one of its own node's.
 ///
@@ -948,7 +948,7 @@ const TOP_N_ROUNDS: [usize; 3] = [4, 32, 512];
 struct Reported {
     /// The groups, by the row each is keyed on. Row ids are cluster-wide for a keyed field -
     /// the schema leader interns them - which is what lets two owners' groups be the same group.
-    counts: BTreeMap<RowId, u64>,
+    counts: BTreeMap<GroupAt, u64>,
     /// What this owner says about everything it did not return: at or below this. Zero when it
     /// returned fewer groups than it was asked for, because then it returned all it has.
     threshold: u64,
@@ -958,7 +958,7 @@ impl Reported {
     fn of(value: &Value, asked: usize) -> Self {
         let groups = value.as_groups().unwrap_or(&[]);
         let counts =
-            groups.iter().map(|g| (g.row, group_count(g))).collect::<BTreeMap<RowId, u64>>();
+            groups.iter().map(|g| (g.at, group_count(g))).collect::<BTreeMap<GroupAt, u64>>();
         // **Fewer groups than asked for means there are no others**, so nothing is hidden and
         // the threshold is zero. Exactly as many is treated as if there were more, which costs
         // at most one extra round and can never be wrong in the other direction.
@@ -996,17 +996,17 @@ fn top_n_is_certain(reports: &[Reported], n: usize) -> bool {
 
     // What is known about each group so far, and what it could still gain from the owners that
     // did not mention it.
-    let mut known: BTreeMap<RowId, u64> = BTreeMap::new();
+    let mut known: BTreeMap<GroupAt, u64> = BTreeMap::new();
     for report in reports {
         for (row, count) in &report.counts {
             *known.entry(*row).or_insert(0) += *count;
         }
     }
-    let unseen_gain = |row: RowId| -> u64 {
+    let unseen_gain = |row: GroupAt| -> u64 {
         reports.iter().filter(|r| !r.counts.contains_key(&row)).map(|r| r.threshold).sum()
     };
 
-    let mut ranked: Vec<(RowId, u64)> = known.into_iter().collect();
+    let mut ranked: Vec<(GroupAt, u64)> = known.into_iter().collect();
     // Descending by count, then by row - the same order `rank_top_n` puts them in, minus the
     // key, which is a tie-break this cannot see and does not need: what is being decided here
     // is only *which* groups are in play.
@@ -1041,7 +1041,7 @@ mod top_n_tests {
 
     /// One owner's round, as counts by row and the threshold it implies.
     fn report(counts: &[(RowId, u64)], threshold: u64) -> Reported {
-        Reported { counts: counts.iter().copied().collect(), threshold }
+        Reported { counts: counts.iter().map(|(r, n)| (GroupAt::Row(*r), *n)).collect(), threshold }
     }
 
     /// Every owner returned everything it has, so there is nothing left to be uncertain about.
