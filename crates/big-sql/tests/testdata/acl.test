@@ -1,0 +1,212 @@
+# Who may do what.
+#
+# The `acl` directive prints the parse tree; `error` prints the refusal code. Every refusal here
+# is one somebody can provoke by typing a statement, which is what `gates.rs` insists on - a
+# refusal with no case is a sentence nobody has read since it was written.
+
+acl
+CREATE ROLE analyst
+----
+CreateRole analyst
+
+acl
+CREATE ROLE IF NOT EXISTS analyst
+----
+CreateRole analyst if_not_exists
+
+acl
+DROP ROLE analyst
+----
+DropRole analyst
+
+acl
+DROP ROLE IF EXISTS analyst
+----
+DropRole analyst if_exists
+
+# The three levels an object can be named at.
+
+acl
+GRANT SELECT ON sales.orders TO analyst
+----
+Grant SELECT on sales.orders to analyst
+
+acl
+GRANT SELECT ON sales.* TO analyst
+----
+Grant SELECT on sales.* to analyst
+
+acl
+GRANT SELECT ON *.* TO analyst
+----
+Grant SELECT on *.* to analyst
+
+# A bare name is a table in the request's database; a bare star is that database.
+
+acl
+GRANT SELECT ON orders TO analyst
+----
+Grant SELECT on orders to analyst
+
+acl
+GRANT SELECT ON * TO analyst
+----
+Grant SELECT on *.* to analyst
+
+# A list, and the noise word the standard puts after ALL.
+
+acl
+GRANT SELECT, INSERT, DELETE ON sales.orders TO loader
+----
+Grant SELECT, INSERT, DELETE on sales.orders to loader
+
+acl
+GRANT ALL ON sales.orders TO loader
+----
+Grant SELECT, INSERT, DELETE, DROP, ALTER on sales.orders to loader
+
+# `ALL` is level-aware: CREATE means nothing on a table that exists, and ROLES means nothing
+# anywhere but the server.
+
+acl
+GRANT ALL ON sales.* TO loader
+----
+Grant SELECT, INSERT, DELETE, CREATE, DROP, ALTER on sales.* to loader
+
+acl
+GRANT ALL PRIVILEGES ON *.* TO admin
+----
+Grant SELECT, INSERT, DELETE, CREATE, DROP, ALTER, ROLES on *.* to admin
+
+acl
+REVOKE INSERT ON sales.orders FROM loader
+----
+Revoke INSERT on sales.orders from loader
+
+acl
+REVOKE ALL ON *.* FROM admin
+----
+Revoke SELECT, INSERT, DELETE, CREATE, DROP, ALTER, ROLES on *.* from admin
+
+# Case does not matter: the lexer has no keyword list, so these are ordinary words compared
+# case-insensitively where they are expected.
+
+acl
+grant select on Sales.Orders to Analyst
+----
+Grant SELECT on Sales.Orders to Analyst
+
+# Listings.
+
+show
+SHOW ROLES
+----
+Roles
+
+show
+SHOW GRANTS
+----
+Grants
+
+show
+SHOW GRANTS FOR analyst
+----
+Grants analyst
+
+# `EXPLAIN` describes it and runs none of it.
+
+explain
+EXPLAIN GRANT SELECT ON sales.orders TO analyst
+----
+acl
+Grant SELECT on sales.orders to analyst
+
+# ---- refusals ----------------------------------------------------------------------------
+
+# People are not stored here.
+
+error
+CREATE USER alice IDENTIFIED BY 'hunter2'
+----
+sql_no_users
+
+error
+DROP USER alice
+----
+sql_no_users
+
+error
+ALTER USER alice IDENTIFIED BY 'hunter2'
+----
+sql_no_users
+
+error
+ALTER ROLE analyst
+----
+sql_no_users
+
+# A word that is not a privilege.
+
+error
+GRANT EXECUTE ON sales.orders TO analyst
+----
+sql_unknown_privilege
+
+# A privilege that means nothing where it was granted.
+
+error
+GRANT ROLES ON sales.* TO analyst
+----
+sql_acl_object
+
+error
+GRANT CREATE ON sales.orders TO analyst
+----
+sql_acl_object
+
+# A table is only nameable inside a database.
+
+error
+GRANT SELECT ON *.orders TO analyst
+----
+sql_acl_object
+
+# Grants are per table.
+
+error
+GRANT SELECT (amount, country) ON sales.orders TO analyst
+----
+sql_acl_columns
+
+# A role does not hold another role.
+
+error
+GRANT analyst TO senior
+----
+sql_no_role_hierarchy
+
+# There is no role everybody holds.
+
+error
+GRANT SELECT ON sales.orders TO PUBLIC
+----
+sql_no_public
+
+# A grant cannot be passed on.
+
+error
+GRANT SELECT ON sales.orders TO analyst WITH GRANT OPTION
+----
+sql_no_grant_option
+
+# The reserved role holds everything and is not a row.
+
+error
+CREATE ROLE superuser
+----
+sql_reserved_role
+
+error
+DROP ROLE superuser
+----
+sql_reserved_role

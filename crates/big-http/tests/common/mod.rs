@@ -42,6 +42,72 @@ pub fn spawn(requests: usize) -> SocketAddr {
     addr
 }
 
+/// The same, with authentication on, and a chance to arrange roles and grants first.
+pub fn spawn_with_auth(
+    requests: usize,
+    users: &str,
+    setup: impl FnOnce(&Api<big_pager::MemPager>),
+) -> SocketAddr {
+    let api = Api::in_memory().unwrap();
+    // Before the server takes it, because arranging the grants *through* the surface being
+    // tested would make every test here assume the thing it is checking.
+    setup(&api);
+    let config = big_http::ServerConfig {
+        auth: big_http::Auth::parse(users, "test").unwrap(),
+        ..Default::default()
+    };
+    let server = Server::bind_with(api, "127.0.0.1:0", config).unwrap();
+    let addr = server.local_addr().unwrap();
+    std::thread::spawn(move || {
+        let _ = server.serve_n(requests);
+    });
+    addr
+}
+
+/// One request on its own connection, carrying a username and password.
+pub fn send_as(
+    addr: SocketAddr,
+    user: &str,
+    password: &str,
+    method: &str,
+    target: &str,
+    body: &str,
+) -> (u16, String) {
+    let mut stream = TcpStream::connect(addr).unwrap();
+    let credential = base64(format!("{user}:{password}").as_bytes());
+    let request = format!(
+        "{method} {target} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic {credential}\r\n\
+         Content-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(request.as_bytes()).unwrap();
+    stream.flush().unwrap();
+    let mut raw = String::new();
+    stream.read_to_string(&mut raw).unwrap();
+    let status = raw.split(' ').nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+    let body = raw.split_once("\r\n\r\n").map(|(_, b)| b.to_string()).unwrap_or_default();
+    (status, body)
+}
+
+/// Standard base64, written out rather than pulled in: this crate has no dependencies and a test
+/// helper is not a reason to give it one.
+fn base64(input: &[u8]) -> String {
+    const SET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in input.chunks(3) {
+        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let n = u32::from(b[0]) << 16 | u32::from(b[1]) << 8 | u32::from(b[2]);
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(SET[(n >> (18 - 6 * i)) as usize & 63] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
 /// One request on its own connection, and the status and body that come back.
 pub fn send(addr: SocketAddr, method: &str, target: &str, body: &str) -> (u16, String) {
     let (status, _, body) = send_full(addr, method, target, body);

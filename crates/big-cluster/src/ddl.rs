@@ -296,5 +296,16 @@ pub fn apply_ddl<P: PagerMut + Sync>(api: &Api<P>, op: &Ddl) -> big_embed::Resul
         // could refuse a change the leader already made.
         Ddl::CreateView { view, text } => api.create_view(view, text, true)? as u64,
         Ddl::DropView { view } => api.drop_view(view)? as u64,
+        Ddl::CreateRole { role } => api.create_role(role)? as u64,
+        Ddl::DropRole { role } => api.drop_role(role)? as u64,
+        // The mask is applied as it arrives, for the reason `CreateView` is always the replacing
+        // form: whether it was a `GRANT` or a `REVOKE`, and what was there before, was judged at
+        // the leader. A peer recomputing it against its own grants would be a second opinion.
+        Ddl::SetGrant { role, database, table, privileges } => {
+            let database = (!database.is_empty()).then_some(database.as_str());
+            let table = (!table.is_empty()).then_some(table.as_str());
+            api.set_grant(role, database, table, big_rbac::Privileges(*privileges))?;
+            1
+        }
     })
 }

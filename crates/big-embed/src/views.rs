@@ -74,8 +74,8 @@ pub fn expand(parsed: &mut Parsed, catalog: &Catalog) -> Result<()> {
         // `SELECT ... FROM v` means describing the statement `v` stands for. The parser refuses
         // a second `EXPLAIN`, so this recurses exactly once.
         Parsed::Explain { inner, .. } => expand(inner, catalog),
-        // A schema change and a listing name no source to read through.
-        Parsed::Insert(_) | Parsed::Show(_) | Parsed::Ddl(_) => Ok(()),
+        // A schema change, a listing and a grant name no source to read through.
+        Parsed::Insert(_) | Parsed::Show(_) | Parsed::Ddl(_) | Parsed::Acl(_) => Ok(()),
     }
 }
 

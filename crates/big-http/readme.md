@@ -7,30 +7,37 @@ HTTP/1.1 with a `Content-Length` body — deliberately the least server that cou
 the decision to have one at all stays cheap to revisit.
 
 ```console
-$ big serve data.big 127.0.0.1:7654 --users tokens.txt
+$ big serve data.big 127.0.0.1:7654 --users users.txt
 $ curl -u ops:… -d 'Count(Row(country="GB"))' \
       localhost:7654/table/tx/query
 ```
 
 ## Routes
 
-| | | Role |
+| | | Needs |
 |---|---|---|
-| `POST` | `/table/{t}/query` | read |
-| `GET` | `/table/{t}/records?after=&limit=` | read |
-| `GET` | `/schema` | read |
-| `POST` | `/table/{t}/import` | write |
-| `POST` | `/table/{t}/delete` | write |
-| `POST` | `/table/{t}`, `/table/{t}/field/{f}` | admin |
-| `DELETE` | `/table/{t}`, `/table/{t}/field/{f}` | admin |
+| `POST` | `/sql` | a credential; the *statement* says what it needs |
+| `POST` | `/table/{t}/query` | `SELECT` on that table |
+| `GET` | `/table/{t}/records?after=&limit=` | `SELECT` on that table |
+| `GET` | `/schema` | a credential — it answers with names |
+| `POST` | `/table/{t}/import` | `INSERT` on that table |
+| `POST` | `/table/{t}/delete` | `DELETE` on that table |
+| `POST` | `/table/{t}` | `CREATE` on the database holding it |
+| `DELETE` | `/table/{t}` | `DROP` on that table |
+| `POST`/`DELETE` | `/table/{t}/field/{f}` | `ALTER` on that table |
+| `POST`/`DELETE` | `/database/{d}` | `CREATE`/`DROP` on `*.*` |
 | `GET` | `/health`, `/ready` | none, ever |
-| `GET` | `/metrics` | read |
+| `GET` | `/metrics` | `OPERATE` on `*.*` |
+
+A privilege is a grant in the catalog, made with `GRANT` — see [access-control.md](../../docs/access-control.md).
+The role in the users file is a name that resolves to one; a name the catalog does not have holds
+nothing.
 
 `/health` and `/ready` are never authenticated: a probe that needs a credential is a probe that
 reports the credential's health instead of the server's.
 
-`GET /verify` (read) asks every copy of every replicated range whether it still holds the same
-facts, and `POST /repair` (admin) catches up the ones that are behind. Both are scans, and
+`GET /verify` (`OPERATE`) asks every copy of every replicated range whether it still holds the same
+facts, and `POST /repair` (`OPERATE`) catches up the ones that are behind. Both are scans, and
 operators' tools rather than probes.
 
 Thirteen more, under `/internal/`, exist for one node to reach another: `query`, `records`,

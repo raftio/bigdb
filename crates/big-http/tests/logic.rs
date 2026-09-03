@@ -94,7 +94,7 @@ impl Server {
             return format!("unknown directive `{}`", case.directive);
         }
 
-        let want = self.local.sql(sql, &QueryOptions::default());
+        let want = self.local.sql(sql, &big_rbac::Who::Trusted, &QueryOptions::default());
         let (status, body) = send(self.addr, "POST", "/sql", sql);
 
         match want {

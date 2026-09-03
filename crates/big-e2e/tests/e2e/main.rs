@@ -34,4 +34,5 @@ mod cluster;
 mod cluster_mtls;
 mod daemon;
 mod offline;
+mod rbac;
 mod together;

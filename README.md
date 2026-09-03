@@ -107,16 +107,19 @@ bigctl import tx facts.txt --resume facts.txt.ck
 | | |
 |---|---|
 | `GET /health`, `GET /ready` | probes, never authenticated |
-| `GET /metrics` | Prometheus text; needs a `read` user |
+| `GET /metrics` | Prometheus text; needs `OPERATE` on `*.*` |
 | `GET /table/{t}/records?after=&limit=` | records in order, a page at a time |
 | `GET /verify` | do the copies of every range still hold the same facts |
 | `POST /repair` | catch up every copy that is behind |
-| `POST /admin/backup?name=<f>` | online compact copy; needs `--backup-dir` and an `admin` user |
+| `POST /admin/backup?name=<f>` | online compact copy; needs `--backup-dir` and `OPERATE` on `*.*` |
 | `/internal/*` | another node of the cluster, proven by its client certificate |
 
 Auth is a username and a password over TLS. Users live one `username role hash` per line in a
 mode-600 file passed to `--users`, written by `big passwd` and by nothing else; the hashes are
-argon2id. Roles are `read`, `write`, `admin`.
+argon2id. **A role is a name, not a rank**: what it may do is a set of grants in the catalog,
+made with `GRANT SELECT ON sales.* TO analyst` and friends. `superuser` holds everything without
+being stored, which is how a fresh database gets its first role. See
+[docs/access-control.md](docs/access-control.md).
 
 The daemon refuses a non-loopback bind twice: once with no `--users`, once with no `--tls-cert`.
 Each refusal has its own override (`--insecure-no-auth`, `--insecure-no-tls`) because they are

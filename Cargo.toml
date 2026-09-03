@@ -8,6 +8,7 @@ members = [
     "crates/big-btree",
     "crates/big-engine",
     "crates/big-keys",
+    "crates/big-rbac",
     "crates/big-db",
     "crates/big-plan",
     "crates/big-sql",
@@ -56,6 +57,7 @@ big-keys = { path = "crates/big-keys", version = "0.1.0" }
 big-page = { path = "crates/big-page", version = "0.1.0" }
 big-pager = { path = "crates/big-pager", version = "0.1.0" }
 big-plan = { path = "crates/big-plan", version = "0.1.0" }
+big-rbac = { path = "crates/big-rbac", version = "0.1.0" }
 big-sql = { path = "crates/big-sql", version = "0.1.0" }
 big-tls = { path = "crates/big-tls", version = "0.1.0" }
 # No version: `publish = false`, so it can only ever be reached by path.

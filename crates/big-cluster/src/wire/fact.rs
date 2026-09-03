@@ -239,6 +239,28 @@ pub enum Ddl {
     DropView {
         view: String,
     },
+    /// `CREATE ROLE`. Idempotent, so a peer that already has it is already correct.
+    CreateRole {
+        role: String,
+    },
+    /// `DROP ROLE`, taking every grant it held.
+    DropRole {
+        role: String,
+    },
+    /// One role's privileges on one object, set to exactly this mask.
+    ///
+    /// **The resulting mask, not the change to it.** `GRANT` and `REVOKE` are each a read of
+    /// what is there followed by one of these, computed once at the leader; what travels is the
+    /// answer rather than the arithmetic, so a peer cannot reach a different result from its own
+    /// state and applying it twice is applying it once. The same rule `CreateView` follows.
+    ///
+    /// An empty string means "every" at that level, and an empty mask removes the grant.
+    SetGrant {
+        role: String,
+        database: String,
+        table: String,
+        privileges: u32,
+    },
 }
 
 impl Ddl {
@@ -299,6 +321,21 @@ impl Ddl {
                 put_u8(&mut out, 9);
                 put_str(&mut out, view);
             }
+            Self::CreateRole { role } => {
+                put_u8(&mut out, 10);
+                put_str(&mut out, role);
+            }
+            Self::DropRole { role } => {
+                put_u8(&mut out, 11);
+                put_str(&mut out, role);
+            }
+            Self::SetGrant { role, database, table, privileges } => {
+                put_u8(&mut out, 12);
+                put_str(&mut out, role);
+                put_str(&mut out, database);
+                put_str(&mut out, table);
+                put_u32(&mut out, *privileges);
+            }
         }
         out
     }
@@ -351,6 +388,14 @@ impl Ddl {
             7 => Self::DropDatabase { name: r.str()? },
             8 => Self::CreateView { view: r.str()?, text: r.str()? },
             9 => Self::DropView { view: r.str()? },
+            10 => Self::CreateRole { role: r.str()? },
+            11 => Self::DropRole { role: r.str()? },
+            12 => Self::SetGrant {
+                role: r.str()?,
+                database: r.str()?,
+                table: r.str()?,
+                privileges: r.u32()?,
+            },
             tag => return Err(WireError::BadTag { what: "schema change", tag }),
         };
         finished(&r)?;

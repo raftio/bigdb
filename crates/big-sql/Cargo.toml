@@ -13,6 +13,9 @@ readme = "readme.md"
 [dependencies]
 big-civil.workspace = true
 big-plan.workspace = true
+# The privilege vocabulary. A leaf crate with no dependencies of its own, which is what lets this
+# one name a privilege without linking any storage - the property the whole crate rests on.
+big-rbac.workspace = true
 
 [dev-dependencies]
 big-testfile.workspace = true

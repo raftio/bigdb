@@ -314,7 +314,7 @@ proptest! {
     fn the_groups_of_a_predicate_sum_to_its_count(p in pred()) {
         let clause = p.sql();
         let sql = format!("SELECT country, count(*) FROM t WHERE {clause} GROUP BY country");
-        let (set, _) = db().sql(&sql, &QueryOptions::default()).unwrap();
+        let (set, _) = db().sql(&sql, &big_rbac::Who::Trusted, &QueryOptions::default()).unwrap();
         let total: i128 = set
             .rows
             .iter()

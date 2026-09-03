@@ -80,6 +80,13 @@ pub enum DbError {
         bytes: usize,
         max: usize,
     },
+    /// A change to the roles or grants that the store refused: an unknown role, the reserved one,
+    /// or a ceiling reached.
+    ///
+    /// Delegated rather than restated, the way [`DbError::Tree`] is. What a role *is* belongs to
+    /// `big-rbac`, and a copy of its refusals here would be a second place to update and a first
+    /// place for the two to disagree.
+    Rbac(big_rbac::RbacError),
     /// A backup was aimed at a path that already holds something. Never overwritten: the
     /// caller who typed the wrong name is the one who needed the old file.
     BackupDestinationExists(std::path::PathBuf),
@@ -187,6 +194,12 @@ impl From<std::io::Error> for DbError {
     }
 }
 
+impl From<big_rbac::RbacError> for DbError {
+    fn from(e: big_rbac::RbacError) -> Self {
+        Self::Rbac(e)
+    }
+}
+
 impl From<StoreError> for DbError {
     fn from(e: StoreError) -> Self {
         Self::Store(e)
@@ -274,6 +287,7 @@ impl core::fmt::Display for DbError {
                 f,
                 "the statement for view `{view}` is {bytes} bytes, past the {max}-byte limit"
             ),
+            Self::Rbac(e) => write!(f, "{e}"),
             Self::BackupDestinationExists(p) => {
                 write!(f, "{} already exists; backups never overwrite", p.display())
             }
@@ -366,6 +380,7 @@ impl DbError {
             Self::ViewRedefined(_) => "view_redefined",
             Self::ViewNameTaken(_) => "view_name_taken",
             Self::ViewTooLong { .. } => "view_too_long",
+            Self::Rbac(e) => e.code(),
             Self::BackupDestinationExists(_) => "backup_destination_exists",
             Self::BackupDestinationNotEmpty => "backup_destination_not_empty",
             Self::QueryTooLarge { .. } => "query_too_large",

@@ -60,7 +60,9 @@ fn a_listing_is_written_in_whichever_format_was_asked_for() {
 #[test]
 fn the_catalog_questions_that_have_no_answer_here() {
     // Each of these is a surface of its own, and none is one this statement grows by accident.
-    for sql in ["SHOW INDEX FROM t", "SHOW GRANTS", "SHOW PROCESSLIST", "DESCRIBE", "SHOW"] {
+    // `SHOW GRANTS` was on this list until roles arrived, and is now answered - which is why
+    // the list is a list rather than a comment: the surface grows, and what it refuses shrinks.
+    for sql in ["SHOW INDEX FROM t", "SHOW PROCESSLIST", "DESCRIBE", "SHOW"] {
         assert_eq!(code(sql), "parse_error", "{sql}");
     }
 }

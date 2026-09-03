@@ -70,20 +70,20 @@ fn the_corpus() {
 fn dispatch(db: &Cluster<MemPager>, case: &Case) -> String {
     let sql = case.input.trim();
     match case.directive.as_str() {
-        "statement" => match db.sql(sql, &opts()) {
+        "statement" => match db.sql(sql, &big_rbac::Who::Trusted, &opts()) {
             Ok(_) => String::new(),
             Err(e) => refusal(&e),
         },
-        "exec" => match db.sql(sql, &opts()) {
+        "exec" => match db.sql(sql, &big_rbac::Who::Trusted, &opts()) {
             Ok((set, _)) => table(&set, false),
             Err(e) => refusal(&e),
         },
-        "query" => match db.sql(sql, &opts()) {
+        "query" => match db.sql(sql, &big_rbac::Who::Trusted, &opts()) {
             Ok((set, _)) => table(&set, case.words().contains(&"rowsort")),
             Err(e) => refusal(&e),
         },
         "same" => same(db, sql, &case.args, case.words().contains(&"rowsort")),
-        "error" => match db.sql(sql, &opts()) {
+        "error" => match db.sql(sql, &big_rbac::Who::Trusted, &opts()) {
             // A statement that stopped being refused is a change to the surface, and reads here
             // as one failing case rather than as a crashed corpus.
             Ok(_) => "accepted".to_string(),

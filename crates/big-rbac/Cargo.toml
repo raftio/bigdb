@@ -1,0 +1,19 @@
+[package]
+name = "big-rbac"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Roles, privileges and the decision that a statement may run."
+
+# Deliberately empty, and this is the crate's whole shape.
+#
+# Two crates that could not otherwise see each other both need this vocabulary: `big-sql` says
+# what a statement demands, and `big-embed` decides whether a caller holds it. Putting the
+# vocabulary in either one would make the other depend on it - a parser that links storage, or
+# an engine that links a dialect - so it lives here, where neither has to.
+#
+# Nothing here reads or writes anything. Where the roles are *kept* is `big-db`'s, next to the
+# rest of the catalog's encoding; what a role means is here.
+[dependencies]

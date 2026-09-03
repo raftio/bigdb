@@ -69,13 +69,18 @@ fn a_file_it_creates_is_readable_only_by_its_owner() {
 }
 
 #[test]
-fn a_new_user_defaults_to_the_least_role() {
+fn a_new_user_defaults_to_a_role_that_grants_nothing() {
     // A user created without anybody saying what they should be able to do should be able to do
-    // the least, not the most.
+    // the least, not the most - and with roles being names the catalog resolves, the least is a
+    // name no catalog has. It authenticates and holds nothing until somebody grants it
+    // something, which is the fail-closed direction.
     let dir = tempfile::tempdir().unwrap();
     let users = dir.path().join("users");
     passwd(&users, &["set", "alice"], "s3cret\n").expect(0);
-    assert_eq!(field(&std::fs::read_to_string(&users).unwrap(), 1), "read");
+    let text = std::fs::read_to_string(&users).unwrap();
+    let role = field(&text, 1);
+    assert_eq!(role, "none");
+    assert_ne!(role, "superuser", "never the one that holds everything");
 }
 
 #[test]
@@ -184,13 +189,34 @@ fn a_users_file_anyone_can_read_is_refused_before_it_is_edited() {
     assert!(run.said("chmod 600"), "{}", run.err);
 }
 
+/// **A role this command has never heard of is accepted, on purpose.**
+///
+/// Roles live in the catalog and are made with `CREATE ROLE`. This command edits a file on disk
+/// and may run with no server up at all, so it cannot check - and refusing would make it
+/// impossible to write the line before creating the role it names, which is precisely the order
+/// a fresh database has to be set up in. A name the catalog does not have is no privileges.
 #[test]
-fn an_unknown_role_is_refused_by_name() {
+fn a_role_the_catalog_may_not_have_yet_is_accepted() {
     let dir = tempfile::tempdir().unwrap();
     let users = dir.path().join("users");
-    let run = passwd(&users, &["set", "alice", "--role", "superuser"], "pw\n").expect(2);
-    assert!(run.said("superuser"), "{}", run.err);
-    assert!(run.said("read, write or admin"), "it lists what it takes: {}", run.err);
+    passwd(&users, &["set", "alice", "--role", "not-made-yet"], "pw\n").expect(0);
+    assert_eq!(field(&std::fs::read_to_string(&users).unwrap(), 1), "not-made-yet");
+
+    // `superuser` above all: it is the reserved name a locked-out operator recovers through, so
+    // writing it has to work before any database exists.
+    passwd(&users, &["role", "alice", "superuser"], "").expect(0);
+    assert_eq!(field(&std::fs::read_to_string(&users).unwrap(), 1), "superuser");
+}
+
+/// What is refused is a name no catalog record could hold, because that one can never resolve
+/// however many roles are created later.
+#[test]
+fn a_role_name_no_record_could_hold_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let users = dir.path().join("users");
+    // A `.` is the separator in a qualified name.
+    let run = passwd(&users, &["set", "alice", "--role", "a.b"], "pw\n").expect(2);
+    assert!(run.said("a.b"), "{}", run.err);
     assert!(!users.exists(), "nothing was written: {}", users.display());
 }
 

@@ -98,24 +98,18 @@ pub(super) fn sql<P: PagerMut + Sync>(
         Err(e) => return from_cluster(&e),
     };
 
-    // **The route's role is a floor, and the statement raises it.** The check in `dispatch` runs
-    // before any body is decoded, which is what keeps it cheap and is why it cannot know what
-    // statement arrived. Without this a read-only token could create tables and write facts -
-    // the same powers `POST /table/{t}` and `POST /table/{t}/import` demand their own roles for.
+    // **The route's guard is a floor, and the statement's own demands raise it.** The check in
+    // `dispatch` runs before any body is decoded, which is what keeps it cheap and is why it
+    // cannot know what statement arrived.
     //
-    // Which statements cost what is `big_embed::Sql::authority`'s to say, not this route's: the
-    // rule belongs next to the variants it is about, where a kind of statement added later
-    // cannot be added without answering for it.
+    // Which objects a statement needs, and which privilege on each, is `Sql::demands`'s to say -
+    // the rule belongs next to the variants it is about, where a kind of statement added later
+    // cannot be added without answering for it. `Cluster::run` asks it, against the same
+    // resolver this route's guard used, before any of the work starts.
     //
-    // **This is free because the principal was resolved once**, not because comparing is cheap -
-    // which is what the comment here used to say, and what stopped being true when the
-    // credential became a password. Re-running the check against the request would mean a second
-    // argon2 verification on every statement this server ever runs.
-    if let Some(refusal) = super::require(principal, sql.authority().into()) {
-        return refusal;
-    }
-
-    match ctx.cluster.run(sql, &opts) {
+    // Nothing is re-verified here. The principal was resolved once by `refuse`, and re-running
+    // the credential check would mean a second argon2 verification on every statement.
+    match ctx.cluster.run(sql, &principal.who(), &opts) {
         // The statement's `FORMAT` decides both the bytes and the type they are declared as: a
         // client that asked for TSV and was told `application/json` was answered twice, once
         // wrongly.

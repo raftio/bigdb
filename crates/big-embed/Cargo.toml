@@ -18,6 +18,9 @@ unstable = []
 [dependencies]
 big-civil.workspace = true
 big-db.workspace = true
+# Roles and grants. The model and the decision, which this crate administers and which
+# `big-db` only stores.
+big-rbac.workspace = true
 big-exec.workspace = true
 # For `Api::execute`, which takes a plan a caller built rather than text this crate parses.
 # The coordinator needs it: a plan is what goes over the wire, so that two nodes cannot

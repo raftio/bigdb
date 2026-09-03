@@ -47,6 +47,13 @@ pub enum ApiError {
     /// two. The sentence is built by `fact::ValueError::why`, which is where both write paths
     /// meet, so an import line and a SQL `INSERT` report the same mistake the same way.
     Value(String),
+    /// The caller does not hold what the statement demands.
+    ///
+    /// **Not a `Refused`.** A refusal says this engine will never answer that statement; this
+    /// says it will not answer it for *you* - a different sentence and a different status. Boxed
+    /// because it is the rare variant and the widest, and an error is returned by value on every
+    /// path that can fail.
+    Denied(Box<big_rbac::Denied>),
 }
 
 impl From<ExecError> for ApiError {
@@ -74,6 +81,7 @@ impl core::fmt::Display for ApiError {
             Self::Sql(e) => write!(f, "{e}"),
             Self::Db(e) => write!(f, "{e}"),
             Self::Value(why) => write!(f, "{why}"),
+            Self::Denied(d) => write!(f, "{d}"),
         }
     }
 }
@@ -91,6 +99,7 @@ impl ApiError {
             Self::Db(e) => e.code(),
             // The code an import line with the same mistake already carries.
             Self::Value(_) => "malformed_line",
+            Self::Denied(_) => "denied",
         }
     }
 }

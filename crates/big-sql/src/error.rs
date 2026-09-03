@@ -176,6 +176,40 @@ pub enum Refused {
     /// Raised in `big-embed`, next to the three statements that resolve to no plan either, and so
     /// not reachable by [`crate::translate`] - the same shape as [`Refused::ViewColumn`].
     ExplainRows,
+
+    // ---- who may do what -------------------------------------------------------------------
+    /// `CREATE USER`, `ALTER USER`, `DROP USER`, `ALTER ROLE`.
+    ///
+    /// **The decision that people are not stored here, made visible.** A credential is a line in
+    /// a file the server reads off its own disk, and a route that could write one would let an
+    /// `admin` password rewrite the password file over the network. Roles are administered in
+    /// SQL; who holds one is the users file's to say.
+    CreateUser,
+    /// A word in a privilege list that is not a privilege.
+    AclPrivilege,
+    /// A privilege that means nothing at the level it was granted on: `ROLES` inside a database,
+    /// or `CREATE` on a table that would have to exist for the statement to parse.
+    AclObject,
+    /// `GRANT SELECT(a, b) ON t`. Grants here are per table.
+    ///
+    /// The other half of a published decision: this surface answers questions over whole tables,
+    /// and a privilege finer than the answer is a fence somebody walks around by asking a
+    /// slightly different question.
+    AclColumns,
+    /// `GRANT analyst TO senior`: a role holding another role.
+    ///
+    /// Also what a mistyped privilege becomes when the shape is otherwise a grant, which is why
+    /// it is separate from [`Refused::AclPrivilege`] - the two call for different fixes.
+    RoleGrant,
+    /// `TO PUBLIC`, `TO ALL`: a role everybody holds without being given it.
+    AclPublic,
+    /// `WITH GRANT OPTION`, `WITH ADMIN OPTION`: the power to pass a grant on.
+    GrantOption,
+    /// `CREATE ROLE superuser`, or a grant aimed at it.
+    ///
+    /// It holds everything without being stored, which is what a database whose catalog is empty
+    /// is recovered through - so it must not be creatable, droppable or narrowable.
+    ReservedRole,
 }
 
 impl Refused {
@@ -189,7 +223,7 @@ impl Refused {
     /// Kept honest by [`Refused::rank`] below, whose exhaustive match will not compile until a
     /// new variant is named - and by a test asserting that every rank appears here exactly once,
     /// which is what catches naming one and forgetting to add it.
-    pub const ALL: [Self; 53] = [
+    pub const ALL: [Self; 61] = [
         Self::Joins,
         Self::OuterJoin,
         Self::JoinOn,
@@ -243,6 +277,14 @@ impl Refused {
         Self::ViewDepth,
         Self::ExplainHalf,
         Self::ExplainRows,
+        Self::CreateUser,
+        Self::AclPrivilege,
+        Self::AclObject,
+        Self::AclColumns,
+        Self::RoleGrant,
+        Self::AclPublic,
+        Self::GrantOption,
+        Self::ReservedRole,
     ];
 
     /// Where this refusal sits in [`Refused::ALL`], and the reason that list can be trusted.
@@ -307,6 +349,14 @@ impl Refused {
             Self::ExplainSet => 50,
             Self::Segment => 51,
             Self::SegmentTable => 52,
+            Self::CreateUser => 53,
+            Self::AclPrivilege => 54,
+            Self::AclObject => 55,
+            Self::AclColumns => 56,
+            Self::RoleGrant => 57,
+            Self::AclPublic => 58,
+            Self::GrantOption => 59,
+            Self::ReservedRole => 60,
         }
     }
 
@@ -359,6 +409,14 @@ impl Refused {
             Self::Quantile => "sql_quantile_level",
             Self::ExplainHalf => "sql_explain_half",
             Self::ExplainRows => "sql_explain_rows",
+            Self::CreateUser => "sql_no_users",
+            Self::AclPrivilege => "sql_unknown_privilege",
+            Self::AclObject => "sql_acl_object",
+            Self::AclColumns => "sql_acl_columns",
+            Self::RoleGrant => "sql_no_role_hierarchy",
+            Self::AclPublic => "sql_no_public",
+            Self::GrantOption => "sql_no_grant_option",
+            Self::ReservedRole => "sql_reserved_role",
             Self::Subquery
             | Self::Having
             | Self::Window
@@ -686,6 +744,51 @@ impl Refused {
                  calls resolve to, and the columns and clauses its answer takes. A schema \
                  change, a write and a question about the catalog have one description and no \
                  halves, so `EXPLAIN` on its own is the whole of what there is to ask for"
+            }
+            Self::CreateUser => {
+                "people are not stored in this database. A credential is a line in the users \
+                 file the server reads off its own disk, written with `big passwd`, and a route \
+                 that could write one would let an `admin` password rewrite the password file \
+                 over the network. What SQL administers is roles - `CREATE ROLE`, `GRANT`, \
+                 `REVOKE` - and the users file says who holds one"
+            }
+            Self::AclPrivilege => {
+                "the privileges are SELECT, INSERT, DELETE, CREATE, DROP, ALTER and ROLES, or \
+                 ALL for every one grantable on the object named"
+            }
+            Self::AclObject => {
+                "a privilege has to mean something where it is granted: ROLES is held on `*.*` \
+                 or nowhere, because a role that could hand out privileges inside one database \
+                 would still be handing out the power to hand them out; and CREATE is held on \
+                 `*.*` or `db.*`, because a table that exists is not one there is anything left \
+                 to create"
+            }
+            Self::AclColumns => {
+                "grants here are per table. This surface answers questions over whole tables, \
+                 so a privilege on some columns of one would be a fence that a slightly \
+                 different question walks around - grant on the table, or keep the columns \
+                 somebody may not read in a table of their own"
+            }
+            Self::RoleGrant => {
+                "a role does not hold another role. What was written names a role where a \
+                 privilege belongs: grant the privileges themselves, or give the person the \
+                 other role in the users file. One name resolving to a set of others is a graph \
+                 whose answer depends on how far it is walked"
+            }
+            Self::AclPublic => {
+                "there is no role everybody holds. A privilege nobody was given and everybody \
+                 has is one that no listing explains and no revoke reaches - make a role, grant \
+                 it what it needs, and name it in the users file for whoever should hold it"
+            }
+            Self::GrantOption => {
+                "a grant cannot be passed on. Delegation here is one privilege, ROLES on `*.*`, \
+                 which is the power to administer every role - held or not, with nothing in \
+                 between, because the levels between are what nobody can audit"
+            }
+            Self::ReservedRole => {
+                "`superuser` holds everything and exists without being created. It is what a \
+                 database whose catalog is empty is recovered through, so it cannot be made, \
+                 dropped, or narrowed by a grant - name any other role"
             }
             Self::ExplainRows => {
                 "`EXPLAIN` is answered as rows - one line of the description per row, under a \

@@ -24,17 +24,27 @@
 //! has to outlive a password change, and a users file half-written by a `^C` is an operator
 //! locked out of their own database.
 
-use big_http::auth::{hash_password, Role};
+use big_http::auth::{check_rolename, hash_password};
 use std::io::Write;
 use std::path::Path;
 
 const USAGE: &str = "\
 usage: big passwd <users-file> <command>
 
-  set <user> [--role read|write|admin]   add a user, or change an existing password
-  role <user> <read|write|admin>         change a role, leaving the password alone
-  delete <user>                          remove a user
-  list                                   names and roles, never a hash
+  set <user> [--role <role>]   add a user, or change an existing password
+  role <user> <role>           change a role, leaving the password alone
+  delete <user>                remove a user
+  list                         names and roles, never a hash
+
+A role is a name, made in SQL with `CREATE ROLE` and given privileges with `GRANT`. This
+command does not check that it exists: the database may not be running, and a name the
+catalog does not have is simply no privileges - which is the safe direction, and leaves
+`superuser` usable to create the first real role on a fresh database.
+
+**Changing a role here needs a restart to take effect.** The users file is read once, when
+the server starts. Privileges themselves are live - a `GRANT` or a `REVOKE` applies to the
+next statement, cluster-wide - so it is only the line that says *which* role somebody holds
+that waits for a restart.
 
 The password is read from the terminal, twice, and echoed nowhere. It is never a flag and
 never an environment variable: an argument is visible in `ps` and in shell history, and a
@@ -62,10 +72,9 @@ pub fn main(args: &[String]) -> std::io::Result<()> {
 
 fn run(path: &Path, args: &[&str]) -> Result<(), String> {
     match args {
-        ["set", user, flags @ ..] => set(path, user, role_flag(flags)?),
+        ["set", user, flags @ ..] => set(path, user, &role_flag(flags)?),
         ["role", user, role] => {
-            let role = Role::parse(role)
-                .ok_or_else(|| format!("`{role}` is not a role; use read, write or admin"))?;
+            check_rolename(role)?;
             change_role(path, user, role)
         }
         ["delete", user] => delete(path, user),
@@ -79,22 +88,24 @@ fn run(path: &Path, args: &[&str]) -> Result<(), String> {
 ///
 /// The least role, on purpose: a user created without anybody saying what they should be able to
 /// do should be able to do the least, not the most.
-fn role_flag(flags: &[&str]) -> Result<Role, String> {
+fn role_flag(flags: &[&str]) -> Result<String, String> {
     match flags {
-        [] => Ok(Role::Read),
-        ["--role", name] => Role::parse(name)
-            .ok_or_else(|| format!("`{name}` is not a role; use read, write or admin")),
+        // The reserved role holds everything, so it is never what somebody gets by saying
+        // nothing. A user made without anybody naming a role holds a name the catalog does not
+        // have, which is no privileges at all - the least, which is the right default.
+        [] => Ok("none".to_string()),
+        ["--role", name] => check_rolename(name).map(|()| name.to_string()),
         ["--role"] => Err("--role needs a value".to_string()),
         [other, ..] => Err(format!("unknown option {other}")),
     }
 }
 
-fn set(path: &Path, user: &str, role: Role) -> Result<(), String> {
+fn set(path: &Path, user: &str, role: &str) -> Result<(), String> {
     let existed = path.exists();
     let mut lines = read(path)?;
     let password = crate::tty::read_password_twice().map_err(|e| e.to_string())?;
     let hash = hash_password(&password).map_err(|e| e.to_string())?;
-    let line = format!("{user} {} {hash}", role.as_str());
+    let line = format!("{user} {role} {hash}");
 
     match lines.iter().position(|l| names(l) == Some(user)) {
         // Replaced in place rather than removed and appended, so that a password change does not
@@ -104,14 +115,14 @@ fn set(path: &Path, user: &str, role: Role) -> Result<(), String> {
     }
     write(path, &lines)?;
     if existed {
-        eprintln!("big passwd: set `{user}` ({}) in {}", role.as_str(), path.display());
+        eprintln!("big passwd: set `{user}` ({}) in {}", role, path.display());
     } else {
-        eprintln!("big passwd: created {} with `{user}` ({})", path.display(), role.as_str());
+        eprintln!("big passwd: created {} with `{user}` ({})", path.display(), role);
     }
     Ok(())
 }
 
-fn change_role(path: &Path, user: &str, role: Role) -> Result<(), String> {
+fn change_role(path: &Path, user: &str, role: &str) -> Result<(), String> {
     let mut lines = read(path)?;
     let at = lines
         .iter()
@@ -120,9 +131,9 @@ fn change_role(path: &Path, user: &str, role: Role) -> Result<(), String> {
     // The hash is the third field and is carried across untouched: changing what somebody may do
     // is not a reason to make them choose a new password.
     let hash = lines[at].split_whitespace().nth(2).unwrap_or_default().to_string();
-    lines[at] = format!("{user} {} {hash}", role.as_str());
+    lines[at] = format!("{user} {role} {hash}");
     write(path, &lines)?;
-    eprintln!("big passwd: `{user}` is now `{}`", role.as_str());
+    eprintln!("big passwd: `{user}` is now `{}`", role);
     Ok(())
 }
 

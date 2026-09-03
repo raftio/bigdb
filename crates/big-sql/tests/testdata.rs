@@ -131,6 +131,10 @@ fn dispatch(case: &Case) -> String {
             Ok(_) => "accepted".to_string(),
             Err(e) => e.code().to_string(),
         },
+        "acl" => with(sql, |s| match s {
+            Sql::Acl(a) => explain::acl(&a),
+            other => not(&other, "a change to who may do what"),
+        }),
         "ddl" => with(sql, |s| match s {
             Sql::Ddl(d) => explain::ddl(&d),
             other => not(&other, "a schema change"),
@@ -188,6 +192,7 @@ fn not(sql: &Sql, wanted: &str) -> String {
         Sql::Insert(_) => "a write",
         Sql::Show(_) => "a question about the catalog",
         Sql::Ddl(_) => "a schema change",
+        Sql::Acl(_) => "a change to who may do what",
         Sql::Explain { .. } => "an explanation",
     };
     format!("not {wanted}: {what}")
@@ -232,6 +237,7 @@ fn explained(mode: big_sql::ExplainMode, inner: Sql) -> String {
             )
         }
         Sql::Ddl(d) => big_sql::explain::explained(mode, &Explained::Ddl(&d)),
+        Sql::Acl(a) => big_sql::explain::explained(mode, &Explained::Acl(&a)),
         Sql::Insert(i) => big_sql::explain::explained(mode, &Explained::Insert(&i)),
         Sql::Show(s) => big_sql::explain::explained(mode, &Explained::Show(&s)),
         // The parser refuses a second `EXPLAIN`, so no statement in the corpus reaches this.

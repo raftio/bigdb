@@ -38,6 +38,15 @@ pub type ViewId = u32;
 /// not use the word "view" for the SQL one anywhere - only `big-sql` and the wire do.
 pub type QueryId = u32;
 
+// Roles and grants are `big-rbac`'s. What lives here is where they are *kept*: the fixed-width
+// records below, and the transaction that commits them. Re-exported so a caller holding a
+// `Catalog` does not have to know which crate drew the line, and so that moving the line later
+// is one file's change.
+pub use big_rbac::{
+    GrantKey, Grants, Privilege, Privileges, RoleDef, RoleId, ANY_DATABASE, ANY_TABLE, MAX_GRANTS,
+    MAX_ROLES, SUPERUSER,
+};
+
 // The numbers themselves live in `big-page`, next to the record layout, because `big-keys`
 // writes into the same stream and neither crate can see the other's constants.
 pub const KIND_TABLE: u8 = kind::TABLE;
@@ -48,6 +57,8 @@ pub const KIND_SEQ: u8 = kind::SEQ;
 pub const KIND_DATABASE: u8 = kind::DATABASE;
 pub const KIND_SAVED_QUERY: u8 = kind::SAVED_QUERY;
 pub const KIND_SAVED_QUERY_TEXT: u8 = kind::SAVED_QUERY_TEXT;
+pub const KIND_ROLE: u8 = kind::ROLE;
+pub const KIND_GRANT: u8 = kind::GRANT;
 
 const NAME_AT: usize = 24;
 
@@ -114,6 +125,12 @@ pub const RESERVED_VIEWS: u32 = 2;
 /// Reserved field marking which record ids exist at all. Without it `NOT` would include every
 /// record that was never written.
 pub const EXISTS_FIELD: FieldId = u32::MAX;
+
+// `ANY_DATABASE`, `ANY_TABLE`, `SUPERUSER` and the two ceilings are `big-rbac`'s and re-exported
+// above. The promise this file makes about them is the one below: the id allocators in
+// `intern_database` and `intern_table` never reach the sentinels, so a real object can never be
+// mistaken for "every object". `MAX_ROLES` and `MAX_GRANTS` are bounded for the reason
+// `MAX_VIEW_BYTES` is - the whole catalog is re-encoded on every commit that dirties it.
 
 /// What a table writes to disk for every fact it takes.
 ///
@@ -325,6 +342,12 @@ pub struct Catalog {
     /// allocates nothing.
     saved_query_ids: BTreeMap<DatabaseId, BTreeMap<String, QueryId>>,
     fragments: BTreeMap<FragmentKey, FragmentMeta>,
+    /// Roles and what each has been granted.
+    ///
+    /// Public and owned outright, exactly as [`Catalog::keys`] is: both are stores this file
+    /// persists but does not interpret. What a privilege *means* is `big-rbac`'s, in a crate that
+    /// links no storage so the SQL surface can see the same vocabulary without linking one.
+    pub rbac: Grants,
     /// Id high-water marks, persisted rather than derived.
     ///
     /// Ids used to be handed out as `max(existing) + 1`, which is correct only while nothing
@@ -365,6 +388,7 @@ mod seq_of {
     pub const FIELD: u8 = 2;
     pub const DATABASE: u8 = 3;
     pub const SAVED_QUERY: u8 = 4;
+    pub const ROLE: u8 = 5;
 }
 
 /// Panics rather than truncating if a name got this far over-long: every public entry point
@@ -377,7 +401,12 @@ fn put_name(b: &mut [u8], name: &str) {
     b[NAME_AT..NAME_AT + n].copy_from_slice(&name.as_bytes()[..n]);
 }
 
-fn check_name(name: &str) -> Result<()> {
+/// The rule every name in a catalog record is held to.
+///
+/// Public because a role's name has to pass it too, and roles are made a layer up: the ceiling
+/// and the ban on a `.` are facts about the fixed-width record, which is this file's to state
+/// wherever the name is coming from.
+pub fn check_name(name: &str) -> Result<()> {
     if name.len() > MAX_NAME_LEN {
         return Err(DbError::NameTooLong { name: name.to_string(), max: MAX_NAME_LEN });
     }
@@ -584,6 +613,11 @@ impl Catalog {
             return Ok(id);
         }
         let id = self.seq.database;
+        // `DatabaseId::MAX` is `ANY_DATABASE`, which a grant uses to mean every database. A real
+        // database holding it would be granted whatever every database was.
+        if id == ANY_DATABASE {
+            return Err(DbError::NameTaken(name.to_string()));
+        }
         self.seq.database += 1;
         self.databases.insert(id, name.to_string());
         self.database_ids.insert(name.to_string(), id);
@@ -612,6 +646,9 @@ impl Catalog {
         self.databases.remove(&id);
         self.table_ids.remove(&id);
         self.saved_query_ids.remove(&id);
+        // Grants on the database itself. The tables inside it took their own with them on the
+        // way out, because emptiness is the caller's to arrange before reaching here.
+        self.rbac.forget_database(id);
         Some(id)
     }
 
@@ -656,6 +693,12 @@ impl Catalog {
             };
         }
         let id = self.seq.table;
+        // `TableId::MAX` is `ANY_TABLE`, the widening a grant uses to mean every table in its
+        // database. A real table holding it would answer to every one of those grants.
+        if id == ANY_TABLE {
+            return Err(DbError::NameTaken(name.to_string()));
+        }
+
         self.seq.table += 1;
         self.tables.insert(id, TableDef { id, name: name.to_string(), engine, database });
         self.table_ids.entry(database).or_default().insert(name.to_string(), id);
@@ -838,6 +881,11 @@ impl Catalog {
         // be handed out again, so keeping it would only be dead weight in the catalog chain.
         self.seq.field.remove(&id);
 
+        // Every grant naming this table. Ids are never reissued, so leaving these would not
+        // hand the privilege to a later table - but they would accumulate in a chain that is
+        // rewritten on every schema commit, and `SHOW GRANTS` would list an object that is gone.
+        self.rbac.forget_table(id);
+
         Some(self.take_fragments(
             FragmentKey { table: id, field: 0, view: 0, shard: 0 },
             FragmentKey { table: id, field: FieldId::MAX, view: ViewId::MAX, shard: u64::MAX },
@@ -1015,6 +1063,26 @@ impl Catalog {
             b[40..48].copy_from_slice(&m.max.to_le_bytes());
             out.push(b);
         }
+        for (id, name) in self.rbac.all_roles() {
+            let mut b = vec![0u8; CATALOG_ENTRY_BYTES];
+            b[0] = KIND_ROLE;
+            b[4..8].copy_from_slice(&id.to_le_bytes());
+            put_name(&mut b, name);
+            out.push(b);
+        }
+        for (k, mask) in self.rbac.all() {
+            // The one record with no name in it: four words and then nothing, because every
+            // object it names was interned by a record above. The mask is written back exactly
+            // as it was read - a bit this build does not know is preserved, not dropped, or a
+            // downgrade would quietly revoke what it merely could not interpret.
+            let mut b = vec![0u8; CATALOG_ENTRY_BYTES];
+            b[0] = KIND_GRANT;
+            b[4..8].copy_from_slice(&k.role.to_le_bytes());
+            b[8..12].copy_from_slice(&k.database.to_le_bytes());
+            b[12..16].copy_from_slice(&k.table.to_le_bytes());
+            b[16..20].copy_from_slice(&mask.0.to_le_bytes());
+            out.push(b);
+        }
         for (which, scope, value) in self.seq_records() {
             let mut b = vec![0u8; CATALOG_ENTRY_BYTES];
             b[0] = KIND_SEQ;
@@ -1035,6 +1103,7 @@ impl Catalog {
             (seq_of::VIEW, 0, self.seq.view),
             (seq_of::DATABASE, 0, self.seq.database),
             (seq_of::SAVED_QUERY, 0, self.seq.saved_query),
+            (seq_of::ROLE, 0, self.rbac.next_role_id()),
         ];
         out.extend(self.seq.field.iter().map(|(t, n)| (seq_of::FIELD, *t, *n)));
         out
@@ -1059,6 +1128,12 @@ impl Catalog {
         // were written in.
         let mut query_headers: BTreeMap<QueryId, (DatabaseId, String, usize)> = BTreeMap::new();
         let mut query_text: BTreeMap<(QueryId, u32), Vec<u8>> = BTreeMap::new();
+
+        // Grants are staged for the same reason, one relation over: a grant names a role by id,
+        // and nothing orders the chain so that the role record comes first. Collected here and
+        // joined once every role is known, so a grant whose role never turns up can be dropped
+        // rather than kept as a privilege pointing at nobody.
+        let mut staged_grants: BTreeMap<GrantKey, Privileges> = BTreeMap::new();
 
         for e in entries {
             if e.len() < CATALOG_ENTRY_BYTES {
@@ -1150,6 +1225,23 @@ impl Catalog {
                         },
                     );
                 }
+                KIND_ROLE => {
+                    let (id, Some(name)) = (rd32(4), get_name(e)) else { continue };
+                    // `restore_role` drops `SUPERUSER` on the floor, for the reason
+                    // `DEFAULT_DATABASE` is skipped above: it is never written, so a record
+                    // claiming it came from somewhere else, and a stored copy would shadow the
+                    // built-in that holds everything - the one name where being shadowed is a
+                    // way in rather than a wrong answer.
+                    c.rbac.restore_role(id, &name);
+                }
+                KIND_GRANT => {
+                    // The mask is taken whole. Masking to the bits this build knows would look
+                    // like caution and would in fact destroy them: `encode` writes back what is
+                    // here, so a narrowed mask becomes the stored truth on the next schema
+                    // commit. Bits nobody understands are refused at the check, not at the read.
+                    let key = GrantKey { role: rd32(4), database: rd32(8), table: rd32(12) };
+                    staged_grants.insert(key, Privileges(rd32(16)));
+                }
                 KIND_SEQ => {
                     let (scope, value) = (rd32(4), rd32(8));
                     match e[1] {
@@ -1161,6 +1253,7 @@ impl Catalog {
                         }
                         seq_of::DATABASE => c.seq.database = c.seq.database.max(value),
                         seq_of::SAVED_QUERY => c.seq.saved_query = c.seq.saved_query.max(value),
+                        seq_of::ROLE => c.rbac.observe_role_id(value),
                         _ => {}
                     }
                 }
@@ -1193,6 +1286,16 @@ impl Catalog {
             c.saved_query_ids.entry(database).or_default().insert(name.clone(), id);
             c.saved_queries.insert(id, SavedQuery { id, database, name, text });
         }
+
+        // The grants, now that every role record has gone past. One whose role is not there is
+        // dropped: a privilege attached to nobody can never be exercised, and keeping it would
+        // let a later `CREATE ROLE` that happened to reuse the id inherit it - which the
+        // monotonic counter makes unreachable, but only while the counter is the one this file
+        // was written with. Fail-closed costs nothing here and does not depend on that.
+        for (key, mask) in staged_grants {
+            c.rbac.restore_grant(key, mask);
+        }
+        c.rbac.seal();
 
         // A file written before `KIND_SEQ` existed carries no counters, so derive them the way
         // every reader used to. Taking the max of the two rather than choosing means a file
