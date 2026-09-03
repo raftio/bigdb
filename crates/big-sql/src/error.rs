@@ -80,12 +80,13 @@ pub enum Refused {
     InsertId,
     /// A field declared as `_record_id`, which is the name the record itself answers under.
     IdColumn,
-    /// An `INSERT ... SELECT` whose query is not a projection.
+    /// An `INSERT ... SELECT` whose query answers with something other than values.
     ///
-    /// The form itself is answered - see [`crate::insert::Source::Select`]. What is refused is
-    /// every other shape of answer: a count is a number *about* a set of records rather than
-    /// records to copy, and `SELECT *` answers with ids because a record has no row of values
-    /// to read out.
+    /// The form itself is answered - see [`crate::insert::Source::Select`] - and so is a
+    /// *grouped* query, which is what a materialised rollup is here. What is refused is
+    /// `SELECT *`, which answers with record ids: an id is the address a fact is written to
+    /// rather than anything stored in a column, and writing one into a user's data would put
+    /// this engine's own coordinates there.
     InsertSelect,
     /// `INSERT INTO t ... SELECT ... FROM t`: one table on both sides of one statement.
     InsertSelfRead,
@@ -521,14 +522,13 @@ impl Refused {
                  for a field of yours"
             }
             Self::InsertSelect => {
-                "`INSERT ... SELECT` reads a **projection** - `SELECT <columns> FROM <table> \
-                 [WHERE ...] [LIMIT n]`, naming as many columns as the `INSERT` does. That is \
-                 the one shape that reads stored values back per record; a count or a grouping \
-                 is a number *about* a set of records rather than records to copy, and \
-                 `SELECT *` gives ids because a record has no row of values to read out. The \
-                 record ids are allocated, so the column list may not name `_record_id` either. \
-                 For anything else, select what you want and write it back with \
-                 `POST /table/{t}/import`"
+                "`INSERT ... SELECT` reads any answer whose cells are **values**, naming as \
+                 many columns as the `INSERT` does - a projection, and a grouping just as much: \
+                 a key is a string and a count is a number, and writing a merged grouping into \
+                 a table is what a materialised rollup is here. What it cannot read is \
+                 `SELECT *`, which answers with record *ids* - the address a fact is written to \
+                 rather than anything stored in a column. The ids are allocated, so the column \
+                 list may not name `_record_id` either"
             }
             Self::InsertSelfRead => {
                 "an `INSERT ... SELECT` reads one table and writes another. Reading and writing \

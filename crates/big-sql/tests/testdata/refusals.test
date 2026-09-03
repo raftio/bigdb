@@ -225,21 +225,13 @@ TRUNCATE TABLE t
 ----
 sql_read_only
 
-## `INSERT ... SELECT` reads a **projection** - that form is answered, see `insert.test`. What
-## is refused is every other shape of answer, because a count or a grouping is a number *about*
-## a set of records rather than records to copy.
-
-error
-INSERT INTO t (amount) SELECT count(*) FROM u
-----
-sql_unsupported
-
-error
-INSERT INTO t (country) SELECT country FROM u GROUP BY country
-----
-sql_unsupported
-
-## `SELECT *` answers with record ids, because a record has no row of values to read out.
+## `INSERT ... SELECT` reads any answer whose cells are **values** - a projection, and a grouping
+## just as much: a key is the string a keyed column was interned from, and a count is a number.
+## Writing a merged grouping into a table is what a materialised rollup is here, and it needs no
+## object of its own. See `insert.test`.
+##
+## What is refused is `SELECT *`, which answers with **record ids** - the address a fact is
+## written to rather than anything stored in a column.
 
 error
 INSERT INTO t (amount) SELECT * FROM u

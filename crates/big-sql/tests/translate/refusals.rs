@@ -116,9 +116,10 @@ fn every_refusal_names_itself() {
     // server to allocate one.
     assert_eq!(code("INSERT INTO t VALUES (1, 2)"), "sql_insert_shape");
     assert_eq!(code("INSERT INTO t (_record_id, amount) VALUES ('seven', 2)"), "sql_insert_shape");
-    // A projection is answered; every other shape of answer is not, and one table on both
-    // sides has no snapshot under it.
-    assert_eq!(code("INSERT INTO t (amount) SELECT count(*) FROM u"), "sql_unsupported");
+    // Any answer whose cells are values is a source - a projection, and a grouping just as
+    // much, which is what a materialised rollup is here. What is not is `SELECT *`: it answers
+    // with record ids, which are the address a fact is written to rather than anything stored
+    // in a column. And one table on both sides has no snapshot under it.
     assert_eq!(code("INSERT INTO t (amount) SELECT * FROM u"), "sql_unsupported");
     assert_eq!(code("INSERT INTO t (amount) SELECT amount FROM t"), "sql_insert_self_read");
     // `id` is what a record is called, so a *field* of that name is one no `INSERT` could ever

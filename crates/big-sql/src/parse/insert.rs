@@ -114,19 +114,21 @@ impl Parser<'_> {
         self.i += 1;
         let select = self.select()?;
 
-        // A projection and nothing else. Ordered outermost clause first, so the first thing
-        // wrong is the thing reported.
-        let not_a_projection = !select.joins.is_empty()
-            || !select.group_by.is_empty()
-            || select.having.is_some()
-            || select.order_by.is_some()
-            || select.offset.is_some()
-            || select.items.is_empty()
-            || select
-                .items
-                .iter()
-                .any(|item| item.filter.is_some() || !matches!(item.leaf(), Proj::Column(_)));
-        if not_a_projection {
+        // **Values, not identities.** What the write path needs of a source is that every cell
+        // it produces is a value a fact can hold - which a projection's cells are, and which a
+        // grouped answer's cells are just as much: a key is the string a keyed column was
+        // interned from, and a count is a number.
+        //
+        // So the rule is not "a projection". It is `SELECT *`, which answers with *record ids*
+        // because a record has no row of values to read out - an id is the address a fact is
+        // written to rather than something stored in one, and writing those into a column would
+        // put this engine's own coordinates into a user's data.
+        //
+        // A cell that is a value but not an exact one - the float an `avg` is - is refused
+        // where it is read rather than here, by `literal_of`, with the sentence that says what
+        // to write instead. This layer has no schema and cannot tell which those are.
+        let has_star = select.items.iter().any(|item| matches!(item.leaf(), Proj::Star));
+        if has_star || select.items.is_empty() {
             return Err(self.refuse_at(Refused::InsertSelect, at));
         }
 

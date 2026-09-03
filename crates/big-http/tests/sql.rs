@@ -1829,3 +1829,80 @@ fn a_segment_refuses_a_view_that_is_not_a_set_of_this_statements_records() {
     assert_eq!(status, 400, "{body}");
     assert!(body.contains("sql_segment_table"), "{body}");
 }
+
+/// A materialised rollup: a grouped answer written into a table, read back as an ordinary one.
+///
+/// **This is what a materialised view is here, and it is `INSERT ... SELECT` rather than a new
+/// kind of object.** The expensive part of a grouping in this engine is not reading it - a
+/// `Distinct` is one fragment per shard - it is *merging* it, because every owner has to ship
+/// every group it holds to the coordinator before a total is right. Writing that merged answer
+/// into a table pays it once instead of once per query, and what comes out is a table, so
+/// nothing new reads it.
+///
+/// The refusal that used to stand here said "a count is a number *about* a set of records rather
+/// than records to copy". That is true of a count and irrelevant to the write path: what a fact
+/// needs is a value, and a key and a count are both values. What genuinely cannot be written is
+/// `SELECT *`, which answers with record ids - and that is still refused.
+#[test]
+fn a_grouped_answer_can_be_written_into_a_table_and_read_back_as_one() {
+    let addr = spawn(12);
+    assert_eq!(send(addr, "POST", "/table/orders", "").0, 200);
+    assert_eq!(send(addr, "POST", "/table/orders/field/country?kind=set", "").0, 200);
+    assert_eq!(send(addr, "POST", "/table/orders/field/amount?kind=int&bit_depth=32", "").0, 200);
+    // The rollup's own table: one record per country, holding the two numbers.
+    assert_eq!(send(addr, "POST", "/table/by_country", "").0, 200);
+    assert_eq!(send(addr, "POST", "/table/by_country/field/country?kind=set", "").0, 200);
+    assert_eq!(
+        send(addr, "POST", "/table/by_country/field/orders?kind=int&bit_depth=32", "").0,
+        200
+    );
+    assert_eq!(
+        send(addr, "POST", "/table/by_country/field/total?kind=int&bit_depth=32", "").0,
+        200
+    );
+
+    // GB: 3 orders worth 600. US: 1 worth 400. FR: 1 worth 500.
+    assert_eq!(
+        send(
+            addr,
+            "POST",
+            "/table/orders/import",
+            "country 1 GB\namount 1 100\ncountry 2 GB\namount 2 200\ncountry 3 GB\namount 3 300\n\
+             country 4 US\namount 4 400\ncountry 5 FR\namount 5 500\n",
+        )
+        .0,
+        200
+    );
+
+    let (status, body) = send(
+        addr,
+        "POST",
+        "/sql",
+        "INSERT INTO by_country (country, orders, total) \
+         SELECT country, count(*), sum(amount) FROM orders GROUP BY country",
+    );
+    assert_eq!(status, 200, "{body}");
+
+    // Read back as an ordinary table, with no notion that it was ever a grouping.
+    let (_, body) = send(
+        addr,
+        "POST",
+        "/sql",
+        "SELECT country, sum(orders), sum(total) FROM by_country GROUP BY country",
+    );
+    assert_eq!(
+        body,
+        r#"{"columns":["country","sum","sum"],"rows":[["FR",1,500],["GB",3,600],["US",1,400]]}"#
+    );
+
+    // And the whole point: the total over the rollup is the total over the source, paid once.
+    let (_, body) = send(addr, "POST", "/sql", "SELECT sum(total) FROM by_country");
+    assert_eq!(body, r#"{"columns":["sum"],"rows":[[1500]]}"#);
+
+    // **`SELECT *` is still refused**, and for the reason that survived: it answers with record
+    // ids, which are this engine's own coordinates rather than anything stored in a column.
+    let (status, body) =
+        send(addr, "POST", "/sql", "INSERT INTO by_country (country) SELECT * FROM orders");
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("sql_unsupported"), "{body}");
+}
