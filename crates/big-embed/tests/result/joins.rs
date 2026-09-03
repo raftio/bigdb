@@ -198,3 +198,100 @@ fn per_key_an_average_over_a_join_is_that_keys_own_mean() {
         ]
     );
 }
+
+/// A side that is not required contributes one null-filled partner where it holds nothing.
+///
+/// **This is the whole of an outer join, and it is arithmetic like every other part.** A
+/// `LEFT JOIN` keeps every key the left side holds; where the right holds none, the pair count
+/// is the left's own count times one, because SQL produces exactly one row of nulls there. So
+/// the only two things that change are which points are in the space and what a missing side
+/// multiplies by - not a row, which a join here never had.
+fn outer_shape(per_key: bool, required: [bool; 2], cells: Vec<big_embed::Cell>) -> Shape {
+    Shape::Join {
+        axes: 1,
+        sides: vec![
+            JoinSide { keyed: Keying::By { plan: 0, axis: 0 }, required: required[0] },
+            JoinSide { keyed: Keying::By { plan: 1, axis: 0 }, required: required[1] },
+        ],
+        cells,
+        per_key,
+        having: None,
+        order: None,
+        cut: Cut::default(),
+    }
+}
+
+#[test]
+fn a_left_join_keeps_the_left_keys_and_pairs_an_unmatched_one_with_a_single_null_partner() {
+    let cells = vec![
+        cell("k", Of::Key),
+        cell("count()", Of::Paired { plan: 0, side: 0, how: Pairing::Product }),
+    ];
+
+    let set = result_set(&answer(outer_shape(true, [true, false], cells)), &values());
+
+    // `FR` is the left's alone: 9 records, each with one null partner, so nine rows - not zero
+    // and not nine times the right's total.
+    assert_eq!(
+        rows(set),
+        vec![
+            vec![Datum::Text("FR".to_string()), Datum::Int(9)],
+            vec![Datum::Text("GB".to_string()), Datum::Int(10)],
+            vec![Datum::Text("US".to_string()), Datum::Int(3)],
+        ]
+    );
+}
+
+#[test]
+fn a_left_joins_folded_count_is_the_inner_count_plus_the_unmatched_left_records() {
+    let cells = vec![cell("count()", Of::Paired { plan: 0, side: 0, how: Pairing::Product })];
+
+    let set = result_set(&answer(outer_shape(false, [true, false], cells)), &values());
+
+    // 2·5 + 3·1 + 9·1 = 22, where the inner join was 13.
+    assert_eq!(rows(set), vec![vec![Datum::Int(22)]]);
+}
+
+#[test]
+fn a_right_join_is_the_same_arithmetic_with_the_other_side_required() {
+    let cells = vec![cell("count()", Of::Paired { plan: 0, side: 0, how: Pairing::Product })];
+
+    let set = result_set(&answer(outer_shape(false, [false, true], cells)), &values());
+
+    // `DE` is the right's alone: 4 records, each with one null partner. 10 + 3 + 4 = 17.
+    assert_eq!(rows(set), vec![vec![Datum::Int(17)]]);
+}
+
+#[test]
+fn a_full_join_requires_no_side_and_its_space_is_every_key_either_holds() {
+    let cells = vec![cell("count()", Of::Paired { plan: 0, side: 0, how: Pairing::Product })];
+
+    let set = result_set(&answer(outer_shape(false, [false, false], cells)), &values());
+
+    // 2·5 + 3·1 + 9·1 + 1·4 = 26.
+    assert_eq!(rows(set), vec![vec![Datum::Int(26)]]);
+}
+
+/// An extreme stands where the other side holds nothing, because the row is still a row.
+///
+/// The inner rule was "this side's number over the keys the other side holds at all". The outer
+/// one is the same sentence with *required* in it: a side that need not match cannot remove a
+/// point from the space, so the extreme is taken over every point the required sides give.
+#[test]
+fn an_extreme_over_a_left_join_is_taken_over_every_left_key() {
+    let cells = vec![
+        cell("k", Of::Key),
+        cell("max(x)", Of::Paired { plan: 0, side: 0, how: Pairing::Greatest }),
+    ];
+
+    let set = result_set(&answer(outer_shape(true, [true, false], cells)), &values());
+
+    assert_eq!(
+        rows(set),
+        vec![
+            vec![Datum::Text("FR".to_string()), Datum::Int(9)],
+            vec![Datum::Text("GB".to_string()), Datum::Int(2)],
+            vec![Datum::Text("US".to_string()), Datum::Int(3)],
+        ]
+    );
+}

@@ -133,6 +133,41 @@ count
 2
 
 # ---------------------------------------------------------------------------------------------
+# The materialised rollup
+# ---------------------------------------------------------------------------------------------
+
+# **A grouping is a source too, and this is the whole of what a materialised view is here.** The
+# expensive part of a grouping is not reading it - a `Distinct` is one fragment per shard - it is
+# *merging* it, because every owner ships every group it holds before a total is right. Written
+# into a table, that is paid once instead of once per query, and what comes out is an ordinary
+# table that nothing new has to read.
+#
+# The merge is the point: this runs across every owner and the numbers below are the merged ones,
+# not one node's share.
+
+statement
+CREATE TABLE by_country (country SET, orders UINT(32), total UINT(32))
+
+statement
+INSERT INTO by_country (country, orders, total) SELECT country, count(*), sum(amount) FROM src GROUP BY country
+
+query rowsort
+SELECT country, orders, total FROM by_country
+----
+country  orders  total
+fr       1       900
+gb       1       100
+us       1       500
+
+# And the rollup answers the question the source answered, over three records instead of the
+# source's however many.
+query
+SELECT sum(total) FROM by_country
+----
+sum
+1500
+
+# ---------------------------------------------------------------------------------------------
 # What is refused
 # ---------------------------------------------------------------------------------------------
 
@@ -142,12 +177,6 @@ error
 INSERT INTO src (country) SELECT country FROM src
 ----
 error: sql_insert_self_read
-
-# A count is a number *about* a set of records rather than records to copy.
-error
-INSERT INTO dst (amount) SELECT count(*) FROM src
-----
-error: sql_unsupported
 
 # `SELECT *` answers with record ids, because a record has no row of values to read out.
 error

@@ -18,9 +18,9 @@
 //! no socket, and a table of cases instead of a fixture. What they answer is what `DESCRIBE`,
 //! `SHOW` and `INSERT` answer, so the claims here are the ones those statements rest on.
 
+use big_db::Granularity;
 use big_embed::fact::{from_literal, from_text, ValueError};
 use big_embed::{introspect, Datum, Fact, FieldInfo, FieldKind, TableEngine, TableInfo};
-use big_db::Granularity;
 use big_plan::Literal;
 
 fn field(name: &str, kind: FieldKind, bit_depth: u32, scale: i8) -> FieldInfo {

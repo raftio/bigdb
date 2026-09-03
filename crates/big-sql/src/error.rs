@@ -43,6 +43,14 @@ pub enum Refused {
     Ambiguous,
     /// A `WHERE` term that names two of a join's tables where they cannot be separated.
     JoinFilter,
+    /// A semi-join whose inner set is larger than the union it would expand into.
+    SetTooLarge,
+    /// `EXPLAIN` over a statement containing a semi-join.
+    ExplainSet,
+    /// A `SEGMENT(...)` that reached the lowering, which means nothing expanded it.
+    Segment,
+    /// A `SEGMENT(...)` naming a view of a table this statement does not read.
+    SegmentTable,
     /// A subquery, a CTE, or `UNION` between two selects.
     Subquery,
     /// A `HAVING` that names an aggregate the answer does not carry.
@@ -72,12 +80,13 @@ pub enum Refused {
     InsertId,
     /// A field declared as `_record_id`, which is the name the record itself answers under.
     IdColumn,
-    /// An `INSERT ... SELECT` whose query is not a projection.
+    /// An `INSERT ... SELECT` whose query answers with something other than values.
     ///
-    /// The form itself is answered - see [`crate::insert::Source::Select`]. What is refused is
-    /// every other shape of answer: a count is a number *about* a set of records rather than
-    /// records to copy, and `SELECT *` answers with ids because a record has no row of values
-    /// to read out.
+    /// The form itself is answered - see [`crate::insert::Source::Select`] - and so is a
+    /// *grouped* query, which is what a materialised rollup is here. What is refused is
+    /// `SELECT *`, which answers with record ids: an id is the address a fact is written to
+    /// rather than anything stored in a column, and writing one into a user's data would put
+    /// this engine's own coordinates there.
     InsertSelect,
     /// `INSERT INTO t ... SELECT ... FROM t`: one table on both sides of one statement.
     InsertSelfRead,
@@ -180,7 +189,7 @@ impl Refused {
     /// Kept honest by [`Refused::rank`] below, whose exhaustive match will not compile until a
     /// new variant is named - and by a test asserting that every rank appears here exactly once,
     /// which is what catches naming one and forgetting to add it.
-    pub const ALL: [Self; 49] = [
+    pub const ALL: [Self; 53] = [
         Self::Joins,
         Self::OuterJoin,
         Self::JoinOn,
@@ -215,6 +224,10 @@ impl Refused {
         Self::TruncUnit,
         Self::Interval,
         Self::ScalarFilter,
+        Self::SetTooLarge,
+        Self::ExplainSet,
+        Self::Segment,
+        Self::SegmentTable,
         Self::Constraint,
         Self::DecimalScale,
         Self::BitDepth,
@@ -290,6 +303,10 @@ impl Refused {
             Self::TruncUnit => 45,
             Self::Interval => 46,
             Self::ScalarFilter => 47,
+            Self::SetTooLarge => 49,
+            Self::ExplainSet => 50,
+            Self::Segment => 51,
+            Self::SegmentTable => 52,
         }
     }
 
@@ -300,6 +317,10 @@ impl Refused {
     /// the same rule `PlanError` applies to its four parse variants.
     pub fn code(self) -> &'static str {
         match self {
+            Self::SetTooLarge => "sql_set_too_large",
+            Self::ExplainSet => "sql_explain_set",
+            Self::Segment => "sql_segment_unexpanded",
+            Self::SegmentTable => "sql_segment_table",
             Self::Joins => "sql_no_joins",
             Self::OuterJoin => "sql_no_outer_joins",
             Self::JoinOn => "sql_join_condition",
@@ -370,10 +391,11 @@ impl Refused {
                  pass over the second per value of the first"
             }
             Self::OuterJoin => {
-                "only an inner join is answered. An outer join has to produce a row for a \
-                 record with no partner, and what this engine computes about a join is \
-                 arithmetic over the records each key holds on both sides - there is no row to \
-                 null out half of"
+                "`LEFT`, `RIGHT` and `FULL` are answered, but a `FULL JOIN` only where every \
+                 join in the statement is one. `(a JOIN b) FULL JOIN c` pairs on the keys `a` \
+                 and `b` share unioned with `c`'s, and what this engine carries is one flag per \
+                 side saying whether it has to match - which cannot tell that nesting from the \
+                 union of all three. Write the full join over one pair of tables"
             }
             Self::JoinOn => {
                 "a join is one equality between two keyed columns, as `ON a.k = b.k`, \
@@ -397,6 +419,29 @@ impl Refused {
                 "a `WHERE` over a join is each table's own conditions, combined with `AND`. A \
                  term that names two of them under `OR` or `NOT` selects records neither side \
                  can be filtered to on its own"
+            }
+            Self::Segment => {
+                "a segment is a named `WHERE` over one table, and expanding it needs the \
+                 catalog the view is stored in - which this translation does not have. Reached \
+                 through a server, `SEGMENT(...)` is substituted before anything is planned"
+            }
+            Self::SegmentTable => {
+                "`SEGMENT(...)` names a view whose `WHERE` becomes a term of this one, so the \
+                 view has to exist, has to be over exactly one table this statement reads, and \
+                 has to select by something - a view with no `WHERE` is every record of its \
+                 table and defines no set"
+            }
+            Self::ExplainSet => {
+                "a statement with `IN (SELECT ...)` has no plan until it has run: the outer \
+                 call is narrowed by the ids the inner set holds, so its tree is a fact about \
+                 the other table's contents rather than about the statement. Explaining the \
+                 inner set on its own says everything that is fixed about it"
+            }
+            Self::SetTooLarge => {
+                "`IN (SELECT _record_id FROM ...)` narrows a bit-sliced column by the ids the \
+                 inner set holds, and that is one equality per id - each of them a read per bit \
+                 plane. A set this large is a scan wearing a `WHERE`, so it is refused with the \
+                 number rather than answered slowly. Narrow the inner `WHERE`"
             }
             Self::Subquery => {
                 "subqueries, CTEs and `UNION` between selects are not supported; a set of \
@@ -477,14 +522,13 @@ impl Refused {
                  for a field of yours"
             }
             Self::InsertSelect => {
-                "`INSERT ... SELECT` reads a **projection** - `SELECT <columns> FROM <table> \
-                 [WHERE ...] [LIMIT n]`, naming as many columns as the `INSERT` does. That is \
-                 the one shape that reads stored values back per record; a count or a grouping \
-                 is a number *about* a set of records rather than records to copy, and \
-                 `SELECT *` gives ids because a record has no row of values to read out. The \
-                 record ids are allocated, so the column list may not name `_record_id` either. \
-                 For anything else, select what you want and write it back with \
-                 `POST /table/{t}/import`"
+                "`INSERT ... SELECT` reads any answer whose cells are **values**, naming as \
+                 many columns as the `INSERT` does - a projection, and a grouping just as much: \
+                 a key is a string and a count is a number, and writing a merged grouping into \
+                 a table is what a materialised rollup is here. What it cannot read is \
+                 `SELECT *`, which answers with record *ids* - the address a fact is written to \
+                 rather than anything stored in a column. The ids are allocated, so the column \
+                 list may not name `_record_id` either"
             }
             Self::InsertSelfRead => {
                 "an `INSERT ... SELECT` reads one table and writes another. Reading and writing \

@@ -350,8 +350,16 @@ fn of(of: Of, sides: &[JoinSide]) -> String {
 }
 
 /// A join's sides, as the plans they are: `#0, #1`.
+///
+/// A side that need not match is printed `#1?`, because that one character is the whole
+/// difference between an inner join and an outer one - and a plan that reads the same either
+/// way would otherwise give the reader nothing to tell them apart by.
 fn plans_of(sides: &[JoinSide]) -> String {
-    sides.iter().map(|s| format!("#{}", s.keyed.plan())).collect::<Vec<_>>().join(", ")
+    sides
+        .iter()
+        .map(|s| format!("#{}{}", s.keyed.plan(), if s.required { "" } else { "?" }))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// What a number is measured in, printed only when it is not plain.

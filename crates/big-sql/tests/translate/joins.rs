@@ -124,3 +124,149 @@ fn a_join_groups_by_its_key_and_nothing_else() {
         "sql_unsupported"
     );
 }
+
+/// The sides of a join, as the shape says whether each one has to match.
+fn required_of(sql: &str) -> Vec<bool> {
+    let s = translate(sql).unwrap();
+    let Shape::Join { sides, .. } = &s.answer.shape else { panic!("expected a join") };
+    sides.iter().map(|s| s.required).collect()
+}
+
+/// **An outer join is one flag per side, and the plans below it do not change at all.**
+///
+/// Each side is still the ordinary grouping it would have been written alone; what `LEFT` says
+/// is that a key the right side is missing is still a row, which is a fact about the key space
+/// and is settled after the merge. That is why this costs a word in the shape rather than a
+/// second lowering.
+#[test]
+fn an_outer_join_changes_which_sides_must_match_and_nothing_below_it() {
+    let inner = "SELECT count(*) FROM t JOIN u ON t.category = u.category";
+    let left = "SELECT count(*) FROM t LEFT JOIN u ON t.category = u.category";
+
+    assert_eq!(required_of(inner), vec![true, true]);
+    assert_eq!(required_of(left), vec![true, false]);
+    // The same two calls, spelled the same way, for both.
+    assert_eq!(resolved(left, 0), resolved(inner, 0));
+    assert_eq!(resolved(left, 1), resolved(inner, 1));
+}
+
+#[test]
+fn right_clears_every_side_already_in_scope_and_full_clears_them_all() {
+    assert_eq!(
+        required_of("SELECT count(*) FROM t RIGHT JOIN u ON t.category = u.category"),
+        vec![false, true]
+    );
+    assert_eq!(
+        required_of("SELECT count(*) FROM t FULL OUTER JOIN u ON t.category = u.category"),
+        vec![false, false]
+    );
+    // A star of three, joined in one at a time: `RIGHT` is about every table written before it,
+    // which is what "all the rows of the right-hand side" means once the rows are keys.
+    assert_eq!(
+        required_of(
+            "SELECT count(*) FROM t JOIN u ON t.category = u.category \
+             RIGHT JOIN v ON t.category = v.category"
+        ),
+        vec![false, false, true]
+    );
+    // A `LEFT` only ever excuses the table it brings in, so an inner join after one still has
+    // to match.
+    assert_eq!(
+        required_of(
+            "SELECT count(*) FROM t LEFT JOIN u ON t.category = u.category \
+             JOIN v ON t.category = v.category"
+        ),
+        vec![true, false, true]
+    );
+}
+
+/// **A `WHERE` on an optional side makes it required, which is SQL's own rule.**
+///
+/// The rows an outer join adds are null on that side, so a predicate about one of its columns
+/// is false there and drops them - the difference between putting a condition in the `WHERE`
+/// and putting it in the `ON`. The one thing that would escape this is `IS NULL`, and there are
+/// no nulls here to write it with.
+#[test]
+fn a_where_on_an_optional_side_makes_it_required_again() {
+    assert_eq!(
+        required_of(
+            "SELECT count(*) FROM t a LEFT JOIN u b ON a.category = b.category \
+             WHERE b.amount > 5"
+        ),
+        vec![true, true]
+    );
+    // A predicate on the required side leaves the optional one optional: it narrows which of
+    // the left's records are there, not whether an unmatched key is a row.
+    assert_eq!(
+        required_of(
+            "SELECT count(*) FROM t a LEFT JOIN u b ON a.category = b.category \
+             WHERE a.amount > 5"
+        ),
+        vec![true, false]
+    );
+}
+
+/// **A join on the other table's record id lowers to a statement with no join in it.**
+///
+/// That is the claim worth pinning, and it is stronger than "it answers": the shape is not a
+/// `Shape::Join` at all, there is one call rather than one per table, and no per-key product is
+/// computed anywhere. A foreign key join multiplies nothing - each record has at most one
+/// partner - so what is left after the fold is an ordinary single-table statement over a
+/// narrower set.
+#[test]
+fn a_join_on_a_record_id_is_not_a_join_once_it_has_been_lowered() {
+    let s = translate(
+        "SELECT count(*) FROM t o JOIN u s ON o.amount = s._record_id WHERE s.category = 'GB'",
+    )
+    .unwrap();
+
+    assert_eq!(s.calls.len(), 1, "one table is read, not two");
+    assert_eq!(s.tables(), vec!["t"]);
+    assert!(!matches!(s.answer.shape, Shape::Join { .. }), "the join is gone, not answered");
+}
+
+/// The grouping a star join cannot do, and the reason it can be done here.
+///
+/// A star join groups **both** tables by the key it pairs on, so the only `GROUP BY` it can
+/// answer is that key. A folded one has no pairing left: the grouping is over whatever column
+/// the one remaining table has.
+#[test]
+fn a_folded_join_groups_by_a_column_that_is_not_the_join_key() {
+    let s = translate(
+        "SELECT o.country, count(*) FROM t o JOIN u s ON o.amount = s._record_id \
+         GROUP BY o.country",
+    )
+    .unwrap();
+
+    assert_eq!(s.calls.len(), 1);
+    assert!(!matches!(s.answer.shape, Shape::Join { .. }));
+}
+
+/// A `LEFT JOIN` on a record id narrows nothing, so it lowers to the statement without it.
+#[test]
+fn a_left_join_on_a_record_id_lowers_to_the_unjoined_statement() {
+    let left = translate("SELECT count(*) FROM t o LEFT JOIN u s ON o.amount = s._record_id");
+    let bare = translate("SELECT count(*) FROM t o");
+    assert_eq!(left.unwrap().calls, bare.unwrap().calls);
+}
+
+/// Every name outside the `ON` and the `WHERE` has to be about a table still in scope.
+///
+/// **Checked rather than left to the planner**, because two tables may declare the same column
+/// name: `sum(s.amount)` folded into `sum(amount)` over the outer table would be a wrong number
+/// rather than an unknown field, and nothing in the answer could reveal it.
+#[test]
+fn a_folded_join_refuses_a_name_about_the_table_it_folded() {
+    for sql in [
+        "SELECT sum(s.amount) FROM t o JOIN u s ON o.amount = s._record_id",
+        "SELECT s.category, count(*) FROM t o JOIN u s ON o.amount = s._record_id GROUP BY s.category",
+        "SELECT count(*) FROM t o JOIN u s ON o.amount = s._record_id ORDER BY s.category",
+    ] {
+        assert_eq!(code(sql), "sql_unsupported", "{sql}");
+    }
+    // `RIGHT` and `FULL` ask for records of the folded table that the outer one does not name.
+    assert_eq!(
+        code("SELECT count(*) FROM t o RIGHT JOIN u s ON o.amount = s._record_id"),
+        "sql_no_outer_joins"
+    );
+}

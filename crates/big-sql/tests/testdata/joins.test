@@ -285,3 +285,69 @@ Join keys=(#0, #1) per_key
 ├── m = ratio(#2 / #0, #1)
 ├── order: ratio(#2 / #0, #1) desc
 └── cut: limit 3
+
+## An outer join is one flag per side and the same two plans.
+##
+## `#1?` is the whole difference: the right side need not hold a key for that key to be a row,
+## and where it holds none it contributes one null-filled partner. So `count(*)` over a
+## `LEFT JOIN` is the same product it always was, with `max(|B_s|, 1)` in place of `|B_s|`.
+
+plan
+SELECT count(*) FROM t LEFT JOIN u ON t.category = u.category
+----
+Distinct t.category
+└── all
+Distinct u.category
+└── all
+
+shape
+SELECT count(*) FROM t LEFT JOIN u ON t.category = u.category
+----
+Join keys=(#0, #1?)
+└── count = product(#0, #1)
+
+shape
+SELECT count(*) FROM t RIGHT OUTER JOIN u ON t.category = u.category
+----
+Join keys=(#0?, #1)
+└── count = product(#0, #1)
+
+shape
+SELECT count(*) FROM t FULL JOIN u ON t.category = u.category
+----
+Join keys=(#0?, #1?)
+└── count = product(#0, #1)
+
+## A `WHERE` about the optional side makes it required: the rows the outer join adds are null
+## there, so any predicate on one of its columns drops them.
+
+shape
+SELECT count(*) FROM t a LEFT JOIN u b ON a.category = b.category WHERE b.amount > 5
+----
+Join keys=(#0, #1)
+└── count = product(#0, #1)
+
+## A join on the other table's record id is a foreign key join, and it folds away entirely.
+##
+## The column holds record ids, so each record has at most one partner and the join multiplies
+## nothing. What is left is one table narrowed by a set - one call, no `Join` shape, and a
+## `GROUP BY` over any column the remaining table has rather than only over the key.
+##
+## The `plan` of one is deliberately absent here for the reason `sql_explain_set` gives: the
+## tree depends on which ids came back, so there is none until the statement has run.
+
+shape
+SELECT count(*) FROM t o JOIN u s ON o.amount = s._record_id WHERE s.category = 'GB'
+----
+Row
+└── count = #0
+
+## A `LEFT JOIN` on a record id narrows nothing: the one partner a record could have had
+## contributes one row whether it is there or not. So this resolves to the statement without it,
+## and has a plan like any other.
+
+plan
+SELECT count(*) FROM t o LEFT JOIN u s ON o.amount = s._record_id
+----
+Count t
+└── all

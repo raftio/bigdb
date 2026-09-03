@@ -22,10 +22,10 @@
 //! Records below `SHARD_WIDTH` belong to `a` and everything above to `b`, so a batch that
 //! crosses that line is a batch that crosses machines.
 
-use big_embed::Api;
 use big_cluster::controller::Leases;
 use big_cluster::raft::{Forgetful, Timing};
 use big_cluster::{Cluster, ClusterFile};
+use big_embed::Api;
 use big_http::{Server, ServerConfig};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -1461,4 +1461,56 @@ fn term_of(ready: String) -> u64 {
         .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
         .and_then(|n| n.parse().ok())
         .unwrap_or_else(|| panic!("no term in {ready}"))
+}
+
+/// The bound a `TopN` is asked for widens until the answer is provably the whole cluster's.
+///
+/// **This is the case the bound exists to get right, and the one it could get wrong.** Each node
+/// is asked for more than `n` groups but not for all of them, so a group that is below *both*
+/// nodes' cut is invisible in the first round - and here that group is the winner. `A` through
+/// `E` hold ten each and live only on `a`; `F` through `J` hold ten each and live only on `b`;
+/// `X` holds nine on each node, which is eighteen and beats all of them, and is sixth on both.
+///
+/// A bound that stopped at the first round would answer `A` with ten. The answer is `X` with
+/// eighteen, because the first round's thresholds say each node is still holding groups worth up
+/// to ten - which is not less than the ten a candidate leads with, so nothing is certain yet and
+/// the bound widens. The second round asks for more than either node has, and every threshold
+/// becomes zero.
+#[test]
+fn a_top_n_widens_its_bound_until_a_group_hidden_on_every_node_can_be_seen() {
+    let (a, b) = two_nodes();
+    ok(a, "POST", "/table/tx", "");
+    ok(a, "POST", "/table/tx/field/country?kind=set", "");
+
+    let mut facts = String::new();
+    let mut id = 1;
+    let put = |facts: &mut String, id: &mut u64, key: &str, base: u64, times: usize| {
+        for _ in 0..times {
+            facts.push_str(&format!("country {} {key}\n", base + *id));
+            *id += 1;
+        }
+    };
+    // Ten each on `a` alone, and ten each on `b` alone: five leaders per node, none shared.
+    for key in ["A", "B", "C", "D", "E"] {
+        put(&mut facts, &mut id, key, 0, 10);
+    }
+    for key in ["F", "G", "H", "I", "J"] {
+        put(&mut facts, &mut id, key, WIDTH, 10);
+    }
+    // Nine on each node, so sixth on both and first overall.
+    put(&mut facts, &mut id, "X", 0, 9);
+    put(&mut facts, &mut id, "X", WIDTH, 9);
+    ok(a, "POST", "/table/tx/import", &facts);
+
+    let top = ok(b, "POST", "/table/tx/query", r#"TopN(All(), field="country", n=1)"#);
+    assert!(top.contains(r#""key":"X""#), "{top}");
+    assert!(top.contains(r#""count":18"#), "{top}");
+
+    // And the ranking below it, which a bound that stopped early would also have cut wrong.
+    let three = ok(a, "POST", "/table/tx/query", r#"TopN(All(), field="country", n=3)"#);
+    let counts: Vec<&str> =
+        three.match_indices("\"count\":").map(|(i, _)| &three[i + 8..]).collect();
+    assert!(counts.first().is_some_and(|c| c.starts_with("18")), "{three}");
+    // The other two are tens, whichever pair of the ten-count groups the tie-break picks.
+    assert_eq!(three.matches("\"count\":10").count(), 2, "{three}");
 }

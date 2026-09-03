@@ -121,3 +121,22 @@ INSERT INTO tx (amount) SELECT amount * 2 FROM u
 ----
 Insert tx (amount) id=allocated
 └── select amount * 2 from u
+
+# **A grouping is a source too, and that is what a materialised rollup is here.** The expensive
+# part of a grouping in this engine is not reading it - a `Distinct` is one fragment per shard -
+# it is *merging* it, because every owner ships every group it holds before a total is right.
+# Writing that merged answer into a table pays it once instead of once per query, and what comes
+# out is an ordinary table that nothing new has to read.
+insert
+INSERT INTO tx (country, amount) SELECT country, count(*) FROM u GROUP BY country
+----
+Insert tx (country, amount) id=allocated
+└── select country, count from u
+
+# A `HAVING` and an ordering ride along the same way a `WHERE` does: they decide which groups the
+# answer holds, and the write is of that answer.
+insert
+INSERT INTO tx (country, amount) SELECT country, sum(amount) FROM u GROUP BY country HAVING sum(amount) >= 100 ORDER BY country LIMIT 10
+----
+Insert tx (country, amount) id=allocated
+└── select country, sum from u

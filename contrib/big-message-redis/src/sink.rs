@@ -24,7 +24,7 @@
 //!   flushes explicitly rather than letting the producer's linger decide. A producer that
 //!   flushed on its own schedule would leave the sink acknowledging entries whose rows were
 //!   still in a buffer.
-//! - An [`Error::Unknown`](big_message::Error::Unknown) acknowledges nothing and stops. Those
+//! - An [`Error::Unknown`] acknowledges nothing and stops. Those
 //!   entries stay pending, which is the honest state: nobody knows whether they landed.
 //!
 //! # Where the mapping lives, and why it is the operator's

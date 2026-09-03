@@ -56,7 +56,7 @@ pub enum Tok {
     /// number, because a dialect with no arithmetic has no other reading of one; with
     /// arithmetic there are two, and `amount-1` is the one a lexer cannot tell from `amount`
     /// and `-1`. The sign is put back where the difference is visible - see
-    /// [`crate::parse::Parser::literal`], the one place a value is read.
+    /// `Parser::literal`, the one place a value is read.
     Arith(&'static str),
     /// `(`
     LParen,
@@ -227,7 +227,7 @@ fn string(s: &[u8], i: &mut usize, quote: u8) -> Result<String> {
 ///
 /// **The sign is not read here.** A `-` is its own token now that this dialect has arithmetic,
 /// because `amount-1` and `amount, -1` are the same three bytes to a scanner and different
-/// statements to a reader. [`crate::parse::Parser::literal`] puts it back where a value is
+/// statements to a reader. `Parser::literal` puts it back where a value is
 /// being read and the difference is decidable.
 fn number(s: &[u8], i: &mut usize) -> Result<Tok> {
     let at = *i;
@@ -260,7 +260,7 @@ fn number(s: &[u8], i: &mut usize) -> Result<Tok> {
     }))
 }
 
-/// The same number with a `-` in front of it, which is how [`crate::parse::Parser::literal`]
+/// The same number with a `-` in front of it, which is how `Parser::literal`
 /// reads a sign that is now a token of its own.
 ///
 /// A negative fractional number is not refused here: a decimal field is unsigned and a float

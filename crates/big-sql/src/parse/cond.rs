@@ -16,7 +16,7 @@
 
 use super::Parser;
 use super::MAX_DEPTH;
-use crate::ast::Cond;
+use crate::ast::{Cond, Name};
 use crate::error::{Refused, Result, SqlError};
 use crate::lex::Tok;
 use big_plan::Literal;
@@ -96,6 +96,16 @@ impl Parser<'_> {
 
     pub(super) fn predicate(&mut self) -> Result<Cond> {
         let at = self.at();
+        // **`SEGMENT(<view>)` is a term, not a column.** Recognised before a name is read
+        // because it is the one predicate whose argument is a *view* rather than a value - and
+        // recognised by the bracket as well as the word, so a column called `segment` is still
+        // a column. `WHERE segment = 'a'` and `WHERE segment` both go the ordinary way.
+        if self.word_is("SEGMENT") && self.tok_at_is(1, &Tok::LParen) {
+            self.i += 2;
+            let view = self.source("a view name inside SEGMENT")?;
+            self.expect(&Tok::RParen, ") to close SEGMENT")?;
+            return Ok(Cond::Segment { view, at });
+        }
         let field = self.name("a column name")?;
         // A scalar call where a column belongs. Caught by name so it is refused as what it is -
         // a computation asked for before there is anything to compute it on - rather than as a
@@ -132,7 +142,7 @@ impl Parser<'_> {
         let inner = if self.eat_word("IN") {
             self.expect(&Tok::LParen, "( after IN")?;
             if self.word_is("SELECT") {
-                return Err(self.refuse(Refused::Subquery));
+                return self.in_records(field, at, negated);
             }
             let mut values = vec![self.literal("a value inside IN")?];
             while self.eat(&Tok::Comma) {
@@ -183,6 +193,37 @@ impl Parser<'_> {
             }
         };
 
+        Ok(if negated { Cond::Not(Box::new(inner)) } else { inner })
+    }
+
+    /// `IN (SELECT _record_id FROM <table> [WHERE ...])`, with the `(` and `SELECT` still ahead.
+    ///
+    /// **`_record_id` is the only column this may name, and that is the whole reason it can be
+    /// answered.** The inner statement is a set of records - the same thing every `WHERE`
+    /// already produces - and the outer column holds ids of that table's records, so what
+    /// crosses between them is a set of ids rather than a pair of rows. Every other select list
+    /// asks for a number or a value, which is not something the outer column could be one of.
+    ///
+    /// Nothing else of a `SELECT` is taken either: a `GROUP BY`, an `ORDER BY` or a `LIMIT` in
+    /// here would each name an order or a grouping over a set that is about to be unordered.
+    fn in_records(&mut self, field: Name, at: usize, negated: bool) -> Result<Cond> {
+        self.expect_word("SELECT", "SELECT inside IN")?;
+        let id_at = self.at();
+        match self.name("_record_id inside IN") {
+            Ok(name) if name.column == "_record_id" && name.qualifier.is_none() => {}
+            Ok(_) | Err(_) => return Err(self.refuse_at(Refused::Subquery, id_at)),
+        }
+        self.expect_word("FROM", "FROM inside IN")?;
+        let table = self.source("a table name inside IN")?;
+        let filter = if self.eat_word("WHERE") { Some(Box::new(self.cond()?)) } else { None };
+        // A clause this cannot mean is refused where it is written, rather than parsed and
+        // dropped - a `LIMIT` that silently did nothing would be a different set answered
+        // quietly.
+        if !matches!(self.peek(), Some(&Tok::RParen)) {
+            return Err(self.refuse(Refused::Subquery));
+        }
+        self.expect(&Tok::RParen, ") to close IN")?;
+        let inner = Cond::InRecords { field, table, filter, at };
         Ok(if negated { Cond::Not(Box::new(inner)) } else { inner })
     }
 }

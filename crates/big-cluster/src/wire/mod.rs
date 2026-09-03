@@ -45,12 +45,12 @@ pub use plan::*;
 pub use request::*;
 pub use value::*;
 
+use big_container::{Container, ContainerRef, Interval};
+use big_db::Matches;
 use big_embed::{
     ColumnCell, FieldKind, FragmentAddr, FragmentData, FragmentMeta, Granularity, Pair, Plan,
     Projected, Projection, RecordId, RowId, Rows, TableEngine, Value,
 };
-use big_container::{Container, ContainerRef, Interval};
-use big_db::Matches;
 use big_engine::bitmap::RowSet;
 use big_engine::ShardId;
 use big_exec::Group;

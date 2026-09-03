@@ -321,6 +321,25 @@ impl<P: PagerMut + Sync> Cluster<P> {
             big_embed::Sql::Explain { mode, inner } => return self.sql_explain(mode, *inner),
             big_embed::Sql::Query(s) => s,
         };
+        let started = Instant::now();
+        // **The semi-joins first, and they fan out like everything else - which is the whole
+        // reason they are here rather than in a plan.** `IN (SELECT _record_id FROM b ...)`
+        // narrows this table by the ids `b` holds, and a per-node share of those ids would
+        // narrow one node's records by a fraction of the set: a smaller answer that looks
+        // exactly like a correct one. So the inner set is fanned out and merged in full before
+        // the outer call is planned, the same way a join's arithmetic waits for both sides.
+        let mut statement = statement;
+        big_embed::resolve_sets(
+            &mut statement.calls,
+            |t, c| self.api.plan_call(t, c).map_err(ClusterError::Local),
+            |p| self.execute(p, &big_embed::remaining(opts, started)),
+            |_, _| {
+                ClusterError::Local(big_embed::ApiError::Sql(big_embed::SqlError::Refused {
+                    what: big_embed::Refused::SetTooLarge,
+                    at: 0,
+                }))
+            },
+        )?;
         let (plans, probes, answer) = self.api.plan_statement(statement)?;
         // One fan-out and one merge per plan, each exactly the fan-out and merge that plan
         // would have got written on its own. A statement that asks two questions costs two
@@ -329,7 +348,6 @@ impl<P: PagerMut + Sync> Cluster<P> {
         // The timeout bounds the statement rather than each plan in it, which matters more here
         // than it does un-clustered: what is being held is a worker on every owner, not only on
         // this node. See `big_embed::remaining`.
-        let started = Instant::now();
         let mut values = Vec::with_capacity(plans.len());
         for plan in &plans {
             values.push(self.execute(plan, &big_embed::remaining(opts, started))?);
@@ -367,6 +385,20 @@ impl<P: PagerMut + Sync> Cluster<P> {
         // it resolves, and hands over.
         let (planned, format) = match inner {
             big_embed::Sql::Query(statement) => {
+                // **A semi-join has no plan to draw until it has run, and this says so rather
+                // than drawing a different one.** The outer call is narrowed by the ids the
+                // inner set holds, so its tree is not a fact about the statement - it is a fact
+                // about the other table's contents at the moment it was asked. Standing in an
+                // `All()` would print a tree that is never the one that runs, and running the
+                // inner set would break the one promise an `EXPLAIN` makes.
+                if statement.calls.iter().any(|a| big_embed::has_set(&a.call)) {
+                    return Err(ClusterError::Local(big_embed::ApiError::Sql(
+                        big_embed::SqlError::Refused {
+                            what: big_embed::Refused::ExplainSet,
+                            at: 0,
+                        },
+                    )));
+                }
                 let (plans, probes, answer) = self.api.plan_statement(statement)?;
                 // A search's records are an ordinary call, resolved so the tree under it is the
                 // one the search would actually walk. Without this a statement that is only a
@@ -616,7 +648,61 @@ impl<P: PagerMut + Sync> Cluster<P> {
     /// The plan travels, not the text. Re-parsing per node would let two nodes disagree about
     /// what was asked, and a result cannot show that it happened.
     pub fn execute(&self, plan: &Plan, opts: &QueryOptions) -> Result<Value> {
-        let asked = asked_of_owners(plan);
+        // **The one plan that is asked more than once.** See `top_n_is_certain`: an owner cut to
+        // `n` is wrong, an owner asked for everything is right and can ship a million groups, and
+        // between them is a bound that says when it has already been asked for enough.
+        if let Plan::TopN { n, .. } = plan {
+            return self.execute_top_n(plan, *n, opts);
+        }
+        self.execute_asked(plan, &asked_of_owners(plan), opts)
+    }
+
+    /// A `TopN`, asked for a widening bound until the merge is provably the whole table's.
+    ///
+    /// The last round asks for everything, which is what this replaced - so the worst case is
+    /// the old behaviour plus the rounds before it, and the best case is one round of `n + 4`
+    /// groups per owner instead of every group each of them holds.
+    fn execute_top_n(&self, plan: &Plan, n: usize, opts: &QueryOptions) -> Result<Value> {
+        let Plan::TopN { table, rows, field, .. } = plan else {
+            unreachable!("only a `TopN` reaches here")
+        };
+        let bound = |m: usize| Plan::TopN {
+            table: table.clone(),
+            rows: rows.clone(),
+            field: field.clone(),
+            n: m,
+        };
+        for extra in TOP_N_ROUNDS {
+            let asked = n.saturating_add(extra);
+            let answers = self.ask_owners(&bound(asked), opts)?;
+            let reports: Vec<Reported> =
+                answers.iter().map(|(_, v)| Reported::of(v, asked)).collect();
+            if top_n_is_certain(&reports, n) {
+                return self.merge_answers(plan, answers);
+            }
+        }
+        // Everything, which is where this started and is always correct.
+        let answers = self.ask_owners(&bound(usize::MAX), opts)?;
+        self.merge_answers(plan, answers)
+    }
+
+    /// One fan-out of one plan, and the merge that follows it.
+    fn execute_asked(&self, plan: &Plan, asked: &Plan, opts: &QueryOptions) -> Result<Value> {
+        let answers = self.ask_owners(asked, opts)?;
+        self.merge_answers(plan, answers)
+    }
+
+    fn merge_answers(&self, plan: &Plan, answers: Vec<(usize, Value)>) -> Result<Value> {
+        let mut merge = Merge::new(plan);
+        for (i, value) in answers {
+            merge.add(&self.config.nodes()[i].name, value)?;
+        }
+        Ok(merge.finish())
+    }
+
+    /// Every primary owner's answer to one plan, exactly as it was asked.
+    fn ask_owners(&self, asked: &Plan, opts: &QueryOptions) -> Result<Vec<(usize, Value)>> {
+        let asked = asked.clone();
         let body = wire::QueryRequest {
             plan: asked.clone(),
             timeout_ms: opts.timeout.map(|t| t.as_millis().min(u64::MAX as u128) as u64),
@@ -639,12 +725,7 @@ impl<P: PagerMut + Sync> Cluster<P> {
                 self.api.execute(&asked, opts).map_err(ClusterError::Local)
             },
         )?;
-
-        let mut merge = Merge::new(plan);
-        for (i, value) in answers {
-            merge.add(&self.config.nodes()[i].name, value)?;
-        }
-        Ok(merge.finish())
+        Ok(answers)
     }
 
     /// A page of record ids from the whole cluster, ascending.
@@ -715,5 +796,203 @@ fn qualified(database: &Option<String>, table: &str) -> String {
     match database {
         Some(d) => format!("{d}.{table}"),
         None => table.to_string(),
+    }
+}
+
+/// The bound each owner is asked for before a `TopN` can be answered from less than everything.
+///
+/// **Why there has to be a bound at all.** A group that leads nowhere can still lead everywhere
+/// once the shards are added up, so no owner may cut to `n` - the simplest correct rule is to
+/// ask every owner for *all* of its groups, and that is what this replaces. On a column with a
+/// million distinct values, a `LIMIT 10` then ships a million groups from every node.
+///
+/// **Why a bound can be safe.** An owner asked for its top `m` also says, by the count of the
+/// smallest group it returned, that everything it did *not* return is at or below that number.
+/// Call that its threshold. A group nobody returned therefore has a total no larger than the
+/// thresholds added up, and a group some returned has a total no larger than what is known plus
+/// the thresholds of the owners that stayed quiet. When both of those bounds fall below the
+/// `n`-th known total, nothing unseen can enter the answer and the merge is already exact.
+///
+/// When they do not, the bound widens and the round is asked again - and the widening ends at
+/// everything, which is where it started. So this is never wrong and never worse than one extra
+/// round of the old behaviour; it is only ever cheaper, and it is cheapest exactly where the old
+/// rule was most expensive.
+const TOP_N_ROUNDS: [usize; 3] = [4, 32, 512];
+
+/// One round's answer from one owner, as the certainty test needs it.
+struct Reported {
+    /// The groups, by the row each is keyed on. Row ids are cluster-wide for a keyed field -
+    /// the schema leader interns them - which is what lets two owners' groups be the same group.
+    counts: BTreeMap<RowId, u64>,
+    /// What this owner says about everything it did not return: at or below this. Zero when it
+    /// returned fewer groups than it was asked for, because then it returned all it has.
+    threshold: u64,
+}
+
+impl Reported {
+    fn of(value: &Value, asked: usize) -> Self {
+        let groups = value.as_groups().unwrap_or(&[]);
+        let counts =
+            groups.iter().map(|g| (g.row, group_count(g))).collect::<BTreeMap<RowId, u64>>();
+        // **Fewer groups than asked for means there are no others**, so nothing is hidden and
+        // the threshold is zero. Exactly as many is treated as if there were more, which costs
+        // at most one extra round and can never be wrong in the other direction.
+        let threshold = if groups.len() < asked {
+            0
+        } else {
+            groups.iter().map(group_count).min().unwrap_or(0)
+        };
+        Self { counts, threshold }
+    }
+}
+
+fn group_count(g: &big_embed::Group) -> u64 {
+    match g.value.as_ref() {
+        Value::Count(n) => *n,
+        _ => 0,
+    }
+}
+
+/// Whether the answer merged from these owners is already the one the whole table would give.
+///
+/// Three things have to hold, and each of them is about a different way a bounded round can be
+/// short. Written out rather than folded together, because a bound that is subtly too generous
+/// is a plausible wrong answer that nothing in the result could reveal.
+fn top_n_is_certain(reports: &[Reported], n: usize) -> bool {
+    if n == 0 {
+        return true;
+    }
+    let total_threshold: u64 = reports.iter().map(|r| r.threshold).sum();
+    // Every owner returned everything it has: there is nothing left to be uncertain about,
+    // whatever the numbers say.
+    if total_threshold == 0 {
+        return true;
+    }
+
+    // What is known about each group so far, and what it could still gain from the owners that
+    // did not mention it.
+    let mut known: BTreeMap<RowId, u64> = BTreeMap::new();
+    for report in reports {
+        for (row, count) in &report.counts {
+            *known.entry(*row).or_insert(0) += *count;
+        }
+    }
+    let unseen_gain = |row: RowId| -> u64 {
+        reports.iter().filter(|r| !r.counts.contains_key(&row)).map(|r| r.threshold).sum()
+    };
+
+    let mut ranked: Vec<(RowId, u64)> = known.into_iter().collect();
+    // Descending by count, then by row - the same order `rank_top_n` puts them in, minus the
+    // key, which is a tie-break this cannot see and does not need: what is being decided here
+    // is only *which* groups are in play.
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+
+    // Fewer candidates than asked for, and some owner is still holding groups back.
+    if ranked.len() < n {
+        return false;
+    }
+    let (top, rest) = ranked.split_at(n);
+    let cut = top[n - 1].1;
+
+    // 1. Every group in the answer has to have an *exact* count, not merely the largest known
+    //    one: an owner that did not mention it may still hold records under it, and the number
+    //    this returns is the number a client reads.
+    if top.iter().any(|(row, _)| unseen_gain(*row) > 0) {
+        return false;
+    }
+    // 2. No group that was seen but did not make the cut may be able to climb into it.
+    if rest.iter().any(|(row, count)| count + unseen_gain(*row) >= cut) {
+        return false;
+    }
+    // 3. Nor may a group no owner returned at all, whose total is bounded by the thresholds
+    //    added up. Compared with `>=` rather than `>` for the reason the last one is: a tie at
+    //    the cut is broken by a key this test cannot see, so a tie is not a certainty.
+    total_threshold < cut
+}
+
+#[cfg(test)]
+mod top_n_tests {
+    use super::*;
+
+    /// One owner's round, as counts by row and the threshold it implies.
+    fn report(counts: &[(RowId, u64)], threshold: u64) -> Reported {
+        Reported { counts: counts.iter().copied().collect(), threshold }
+    }
+
+    /// Every owner returned everything it has, so there is nothing left to be uncertain about.
+    #[test]
+    fn no_threshold_anywhere_is_certain_whatever_the_counts_say() {
+        let reports = [report(&[(1, 10), (2, 9)], 0), report(&[(2, 8)], 0)];
+        assert!(top_n_is_certain(&reports, 1));
+        assert!(top_n_is_certain(&reports, 5));
+    }
+
+    /// **A group in the answer needs an exact count, not merely the largest known one.**
+    ///
+    /// Row 1 leads on the first owner and the second never mentioned it - but the second is
+    /// still holding groups worth up to three, so the number this would return is a number the
+    /// client would read as final and it is not.
+    #[test]
+    fn a_leader_no_owner_confirmed_is_not_certain_even_when_it_cannot_be_beaten() {
+        let reports = [report(&[(1, 100)], 3), report(&[(2, 4), (3, 3)], 3)];
+        assert!(!top_n_is_certain(&reports, 1));
+        // The same owners with nothing held back: now it is exact.
+        let settled = [report(&[(1, 100)], 0), report(&[(2, 4), (3, 3)], 0)];
+        assert!(top_n_is_certain(&settled, 1));
+    }
+
+    /// A group that missed the cut but could still climb into it.
+    ///
+    /// Row 2 is known to hold nine, and the owner that did not mention it is holding groups
+    /// worth up to two - which is eleven against a cut of ten. **The threshold only bounds what
+    /// an owner did not say**, so a group both owners confirmed cannot climb however large their
+    /// thresholds are; this is the case where one of them stayed quiet.
+    #[test]
+    fn a_candidate_an_owner_stayed_quiet_about_can_still_reach_the_cut() {
+        let reports = [report(&[(1, 10), (2, 9)], 2), report(&[(1, 0)], 2)];
+        assert!(!top_n_is_certain(&reports, 1));
+
+        // The same shape with that owner holding nothing back: row 2 is exact at nine, which
+        // is below the cut, and nothing unseen can reach it either.
+        let settled = [report(&[(1, 10), (2, 9)], 2), report(&[(1, 0)], 0)];
+        assert!(top_n_is_certain(&settled, 1));
+    }
+
+    /// A threshold bounds only what its owner did not say.
+    ///
+    /// Both owners confirmed both groups, so neither number can grow - and a threshold of two
+    /// against a cut of ten leaves nothing unseen that could reach it either.
+    #[test]
+    fn a_group_every_owner_confirmed_cannot_climb_however_large_the_thresholds() {
+        let reports = [report(&[(1, 10), (2, 9)], 2), report(&[(1, 0), (2, 0)], 2)];
+        assert!(top_n_is_certain(&reports, 1));
+    }
+
+    /// A group no owner returned, whose total is bounded by the thresholds added up.
+    #[test]
+    fn an_unseen_group_that_could_beat_the_cut_is_not_certain() {
+        // Both owners confirmed row 1 at four apiece, so its count is exact at eight. But each
+        // is still holding groups worth up to five, and ten beats eight.
+        let reports = [report(&[(1, 4)], 5), report(&[(1, 4)], 5)];
+        assert!(!top_n_is_certain(&reports, 1));
+
+        // Drop what they are holding below the cut and the same shape is certain.
+        let reports = [report(&[(1, 4)], 3), report(&[(1, 4)], 3)];
+        assert!(top_n_is_certain(&reports, 1));
+    }
+
+    /// Fewer candidates than asked for, while an owner is still holding groups back.
+    #[test]
+    fn too_few_candidates_is_not_certain_unless_that_is_all_there_is() {
+        let reports = [report(&[(1, 9)], 4), report(&[(1, 1)], 4)];
+        assert!(!top_n_is_certain(&reports, 3));
+        let settled = [report(&[(1, 9)], 0), report(&[(1, 1)], 0)];
+        assert!(top_n_is_certain(&settled, 3));
+    }
+
+    /// Nothing was asked for, so nothing can be missing.
+    #[test]
+    fn a_top_none_is_certain() {
+        assert!(top_n_is_certain(&[report(&[(1, 9)], 4)], 0));
     }
 }

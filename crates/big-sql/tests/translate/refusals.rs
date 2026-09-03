@@ -32,7 +32,13 @@ fn every_refusal_names_itself() {
         code("SELECT count(*) FROM t JOIN u ON t.a = u.a JOIN v ON u.b = v.b"),
         "sql_no_joins"
     );
-    assert_eq!(code("SELECT count(*) FROM t LEFT JOIN u ON t.a = u.a"), "sql_no_outer_joins");
+    // A `FULL` mixed with any other kind: `(t JOIN u) FULL JOIN v` pairs on the keys `t` and
+    // `u` share unioned with `v`'s, and one flag per side cannot tell that from the union of
+    // all three. Every other outer join is answered - see `joins.rs`.
+    assert_eq!(
+        code("SELECT count(*) FROM t JOIN u ON t.a = u.a FULL JOIN v ON t.a = v.a"),
+        "sql_no_outer_joins"
+    );
     // A cross join and a natural join name no key at all, which is what a comma between tables
     // is - so they get that refusal and not the outer join one, whose sentence is about
     // producing a row for a record with no partner.
@@ -110,9 +116,10 @@ fn every_refusal_names_itself() {
     // server to allocate one.
     assert_eq!(code("INSERT INTO t VALUES (1, 2)"), "sql_insert_shape");
     assert_eq!(code("INSERT INTO t (_record_id, amount) VALUES ('seven', 2)"), "sql_insert_shape");
-    // A projection is answered; every other shape of answer is not, and one table on both
-    // sides has no snapshot under it.
-    assert_eq!(code("INSERT INTO t (amount) SELECT count(*) FROM u"), "sql_unsupported");
+    // Any answer whose cells are values is a source - a projection, and a grouping just as
+    // much, which is what a materialised rollup is here. What is not is `SELECT *`: it answers
+    // with record ids, which are the address a fact is written to rather than anything stored
+    // in a column. And one table on both sides has no snapshot under it.
     assert_eq!(code("INSERT INTO t (amount) SELECT * FROM u"), "sql_unsupported");
     assert_eq!(code("INSERT INTO t (amount) SELECT amount FROM t"), "sql_insert_self_read");
     // `id` is what a record is called, so a *field* of that name is one no `INSERT` could ever

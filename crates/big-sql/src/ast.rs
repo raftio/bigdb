@@ -104,6 +104,8 @@ impl Source {
 /// columns at once is a pass over the second per value of the first.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Join {
+    /// Which sides a row of this join has to have a partner on. See [`JoinKind`].
+    pub kind: JoinKind,
     /// The table being joined in.
     pub source: Source,
     /// The column on the left-hand table.
@@ -112,6 +114,29 @@ pub struct Join {
     pub right: Name,
     /// Byte offset, for the refusal.
     pub at: usize,
+}
+
+/// Which sides of a join a key has to be held by for it to be a row.
+///
+/// **An outer join here is not a row with half of it nulled out - it is a side that stops
+/// removing keys from the space.** For each key, the join is the Cartesian product of the
+/// records each side holds under it; a side that need not match contributes exactly one
+/// null-filled partner where it holds none, and one is the identity of that product. So
+/// `count(*)` over a `LEFT JOIN` is `Σ_s |A_s| · max(|B_s|, 1)` over the keys `A` holds, which
+/// is the same arithmetic the inner join already was.
+///
+/// That is why this is one word per `JOIN` and not a second code path: it decides
+/// [`crate::JoinSide::required`], and nothing else.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum JoinKind {
+    /// Every side has to hold the key. The intersection.
+    Inner,
+    /// The table being joined in need not hold it.
+    Left,
+    /// Only the table being joined in has to hold it.
+    Right,
+    /// No side has to hold it: the space is every key any side holds.
+    Full,
 }
 
 /// One accepted statement: a `SELECT`, or several stacked by `UNION ALL`.
@@ -528,6 +553,52 @@ pub enum Cond {
         /// At least one value; an empty list is a syntax error rather than an empty set,
         /// because SQL does not accept one either.
         values: Vec<Literal>,
+    },
+    /// `SEGMENT(<view>)`: a named set of records of *this* table, used as a term.
+    ///
+    /// **A segment is a `WHERE` with a name, and composing two of them is one bitmap
+    /// operation.** The view it names is over the same table, so nothing crosses between
+    /// tables and no ids travel: the term is replaced by that view's own condition, and
+    /// `SEGMENT(a) AND NOT SEGMENT(b)` becomes the `Difference` the lowering already emits for
+    /// any other conjunction. Which is the whole point - a set that costs nothing to name, and
+    /// whose intersection with another set is the operation this engine is built out of.
+    ///
+    /// Distinct from reading the view as a table. `FROM v` answers *the view's* statement, one
+    /// per statement, and two of them cannot be combined; `SEGMENT(v)` takes only the records
+    /// and leaves the question to the reader, which is what makes it composable.
+    ///
+    /// **Expanded before the lowering, in `big_embed::views`**, because it needs the catalog -
+    /// the same place and the same depth bound a view read through `FROM` gets. Nothing below
+    /// that layer ever sees one.
+    Segment {
+        /// The view named, as a source so it carries a database the way every other name does.
+        view: Source,
+        /// Byte offset, for the refusal.
+        at: usize,
+    },
+    /// `<column> IN (SELECT _record_id FROM <table> [WHERE ...])`: the semi-join.
+    ///
+    /// **This is the one join shape a bitmap engine is actually built for.** The column holds
+    /// record ids of the other table, so the inner statement is an ordinary set of records -
+    /// the same `Rows` call any `WHERE` already produces - and the outer term is the union of
+    /// the bitmaps whose value is one of them. Nothing pairs records and nothing is grouped:
+    /// what crosses between the tables is a set of ids, and a set is what this engine merges.
+    ///
+    /// The inner statement is deliberately not a whole [`Select`]. `_record_id` is the only
+    /// column it may name, because a record id is the only thing one table can hold about
+    /// another's records, and there is nothing for a `GROUP BY` or a `LIMIT` in here to mean.
+    ///
+    /// `NOT IN` is a [`Cond::Not`] around one, exactly as it is for a list of values - which is
+    /// the anti-join, and comes free.
+    InRecords {
+        /// The column holding the other table's record ids. A bit-sliced integer field.
+        field: Name,
+        /// The table the ids are records of.
+        table: Source,
+        /// The inner `WHERE`, or `None` for every record the table holds.
+        filter: Option<Box<Cond>>,
+        /// Byte offset, for the refusal.
+        at: usize,
     },
     /// `<column> LIKE '<pattern>'`, and `ILIKE` for the folded one. `NOT LIKE` is a
     /// [`Cond::Not`] around one, exactly as `NOT IN` is.
