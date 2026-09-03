@@ -195,6 +195,25 @@ fn reading_tables_does_not_make_somebody_an_operator() {
     assert_eq!(status, 200, "{body}");
 }
 
+/// **`OPERATE` is grantable in SQL even though no statement demands it.** Denying it never
+/// produces a query-side refusal - only a `403` on the routes it guards - and that asymmetry is
+/// not a reason to keep it out of `GRANT`. This is the test that would catch a regression back
+/// to refusing it at the parser.
+#[test]
+fn granting_operate_lets_a_reader_reach_the_operator_routes() {
+    let addr = spawn_with_auth(4, &users(), stocked);
+    let (status, body) = send_as(addr, "reader", PW, "GET", "/metrics", "");
+    assert_eq!(status, 403, "{body}");
+
+    let (status, body) = sql(addr, "root", "GRANT OPERATE ON *.* TO analyst");
+    assert_eq!(status, 200, "{body}");
+
+    let (status, body) = send_as(addr, "reader", PW, "GET", "/metrics", "");
+    assert_eq!(status, 200, "no reload, no restart: {body}");
+    let (status, body) = send_as(addr, "reader", PW, "GET", "/verify", "");
+    assert_eq!(status, 200, "{body}");
+}
+
 /// Administering roles is `ROLES` on the server, which is not something a database-wide grant
 /// includes - or the fence would not hold for one hop.
 #[test]

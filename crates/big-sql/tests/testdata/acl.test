@@ -76,7 +76,27 @@ Grant SELECT, INSERT, DELETE, CREATE, DROP, ALTER on sales.* to loader
 acl
 GRANT ALL PRIVILEGES ON *.* TO admin
 ----
-Grant SELECT, INSERT, DELETE, CREATE, DROP, ALTER, ROLES on *.* to admin
+Grant SELECT, INSERT, DELETE, CREATE, DROP, ALTER, ROLES, OPERATE on *.* to admin
+
+# Grantable even though no statement demands it: the refusal it produces is a 403 on a route,
+# not a query.
+
+acl
+GRANT OPERATE ON *.* TO ops
+----
+Grant OPERATE on *.* to ops
+
+# It has no meaning below the server.
+
+error
+GRANT OPERATE ON sales.* TO ops
+----
+sql_acl_object
+
+error
+GRANT OPERATE ON sales.orders TO ops
+----
+sql_acl_object
 
 acl
 REVOKE INSERT ON sales.orders FROM loader
@@ -86,7 +106,7 @@ Revoke INSERT on sales.orders from loader
 acl
 REVOKE ALL ON *.* FROM admin
 ----
-Revoke SELECT, INSERT, DELETE, CREATE, DROP, ALTER, ROLES on *.* from admin
+Revoke SELECT, INSERT, DELETE, CREATE, DROP, ALTER, ROLES, OPERATE on *.* from admin
 
 # Case does not matter: the lexer has no keyword list, so these are ordinary words compared
 # case-insensitively where they are expected.

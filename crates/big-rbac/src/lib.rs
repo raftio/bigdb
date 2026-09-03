@@ -120,8 +120,10 @@ pub enum Privilege {
     Roles,
     /// Operate the server: metrics, repair, backup.
     ///
-    /// **Demanded by no statement.** It guards routes rather than SQL, which is why it is not
-    /// grantable in a `GRANT` today: there is no statement whose refusal would explain it.
+    /// **Demanded by no statement, and grantable anyway.** It guards REST routes rather than
+    /// SQL, so denying it produces no refusal a query would ever see - only a `403` on
+    /// `/metrics`, `/verify`, `/repair` and `/admin/backup`. Held on [`Object::Server`] only:
+    /// there is no per-database or per-table meaning for "may operate the process".
     Operate,
 }
 
@@ -179,14 +181,16 @@ impl Privilege {
         !matches!(self, Self::Roles | Self::Operate)
     }
 
-    /// Whether a `GRANT` may name this privilege at all.
+    /// Whether a `GRANT` may name this privilege on [`Object::Server`].
     ///
-    /// [`Privilege::Operate`] is the one that may not, and only because nothing demands it: it
-    /// guards routes rather than statements, so a `GRANT OPERATE` would be a privilege whose
-    /// refusal no statement could ever explain. Adding it later is additive - the bit is already
-    /// reserved and already stored.
+    /// Every privilege is grantable at the server, including [`Privilege::Operate`]: it guards
+    /// REST routes rather than statements, so granting or revoking it changes nothing about SQL
+    /// and everything about `/metrics`, `/verify`, `/repair` and `/admin/backup`. Kept as its own
+    /// function, symmetric with [`Privilege::grantable_on_database`] and
+    /// [`Privilege::grantable_on_table`], so a privilege that ever needs a server-only exception
+    /// has exactly one place to state it.
     pub const fn grantable_on_server(self) -> bool {
-        !matches!(self, Self::Operate)
+        true
     }
 
     /// Whether this privilege may be granted on `object`.
@@ -939,5 +943,11 @@ mod tests {
         // Administering roles is about the server and means nothing inside a database.
         assert!(!Privilege::Roles.grantable_on_database());
         assert!(!Privilege::Operate.grantable_on_database());
+        // Operating the server is grantable there, even though no statement demands it: the
+        // refusal it produces is a `403` on a route, not a query-side error.
+        assert!(Privilege::Operate.grantable_on(&Object::Server));
+        for p in Privilege::ALL {
+            assert!(p.grantable_on(&Object::Server), "{p:?} is grantable at the server");
+        }
     }
 }

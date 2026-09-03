@@ -488,9 +488,10 @@ Seven privileges, granted on `*.*`, `db.*` or `db.table`:
 | `ALTER` | adding or dropping a column | all three |
 | `ROLES` | `CREATE ROLE`, `DROP ROLE`, `GRANT`, `REVOKE` | `*.*` only |
 
-`OPERATE` is an eighth, held on `*.*`, and guards `/metrics`, `/verify`, `/repair` and
-`/admin/backup`. It is not grantable in SQL yet — no statement demands it, so a refusal would
-have nothing to explain it.
+`OPERATE` is an eighth, held on `*.*` only, and guards `/metrics`, `/verify`, `/repair` and
+`/admin/backup` — `GRANT OPERATE ON *.* TO ops` grants exactly those four, and nothing about SQL.
+No statement ever demands it, so denying it produces no query-side refusal, only a `403` on the
+routes it guards.
 
 Grants are **additive and never subtract**: what a role holds on a table is the union of its
 grants at `*.*`, at that database, and at that table. `REVOKE` removes a grant rather than adding

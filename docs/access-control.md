@@ -36,12 +36,16 @@ rather than at an edge that would have to re-derive it.
 
 ### Privileges
 
-Eight verbs. Seven are grantable in SQL; `OPERATE` guards routes rather than statements and is
-route-only for now, because a refusal no statement can explain is a refusal nobody can debug.
+Eight verbs, all grantable in SQL:
 
 ```
-SELECT  INSERT  DELETE  CREATE  DROP  ALTER  ROLES  (OPERATE)
+SELECT  INSERT  DELETE  CREATE  DROP  ALTER  ROLES  OPERATE
 ```
+
+`OPERATE` is the one that guards REST routes rather than statements — `GRANT OPERATE ON *.* TO
+ops` changes nothing about what SQL that role may run, and everything about whether it can reach
+`/metrics`, `/verify`, `/repair` and `/admin/backup`. It is grantable only at `*.*`: there is no
+per-database or per-table meaning for "may operate the process".
 
 `DELETE` is separate from `INSERT` because deleting records is reachable without inserting them —
 the REST surface has a route for it — and a credential that may add facts is not obviously one
@@ -196,7 +200,6 @@ as having none.
   who authenticates. Narrowing them to what the reader may query belongs beside `Sql::demands`
   when it happens.
 - **No column or row-level control**, by decision rather than omission — see *Objects* above.
-- **`OPERATE` is not grantable in SQL**, only checked at the routes.
 
 ## What this reversed
 
