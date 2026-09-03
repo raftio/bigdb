@@ -10,6 +10,7 @@ readme = "readme.md"
 
 [dependencies]
 big-db.workspace = true
+big-civil.workspace = true
 big-plan.workspace = true
 big-pager.workspace = true
 

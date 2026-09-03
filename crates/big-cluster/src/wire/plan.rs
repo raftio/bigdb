@@ -192,6 +192,7 @@ mod plan_tag {
     pub const GROUP_BY: u8 = 7;
     pub const PROJECT: u8 = 8;
     pub const GROUP_BY_PAIR: u8 = 9;
+    pub const GROUP_BY_BUCKET: u8 = 10;
 }
 
 pub fn put_plan(out: &mut Vec<u8>, plan: &Plan) {
@@ -218,6 +219,14 @@ pub fn put_plan(out: &mut Vec<u8>, plan: &Plan) {
         }
         Plan::GroupBy { table, rows, field, aggregate } => {
             put_aggregate(out, plan_tag::GROUP_BY, table, rows, field);
+            put_plan(out, aggregate);
+        }
+        Plan::GroupByBucket { table, rows, field, unit, max_buckets, aggregate } => {
+            put_aggregate(out, plan_tag::GROUP_BY_BUCKET, table, rows, field);
+            // The boundary travels as its own name rather than as an index into the enum, so
+            // that reordering `big_civil::Unit` cannot silently turn a month into a week.
+            put_str(out, unit_name(*unit));
+            put_u64(out, *max_buckets as u64);
             put_plan(out, aggregate);
         }
         Plan::GroupByPair { table, rows, left, right, aggregate, left_max } => {
@@ -293,6 +302,21 @@ fn get_plan_at(r: &mut Reader<'_>, depth: usize) -> Result<Plan> {
             let (table, rows, field) = get_aggregate(r)?;
             Plan::GroupBy { table, rows, field, aggregate: Box::new(get_plan_at(r, depth + 1)?) }
         }
+        plan_tag::GROUP_BY_BUCKET => {
+            let (table, rows, field) = get_aggregate(r)?;
+            let name = r.str()?;
+            let unit = big_civil::Unit::parse(&name)
+                .ok_or(WireError::Malformed("a calendar boundary this engine does not have"))?;
+            let max_buckets = r.u64()? as usize;
+            Plan::GroupByBucket {
+                table,
+                rows,
+                field,
+                unit,
+                max_buckets,
+                aggregate: Box::new(get_plan_at(r, depth + 1)?),
+            }
+        }
         plan_tag::GROUP_BY_PAIR => {
             let table = r.str()?;
             let rows = get_rows(r)?;
@@ -331,4 +355,19 @@ fn get_plan_at(r: &mut Reader<'_>, depth: usize) -> Result<Plan> {
 
 fn get_aggregate(r: &mut Reader<'_>) -> Result<(String, Rows, String)> {
     Ok((r.str()?, get_rows(r)?, r.str()?))
+}
+
+/// The boundary's name, which is what travels rather than its position in the enum.
+fn unit_name(unit: big_civil::Unit) -> &'static str {
+    use big_civil::Unit;
+    match unit {
+        Unit::Year => "year",
+        Unit::Quarter => "quarter",
+        Unit::Month => "month",
+        Unit::Week => "week",
+        Unit::Day => "day",
+        Unit::Hour => "hour",
+        Unit::Minute => "minute",
+        Unit::Second => "second",
+    }
 }

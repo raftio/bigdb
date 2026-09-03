@@ -334,6 +334,86 @@ pub fn execute<P: Pager + Sync>(db: &DbRead<'_, P>, plan: &Plan) -> Result<Value
             Value::Groups(out)
         }
 
+        // One group per calendar bucket the column's values reach into.
+        //
+        // **The buckets come from the calendar, not from the data**, which is what lets this
+        // group a column with no dictionary to walk. The range of values is two `Bsi::extreme`
+        // reads; the calendar says which buckets that range covers; and each bucket's records
+        // are a range on the bit planes, which is the read the field already answers.
+        //
+        // Empty buckets are dropped rather than answered with a zero. A month nothing happened
+        // in is not a group - `GROUP BY` answers about the values present - and keeping them
+        // would make a sparse column cost its whole span rather than its contents.
+        Plan::GroupByBucket { rows, field, unit, max_buckets, aggregate, .. } => {
+            let matched = eval(db, table, rows)?;
+            // The column's own units, which decide whether the calendar is asked in days or
+            // in seconds. Taken from the same mapping the planner used, so the two cannot
+            // disagree about what a `DATE` counts.
+            let unit_of = match CatalogSchema(db.catalog()).field_class(table, field) {
+                Some(FieldClass::Temporal { unit }) => unit,
+                // The planner refused every other class before this plan was built.
+                _ => unreachable!("a bucket grouping is planned only over a temporal column"),
+            };
+            let (lo, hi) = (
+                db.min_signed_where(table, field, &matched)?,
+                db.max_signed_where(table, field, &matched)?,
+            );
+            // No record in the filter holds a value, so there is nothing to bucket. Not an
+            // empty first bucket: a record with no value is in no bucket at all.
+            let (Some(lo), Some(hi)) = (lo, hi) else { return Ok(Value::Groups(Vec::new())) };
+
+            // **The span is counted before any of it is read.** What this costs is one range
+            // read per bucket the values *span*, not per bucket that turns out to hold
+            // something - a column with two records two years apart still walks every month
+            // between them. So the budget is checked against the walk, on the calendar alone,
+            // and a query past it is refused before it has read anything.
+            let first = truncate_to(lo, *unit, unit_of);
+            let mut span = 0usize;
+            let mut edge = first;
+            while edge <= hi {
+                span += 1;
+                if span > *max_buckets {
+                    return Err(ExecError::TooManyBuckets {
+                        field: field.clone(),
+                        limit: *max_buckets,
+                    });
+                }
+                let next = next_after(edge, *unit, unit_of);
+                // Guards the end of the calendar, where the next boundary cannot be past this
+                // one and the walk would not terminate.
+                if next <= edge {
+                    break;
+                }
+                edge = next;
+            }
+
+            let mut out = Vec::with_capacity(span);
+            let mut start = first;
+            while start <= hi {
+                let next = next_after(start, *unit, unit_of);
+                let within = db
+                    .matching_signed(table, field, RangeOp::Ge, start)?
+                    .and(&db.matching_signed(table, field, RangeOp::Lt, next)?)
+                    .and(&matched);
+                // An empty bucket is not a group. A month nothing happened in is not something
+                // `GROUP BY` answers about, and keeping it would make a sparse column cost its
+                // whole span in rows as well as in reads.
+                if !within.is_empty() {
+                    out.push(Group {
+                        at: GroupAt::Bucket { start, unit: unit_of },
+                        // A bucket names itself: see `GroupAt::Bucket`.
+                        key: None,
+                        value: Box::new(aggregate_over(db, table, aggregate, &within)?),
+                    });
+                }
+                if next <= start {
+                    break;
+                }
+                start = next;
+            }
+            Value::Groups(out)
+        }
+
         // One grouping per value of the left column, over the records holding that value.
         //
         // **Not a composite key.** Nothing here materialises a pair of rows: the records
@@ -788,5 +868,26 @@ fn range_op(op: CmpOp) -> RangeOp {
         CmpOp::Le => RangeOp::Le,
         CmpOp::Eq => RangeOp::Eq,
         CmpOp::Ne => RangeOp::Ne,
+    }
+}
+
+/// The start of the `unit` that a stored count falls in, in that column's own units.
+///
+/// **The two temporal classes count different things**, so the calendar is asked in the units the
+/// field stores rather than converting both to one: a `DATE` is whole days and a `DATETIME` is
+/// seconds, and rounding a day count through seconds would be two conversions where the calendar
+/// question is the same one. `big_civil` keeps both spellings for exactly this reason.
+fn truncate_to(value: i64, unit: big_civil::Unit, of: TimeUnit) -> i64 {
+    match of {
+        TimeUnit::Days => big_civil::truncate_days(value, unit),
+        TimeUnit::Seconds => big_civil::truncate(value, unit),
+    }
+}
+
+/// The start of the `unit` after the one a stored count falls in. The other end of a bucket.
+fn next_after(value: i64, unit: big_civil::Unit, of: TimeUnit) -> i64 {
+    match of {
+        TimeUnit::Days => big_civil::next_days(value, unit),
+        TimeUnit::Seconds => big_civil::next(value, unit),
     }
 }

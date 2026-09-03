@@ -48,9 +48,23 @@ pub struct Merge<'a> {
 
 impl<'a> Merge<'a> {
     pub fn new(plan: &'a Plan) -> Self {
-        let groups =
-            matches!(plan, Plan::Distinct { .. } | Plan::TopN { .. } | Plan::GroupBy { .. })
-                .then(BTreeMap::new);
+        // **Exhaustive on purpose.** A `matches!` here would let a grouping plan added later
+        // fall silently into the scalar path below, where it fails only once there is more than
+        // one owner - a bug that passes every single-node test.
+        let is_grouping = match plan {
+            Plan::Distinct { .. }
+            | Plan::TopN { .. }
+            | Plan::GroupBy { .. }
+            | Plan::GroupByBucket { .. } => true,
+            Plan::Rows { .. }
+            | Plan::Count { .. }
+            | Plan::Sum { .. }
+            | Plan::Min { .. }
+            | Plan::Max { .. }
+            | Plan::GroupByPair { .. }
+            | Plan::Project { .. } => false,
+        };
+        let groups = is_grouping.then(BTreeMap::new);
         Self { plan, acc: None, groups }
     }
 
@@ -146,8 +160,13 @@ fn merge_pairs(
 /// is what lets one function handle all three.
 fn group_aggregate(plan: &Plan) -> &Plan {
     match plan {
-        Plan::GroupBy { aggregate, .. } => aggregate,
+        Plan::GroupBy { aggregate, .. } | Plan::GroupByBucket { aggregate, .. } => aggregate,
         // Any `Count` will do: `combine` reads the variant, never the table or the rows.
+        //
+        // A grouping plan that carries an aggregate must be named above, not left to this arm.
+        // Falling through would hand `combine` the *grouping* rather than what it measures, so
+        // `min` over two nodes would be refused as "an extreme, for a query that is not Min or
+        // Max" - and only ever on a cluster.
         other => other,
     }
 }

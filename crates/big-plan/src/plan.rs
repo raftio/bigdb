@@ -161,6 +161,39 @@ pub enum Plan {
         field: String,
         aggregate: Box<Plan>,
     },
+    /// One group per calendar bucket of a bit-sliced temporal column that holds a record.
+    ///
+    /// **The one grouping over a column with no rows to enumerate.** A keyed field interns each
+    /// value and keeps a bitmap per row, so grouping it is a walk of that dictionary. A `DATE`
+    /// keeps bit planes and nothing else - there is no dictionary, and `Distinct` over one is
+    /// refused for exactly that reason.
+    ///
+    /// What makes this answerable anyway is that a bucket is a **range**: the records in one are
+    /// `x >= start AND x < next`, which is the read the bit planes already answer. So the groups
+    /// come from the calendar rather than from the data, and the cost is a range scan per bucket
+    /// instead of a dictionary walk.
+    ///
+    /// A record holding no value in the column is in **no** bucket, which is what `GROUP BY`
+    /// means and is why these counts sum to the number of records that hold a value rather than
+    /// to `count(*)`.
+    GroupByBucket {
+        table: String,
+        rows: Rows,
+        /// The temporal column, which must be bit-sliced: a `DATE` or a `DATETIME`.
+        field: String,
+        /// The calendar boundary the buckets fall on.
+        unit: big_civil::Unit,
+        /// How many buckets the column's values may span. Never absent, and part of the plan for
+        /// the reason [`Plan::GroupByPair::left_max`] is: the number of them is what this costs,
+        /// and a cut applied to the answer would be a cut applied after paying for it.
+        ///
+        /// Counted per node. Each walks its own values' range, so a coordinator can hold up to
+        /// one bound's worth per owner - the same semantics `left_max` already has.
+        max_buckets: usize,
+        /// What each bucket carries, planned against a placeholder bitmap exactly as a
+        /// [`Plan::GroupBy`]'s aggregate is.
+        aggregate: Box<Plan>,
+    },
     /// The same over a pair of keyed columns: one group per combination both hold records for.
     ///
     /// **Not a composite key, which this index never stored.** For each value of the left
@@ -217,6 +250,7 @@ impl Plan {
             | Self::Distinct { table, .. }
             | Self::TopN { table, .. }
             | Self::GroupBy { table, .. }
+            | Self::GroupByBucket { table, .. }
             | Self::GroupByPair { table, .. }
             | Self::Project { table, .. } => table,
         }
@@ -241,6 +275,7 @@ pub fn plan(table: &str, call: &Call, schema: &impl Schema) -> Result<Plan> {
         "Sum" | "Min" | "Max" => ctx.aggregate(call),
         "Distinct" | "TopN" => ctx.grouped(call),
         "GroupBy" => ctx.group_by(call),
+        "GroupByBucket" => ctx.group_by_bucket(call),
         "GroupByPair" => ctx.group_by_pair(call),
         "Project" => ctx.project(call),
         _ => Ok(Plan::Rows { table: table.to_string(), rows: ctx.rows(call)? }),
@@ -415,6 +450,80 @@ impl<S: Schema> Ctx<'_, S> {
         let table = self.table.to_string();
         let aggregate = aggregate.unwrap_or(Plan::Count { table: table.clone(), rows: Rows::All });
         Ok(Plan::GroupBy { table, rows, field, aggregate: Box::new(aggregate) })
+    }
+
+    /// `GroupByBucket(<bitmap>, field=<name>, unit='month', n=<count>, [aggregate=<call>])`.
+    ///
+    /// `unit=` takes `date_trunc`'s own vocabulary, so the two cannot come to disagree about what
+    /// a month is; `n=` bounds the work the way [`Self::group_by_pair`]'s does.
+    fn group_by_bucket(&self, call: &Call) -> Result<Plan> {
+        const WANT: &str = "a bitmap, field=<name>, unit=<year|month|day|...> and n=<count>";
+        let (mut rows, mut field, mut unit, mut n, mut aggregate) = (None, None, None, None, None);
+        for arg in &call.args {
+            match arg {
+                Expr::Call(c) if rows.is_none() => rows = Some(self.rows(c)?),
+                Expr::Named { name, value } if name == "field" => {
+                    field = Some(str_arg("GroupByBucket", value)?)
+                }
+                Expr::Named { name, value } if name == "unit" => match value.as_ref() {
+                    Expr::Literal(Literal::Str(u)) => {
+                        unit = Some(big_civil::Unit::parse(u).ok_or(PlanError::BadRounding {
+                            call: format!("date_trunc('{u}', ...)"),
+                            why: "a boundary the calendar has: year, quarter, month, week, day, \
+                                  hour, minute or second",
+                        })?)
+                    }
+                    _ => {
+                        return Err(PlanError::BadArgument {
+                            call: "GroupByBucket",
+                            want: "unit=<year|month|day|...>",
+                        })
+                    }
+                },
+                Expr::Named { name, value } if name == "n" => match value.as_ref() {
+                    Expr::Literal(Literal::Int(v)) => n = Some(*v as usize),
+                    _ => {
+                        return Err(PlanError::BadArgument {
+                            call: "GroupByBucket",
+                            want: "n=<count>",
+                        })
+                    }
+                },
+                Expr::Named { name, value } if name == "aggregate" => match value.as_ref() {
+                    Expr::Call(c) => aggregate = Some(self.bare_aggregate(c)?),
+                    _ => {
+                        return Err(PlanError::BadArgument {
+                            call: "GroupByBucket",
+                            want: "aggregate=<Sum|Min|Max>(field=...)",
+                        })
+                    }
+                },
+                _ => return Err(PlanError::BadArgument { call: "GroupByBucket", want: WANT }),
+            }
+        }
+
+        let (Some(rows), Some(field), Some(unit), Some(max_buckets)) = (rows, field, unit, n)
+        else {
+            return Err(PlanError::Arity {
+                call: "GroupByBucket",
+                want: WANT,
+                got: call.args.len(),
+            });
+        };
+        // The mirror image of `expect_keyed`: this grouping wants a column with no dictionary
+        // and an ordering instead, which is exactly what a keyed field does not have.
+        check_boundary(&field, self.class(&field)?, unit)?;
+
+        let table = self.table.to_string();
+        let aggregate = aggregate.unwrap_or(Plan::Count { table: table.clone(), rows: Rows::All });
+        Ok(Plan::GroupByBucket {
+            table,
+            rows,
+            field,
+            unit,
+            max_buckets,
+            aggregate: Box::new(aggregate),
+        })
     }
 
     /// `GroupByPair(<bitmap>, left=<name>, right=<name>, n=<count>, [aggregate=<call>])`.
@@ -892,6 +1001,35 @@ pub(crate) fn int_op(op: &str) -> Option<CmpOp> {
         "!=" => CmpOp::Ne,
         _ => return None,
     })
+}
+
+/// Whether a calendar boundary says anything about a value this field could hold.
+///
+/// **One function because two layers ask it.** A `date_trunc` in a select list is checked when
+/// the answer's shape is resolved, and one in a `GROUP BY` is checked when the plan is built;
+/// they are the same question, and two copies of the sentence would eventually disagree about
+/// which boundaries a `DATE` has.
+pub fn check_boundary(field: &str, class: FieldClass, unit: big_civil::Unit) -> Result<()> {
+    match class {
+        // Truncating a count of whole days to the hour asks about a time of day the column never
+        // held, and answering it would hand back the same date wearing a precision it does not
+        // have.
+        FieldClass::Temporal { unit: TimeUnit::Days } if !unit.is_whole_days() => {
+            Err(PlanError::BadRounding {
+                call: format!("a boundary below a day, on `{field}`"),
+                why: "a boundary of a day or coarser: a DATE counts whole days, and there is no \
+                      time of day in one to round",
+            })
+        }
+        FieldClass::Temporal { .. } => Ok(()),
+        other => Err(PlanError::BadRounding {
+            call: format!("a calendar boundary on `{field}`"),
+            why: match other {
+                FieldClass::Keyed(_) => "a DATE or DATETIME column, and this one holds keys",
+                _ => "a DATE or DATETIME column, and this one holds neither",
+            },
+        }),
+    }
 }
 
 /// Rewrites a written number into the units the field actually stores.

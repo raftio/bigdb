@@ -83,6 +83,11 @@ fn head(plan: &Plan) -> String {
         Plan::GroupBy { table, field, aggregate, .. } => {
             format!("GroupBy {table}.{field}{}", folded(aggregate))
         }
+        Plan::GroupByBucket { table, field, unit, max_buckets, aggregate, .. } => format!(
+            "GroupByBucket {table}.{field} by {} n={max_buckets}{}",
+            unit_name(*unit),
+            folded(aggregate)
+        ),
         Plan::GroupByPair { table, left, right, left_max, aggregate, .. } => format!(
             "GroupByPair {table}.({left}, {right}) left_max={left_max}{}",
             folded(aggregate)
@@ -107,6 +112,7 @@ fn rows_of(plan: &Plan) -> &Rows {
         | Plan::Distinct { rows, .. }
         | Plan::TopN { rows, .. }
         | Plan::GroupBy { rows, .. }
+        | Plan::GroupByBucket { rows, .. }
         | Plan::GroupByPair { rows, .. }
         | Plan::Project { rows, .. } => rows,
     }
@@ -228,5 +234,20 @@ fn write_children(out: &mut String, kids: &[Node], prefix: &str) {
                 write_children(out, &below, &inner);
             }
         }
+    }
+}
+
+/// The boundary's name, spelled the way `date_trunc` takes it.
+fn unit_name(unit: big_civil::Unit) -> &'static str {
+    use big_civil::Unit;
+    match unit {
+        Unit::Year => "year",
+        Unit::Quarter => "quarter",
+        Unit::Month => "month",
+        Unit::Week => "week",
+        Unit::Day => "day",
+        Unit::Hour => "hour",
+        Unit::Minute => "minute",
+        Unit::Second => "second",
     }
 }

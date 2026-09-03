@@ -619,6 +619,7 @@ version = "0.1.0"
 name = "big-cluster"
 version = "0.1.0"
 dependencies = [
+ "big-civil",
  "big-container",
  "big-db",
  "big-embed",
@@ -694,6 +695,7 @@ dependencies = [
 name = "big-exec"
 version = "0.1.0"
 dependencies = [
+ "big-civil",
  "big-db",
  "big-pager",
  "big-plan",

@@ -29,6 +29,18 @@ pub enum ExecError {
     /// one per value of the outer, so the number of those values is what it costs - and cutting
     /// the list to fit would answer with fewer groups than exist, which nothing in the answer
     /// could show.
+    /// More calendar buckets than the plan allowed.
+    ///
+    /// **Refused rather than truncated**, for the reason `TooManyGroups` gives: an answer with
+    /// fewer buckets than the data spans is a different answer, and nothing in it could show
+    /// which ones were dropped. The remedy is a different one, though, which is why this is not
+    /// that variant: a coarser boundary, or a narrower `WHERE`.
+    TooManyBuckets {
+        /// The column being bucketed.
+        field: String,
+        /// How many the plan allowed.
+        limit: usize,
+    },
     TooManyGroups {
         /// The outer column.
         field: String,
@@ -56,6 +68,12 @@ impl core::fmt::Display for ExecError {
         match self {
             Self::Plan(e) => write!(f, "{e}"),
             Self::Db(e) => write!(f, "{e}"),
+            Self::TooManyBuckets { field, limit } => write!(
+                f,
+                "grouping `{field}` by a calendar boundary is one range read per bucket, and the \
+                 values here span more than the {limit} this allows. Group by a coarser \
+                 boundary, or narrow the range with a `WHERE`"
+            ),
             Self::TooManyGroups { field, found, limit } => write!(
                 f,
                 "grouping by `{field}` and a second column is one pass over the second per \
@@ -73,6 +91,7 @@ impl ExecError {
         match self {
             Self::Plan(e) => e.code(),
             Self::Db(e) => e.code(),
+            Self::TooManyBuckets { .. } => "too_many_buckets",
             Self::TooManyGroups { .. } => "too_many_groups",
         }
     }
