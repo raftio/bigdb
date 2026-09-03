@@ -191,6 +191,20 @@ SELECT date_trunc('month', seen), count(*) FROM t GROUP BY seen
 ----
 sql_unsupported
 
+## And the same rule over two grouped columns, which used to be a hole: the one-column path
+## refused this and the two-column path rendered it, so the statement below was answered with one
+## row per country, each printed as a letter. One rule now, in one function.
+
+error
+SELECT substring(country, 1, 1), city, count(*) FROM t GROUP BY country, city
+----
+sql_unsupported
+
+error
+SELECT category, date_trunc('month', seen), count(*) FROM t GROUP BY category, seen
+----
+sql_unsupported
+
 ## An aggregate this engine has no fold for is still refused by name, and the sentence names the
 ## ones that exist rather than saying there is no evaluator.
 

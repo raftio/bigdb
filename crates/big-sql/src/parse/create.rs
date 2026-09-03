@@ -300,6 +300,24 @@ impl Parser<'_> {
                 }
                 Column { name, kind: Set, bit_depth: KEYLESS_DEPTH, scale: None }
             }
+            // **The one type name that describes an encoding rather than a domain**, and the
+            // encoding it describes is the only one a keyed field has: a `SET` interns each
+            // distinct value once and stores a bitmap per key, which is what dictionary
+            // encoding means where ClickHouse writes this. So it is read as the thing it
+            // already is rather than refused as something this engine has no storage for, and
+            // a statement pasted from ClickHouse keeps the column it meant.
+            //
+            // The inner name has to be a string. `LowCardinality(Int64)` asks for a dictionary
+            // over a number, and a number here is bit planes with no dictionary to be low
+            // cardinality *of* - so it is refused with the list rather than quietly widened
+            // into a keyed field whose keys are digits.
+            "LOWCARDINALITY" => {
+                let inner = self.wrapped_type()?;
+                if !matches!(inner.as_str(), "STRING" | "TEXT" | "VARCHAR" | "CHAR") {
+                    return Err(self.refuse_at(Refused::ColumnType, at));
+                }
+                Column { name, kind: Set, bit_depth: KEYLESS_DEPTH, scale: None }
+            }
             "TINYINT" | "SMALLINT" | "INT" | "INTEGER" | "BIGINT" => {
                 if self.peek() == Some(&Tok::LParen) {
                     return Err(self.refuse(Refused::ColumnType));
@@ -382,6 +400,22 @@ impl Parser<'_> {
             bit_depth: bits as u32,
             scale: Some(scale as i8),
         })
+    }
+
+    /// `( name )`, for a type whose argument is another type's name.
+    ///
+    /// Uppercased on the way out, like every other type name here, so a caller compares against
+    /// one spelling rather than remembering to fold. Not [`Self::bit_depth`] with a different
+    /// body: that one reads a number, and the two would have to be told apart by their return
+    /// types at every call site if they were one function.
+    fn wrapped_type(&mut self) -> Result<String> {
+        self.expect(&Tok::LParen, "( and a type name")?;
+        let Some(inner) = self.word().map(str::to_ascii_uppercase) else {
+            return Err(self.syntax("a type name"));
+        };
+        self.i += 1;
+        self.expect(&Tok::RParen, ") after the type name")?;
+        Ok(inner)
     }
 
     /// `( bits )`, bounded where a bit-sliced value is bounded.

@@ -298,6 +298,24 @@ fn rows_of(rows: &Expr, item: &Item) -> Expr {
     }
 }
 
+/// **A scalar on a grouped column relabels rows without merging them.**
+///
+/// The grouping happened over the stored key, so `date_trunc('month', ts)` beside `GROUP BY ts`
+/// would answer with one row per instant, every one of them printed as the same month - an answer
+/// that looks aggregated and is not. Refused rather than rendered, because a client cannot see the
+/// difference. Group by the rounded value instead, once there is a plan that can.
+///
+/// **One function because there are two groupings**, and they did not agree: the one-column path
+/// refused this and the two-column path rendered it, so `SELECT substring(country, 1, 1), city,
+/// count(*) FROM t GROUP BY country, city` was answered with one row per country, each printed as
+/// a letter. Written out here so the two cannot drift again.
+fn no_scalar_on_a_grouped_column(columns: &[(&Item, Name)]) -> Result<()> {
+    match columns.iter().find(|(item, _)| item.apply().is_some()) {
+        Some((item, _)) => Err(SqlError::Refused { what: Refused::Shape, at: item.at }),
+        None => Ok(()),
+    }
+}
+
 /// The plan behind a written `count(*)` over a grouping, which several cells can share.
 ///
 /// `GroupBy` with no aggregate rather than `Distinct`, which the planner resolves to a grouping

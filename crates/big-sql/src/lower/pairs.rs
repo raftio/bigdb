@@ -63,6 +63,7 @@ pub(super) fn pairs(
             return Err(SqlError::Refused { what: Refused::Shape, at: item.at });
         }
     }
+    super::no_scalar_on_a_grouped_column(columns)?;
 
     let mut calls = Calls::new(at);
     let mut measures: Vec<(Measure, Of)> = Vec::new();

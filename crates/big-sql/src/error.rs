@@ -710,7 +710,10 @@ impl Refused {
                  `STRING` are a set, `TINYINT`, `SMALLINT`, `INT`, `INTEGER` and `BIGINT` are \
                  an unsigned integer of 8, 16, 32, 32 and 64 bits, `BOOLEAN` is a bool, \
                  `FLOAT` and `REAL` are a `FLOAT32`, `DOUBLE` is a `FLOAT64`, and `TIMESTAMP` \
-                 is a `DATETIME`. None of them takes a width in brackets that its name does not \
+                 is a `DATETIME`. `LowCardinality(String)` is a set too - that is what a set \
+                 already is here, one bitmap per interned key - but only over a string: a \
+                 number is bit planes, with no dictionary to be low cardinality of. None of \
+                 them takes a width in brackets that its name does not \
                  already carry: `FLOAT(10, 2)` is a `DECIMAL(10, 2)`, which keeps those digits \
                  exactly where a float would not. There is nothing here a blob or a JSON \
                  document lands in"

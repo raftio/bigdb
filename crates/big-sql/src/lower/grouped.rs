@@ -132,16 +132,8 @@ fn refuse_what_a_grouping_cannot_hold(
             // grouped nor aggregated has no single value per group.
             return Err(SqlError::Refused { what: Refused::Shape, at: item.at });
         }
-        // **A scalar on the grouped column relabels rows without merging them.** The grouping
-        // happened over the stored key, so `date_trunc('month', ts)` beside `GROUP BY ts` would
-        // answer with one row per instant, every one of them printed as the same month - an
-        // answer that looks aggregated and is not. Refused rather than rendered, because a
-        // client cannot see the difference. Group by the rounded value instead, once there is a
-        // plan that can.
-        if item.apply().is_some() {
-            return Err(SqlError::Refused { what: Refused::Shape, at: item.at });
-        }
     }
+    super::no_scalar_on_a_grouped_column(columns)?;
     for item in aggregates {
         match item.leaf() {
             // A distinct count inside a grouping is a grouping over a composite key this index

@@ -490,6 +490,14 @@ CREATE TABLE t (a BIGINT(20))
 ----
 sql_unknown_column_type
 
+# A dictionary over a number. `LowCardinality(String)` is read, because a set here already is a
+# dictionary; a number is bit planes, and there is no dictionary for this to be low cardinality
+# of - so the name is refused rather than widened into a keyed field whose keys are digits.
+error
+CREATE TABLE t (a LowCardinality(Int64))
+----
+sql_unknown_column_type
+
 ## Types with no field kind behind them.
 
 ## A width in brackets on a type whose name already carries one. `FLOAT(10, 2)` is the one

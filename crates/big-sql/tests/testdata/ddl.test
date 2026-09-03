@@ -230,6 +230,18 @@ CREATE TABLE t (
     e DATETIME
 )
 
+# `LowCardinality` names an encoding rather than a domain, and the encoding is the one a set
+# already has: one interned key, one bitmap. So it renders back as `SET` like every other
+# spelling of a keyed string, and the inner type name is read for what it says rather than kept.
+render
+CREATE TABLE t (a LowCardinality(String), b LowCardinality(VARCHAR), c SET)
+----
+CREATE TABLE t (
+    a SET,
+    b SET,
+    c SET
+)
+
 # Every SQL spelling of a float and a date renders back as the native one, and reads back as the
 # same column. `REAL` and `DOUBLE PRECISION` have no width in brackets on the way out because
 # their names already carry it.
