@@ -16,8 +16,15 @@
 //!
 //! The other half of the server one directory across, and deliberately no more general than
 //! the requests this crate makes: one `POST`, a `Content-Length` body, a status and a body
-//! back. No redirects, no chunked encoding, no cookies, no TLS - the same reasoning as the
-//! listener, and the same answer for transport security, which is a reverse proxy.
+//! back. No redirects, no chunked encoding, no cookies.
+//!
+//! **There is TLS here now, and this paragraph used to say there was not.** A peer used to
+//! present the same `admin` bearer token every other node presented, so one leaked string was
+//! the whole cluster and nothing could say which node was speaking - a gap `docs/clustering.md`
+//! recorded and could not close, because a shared secret has no way to carry an identity. A
+//! client certificate does. So the credential moved from the request to the connection: there is
+//! no `Authorization` header on a peer request at all, and what proves this node is a node is
+//! the key it holds. A reverse proxy could never have offered that.
 //!
 //! **Connections are reused, and both halves of that are here.** A request asks for
 //! `Connection: keep-alive` and a connection that comes back alive goes into a small per-peer
@@ -41,6 +48,7 @@
 //! get what is left of it, so a peer that is slow three times cannot take three times as long
 //! as the caller allowed.
 
+use big_tls::ClientWire;
 use std::io::{BufReader, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::{Condvar, Mutex};
@@ -79,6 +87,12 @@ pub enum ClientError {
     Unreachable(std::io::Error),
     /// The connection failed part way through.
     Io(std::io::Error),
+    /// The peer answered and the handshake did not complete: a certificate this node's CA did
+    /// not sign, an expired one, or a name that does not match the cluster file.
+    ///
+    /// Its own variant because this is an operator's mistake rather than a network's, and
+    /// reporting it as [`ClientError::Unreachable`] sends somebody to look at a firewall.
+    Tls(String),
     /// The budget ran out: waiting for a slot, connecting, writing or reading.
     Timeout,
     /// The bytes coming back were not a response this client understands.
@@ -92,6 +106,7 @@ impl core::fmt::Display for ClientError {
         match self {
             Self::Unreachable(e) => write!(f, "could not connect: {e}"),
             Self::Io(e) => write!(f, "the connection failed: {e}"),
+            Self::Tls(e) => write!(f, "the peer's certificate was not usable: {e}"),
             Self::Timeout => write!(f, "ran out of time"),
             Self::Malformed(what) => write!(f, "the answer was not usable: {what}"),
             Self::TooLarge => write!(f, "the answer was larger than {MAX_RESPONSE} bytes"),
@@ -155,7 +170,15 @@ impl PeerResponse {
 /// One peer, and the ceiling on how much of it this node uses at once.
 pub struct Peer {
     addr: String,
-    token: Option<String>,
+    /// The name this peer's certificate has to be valid for.
+    ///
+    /// The *name* from the cluster file, not the address it is reached at. Those differ whenever
+    /// a node moves, and the name is the half that was issued a certificate.
+    name: String,
+    /// What this node presents when a peer asks, and what it trusts in return. Shared by every
+    /// peer: one configuration, and - the part that matters for a fan-out - one TLS session
+    /// cache, so a reconnect resumes rather than handshaking from nothing.
+    tls: Option<std::sync::Arc<big_tls::ClientTls>>,
     /// Sent on every request: what this build speaks, and which cluster file it read. A peer
     /// that disagrees about either refuses before it decodes anything.
     stamp: String,
@@ -176,12 +199,15 @@ pub struct Peer {
 /// invisible until the connection is reused and then loses a response for no reason anyone
 /// could find.
 struct Conn {
-    io: BufReader<TcpStream>,
+    io: BufReader<ClientWire>,
 }
 
 impl Conn {
+    /// The raw descriptor, for timeouts and for the liveness peek. **Never for reading or
+    /// writing**: under TLS the bytes have to go through the session that encrypts them, and a
+    /// write here would put plaintext on an encrypted socket.
     fn stream(&self) -> &TcpStream {
-        self.io.get_ref()
+        self.io.get_ref().socket()
     }
 
     /// Whether this connection still looks usable, without sending anything.
@@ -190,8 +216,15 @@ impl Conn {
     /// is the normal end of an idle keep-alive connection. Bytes actually waiting mean the two
     /// sides have lost track of where a message ends, which is worse than a closed connection
     /// and gets the same treatment.
-    fn is_live(&self) -> bool {
+    /// **Three buffers, not two.** The `BufReader`'s own buffer, then the plaintext rustls is
+    /// holding that the `BufReader` knows nothing about, and only then the socket. Asking the
+    /// first and the third and skipping the second is the bug that survives review and comes
+    /// back as a response delivered into the middle of the next one's parser.
+    fn is_live(&mut self) -> bool {
         if !self.io.buffer().is_empty() {
+            return false;
+        }
+        if self.io.get_mut().has_pending_plaintext() {
             return false;
         }
         let stream = self.stream();
@@ -251,17 +284,26 @@ pub struct HttpPeers(Vec<Option<Peer>>);
 
 impl HttpPeers {
     /// One client per node except this one.
+    ///
+    /// Names as well as addresses, because a certificate is issued to a name: the address is
+    /// where a node is reached and the name is what it is, and a node that moves keeps the
+    /// second. The `Arc` is shared rather than cloned per peer so that all of them use one TLS
+    /// session cache.
     pub fn new(
+        names: impl IntoIterator<Item = String>,
         addrs: impl IntoIterator<Item = String>,
         this: usize,
-        token: Option<String>,
+        tls: Option<std::sync::Arc<big_tls::ClientTls>>,
         fingerprint: u64,
     ) -> Self {
         Self(
-            addrs
+            names
                 .into_iter()
+                .zip(addrs)
                 .enumerate()
-                .map(|(i, addr)| (i != this).then(|| Peer::new(addr, token.clone(), fingerprint)))
+                .map(|(i, (name, addr))| {
+                    (i != this).then(|| Peer::new(name, addr, tls.clone(), fingerprint))
+                })
                 .collect(),
         )
     }
@@ -290,19 +332,26 @@ impl Peers for HttpPeers {
 }
 
 impl Peer {
-    pub fn new(addr: impl Into<String>, token: Option<String>, fingerprint: u64) -> Self {
-        Self::with_ceiling(addr, token, fingerprint, DEFAULT_MAX_IN_FLIGHT)
+    pub fn new(
+        name: impl Into<String>,
+        addr: impl Into<String>,
+        tls: Option<std::sync::Arc<big_tls::ClientTls>>,
+        fingerprint: u64,
+    ) -> Self {
+        Self::with_ceiling(name, addr, tls, fingerprint, DEFAULT_MAX_IN_FLIGHT)
     }
 
     pub fn with_ceiling(
+        name: impl Into<String>,
         addr: impl Into<String>,
-        token: Option<String>,
+        tls: Option<std::sync::Arc<big_tls::ClientTls>>,
         fingerprint: u64,
         max_in_flight: usize,
     ) -> Self {
         Self {
             addr: addr.into(),
-            token,
+            name: name.into(),
+            tls,
             stamp: format!(
                 "{}: {}\r\n{}: {fingerprint:x}\r\n",
                 crate::WIRE_HEADER,
@@ -364,7 +413,11 @@ impl Peer {
         set_timeouts(conn.stream(), deadline)?;
         // Written in one call so a peer's read never sees a header block arrive in pieces,
         // which is the shape that makes a slow-loris check fire against its own coordinator.
-        let mut out = conn.stream();
+        //
+        // Through the session rather than through a second handle on the socket. There is no
+        // second handle under TLS, and there was never a reason for one here beyond its being
+        // available.
+        let out = conn.io.get_mut();
         out.write_all(request).map_err(ClientError::Io)?;
         out.flush().map_err(ClientError::Io)?;
 
@@ -392,9 +445,10 @@ impl Peer {
             .as_bytes(),
         );
         request.extend_from_slice(self.stamp.as_bytes());
-        if let Some(token) = &self.token {
-            request.extend_from_slice(format!("Authorization: Bearer {token}\r\n").as_bytes());
-        }
+        // **No `Authorization` line, and that is the change.** What proves this node is a node is
+        // the client certificate it presented during the handshake - the credential is the
+        // connection now, not the request. A header could be replayed by anything that read one;
+        // a private key cannot be.
         request.extend_from_slice(b"\r\n");
         request.extend_from_slice(body);
         request
@@ -403,7 +457,7 @@ impl Peer {
     /// The most recently returned connection that still looks open.
     fn take_idle(&self) -> Option<Conn> {
         let mut idle = self.idle.lock().expect("no panic holds this lock");
-        while let Some(conn) = idle.pop() {
+        while let Some(mut conn) = idle.pop() {
             if conn.is_live() {
                 return Some(conn);
             }
@@ -445,7 +499,7 @@ impl Peer {
         Ok(Slot { peer: self })
     }
 
-    fn connect(&self, deadline: Option<Instant>) -> Result<TcpStream, ClientError> {
+    fn connect(&self, deadline: Option<Instant>) -> Result<ClientWire, ClientError> {
         let mut last = None;
         // Resolution is not covered by the deadline: there is no resolver call in the standard
         // library that takes one, and pretending otherwise by checking the clock afterwards
@@ -464,7 +518,12 @@ impl Peer {
                     // A fan-out sends one small message and waits. Nagle would hold it back
                     // for an ack that is not coming until the peer has answered.
                     let _ = s.set_nodelay(true);
-                    return Ok(s);
+                    // The handshake gets whatever is left of the budget, which the timeouts
+                    // set here are what bound: a peer that accepts and then says nothing during
+                    // a handshake is the same hang as one that says nothing during a response.
+                    set_timeouts(&s, deadline)?;
+                    return ClientWire::connect(s, self.tls.as_deref(), &self.name)
+                        .map_err(|e| ClientError::Tls(e.to_string()));
                 }
                 Err(e) => last = Some(e),
             }
@@ -512,7 +571,7 @@ fn set_timeouts(stream: &TcpStream, deadline: Option<Instant>) -> Result<(), Cli
 /// Also answers whether the connection may carry another request: only when the peer said
 /// `Connection: keep-alive` *and* the body had a declared length, because a body that ends
 /// when the stream does has taken the connection with it.
-fn read_response(io: &mut BufReader<TcpStream>) -> Result<(PeerResponse, bool), ClientError> {
+fn read_response(io: &mut BufReader<ClientWire>) -> Result<(PeerResponse, bool), ClientError> {
     let mut head = Vec::new();
     let mut byte = [0u8; 1];
     // One byte at a time, through the buffer that lives with the connection: the body is read
@@ -587,7 +646,7 @@ fn read_response(io: &mut BufReader<TcpStream>) -> Result<(PeerResponse, bool), 
     Ok((PeerResponse { status, body }, keep_alive))
 }
 
-fn read_exact(io: &mut BufReader<TcpStream>, buf: &mut [u8]) -> Result<(), ClientError> {
+fn read_exact(io: &mut BufReader<ClientWire>, buf: &mut [u8]) -> Result<(), ClientError> {
     let mut at = 0;
     while at < buf.len() {
         match io.read(&mut buf[at..]) {

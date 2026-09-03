@@ -25,7 +25,7 @@
 //!
 //! Asking a *running* daemon anything is `bigctl`.
 
-use big_bin::{offline, serve};
+use big_bin::{offline, passwd, serve};
 
 const USAGE: &str = "\
 usage: big <command> [args]
@@ -33,6 +33,10 @@ usage: big <command> [args]
 Serving:
   serve <file> [addr]    serve <file> over HTTP; addr defaults to 127.0.0.1:7654
                          `big serve --help` for the flags, of which there are many
+  passwd <users> <cmd>   add, change or remove a user in a users file
+                         `big passwd --help`. The only thing that writes one: there is
+                         deliberately no route that does, because one would let an
+                         `admin` credential rewrite the credential file over the network
 
 Offline, on a file nothing else has open:
   backup <file> <dest>   write a consistent copy of <file> to <dest>
@@ -65,6 +69,9 @@ fn main() -> std::io::Result<()> {
         // `serve` takes the rest verbatim, so its own `--help` and its own errors are the ones
         // an operator reads. The word is stripped here and nowhere else.
         Some("serve") => serve::main(&args[1..]),
+        // Takes the rest verbatim for the same reason `serve` does: its own `--help` and its own
+        // errors are the ones an operator should see, not this dispatcher's.
+        Some("passwd") => passwd::main(&args[1..]),
 
         // `--help` is not a failure: usage to stdout, exit zero. Being given nothing is,
         // so it goes to stderr with a non-zero code - the same split every binary here makes.

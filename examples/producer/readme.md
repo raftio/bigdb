@@ -6,7 +6,7 @@ Messages into a table, and the table read back. The whole thing is one command.
 ./run.sh
 ```
 
-It builds two images, starts `big serve` with a token file, creates `tx`, produces 20,000
+It builds two images, starts `big serve` with a users file, creates `tx`, produces 20,000
 messages through [`contrib/big-message`](../../contrib/big-message/), and then asks the server
 what it got. `./run.sh 200000` for more. Nothing is installed on your machine.
 
@@ -86,7 +86,7 @@ make stop && make clean-data
 ```
 
 `make start` binds loopback and therefore needs no credentials at all - `big serve` refuses a
-non-loopback address without a token file, and a container's loopback is its own, which is the
+non-loopback address without a users file, and a container's loopback is its own, which is the
 entire reason the compose file above has credentials in it.
 
 ## Not a deployment

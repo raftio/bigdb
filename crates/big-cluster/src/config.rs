@@ -197,7 +197,7 @@ impl core::fmt::Display for ConfigError {
             Self::UnknownKey { line, key } => write!(
                 f,
                 "line {line}: unknown key `{key}`; a cluster file has name, addr and shards \
-                 inside [[node]], and schema_leader and peer_token_file outside it"
+                 inside [[node]], and schema_leader and peer_ca_file outside it"
             ),
             Self::BadRange { line, text } => write!(
                 f,
@@ -292,7 +292,7 @@ pub struct ClusterFile {
     nodes: Vec<Node>,
     primary_count: usize,
     leader: usize,
-    peer_token_file: Option<String>,
+    peer_ca_file: Option<String>,
 }
 
 /// One `[[node]]` block, before it is known whether the file as a whole makes sense.
@@ -344,11 +344,11 @@ impl ClusterFile {
         }
 
         let mut leader_name = None;
-        let mut peer_token_file = None;
+        let mut peer_ca_file = None;
         for (key, value, line) in top {
             match key.as_str() {
                 "schema_leader" => leader_name = Some(value),
-                "peer_token_file" => peer_token_file = Some(value),
+                "peer_ca_file" => peer_ca_file = Some(value),
                 _ => return Err(ConfigError::UnknownKey { line, key }),
             }
         }
@@ -392,13 +392,13 @@ impl ClusterFile {
             parsed.push(Draft { name, addr, shards, replica });
         }
 
-        Self::validated(parsed, leader_name, peer_token_file)
+        Self::validated(parsed, leader_name, peer_ca_file)
     }
 
     fn validated(
         drafts: Vec<Draft>,
         leader_name: Option<String>,
-        peer_token_file: Option<String>,
+        peer_ca_file: Option<String>,
     ) -> Result<Self, ConfigError> {
         if drafts.is_empty() {
             return Err(ConfigError::NoNodes);
@@ -508,7 +508,7 @@ impl ClusterFile {
             return Err(ConfigError::LeaderIsReplica { name: leader_name });
         }
 
-        Ok(Self { nodes, primary_count, leader, peer_token_file })
+        Ok(Self { nodes, primary_count, leader, peer_ca_file })
     }
 
     /// Says which of these nodes is doing the reading.
@@ -547,17 +547,30 @@ impl ClusterFile {
             groups,
             leader: self.leader,
             this,
-            peer_token_file: self.peer_token_file,
+            peer_ca_file: self.peer_ca_file,
         })
     }
 
-    /// The file the outbound bearer token is in, if the operator named one.
+    /// The CA that signs a node's certificate, if the operator named one.
     ///
-    /// The path, not the token. Reading a secret out of a file is a policy this crate does not
-    /// own - the mode check that makes it a secret at all lives with the rest of the token
-    /// handling in `big-http` - so what crosses this boundary is where to look.
-    pub fn peer_token_file(&self) -> Option<&str> {
-        self.peer_token_file.as_deref()
+    /// The path, not the certificate. Loading one is a policy this crate does not own - the mode
+    /// check that makes a key file a secret at all lives with the rest of it in `big-tls` - so
+    /// what crosses this boundary is where to look.
+    ///
+    /// Shared by every node, unlike the certificate and key themselves: one file cannot name node
+    /// A's private key without also naming node B's, so those are `big serve` flags. This is the
+    /// half that is the same everywhere.
+    pub fn peer_ca_file(&self) -> Option<&str> {
+        self.peer_ca_file.as_deref()
+    }
+
+    /// Every node named in the file, before this daemon has worked out which one it is.
+    ///
+    /// The listener needs these before `for_node` runs: they are the names a client certificate
+    /// is allowed to claim, and the certificate is checked during a handshake that happens long
+    /// before any of the routing does.
+    pub fn nodes(&self) -> &[Node] {
+        &self.nodes
     }
 }
 
@@ -573,7 +586,7 @@ pub struct ClusterConfig {
     groups: Vec<Vec<usize>>,
     leader: usize,
     this: usize,
-    peer_token_file: Option<String>,
+    peer_ca_file: Option<String>,
 }
 
 impl ClusterConfig {
@@ -595,7 +608,7 @@ impl ClusterConfig {
             groups: vec![vec![0]],
             leader: 0,
             this: 0,
-            peer_token_file: None,
+            peer_ca_file: None,
         }
     }
 
@@ -741,8 +754,8 @@ impl ClusterConfig {
         self.owner(big_engine::shard_of(record))
     }
 
-    pub fn peer_token_file(&self) -> Option<&str> {
-        self.peer_token_file.as_deref()
+    pub fn peer_ca_file(&self) -> Option<&str> {
+        self.peer_ca_file.as_deref()
     }
 }
 

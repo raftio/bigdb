@@ -29,11 +29,15 @@
 //! immediately rather than queued invisibly. Shedding load is the honest answer; queueing it
 //! only moves the failure somewhere harder to see.
 //!
-//! **Transport security is not here and is not going to be.** Termination belongs to a reverse
-//! proxy - see `runbook.md`. A TLS stack would be a larger dependency than the entire engine,
-//! and a hand-written one is out of the question. What *is* enforced is the half that keeps
-//! that from being an excuse: `big serve` refuses to bind anywhere but loopback without a token
-//! file.
+//! **Transport security is here now, and this paragraph used to say it never would be.** The old
+//! argument was that a TLS stack is a larger dependency than the entire engine, and that
+//! terminating at a reverse proxy protects a bearer token well enough to be worth it. Both
+//! halves of that were true. What changed is not the cost - it is what was being protected. A
+//! token belongs to this database and to nothing else; a password is a thing a person also uses
+//! somewhere else, so sending one in the clear risks something that was never ours to risk. So
+//! [`ServerConfig::tls`] exists, behind a cargo feature that keeps the old tree available to
+//! anybody who still wants the proxy - and `big serve` still refuses to bind anywhere but
+//! loopback without both a users file and a certificate.
 
 #![deny(unsafe_code)]
 #![deny(missing_docs)]
@@ -55,8 +59,9 @@ pub use response::{reason_for, Response};
 use big_cluster::Cluster;
 use big_embed::Api;
 use big_pager::PagerMut;
+use big_tls::{TlsConfig, Wire, WireError};
 use metrics::ServerMetrics;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -110,6 +115,13 @@ pub struct ServerConfig {
     /// Who may do what. [`Auth::disabled`] lets every request through, which `big serve` permits
     /// only on a loopback bind.
     pub auth: Auth,
+    /// The certificate this listener presents, and the CA a peer's client certificate must chain
+    /// to. `None` serves in the clear, which `big serve` permits only on a loopback bind.
+    ///
+    /// An ordinary `Option` with no `#[cfg]` on it: `TlsConfig` is uninhabited in a build with
+    /// the feature off, so this is provably `None` there and every construction site in the tree
+    /// - tests included - compiles either way without knowing which build it is in.
+    pub tls: Option<TlsConfig>,
     /// Where `POST /admin/backup` may write. `None` disables the route.
     ///
     /// A directory settled at start-up rather than a path chosen per request. An `admin` token
@@ -135,6 +147,9 @@ impl Default for ServerConfig {
             // the server was upgraded, so the ceiling is something an operator opts into.
             query_timeout: None,
             auth: Auth::disabled(),
+            // In the clear. Same reasoning as `auth`, and the same safety net: a loopback-only
+            // server is the default, and `big serve` refuses to bind anywhere else without one.
+            tls: None,
             // Off. A daemon that backed itself up somewhere by default would be a daemon
             // filling a disk nobody chose.
             backup_dir: None,
@@ -213,6 +228,9 @@ impl<P: PagerMut + Sync + Send + 'static> Server<P> {
         addr: impl ToSocketAddrs,
         config: ServerConfig,
     ) -> std::io::Result<Self> {
+        // Once, here, because the ceiling on concurrent password verifications is a fact about
+        // the worker pool and `Auth` cannot know the pool from where it is built.
+        config.auth.size_for(config.workers);
         Ok(Self {
             state: Arc::new(State {
                 cluster,
@@ -274,6 +292,28 @@ impl<P: PagerMut + Sync + Send + 'static> Server<P> {
         let (tx, rx) = mpsc::sync_channel::<TcpStream>(self.state.config.queue_depth);
         let rx = Arc::new(Mutex::new(rx));
 
+        // **A lane of its own for saying "too busy", but only when saying it costs a handshake.**
+        // Shedding used to happen on the accepting thread, which was right: the answer is thirty
+        // bytes and writing them costs nothing. Under TLS it is a handshake first, and a
+        // handshake on the accepting thread stops it accepting - precisely the failure shedding
+        // exists to avoid. So a plaintext listener keeps the old path exactly, and a TLS one
+        // hands the socket to one thread whose only job is handshake, `503`, close.
+        //
+        // Deeper than the worker queue on purpose. This queue holds connections that are already
+        // being turned away, and every slot in it is a client that gets a `503` instead of a
+        // reset - so the memory buys something an operator can see.
+        let sheds_inline = self.state.config.tls.is_none();
+        let (shed_tx, shed_rx) =
+            mpsc::sync_channel::<TcpStream>((self.state.config.queue_depth * 4).max(64));
+        let shedder = {
+            let state = Arc::clone(&self.state);
+            std::thread::spawn(move || {
+                while let Ok(stream) = shed_rx.recv() {
+                    shed(&state, stream);
+                }
+            })
+        };
+
         let mut workers = Vec::with_capacity(self.state.config.workers);
         for _ in 0..self.state.config.workers {
             let rx = Arc::clone(&rx);
@@ -296,7 +336,16 @@ impl<P: PagerMut + Sync + Send + 'static> Server<P> {
                 ("addr", log::F::S(&self.listener.local_addr()?.to_string())),
                 ("workers", log::F::N(self.state.config.workers as u64)),
                 ("queue_depth", log::F::N(self.state.config.queue_depth as u64)),
+                // The three of these are one security posture, so they are on one line. An
+                // operator reading a log after an incident should not have to find out from
+                // three different places whether the port was authenticated, encrypted, and
+                // checking its peers.
                 ("auth", log::F::B(self.state.config.auth.is_enabled())),
+                ("tls", log::F::B(self.state.config.tls.is_some())),
+                (
+                    "peer_ca",
+                    log::F::B(self.state.config.tls.as_ref().is_some_and(TlsConfig::checks_peers)),
+                ),
             ],
         );
 
@@ -324,7 +373,16 @@ impl<P: PagerMut + Sync + Send + 'static> Server<P> {
                     self.state.metrics.connection_accepted();
                     if let Err(mpsc::TrySendError::Full(stream)) = tx.try_send(stream) {
                         self.state.metrics.connection_rejected();
-                        shed(stream);
+                        if sheds_inline {
+                            // No handshake to do, so this is the fast answer it always was and
+                            // every refused connection is told why.
+                            shed(&self.state, stream);
+                        } else if let Err(mpsc::TrySendError::Full(_)) = shed_tx.try_send(stream) {
+                            // Past what the shedding thread can keep up with, the connection is
+                            // closed in silence. An unspoken refusal beats an accept loop that
+                            // has stopped accepting, and the counter says how often it happened.
+                            self.state.metrics.connection_shed_unspoken();
+                        }
                     }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock && running.is_some() => {
@@ -338,18 +396,22 @@ impl<P: PagerMut + Sync + Send + 'static> Server<P> {
                 Err(e) if transient(&e) => continue,
                 Err(e) => {
                     drop(tx);
+                    drop(shed_tx);
                     for w in workers {
                         let _ = w.join();
                     }
+                    let _ = shedder.join();
                     return Err(e);
                 }
             }
         }
 
         drop(tx);
+        drop(shed_tx);
         for w in workers {
             let _ = w.join();
         }
+        let _ = shedder.join();
         Ok(())
     }
 
@@ -359,6 +421,10 @@ impl<P: PagerMut + Sync + Send + 'static> Server<P> {
     /// Deliberately not the pool: a test that asserts on `n` responses wants them handled in
     /// the order they arrived and wants the call to return when they are done, and a pool
     /// gives neither.
+    ///
+    /// This does handshake on the accepting thread, which the pooled accept loop goes out of
+    /// its way not to do. That is correct here and must not be "fixed": there is one thread, the
+    /// connections are counted, and handling them in order is the entire point.
     pub fn serve_n(&self, n: usize) -> std::io::Result<()> {
         for stream in self.listener.incoming().take(n) {
             let _ = handle(&self.state, stream?);
@@ -369,6 +435,34 @@ impl<P: PagerMut + Sync + Send + 'static> Server<P> {
     /// The counters, for a caller that embeds the server rather than scraping it.
     pub fn metrics(&self) -> &ServerMetrics {
         &self.state.metrics
+    }
+}
+
+/// Closes a socket in a way that does not throw away what was just written to it.
+///
+/// **Dropping a socket that still has unread bytes in its receive queue sends an `RST`, not a
+/// `FIN`** - and an `RST` discards whatever is still in the send queue. So a client that spoke
+/// plaintext to a TLS port would get "connection reset by peer" instead of the sentence
+/// explaining what it did wrong, which is the exact failure the sentence exists to prevent. The
+/// request that arrived was peeked and never read, so there is always something in that queue.
+///
+/// Draining is bounded twice over - by a short timeout and by a byte ceiling - because the
+/// client on the other end of this is by definition one that is not following the protocol, and
+/// "read until they stop" is not a promise worth making to it.
+fn close_politely(mut sock: TcpStream) {
+    const DRAIN_BUDGET: Duration = Duration::from_millis(250);
+    const DRAIN_CEILING: usize = 64 << 10;
+
+    let _ = sock.flush();
+    let _ = sock.shutdown(std::net::Shutdown::Write);
+    let _ = sock.set_read_timeout(Some(DRAIN_BUDGET));
+    let mut seen = 0usize;
+    let mut buf = [0u8; 4096];
+    while seen < DRAIN_CEILING {
+        match sock.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => seen += n,
+        }
     }
 }
 
@@ -389,13 +483,34 @@ fn transient(e: &std::io::Error) -> bool {
 
 /// Turns a connection away without giving it a worker.
 ///
-/// Written from the accepting thread, which is the only way this can be a fast answer: if
-/// saying "too busy" needed a worker, there would be nothing left to say it with.
-fn shed(mut stream: TcpStream) {
+/// On its own thread rather than on the accepting one, which is where this used to live. Under
+/// TLS the `503` has to go through a handshake to be legible at all - a client waiting for a
+/// ServerHello that is handed `HTTP/1.1 503` reports a protocol error and never sees the
+/// `Retry-After` - and a handshake on the accepting thread stops it accepting.
+///
+/// A short budget of its own, deliberately shorter than a served connection's: this handshake
+/// exists only to carry a refusal, and a client too slow to complete it is a client that can
+/// have the refusal by way of a closed socket instead.
+fn shed<P: PagerMut + Sync>(state: &State<P>, stream: TcpStream) {
+    const BUDGET: Duration = Duration::from_secs(2);
+    let _ = stream.set_read_timeout(Some(BUDGET));
+    let _ = stream.set_write_timeout(Some(BUDGET));
+
     let response = Response::failure(503, "server_busy", "every worker is busy; retry shortly")
         .with_header("Retry-After", 1);
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
-    let _ = stream.write_all(&response.encode(false));
+    match Wire::accept(stream, state.config.tls.as_ref()) {
+        Ok(mut wire) => {
+            let _ = wire.write_all(&response.encode(false)).and_then(|()| wire.flush());
+        }
+        // Plaintext on a TLS port, while saturated. The client gets the same `503` it would
+        // have got on a plain port: it is already talking in the clear, and telling it about
+        // TLS is less use than telling it to come back.
+        Err(WireError::Plaintext(mut sock)) => {
+            let _ = sock.write_all(&response.encode(false));
+            close_politely(sock);
+        }
+        Err(_) => state.metrics.handshake_failed(),
+    }
     log::emit(log::Level::Warn, "connection_shed", &[("status", log::F::N(503))]);
 }
 
@@ -408,16 +523,45 @@ fn shed(mut stream: TcpStream) {
 fn handle<P: PagerMut + Sync>(state: &State<P>, stream: TcpStream) -> std::io::Result<()> {
     let peer = stream.peer_addr().ok().map(|a| a.to_string());
 
-    // Before the first read, so a client that connects and says nothing is on a clock from the
-    // start. This is the whole slow-loris fix; everything else here is bookkeeping.
+    // Before the first read *and before the handshake*, so a client that connects and says
+    // nothing is on a clock from the start - a socket that never sends a ClientHello is the same
+    // slow loris as one that never sends a request line. `Wire` inherits both of these, because
+    // a timeout lives on the open file description rather than on the handle.
     stream.set_read_timeout(Some(state.config.read_timeout))?;
     stream.set_write_timeout(Some(state.config.write_timeout))?;
 
-    // The socket is read through one buffered reader for the life of the connection. Building
-    // one per request would take the front of the next request into a buffer that is then
-    // dropped, which nothing notices until a client pipelines.
-    let socket = stream.try_clone()?;
-    let mut reader = std::io::BufReader::new(stream);
+    let mut wire = match Wire::accept(stream, state.config.tls.as_ref()) {
+        Ok(w) => w,
+        // `curl http://…` against a TLS port. Answered in the language the client was actually
+        // speaking, because rustls's own answer for this is `InvalidMessage` and nobody has ever
+        // read that and known what to do.
+        Err(WireError::Plaintext(mut sock)) => {
+            let response = Response::failure(
+                400,
+                "plaintext_on_a_tls_port",
+                "this port speaks TLS and this request arrived in the clear; use https://",
+            );
+            let _ = sock.write_all(&response.encode(false));
+            state.metrics.handshake_failed();
+            close_politely(sock);
+            return Ok(());
+        }
+        // One connection failing to start is not the listener failing, and is not this worker
+        // failing either. Logged rather than returned, because the caller discards the error and
+        // an operator chasing a certificate problem needs to see which peer and why.
+        Err(e) => {
+            state.metrics.handshake_failed();
+            log::emit(
+                log::Level::Warn,
+                "handshake_failed",
+                &[
+                    ("peer", log::F::S(peer.as_deref().unwrap_or("-"))),
+                    ("why", log::F::S(&e.to_string())),
+                ],
+            );
+            return Ok(());
+        }
+    };
 
     for n in 0..state.config.max_keepalive_requests {
         // Only from the second request onward: the first is covered by `read_timeout`, which
@@ -428,11 +572,14 @@ fn handle<P: PagerMut + Sync>(state: &State<P>, stream: TcpStream) -> std::io::R
             break;
         } else {
             let Some(held) = KeptAlive::admit(state) else { break };
-            reader.get_ref().set_read_timeout(Some(state.config.keepalive_idle))?;
+            // Through `socket()`, which is the *only* way to reach the descriptor. Reaching
+            // through the session instead - a `get_ref()` on the TLS arm - would return the
+            // rustls stream and set a timeout on nothing, and would compile.
+            wire.socket().set_read_timeout(Some(state.config.keepalive_idle))?;
             Some(held)
         };
 
-        let again = serve_one(state, &mut reader, &socket, peer.as_deref())?;
+        let again = serve_one(state, &mut wire, peer.as_deref())?;
         drop(held);
         if !again {
             break;
@@ -444,14 +591,16 @@ fn handle<P: PagerMut + Sync>(state: &State<P>, stream: TcpStream) -> std::io::R
 /// One request on an open connection. `Ok(true)` means the connection may carry another.
 fn serve_one<P: PagerMut + Sync>(
     state: &State<P>,
-    reader: &mut std::io::BufReader<TcpStream>,
-    socket: &TcpStream,
+    wire: &mut Wire,
     peer: Option<&str>,
 ) -> std::io::Result<bool> {
     let started = Instant::now();
     let id = log::next_request_id();
+    // Who the request turned out to be, filled in once the route has decided. Declared out here
+    // so that the log line below can reach it whether or not a handler ever ran.
+    let mut who: Option<(&'static str, String)> = None;
 
-    let (response, method, path, bytes_in, keep) = match Request::read(reader) {
+    let (response, method, path, bytes_in, keep) = match Request::read(wire) {
         // Nobody is left to answer. A kept-alive connection ends this way every time, so it is
         // not logged as anything: a line per client that finished politely is a line per
         // client.
@@ -466,15 +615,16 @@ fn serve_one<P: PagerMut + Sync>(
             // than the panic. Caught here rather than in the worker loop so that the client
             // still gets an answer and the log still gets a line.
             let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                answer(state, &req, socket)
+                answer(state, &req, &*wire)
             }));
-            let response = caught.unwrap_or_else(|_| {
+            let answered = caught.unwrap_or_else(|_| {
                 let mut r =
                     Response::failure(500, "panic", "the server could not complete this request");
                 r.detail = Some(format!("a handler panicked serving {} {}", req.method, req.path));
-                r
+                r.into()
             });
-            (response, method, path, bytes_in, keep)
+            who = answered.who;
+            (answered.response, method, path, bytes_in, keep)
         }
         Err(e) => (e.into_response(), "-".to_string(), "-".to_string(), 0, false),
     };
@@ -482,17 +632,27 @@ fn serve_one<P: PagerMut + Sync>(
     // A request this server could not make sense of, or could not complete, takes the
     // connection with it. Reading the next request means trusting that this one ended where
     // the headers said it did, and a `400` is exactly the case where that is in doubt.
-    let keep = keep && response.status < 500 && response.status != 400 && response.status != 413;
+    //
+    // The last two clauses are what TLS adds. A session that hit an I/O error cannot be
+    // resynchronised, and one holding decrypted bytes nobody read is one where the two sides
+    // have lost track of where a message ends - keeping either alive would deliver the next
+    // response into the middle of somebody's parser.
+    let keep = keep
+        && response.status < 500
+        && response.status != 400
+        && response.status != 413
+        && !wire.is_poisoned()
+        && !wire.has_pending_plaintext();
 
     let response = response.with_header("X-Request-Id", &id);
     let encoded = response.encode(keep);
 
     // A cancelled request means the client is already gone, so writing is pointless and
     // failing to write is expected rather than an error worth reporting.
-    let write = {
-        let mut out = socket;
-        out.write_all(&encoded).and_then(|()| out.flush())
-    };
+    //
+    // Through the `Wire` rather than a second handle on the socket: under TLS there is no
+    // second handle, because the bytes have to go through the session that encrypts them.
+    let write = wire.write_all(&encoded).and_then(|()| wire.flush());
 
     let elapsed = started.elapsed();
     state.metrics.request(response.status, elapsed, bytes_in, response.body.len());
@@ -518,6 +678,12 @@ fn serve_one<P: PagerMut + Sync>(
     ];
     if let Some(peer) = peer {
         fields.push(("peer", log::F::S(peer)));
+    }
+    // **The first time this server has ever logged who asked.** A line saying a table was
+    // dropped, without saying by whom, is half a line - which was tolerable while a credential
+    // was an anonymous string and is not once it belongs to a person.
+    if let Some((kind, name)) = &who {
+        fields.push((kind, log::F::S(name)));
     }
     if let Some(code) = response.code {
         fields.push(("code", log::F::S(code)));
@@ -569,10 +735,20 @@ impl Drop for KeptAlive<'_> {
 }
 
 /// Dispatches one request, with a watchdog on the routes that can run long.
-fn answer<P: PagerMut + Sync>(state: &State<P>, req: &Request, stream: &TcpStream) -> Response {
+///
+/// **Nothing here may touch the wire between `Watchdog::spawn` and `watchdog.stop`.** The
+/// watchdog duplicates the descriptor and makes it non-blocking, and `O_NONBLOCK` lives on the
+/// open file description that both handles share - so for the length of that window the session
+/// is non-blocking too. That was already true and already load-bearing; TLS makes it sharper,
+/// because a `WouldBlock` reaching rustls part way through a record poisons the session rather
+/// than merely confusing a write. This function is pure compute after the body has been read,
+/// which is what keeps it true. A future change that streams a response has to move the
+/// watchdog, not work around it.
+fn answer<P: PagerMut + Sync>(state: &State<P>, req: &Request, wire: &Wire) -> routes::Answered {
     let mut ctx = routes::Ctx {
         cluster: &state.cluster,
         auth: &state.config.auth,
+        identity: wire.identity(),
         metrics: &state.metrics,
         query_timeout: state.config.query_timeout,
         cancel: None,
@@ -589,8 +765,8 @@ fn answer<P: PagerMut + Sync>(state: &State<P>, req: &Request, stream: &TcpStrea
 
     let cancel = Arc::new(AtomicBool::new(false));
     ctx.cancel = Some(Arc::clone(&cancel));
-    let watchdog = Watchdog::spawn(stream, cancel);
+    let watchdog = Watchdog::spawn(wire.socket(), cancel);
     let response = routes::dispatch(&ctx, req);
-    watchdog.stop(stream);
+    watchdog.stop(wire.socket());
     response
 }

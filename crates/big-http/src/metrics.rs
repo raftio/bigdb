@@ -54,6 +54,17 @@ pub struct ServerMetrics {
     queries_timed_out: AtomicU64,
     queries_cancelled: AtomicU64,
     unauthorized: AtomicU64,
+    /// Connections that were shed without being told why.
+    ///
+    /// Separate from `connections_rejected`, which counts every shed. Saying "busy" over TLS
+    /// costs a handshake, so it is done on one dedicated thread; past what that thread can keep
+    /// up with the connection is closed in silence. An operator seeing this climb is seeing
+    /// clients that got a connection reset instead of a `503`, which is a different support
+    /// call from the one a `503` produces.
+    connections_shed_unspoken: AtomicU64,
+    /// Handshakes that never completed: a wrong CA, an expired certificate, a client that hung
+    /// up, or plaintext sent to a TLS port.
+    tls_handshakes_failed: AtomicU64,
     /// Non-cumulative: each slot counts the requests that fell in that band. The exposition
     /// format wants them cumulative, and `render` is where that sum happens - keeping them
     /// separate here means recording a request touches exactly one counter.
@@ -79,6 +90,17 @@ impl ServerMetrics {
     /// limiting throughput, rather than the engine.
     pub fn connection_rejected(&self) {
         self.connections_rejected.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A connection closed without being told it was being shed, because the thread that says so
+    /// was itself saturated.
+    pub fn connection_shed_unspoken(&self) {
+        self.connections_shed_unspoken.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One connection that never became a session.
+    pub fn handshake_failed(&self) {
+        self.tls_handshakes_failed.fetch_add(1, Ordering::Relaxed);
     }
 
     /// One query that hit its wall-clock budget.
@@ -137,6 +159,18 @@ impl ServerMetrics {
             "big_http_connections_rejected_total",
             "Connections shed because every worker was busy and the queue was full.",
             g(&self.connections_rejected),
+        );
+        counter(
+            &mut out,
+            "big_http_connections_shed_unspoken_total",
+            "Connections closed without a 503, because the thread that answers one was busy.",
+            g(&self.connections_shed_unspoken),
+        );
+        counter(
+            &mut out,
+            "big_http_tls_handshakes_failed_total",
+            "Connections that never became a TLS session.",
+            g(&self.tls_handshakes_failed),
         );
         counter(
             &mut out,
@@ -212,6 +246,33 @@ impl ServerMetrics {
 }
 
 /// The gauges the pager has always collected, finally readable from outside the process.
+/// The three numbers an operator sizing `--workers` needs, appended to a scrape.
+///
+/// Rendered from `Auth` rather than kept here, because they belong to the users table and a
+/// second copy in this struct would be a second thing to keep in step. Verifications is the one
+/// that matters: it is the number that explains a latency cliff, because each one is tens of
+/// milliseconds and nineteen mebibytes.
+pub fn render_auth(out: &mut String, verifications: u64, hits: u64, throttled: u64) {
+    counter(
+        out,
+        "big_http_password_verifications_total",
+        "Passwords hashed. Each one is tens of milliseconds; the cache is what keeps this low.",
+        verifications,
+    );
+    counter(
+        out,
+        "big_http_password_cache_hits_total",
+        "Requests answered from a verification made in the last minute.",
+        hits,
+    );
+    counter(
+        out,
+        "big_http_password_throttled_total",
+        "Requests refused with a 503 because every verification slot was busy.",
+        throttled,
+    );
+}
+
 fn render_pager(out: &mut String, m: &PagerMetrics) {
     gauge(out, "big_page_count", "Pages in the file, live and free.", m.page_count);
     gauge(

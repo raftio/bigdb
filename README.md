@@ -89,7 +89,7 @@ bigctl verify | repair               # replication
 bigctl health | ready | metrics
 ```
 
-Options: `--addr` (or `$BIG_ADDR`), `--token-file` (or `$BIG_TOKEN`), `--format table|tsv|json`,
+Options: `--addr` (or `$BIG_ADDR`), `--credentials-file` (or `$BIG_CREDENTIALS`), `--format table|tsv|json`,
 `--timeout`. A token is read from a file and never taken as a flag — an argument is visible in
 `ps` and in shell history.
 
@@ -107,15 +107,28 @@ bigctl import tx facts.txt --resume facts.txt.ck
 | | |
 |---|---|
 | `GET /health`, `GET /ready` | probes, never authenticated |
-| `GET /metrics` | Prometheus text; needs a `read` token |
+| `GET /metrics` | Prometheus text; needs a `read` user |
 | `GET /table/{t}/records?after=&limit=` | records in order, a page at a time |
 | `GET /verify` | do the copies of every range still hold the same facts |
 | `POST /repair` | catch up every copy that is behind |
-| `POST /admin/backup?name=<f>` | online compact copy; needs `--backup-dir` and an `admin` token |
+| `POST /admin/backup?name=<f>` | online compact copy; needs `--backup-dir` and an `admin` user |
+| `/internal/*` | another node of the cluster, proven by its client certificate |
 
-Auth is bearer tokens, one `token role` per line in a mode-600 file passed to
-`--tokens`. Roles are `read`, `write`, `admin`. The daemon refuses a non-loopback bind with no
-tokens unless you say `--insecure-no-auth`.
+Auth is a username and a password over TLS. Users live one `username role hash` per line in a
+mode-600 file passed to `--users`, written by `big passwd` and by nothing else; the hashes are
+argon2id. Roles are `read`, `write`, `admin`.
+
+The daemon refuses a non-loopback bind twice: once with no `--users`, once with no `--tls-cert`.
+Each refusal has its own override (`--insecure-no-auth`, `--insecure-no-tls`) because they are
+two decisions - terminating TLS at a proxy in front is a supported deployment and must not cost
+you your credentials.
+
+Nodes do not use passwords with each other. Each holds a certificate signed by the cluster's
+`peer_ca_file`, and the name in it is its name in the cluster file, so a leaked key is one node
+rather than the whole cluster.
+
+TLS is a cargo feature (`tls`, on by default for the binaries). Built without it, `big-http` has
+the dependency tree it always had, and CI asserts that.
 
 ## Layout
 

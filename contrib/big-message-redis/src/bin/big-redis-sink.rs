@@ -60,7 +60,7 @@ PACE
   --once                   stop when the stream goes quiet, rather than waiting for more
 
 ENVIRONMENT
-  BIG_TOKEN                bearer token for bigdb
+  BIG_CREDENTIALS          path to a file holding one `user:password` line, mode 600
   REDIS_PASSWORD           password for AUTH
 
 EXIT
@@ -122,6 +122,41 @@ fn report(sink: &Sink) {
     if r.skipped > 0 {
         eprintln!("big-redis-sink: skipped {}", r.skipped);
     }
+}
+
+/// One `user:password` line out of a file, refusing one anybody can read.
+///
+/// The same rule the server applies to its own files and the same one `bigctl` applies to its
+/// credentials file, written a third time. That is the price of this crate having no
+/// dependencies, and it is the price the empty `[dependencies]` section is there to pay.
+fn read_credential(path: &str) -> Result<String, String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(path)
+            .map_err(|e| format!("could not read {path}: {e}"))?
+            .permissions()
+            .mode()
+            & 0o777;
+        if mode & 0o077 != 0 {
+            return Err(format!(
+                "{path} is mode {mode:o}; a credentials file must not be readable by anyone \
+                 else (chmod 600 {path})"
+            ));
+        }
+    }
+    let text = std::fs::read_to_string(path).map_err(|e| format!("could not read {path}: {e}"))?;
+    for line in text.lines() {
+        let line = line.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        if !line.contains(':') {
+            return Err(format!("{path}: expected one `user:password` line"));
+        }
+        return Ok(line.to_string());
+    }
+    Err(format!("{path}: no credential in this file"))
 }
 
 fn parse(args: &[String]) -> Result<(Config, bool), String> {
@@ -207,7 +242,13 @@ fn parse(args: &[String]) -> Result<(Config, bool), String> {
             group,
             consumer: consumer.unwrap_or_else(default_consumer),
             addr,
-            token: std::env::var("BIG_TOKEN").ok(),
+            // **A path, not the credential itself.** The old `BIG_TOKEN` here held the raw
+            // token while `bigctl`'s held a path, which meant one name with two meanings across
+            // two programs that talk to the same server. `BIG_CREDENTIALS` is a path everywhere.
+            credential: match std::env::var("BIG_CREDENTIALS") {
+                Err(_) => None,
+                Ok(path) => Some(read_credential(&path)?),
+            },
             table,
             map,
             dedup_field,

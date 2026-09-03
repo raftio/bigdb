@@ -148,7 +148,7 @@ fn config(redis: SocketAddr, addr: SocketAddr, map: &[&str]) -> Config {
         group: "g1".to_string(),
         consumer: "c1".to_string(),
         addr: addr.to_string(),
-        token: None,
+        credential: None,
         table: "tx".to_string(),
         map: map.iter().map(|m| Mapping::parse(m).unwrap()).collect(),
         dedup_field: None,

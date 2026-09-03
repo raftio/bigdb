@@ -41,8 +41,8 @@ Backing up a live database from *outside* the daemon is still not supported, and
 ## Take a backup
 
 ```sh
-# While serving. Needs `big serve --backup-dir /backup` and an admin token.
-curl -X POST -H "Authorization: Bearer $TOKEN" \
+# While serving. Needs `big serve --backup-dir /backup` and an `admin` user.
+curl -X POST -u "$USER:$PASSWORD" \
   "http://127.0.0.1:7654/admin/backup?name=data-$(date +%F).big"
 # {"backup":"data-2026-08-30.big","txn_id":41,"pages":1873,"bytes":10403840}
 
@@ -160,7 +160,7 @@ big compact /var/lib/big/data.big
 the work to a moment when nothing is stopped:
 
 ```sh
-curl -X POST -H "Authorization: Bearer $TOKEN" \
+curl -X POST -u "$USER:$PASSWORD" \
   "http://127.0.0.1:7654/admin/backup?name=compacted.big"   # online; the copy is compact
 systemctl stop big
 mv /backup/compacted.big /var/lib/big/data.big
@@ -270,7 +270,7 @@ Honest gaps, so nobody builds a procedure on top of something that does not exis
 ## Running the server
 
 ```sh
-big serve /var/lib/big/data.big 127.0.0.1:7654 --tokens /etc/big/tokens
+big serve /var/lib/big/data.big 127.0.0.1:7654 --users /etc/big/users
 ```
 
 Everything `big serve` takes:
@@ -278,8 +278,12 @@ Everything `big serve` takes:
 | | Default | What it bounds |
 |---|---|---|
 | `addr` | `127.0.0.1:7654` | Where it listens |
-| `--tokens <file>` | none | Bearer tokens. Must be mode `600` |
-| `--insecure-no-auth` | off | Permits a non-loopback bind with no tokens |
+| `--users <file>` | none | Usernames, roles and password hashes. Must be mode `600` |
+| `--tls-cert <file>` | none | PEM certificate chain this server presents |
+| `--tls-key <file>` | none | PEM key for it. Must be mode `600` |
+| `--peer-cert <file>`, `--peer-key <file>` | none | What this node presents to its peers |
+| `--insecure-no-auth` | off | Permits a non-loopback bind with no users |
+| `--insecure-no-tls` | off | Permits a non-loopback bind in the clear |
 | `--workers <n>` | `cores × 4`, min 8 | Requests handled at once |
 | `--queue <n>` | `64` | Connections allowed to wait. Past this: `503` |
 | `--read-timeout <s>` | `30` | How long a client may take to send a request |
@@ -287,11 +291,16 @@ Everything `big serve` takes:
 | `--durability <level>` | `full` | What a commit promises. See below |
 | `BIG_LOG` | `info` | `off`, `error`, `warn`, `info`, `debug` |
 
-**`big serve` refuses to bind anywhere but loopback without `--tokens`.** That is not a warning that
-can be scrolled past — it exits `2`. Anyone who can reach the port can read and delete
-everything in the database, so the two safe shapes are: bind to loopback and put a proxy in
-front, or pass a token file. `--insecure-no-auth` exists for a port that genuinely is private,
-and it is named so that it shows up in a `ps` listing and a review.
+**`big serve` refuses to bind anywhere but loopback without `--users`, and refuses again
+without a certificate.** Neither is a warning that can be scrolled past — each exits `2`. Anyone
+who can reach an unauthenticated port can read and delete everything in the database; anyone on
+the path of an unencrypted one can read the password, which is a thing the person also uses
+somewhere else. The safe shapes are: bind to loopback and put a proxy in front, or pass both a
+users file and a certificate.
+
+`--insecure-no-auth` and `--insecure-no-tls` are two flags because they answer two decisions —
+an operator terminating TLS at a proxy needs the second and must not be made to buy the first
+with it. Both are named so that they show up in a `ps` listing and in a review.
 
 ### The command line
 
@@ -300,8 +309,10 @@ deliberate, because `curl` is on the box and proves the surface needs nothing el
 same routes spelled for a shell, and is worth having when a person is typing rather than a script:
 
 ```sh
-export BIG_ADDR=127.0.0.1:7654           # or --addr
-export BIG_TOKEN=/etc/big/client-token   # or --token-file; mode 600, one token per file
+export BIG_ADDR=https://big.internal:7654   # or --addr; a bare host:port is plaintext
+export BIG_CREDENTIALS=/etc/big/client.cred # or --credentials-file; mode 600, `user:password`
+# --user <name> asks for the password on the terminal instead. There is no --password flag:
+# an argument is visible in `ps` and in shell history.
 
 bigctl schema
 bigctl sql "SELECT country, count(*) FROM tx GROUP BY country"
@@ -416,37 +427,87 @@ Changing the level at runtime (through the embedding API, not over HTTP) is brac
 tightening flushes everything written under the looser setting *before* it takes effect, so
 `relax → load → tighten` leaves the load durable rather than leaving a hole at the end of it.
 
-### Tokens
+### Users
 
-One `token role` per line; `#` starts a comment.
+One `username role hash` per line; `#` starts a comment. The file is written by `big passwd` and
+by nothing else — there is deliberately no route that writes it, because one would let an `admin`
+credential rewrite the credential file over the network.
 
 ```
-# /etc/big/tokens  — chmod 600
-b7f3…  admin    # schema changes, drops
-a91c…  write    # /import and /delete
-2d40…  read     # /query, /sql, /schema, /metrics
+# /etc/big/users  — chmod 600
+ops        admin  $argon2id$v=19$m=19456,t=2,p=1$…   # schema changes, drops
+loader     write  $argon2id$v=19$m=19456,t=2,p=1$…   # /import and /delete
+dashboard  read   $argon2id$v=19$m=19456,t=2,p=1$…   # /query, /sql, /schema, /metrics
 ```
 
-| Route | Role |
+```sh
+big passwd /etc/big/users set ops --role admin   # asks for the password twice, echoes neither
+big passwd /etc/big/users role ops write         # change a role, leave the password alone
+big passwd /etc/big/users delete ops
+big passwd /etc/big/users list                   # names and roles, never a hash
+```
+
+The password is never a flag and never an environment variable: an argument is visible in `ps`
+and in shell history. When standard input is not a terminal one line is read from it, which is
+the only non-tty path and is there so a provisioning script can pipe one in.
+
+| Route | Who |
 |---|---|
-| `GET /health`, `GET /ready` | **none, ever** |
-| `GET /metrics`, `GET /schema`, `POST /table/{t}/query`, `POST /sql`, `GET /table/{t}/records` | `read` |
-| `POST /table/{t}/import`, `POST /table/{t}/delete` | `write` |
-| `POST`/`DELETE` on tables and fields | `admin` |
+| `GET /health`, `GET /ready` | **nobody, ever** |
+| `GET /metrics`, `GET /schema`, `POST /table/{t}/query`, `POST /sql`, `GET /table/{t}/records` | a `read` user |
+| `POST /table/{t}/import`, `POST /table/{t}/delete` | a `write` user |
+| `POST`/`DELETE` on tables and fields | an `admin` user |
+| `/internal/*` | **another node**, proven by its client certificate — not a user, however privileged |
 
-Give the metrics scraper its own `read` token rather than an `admin` one. A missing or unknown
-token is `401`; a known token that does not reach far enough is `403`, and the body says which
-role it holds and which it needed — hiding that stops a legitimate operator from understanding
-the refusal and stops nobody else.
+Give the metrics scraper its own `read` user rather than an `admin` one. A missing or unknown
+credential is `401`; a known one that does not reach far enough is `403`, and the body names the
+user, the role it holds and the role it needed — hiding that stops a legitimate operator from
+understanding the refusal and stops nobody else.
 
-Tokens are stored in plaintext, deliberately. Hashing them would guard the *smaller* of two
-secrets: anyone who can read `/etc/big/tokens` can read `data.big` sitting next to it. What is
-enforced instead is that the file cannot be read by anyone else — `big serve` refuses to start
-against a token file that is group- or world-readable.
+Credentials are hashed with argon2id, which the file this replaced did not do. That is not a
+change of mind about the old reasoning — a token in a plaintext file really was the smaller of
+two secrets next to the database file beside it — it is a change in what is being stored. A
+password is a thing a person also uses somewhere else, so the file is no longer the smaller
+secret. The mode check is still enforced on top: `big serve` refuses to start against a users
+file that is group- or world-readable.
+
+**A verification costs about 19 MiB and tens of milliseconds, per verification in flight.** That
+is the point of a password hash and it is an operational number. Three things keep it bounded:
+
+- a verified credential is cached for **60 seconds** from when it was verified, so a busy client
+  pays once a minute rather than once a request. The window is absolute, never extended by use,
+  so a `big passwd delete` takes effect within a minute without a restart.
+- failures are **never** cached, so every wrong password pays — which is also the rate limit.
+- at most `--workers / 4` verifications run at once. Past that a request waits up to a second and
+  is then refused with `503 busy_authenticating`, which is a retry, not a `401`.
+
+Watch `big_http_password_verifications_total`. In a steady state it should be near flat: if it
+tracks your request rate, the cache is not being hit and every request is paying for a hash.
+`big_http_password_throttled_total` should be zero; if it is not, either `--workers` is too small
+or something is guessing passwords at you.
 
 ### TLS
 
-**There is none, and there is not going to be.** Terminate it in front:
+**There is TLS now, and this section used to say there never would be.** The old answer —
+terminate in front — was the right one while the credential was a bearer token that belonged to
+this database and to nothing else. A password is not that, so it is no longer the only answer.
+Both deployments are supported.
+
+```sh
+big serve /var/lib/big/data.big 0.0.0.0:7654 \
+    --users /etc/big/users \
+    --tls-cert /etc/big/server.pem --tls-key /etc/big/server.key   # chmod 600
+```
+
+A non-loopback bind is refused twice over: once without `--users`, once without a certificate.
+Each refusal has its own override, because they are two decisions — an operator with a proxy in
+front wants exactly `--insecure-no-tls` and wants to keep their credentials:
+
+```sh
+big serve … 0.0.0.0:7654 --users /etc/big/users --insecure-no-tls
+```
+
+which is the deployment this section used to describe, and it still works:
 
 ```nginx
 server {
@@ -463,8 +524,21 @@ server {
 }
 ```
 
-A TLS stack is a larger dependency than the whole engine, and a hand-written one is out of the
-question. Keeping it out is the same decision as having no web framework and no async runtime.
+Three things worth knowing before you turn it on:
+
+- **TLS 1.3 only.** Clients older than roughly 2017 cannot connect. For a database port that is
+  the right side of the trade; a protocol version that is not compiled in cannot be downgraded to.
+- **A self-signed certificate is not its own CA.** `curl` will accept one as a `--cacert`; a
+  rustls client will not, and says `CaUsedAsEndEntity`. Either issue a real CA and sign with it —
+  `deploy/cluster/certs.sh` is ten lines of `openssl` that does exactly this — or use
+  `bigctl --insecure-skip-verify`, which says what it is on every run.
+- **A build can be made without TLS at all** (`--no-default-features`), and one that was says so
+  on its first line: `big: no tls in this build`. Passing `--tls-cert` to it is an error that
+  names the build rather than the flag.
+
+A client that speaks plaintext to a TLS port gets an HTTP `400` explaining that, rather than a
+TLS protocol error — because `curl http://…` against the new port is the first mistake everybody
+makes and rustls's own answer for it is unreadable.
 
 ### More than one node
 
@@ -472,8 +546,8 @@ question. Keeping it out is the same decision as having no web framework and no 
 
 ```toml
 # /etc/big/cluster.toml — the same file on every node
-schema_leader   = "a"
-peer_token_file = "/etc/big/peer.token"   # chmod 600; first line is the token
+schema_leader = "a"
+peer_ca_file  = "/etc/big/peer-ca.pem"    # who signs a node certificate; the same on every node
 
 [[node]]
 name   = "a"
@@ -514,10 +588,14 @@ command line is the one in the file.
 - **`/ready` is about one node.** It reports that node's name and shard range and says nothing
   about its peers, so a probe never takes a healthy node out of rotation for somebody else's
   outage.
-- **The token file is not the peer token file.** `--tokens` is who may talk to *this* node;
-  `peer_token_file` is the single bearer token this node presents when it talks to others. That
-  token has to appear in every node's `--tokens` file with at least `admin`, because schema
-  changes travel between nodes.
+- **Users are people; nodes are certificates.** `--users` is who may talk to *this* node.
+  Nodes prove themselves to each other with a client certificate signed by `peer_ca_file` —
+  there is no shared secret, and no entry in anybody's users file. This closed a real gap: the
+  cluster used to hand every node the same `admin` token, so one leaked string was every node
+  and nothing could tell which node was speaking.
+- **The two directions are exclusive.** A person cannot reach `/internal/*` however privileged
+  they are, and a node certificate grants no role on the public routes. Under tokens an `admin`
+  credential could post to the internal routes; it cannot now.
 
 ```sh
 # Which node am I talking to, and what does it hold?
@@ -597,19 +675,19 @@ containers there are.
 
 ```sh
 cd deploy/single
-mkdir -p secrets && printf 'change-me-please admin\n' > secrets/tokens
+mkdir -p secrets && printf 'change-me-please\n' | big passwd secrets/users set ops --role admin
 docker compose up -d
 ```
 
 ```sh
 cd deploy/cluster
-./tokens.sh                       # writes secrets/tokens and secrets/peer.token
+./users.sh && ./certs.sh          # writes secrets/users, and a CA plus one cert per node
 docker compose up -d
-curl -H "Authorization: Bearer $(cat secrets/peer.token)" localhost:7654/verify
+curl -u ops:$PASSWORD localhost:7654/verify
 ```
 
 **A container's loopback is its own**, so the daemon binds `0.0.0.0` inside it - and `big serve`
-refuses to bind anywhere but loopback without a token file. That is why both files mount one.
+refuses to bind anywhere but loopback without a users file. That is why every service mounts one.
 A bind mount carries the host's ownership and mode, which the image cannot predict, so the
 entrypoint reads the credentials as root, writes private copies owned by the daemon's user, and
 **drops privileges before the daemon starts**. The database never runs as root. The port is
@@ -619,7 +697,7 @@ should not be the internet.
 **The daemon and the files have to be on the same host.** `docker context` pointing at a remote
 machine means bind mounts resolve *there*: the compose file asks for `./secrets` and the remote
 daemon, finding nothing at that path, creates an empty directory and mounts that. The failure
-looks like a missing token file, which is exactly what it is.
+looks like a missing users file, which is exactly what it is.
 
 **One volume per node.** One process holds one file - the pager takes an exclusive lock - so
 two nodes pointed at one volume is two nodes fighting over a database only one of them can
@@ -658,7 +736,7 @@ catalog as a new record kind, which is additive and needs no format version bump
 
 ## Watch these
 
-`GET /metrics`, Prometheus text. A `read` token when tokens are configured.
+`GET /metrics`, Prometheus text. A `read` user when `--users` is configured.
 
 | Metric | It means |
 |---|---|

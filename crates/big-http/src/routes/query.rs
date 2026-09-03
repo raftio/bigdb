@@ -62,7 +62,11 @@ pub(super) fn query<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request, table: 
 /// a second way for a client to contradict itself. The deadline, the cancellation flag and the
 /// memory ceiling are the ones `/query` gets, because a statement that runs long is the same
 /// problem whichever language it was written in.
-pub(super) fn sql<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request) -> Response {
+pub(super) fn sql<P: PagerMut + Sync>(
+    ctx: &Ctx<'_, P>,
+    req: &Request,
+    principal: &crate::auth::Principal,
+) -> Response {
     let text = match req.text() {
         Ok(t) => t.trim(),
         Err(e) => return e.into_response(),
@@ -101,10 +105,13 @@ pub(super) fn sql<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request) -> Respon
     //
     // Which statements cost what is `big_embed::Sql::authority`'s to say, not this route's: the
     // rule belongs next to the variants it is about, where a kind of statement added later
-    // cannot be added without answering for it. Re-checking `read` against a route whose floor
-    // is already `read` costs one constant-time comparison and removes the branch that used to
-    // decide when the check was worth making.
-    if let Some(refusal) = super::require(ctx.auth, req, sql.authority().into()) {
+    // cannot be added without answering for it.
+    //
+    // **This is free because the principal was resolved once**, not because comparing is cheap -
+    // which is what the comment here used to say, and what stopped being true when the
+    // credential became a password. Re-running the check against the request would mean a second
+    // argon2 verification on every statement this server ever runs.
+    if let Some(refusal) = super::require(principal, sql.authority().into()) {
         return refusal;
     }
 

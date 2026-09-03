@@ -14,11 +14,14 @@ rows=${1:-20000}
 # The daemon's credentials are in docker-compose.yml, as a `config` rather than a mounted file -
 # see the comment there for why. Nothing to set up here.
 
-# `bigctl` is in the server's image, and the token file is already staged inside that container
-# at mode 600 - so the schema and the queries go through `exec`, and this machine needs neither a
-# client nor a copy of the credential.
+# `bigctl` is in the server's image, so the schema and the queries go through `exec` and this
+# machine needs neither a client nor a copy of the credential. The file below is `user:password`,
+# which is what `--credentials-file` reads - not the server's own users file, which holds hashes
+# and from which no password can be recovered.
 ctl() {
-    docker compose exec -T big bigctl --token-file /run/big/tokens "$@"
+    docker compose exec -T big sh -c \
+        'umask 077; printf "demo-admin:demo-admin\n" > /tmp/demo.cred; \
+         exec bigctl --credentials-file /tmp/demo.cred "$@"' -- "$@"
 }
 
 echo "==> building"
@@ -73,7 +76,7 @@ echo "==> the record ids, which the producer never named"
 # subcommand for it, so this is curl, which the server's image already carries for its own
 # health check.
 docker compose exec -T big curl -fsS \
-    -H 'Authorization: Bearer demo-admin' \
+    -u demo-admin:demo-admin \
     'http://127.0.0.1:7654/table/tx/records?limit=5'
 echo
 

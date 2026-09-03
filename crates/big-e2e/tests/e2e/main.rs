@@ -28,8 +28,10 @@
 //! The cluster module is `#[ignore]` by default - see its own header for why.
 
 mod common;
+mod passwd;
 
 mod cluster;
+mod cluster_mtls;
 mod daemon;
 mod offline;
 mod together;

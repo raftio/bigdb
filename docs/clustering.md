@@ -115,8 +115,8 @@ primary of each range, and after that the nodes decide it among themselves.
 ```toml
 schema_leader   = "b"
 # Optional. The first line of this file is the bearer token this node presents to its peers.
-# Mode 600, like the token file it is checked against.
-peer_token_file = "/etc/big/peer.token"
+# The CA that signs a node certificate. Public, unlike the keys it signs.
+peer_ca_file = "/etc/big/peer-ca.pem"
 
 [[node]]
 name   = "a"
@@ -380,12 +380,21 @@ Neither is a version negotiation. There is one version and one file, and a misma
 saying what this node expected - because whoever reads it is looking at two machines and needs
 to know which one to correct.
 
-**A peer is a client with a token, not a trusted origin.** Each route needs the role its public
-counterpart needs; interning is a write because it commits, and a read token that could assign
-row ids would be a read token that can change what every other node means by a string. The
-token a node presents comes from `peer_token_file`, read with the same mode-600 check the
-inbound token file gets. A cluster with no tokens anywhere is allowed, and `big serve` says so on the
-way up, because refusing it here would refuse it only for clusters.
+**A peer is a different kind of caller, not a very privileged client.** It used to be a client
+with a token, and each `/internal/*` route needed the role its public counterpart needed. That
+only ever meant something while a peer presented the same *kind* of credential a person did.
+
+What a peer presents now is a client certificate, checked during the handshake and before a byte
+of HTTP is read, signed by the CA in `peer_ca_file` and naming a node in this file. So the whole
+of the requirement is *be a node*, and it cuts both ways: a person cannot reach `/internal/*`
+however privileged they are, and a node certificate grants no role on the public routes. The
+`--peer-cert` and `--peer-key` a node presents are `big serve` flags rather than entries here,
+because one shared file cannot name node `a`'s private key without also naming node `b`'s.
+
+A cluster with no peer CA anywhere is allowed and runs unauthenticated between its nodes, and
+`big serve` says so on the way up - refusing it here would refuse it only for clusters. A cluster
+that names a peer CA and gives a node no certificate is refused outright, because that node could
+not reach any peer and the failure would show up only under load.
 
 **Every decoder there reads bytes it did not write.** A length is checked against what is left
 before anything is allocated on the strength of it, recursion is bounded by the same
@@ -505,10 +514,14 @@ The most important section on this page.
   bounded queue sheds with `503` and the socket deadlines bound it, so this is congestion rather
   than deadlock - but the remedy is more workers, and there is no work-stealing or continuation
   anywhere that would make it not a remedy.
-- **No cross-node authorisation model.** A peer presents a bearer token like any other client,
-  so a token that can write to a coordinator can write to any node directly. There is no notion
-  of "this request came from a peer" and there is nothing that would be safe to grant on the
-  strength of one.
+- ~~**No cross-node authorisation model.**~~ **Closed.** A peer used to present a bearer token
+  like any other client, so a token that could write to a coordinator could write to any node
+  directly, and there was no notion of "this request came from a peer". There is one now: a node
+  proves itself during the TLS handshake with a client certificate signed by `peer_ca_file`, and
+  the name in that certificate has to be a node in the cluster file. That gives the two things
+  the token could not - the `/internal/*` routes are reachable *only* by a node, and a person's
+  credentials never are however privileged they are; and one leaked key is one node rather than
+  the whole cluster, because each node holds its own.
 
 ## Replication, and failing over
 

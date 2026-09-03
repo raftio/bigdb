@@ -362,10 +362,37 @@ pub fn reserved_port() -> u16 {
     free_port()
 }
 
-/// A token file with the mode the server insists on.
-pub fn token_file(dir: &Path, body: &str) -> PathBuf {
-    let path = dir.join("tokens");
-    std::fs::write(&path, body).expect("a token file");
+/// A users file with the mode the server insists on, from `name role` shorthand.
+///
+/// **Each name is hashed as its own password.** A fixture convention: it keeps the tests below
+/// reading the way they did when a credential was one string, so they stay about roles and about
+/// the daemon's refusals rather than about passwords.
+pub fn users_file(dir: &Path, body: &str) -> PathBuf {
+    // **Built by `big passwd`, not by writing the file here.** This crate deliberately links
+    // nothing - it drives the shipped binaries as processes - so hashing a password in-process
+    // would need `big-http` as a dependency and would undo that. Going through the binary costs
+    // one process per user and gets `big passwd` covered end to end for free.
+    let path = dir.join("users");
+    for line in body.lines().filter(|l| !l.trim().is_empty()) {
+        let mut parts = line.split_whitespace();
+        let (name, role) = (parts.next().unwrap(), parts.next().unwrap());
+        let run = run_with_stdin(
+            "big",
+            &["passwd", &path.display().to_string(), "set", name, "--role", role],
+            // The password is the username, and it goes in on standard input because there is
+            // no flag for one - see `big passwd --help`.
+            &format!("{name}\n"),
+        );
+        assert_eq!(run.code, 0, "big passwd set {name}: {}", run.err);
+    }
+    path
+}
+
+/// A credentials file for the client: one `user:password` line, mode 600.
+pub fn credentials_file(dir: &Path, user: &str) -> PathBuf {
+    let path = dir.join(format!("{user}.cred"));
+    // The password is the username - see `users_file`.
+    std::fs::write(&path, format!("{user}:{user}\n")).expect("a credentials file");
     set_mode(&path, 0o600);
     path
 }

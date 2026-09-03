@@ -105,7 +105,7 @@ impl Producer {
         addr: &str,
         table: &str,
         columns: &[&str],
-        token: Option<&str>,
+        credential: Option<&str>,
         config: Config,
     ) -> Result<Self, Error> {
         if config.max_rows == 0 {
@@ -113,7 +113,7 @@ impl Producer {
         }
         let batch = Batch::new(table, columns, config.max_rows, config.max_bytes)?;
         Ok(Self {
-            conn: Conn::new(addr, token, Some(config.io_timeout)),
+            conn: Conn::new(addr, credential, Some(config.io_timeout)),
             batch,
             linger: config.linger,
             retries: config.retries,

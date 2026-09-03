@@ -324,7 +324,7 @@ fn help_goes_to_stdout_and_a_mistake_goes_to_stderr() {
 // ------------------------------------------------------------------------------------------
 
 /// A file this test owns, at a mode it chooses.
-fn token_file(name: &str, contents: &str, mode: u32) -> String {
+fn secret_file(name: &str, contents: &str, mode: u32) -> String {
     use std::os::unix::fs::PermissionsExt;
     let path = std::env::temp_dir().join(format!("bigctl-{}-{name}", std::process::id()));
     std::fs::write(&path, contents).unwrap();
@@ -332,10 +332,16 @@ fn token_file(name: &str, contents: &str, mode: u32) -> String {
     path.to_string_lossy().into_owned()
 }
 
+/// A users file with one user at a cheap cost, so the suite is not paying OWASP's memory bill.
+fn users_file(name: &str, user: &str, role: &str, password: &str, mode: u32) -> String {
+    let hash = big_http::auth::hash_password(password).unwrap();
+    secret_file(name, &format!("{user} {role} {hash}\n"), mode)
+}
+
 #[test]
-fn a_token_is_presented_from_a_file_and_never_from_a_flag() {
-    let tokens = token_file("server-tokens", "s3cret read\n", 0o600);
-    let auth = Auth::from_file(&tokens).unwrap();
+fn a_password_is_presented_from_a_file_and_never_from_a_flag() {
+    let users = users_file("server-users", "alice", "read", "s3cret", 0o600);
+    let auth = Auth::from_file(&users).unwrap();
     let addr = spawn(2, ServerConfig { auth, ..ServerConfig::default() });
 
     // Without one, the server says so and the client passes that through.
@@ -343,27 +349,51 @@ fn a_token_is_presented_from_a_file_and_never_from_a_flag() {
     assert_eq!(r.code, exit::REFUSED);
     assert!(r.err.contains("[unauthenticated]"), "{}", r.err);
 
-    // With one, the same command works. The client sends only the token, not the role beside it.
-    let client_token = token_file("client-token", "s3cret read\n", 0o600);
-    let r = run(addr, &["--token-file", &client_token, "schema"]);
+    // With one, the same command works.
+    let creds = secret_file("client-credentials", "alice:s3cret\n", 0o600);
+    let r = run(addr, &["--credentials-file", &creds, "schema"]);
     assert_eq!(r.code, exit::OK, "{}", r.err);
     assert!(r.out.contains("amount"), "{}", r.out);
 
-    // There is no `--token` flag, and there will not be: an argument is visible in `ps`.
-    let r = run(addr, &["--token", "s3cret", "schema"]);
+    // There is no `--password` flag, and there will not be: an argument is visible in `ps`.
+    // This is the same invariant the `--token` version of this test asserted, for the credential
+    // that replaced it - and it matters more now, because a password is a thing a person also
+    // uses somewhere else.
+    let r = run(addr, &["--password", "s3cret", "schema"]);
     assert_eq!(r.code, exit::USAGE);
-    assert!(r.err.contains("unknown option --token"), "{}", r.err);
+    assert!(r.err.contains("unknown option --password"), "{}", r.err);
 }
 
-/// A token file anyone can read is not a secret, and the client refuses it before connecting -
-/// the same check the server applies to its own copy.
+/// The flag and the environment variable that are gone say so, rather than falling through to
+/// "unknown option" and sending somebody to check their spelling.
 #[test]
-fn a_world_readable_token_file_is_refused_before_anything_is_sent() {
+fn the_removed_token_flag_explains_itself() {
     let addr = stocked(0);
-    let path = token_file("loose-token", "s3cret\n", 0o644);
-    let r = run(addr, &["--token-file", &path, "schema"]);
+    let r = run(addr, &["--token-file", "/dev/null", "schema"]);
+    assert_eq!(r.code, exit::USAGE);
+    assert!(r.err.contains("--token-file is gone"), "{}", r.err);
+    assert!(r.err.contains("--credentials-file"), "it says what to use instead: {}", r.err);
+}
+
+/// A credentials file anyone can read is not a secret, and the client refuses it before
+/// connecting - the same check the server applies to its own copy.
+#[test]
+fn a_world_readable_credentials_file_is_refused_before_anything_is_sent() {
+    let addr = stocked(0);
+    let path = secret_file("loose-credentials", "alice:s3cret\n", 0o644);
+    let r = run(addr, &["--credentials-file", &path, "schema"]);
     assert_eq!(r.code, exit::USAGE);
     assert!(r.err.contains("chmod 600"), "{}", r.err);
+}
+
+/// A file with no colon in it is a token file somebody forgot to convert.
+#[test]
+fn a_credentials_file_without_a_colon_says_what_it_wanted() {
+    let addr = stocked(0);
+    let path = secret_file("old-token", "s3cret\n", 0o600);
+    let r = run(addr, &["--credentials-file", &path, "schema"]);
+    assert_eq!(r.code, exit::USAGE);
+    assert!(r.err.contains("user:password"), "{}", r.err);
 }
 
 // ------------------------------------------------------------------------------------------

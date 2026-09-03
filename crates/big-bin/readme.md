@@ -19,7 +19,7 @@ running daemon. That is the only distinction an operator has to hold, and it is 
 behind the daemon's back.
 
 ```sh
-big serve data.big 127.0.0.1:7654 --tokens tokens.txt
+big serve data.big 127.0.0.1:7654 --users tokens.txt
 
 bigctl create table tx
 bigctl create field tx country --kind set

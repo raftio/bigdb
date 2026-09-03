@@ -9,8 +9,14 @@
 # the address it binds is not the address the others use to find it.
 
 schema_leader   = "a"
-# Staged from the mount by the entrypoint: see deploy/entrypoint.sh.
-peer_token_file = "/run/big/peer.token"
+# **Who signs a node certificate**, staged from the mount by the entrypoint - see
+# deploy/entrypoint.sh. Shared by every node, which is why it is here: one file cannot name node
+# `a`'s private key without also naming node `b`'s, so the certificate and key each node presents
+# are `big serve` flags (--peer-cert, --peer-key) rather than entries in this file.
+#
+# This replaced `peer_token_file`, which held one `admin` credential every node presented to
+# every other. A certificate says which node is speaking; a shared string could not.
+peer_ca_file = "/run/big/peer-ca.pem"
 
 [[node]]
 name   = "a"

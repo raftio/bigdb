@@ -17,21 +17,22 @@ directories differ in is a config file and how many containers there are.
 
 ```sh
 cd single
-mkdir -p secrets && printf 'change-me-please admin\n' > secrets/tokens
+mkdir -p secrets && chmod 700 secrets
+printf 'change-me-please\n' | big passwd secrets/users set ops --role admin
 docker compose up -d
-curl -H 'Authorization: Bearer change-me-please' localhost:7654/ready
+curl -u ops:change-me-please localhost:7654/ready
 ```
 
 ## Three nodes
 
 ```sh
 cd cluster
-./tokens.sh                       # writes secrets/tokens and secrets/peer.token
+./users.sh                       # writes secrets/users and prints the passwords it generated
+./certs.sh                       # writes secrets/peer-ca.pem and one certificate per node
 docker compose up -d
-admin=$(cat secrets/peer.token)
-curl -H "Authorization: Bearer $admin" localhost:7654/ready
+curl -u ops:$PASSWORD localhost:7654/ready
 # {"status":"ready",...,"node":"a","shards":"0..64","serving":true,"term":1,"leader":"a","behind":[]}
-curl -H "Authorization: Bearer $admin" localhost:7654/verify
+curl -u ops:$PASSWORD localhost:7654/verify
 ```
 
 Only `a` is published. Any node answers any request - the one that receives it plans the query
@@ -40,11 +41,11 @@ not.
 
 ## Four things worth knowing before you run either
 
-**`big serve` refuses to bind anywhere but loopback without a token file**, and a container's
+**`big serve` refuses to bind anywhere but loopback without a users file**, and a container's
 loopback is its own, so both compose files mount one. That refusal is the reason these examples
 have credentials in them at all; it is not decoration.
 
-**A token file that anyone but its owner can read is refused too**, and a bind mount carries
+**A users file that anyone but its owner can read is refused too**, and a bind mount carries
 whatever ownership and mode the *host* gave it - root-owned `600` on one machine, `0755` on
 Docker Desktop, some other uid elsewhere. Nothing the image can do makes those agree with a
 strict check, so the entrypoint reads the file as root and writes a private copy owned by the
@@ -88,8 +89,16 @@ of one range. `docker compose exec b big backup ...` for each service.
 Nothing runs this for you. That is a cron entry and a place to put the output, and neither is
 in this repository.
 
-## There is no TLS in either of these
+## TLS: between the nodes here, and in front of the published port
 
-Termination belongs to a reverse proxy, and `runbook.md` has a configuration that works. Both
-compose files publish to `127.0.0.1` for that reason: what is in front of the port is the
-operator's decision, and the default should not be "the internet".
+**The cluster speaks TLS to itself.** `certs.sh` issues a CA and one certificate per node, and
+that is how the nodes authenticate to each other - there is no shared secret between them at
+all. A leaked key is one node rather than the whole cluster, which is what the peer token it
+replaced could not offer.
+
+**The published port is plaintext, on loopback.** Both compose files publish to `127.0.0.1`
+because what is in front of the port is the operator's decision and the default should not be
+"the internet". For a port that is reachable from anywhere else, either terminate TLS at a
+reverse proxy - `runbook.md` has a configuration that works, and `--insecure-no-tls` is how you
+tell `big serve` you have done so - or give the published node `--tls-cert` and `--tls-key` of
+its own. `big serve` refuses a non-loopback bind that has neither.

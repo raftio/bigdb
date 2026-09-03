@@ -21,18 +21,35 @@ categories = ["database","command-line-utilities"]
 # package for both binaries is one package that links `big-http` - and nothing now stops a
 # future `use big_sql` in `bigctl`. What is left is the rule written down here and in
 # `architecture.md`: the client sends bytes and prints what comes back. It parses no SQL.
+
+# **This is where TLS is turned on**, and the only place in the workspace that does. A library
+# that dragged rustls in behind its callers would be taking the choice away from them; a shipped
+# daemon that cannot speak TLS is not much of a daemon. So the libraries forward the feature and
+# the binaries decide. `cargo check -p big-bin --no-default-features` is asserted in CI, which is
+# what keeps the other answer real rather than theoretical.
+[features]
+default = ["tls"]
+tls = ["big-http/tls", "big-cluster/tls", "big-tls/tls"]
+
 [dependencies]
 big-embed.workspace = true
 big-cluster.workspace = true
 big-db.workspace = true
 big-http.workspace = true
 big-pager.workspace = true
+big-tls.workspace = true
+# For turning terminal echo off while a password is typed. One of the four dependencies the
+# engine already had; a crate for two ioctls would be a fifth for less code than its manifest.
+libc = "0.2"
 
 [dev-dependencies]
 # The client tests drive a real server in-process on a loopback port rather than a mock,
 # because the one thing worth testing there is agreement with what the server actually writes.
 # Every crate they need is already a dependency above; only the scratch directory is not.
 tempfile = "3"
+# Certificates for the TLS tests, generated per run. A fixture certificate expires, and a test
+# that starts failing in 2036 is a landmine left for somebody who will not know what it guarded.
+rcgen = "0.13"
 
 # `big` holds the file: it serves it, or it takes the exclusive lock and works on it offline.
 [[bin]]

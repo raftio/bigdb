@@ -34,7 +34,26 @@ const MAX_HEADERS: usize = 64;
 /// purpose.
 const MAX_HEADER_BYTES: usize = 16 << 10;
 
+/// A username and password out of an `Authorization: Basic` header.
+///
+/// No `Debug`, derived or otherwise, and that is deliberate: the second field is a password.
+///
+/// Nor is it zeroed on drop. There are three copies of a password by the time it gets here - the
+/// kernel's receive buffer, the base64 still sitting in [`Request::headers`], and this one - and
+/// wiping one of the three would be a gesture rather than a defence. `big-http` is
+/// `#![deny(unsafe_code)]`, so there is no way to do it convincingly even for the one.
+pub struct Basic {
+    /// The name, which is not a secret.
+    pub user: String,
+    /// The password, which is.
+    pub password: String,
+}
+
 /// One parsed request: everything read off the socket before a route is chosen.
+///
+/// **No `Debug`, and this is now load-bearing.** `headers` holds the base64 of a password, so a
+/// derived one would put a credential into any panic message or stray `{:?}` that touched a
+/// request.
 pub struct Request {
     /// The method, verbatim and uppercase as sent.
     pub method: String,
@@ -202,12 +221,35 @@ impl Request {
         self.header("connection").is_some_and(|v| v.eq_ignore_ascii_case("keep-alive"))
     }
 
-    /// The bearer token, if the request carries one. Only the `Bearer` scheme is understood;
-    /// anything else is treated as absent rather than half-parsed.
-    pub fn bearer(&self) -> Option<&str> {
+    /// The username and password out of an `Authorization: Basic` header.
+    ///
+    /// Only the `Basic` scheme is understood; anything else - including the `Bearer` this used to
+    /// read - is treated as absent rather than half-parsed, which is the same reading the token
+    /// version gave and for the same reason.
+    ///
+    /// Owned rather than borrowed: the credential is base64 on the wire and plain here, so there
+    /// is nothing in the request to borrow from.
+    ///
+    /// **Split on the first colon**, per RFC 7617: a password may contain one, a username may
+    /// not - which [`crate::auth`] enforces when it loads the users file, so that the two rules
+    /// cannot disagree.
+    pub fn basic(&self) -> Option<Basic> {
         let value = self.header("authorization")?;
-        let (scheme, token) = value.split_once(' ')?;
-        scheme.eq_ignore_ascii_case("bearer").then(|| token.trim())
+        let (scheme, encoded) = value.split_once(' ')?;
+        if !scheme.eq_ignore_ascii_case("basic") {
+            return None;
+        }
+        // Bounded before anything is allocated. This is a header from a stranger, and the
+        // ceiling is generous next to the longest username and password anybody means.
+        let decoded = big_tls::base64::decode(encoded.trim(), 1024).ok()?;
+        let text = String::from_utf8(decoded).ok()?;
+        let (user, password) = text.split_once(':')?;
+        // An empty username cannot match any entry - a users file refuses one - so it is
+        // rejected here rather than being carried down to fail later as "no such user".
+        if user.is_empty() {
+            return None;
+        }
+        Some(Basic { user: user.to_string(), password: password.to_string() })
     }
 
     /// Path split on `/`, empty segments dropped, each one percent-decoded.
