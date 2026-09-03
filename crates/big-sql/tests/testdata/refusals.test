@@ -819,17 +819,34 @@ SELECT date_trunc('fortnight', seen) FROM tx
 ----
 sql_bad_trunc_unit
 
-## A rounding in a `WHERE`. It reads a value per record, and a `WHERE` runs over bitmaps before
-## there are any values - so the refusal names the range to write instead.
+## A rounding in a `WHERE` is answered now, by being turned around rather than run - see
+## `where.test`. What is still refused is a scalar that gathers no range: the values answering
+## `lower(country) = 'gb'` are scattered through the dictionary, and `toMonth` cycles, so every
+## January of every year answers 3 and the records behind that answer are not contiguous either.
+
 error
-SELECT count(*) FROM tx WHERE toDate(seen) = '2024-01-15'
+SELECT count(*) FROM t WHERE lower(country) = 'gb'
 ----
 sql_scalar_in_filter
 
 error
-SELECT count(*) FROM tx WHERE date_trunc('month', seen) = '2024-01-01'
+SELECT count(*) FROM t WHERE toMonth(seen) = 3
 ----
 sql_scalar_in_filter
+
+## And a rounding compared against a value no rounding produces: no month begins on the 15th.
+## Strictly this selects nothing, and another engine answers it that way; it is refused here
+## because this dialect has no bind parameters, so the value was typed rather than substituted.
+
+error
+SELECT count(*) FROM t WHERE date_trunc('month', seen) = '2024-01-15'
+----
+sql_rounded_value
+
+error
+SELECT count(*) FROM t WHERE toDate(seen) != '2024-01-15 10:00:00'
+----
+sql_rounded_value
 
 ## A semi-join narrows one table by the record ids another table's `WHERE` selected. Two things
 ## about it are refused, and both are about the ids rather than about the syntax.

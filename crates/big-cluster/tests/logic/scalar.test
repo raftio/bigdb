@@ -269,3 +269,71 @@ error
 SELECT count(*) FROM s WHERE round(price, 1) > 5
 ----
 error: sql_scalar_in_filter
+
+# ---------------------------------------------------------------------------------------------
+# A rounding in a `WHERE`, over the records it selects
+# ---------------------------------------------------------------------------------------------
+
+# **The claim these cases make is that no rounding ran.** The plan is a range on the column, so
+# what is being checked is that the two ends of that range are the right two dates - which the
+# three records above are chosen to catch: a January the 31st, a leap day, and an instant at one
+# second to midnight on New Year's Eve. An off-by-one at either end moves one of them.
+
+# `d` counts whole days and `ts` counts seconds, and the same written statement is right for
+# both - the bounds go out as written dates and each column reads them in its own units.
+query rowsort
+SELECT country FROM s WHERE date_trunc('month', d) = '2024-01-01'
+----
+country
+gb
+
+query rowsort
+SELECT country FROM s WHERE date_trunc('month', ts) = '2024-01-01'
+----
+country
+gb
+
+# The leap day is inside February, and February ends where March begins.
+query rowsort
+SELECT country FROM s WHERE date_trunc('month', d) = '2024-02-01'
+----
+country
+france
+
+# One second before midnight is still the old year. This is the case an inclusive upper bound
+# would get wrong.
+query rowsort
+SELECT country FROM s WHERE toYear(ts) = 2023
+----
+country
+france
+
+query rowsort
+SELECT country FROM s WHERE toYear(d) = 2024
+----
+country
+france
+gb
+
+# A time of day inside the day it names: `toDate` is a rounding on a `DATETIME` and the identity
+# on a `DATE`, and one rewrite answers both.
+query rowsort
+SELECT country FROM s WHERE toDate(ts) = '2024-03-01'
+----
+country
+us
+
+query rowsort
+SELECT country FROM s WHERE date_trunc('year', ts) >= '2024-01-01'
+----
+country
+gb
+us
+
+# The partition: every record is on exactly one side of a rounding, which is the property the
+# metamorphic tests check over generated predicates and this pins at one point.
+query
+SELECT count(*) FROM s WHERE date_trunc('month', d) != '2024-01-01'
+----
+count
+2

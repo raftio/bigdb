@@ -609,6 +609,7 @@ mod create;
 pub(crate) use create::decimal_bits;
 mod insert;
 mod item;
+mod rounded;
 mod scalar;
 mod select;
 mod show;

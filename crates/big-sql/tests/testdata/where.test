@@ -323,3 +323,41 @@ SELECT count(DISTINCT country) FROM t WHERE amount >= 500
 ----
 Distinct t.country
 └── amount >= 500
+
+# ---------------------------------------------------------------------------------------------
+# A rounding, inverted into the range it means.
+#
+# The plan is the thing to read here: none of these mentions `date_trunc`, because none of them
+# runs it. Every value whose month is January is every value in `[2024-01-01, 2024-02-01)`, so
+# the statement is answered by asking a different question with the same answer - a range off
+# the bit planes, at the cost a written range would have.
+
+plan
+SELECT count(*) FROM t WHERE date_trunc('month', seen) = '2024-01-01'
+----
+Count t
+└── intersect
+    ├── seen >= 1704067200 [signed]
+    └── seen < 1706745600 [signed]
+
+plan
+SELECT count(*) FROM t WHERE toDate(seen) = '2024-01-15'
+----
+Count t
+└── intersect
+    ├── seen >= 1705276800 [signed]
+    └── seen < 1705363200 [signed]
+
+plan
+SELECT count(*) FROM t WHERE date_trunc('month', seen) >= '2024-03-01'
+----
+Count t
+└── seen >= 1709251200 [signed]
+
+plan
+SELECT count(*) FROM t WHERE toYear(day) = 2024
+----
+Count t
+└── intersect
+    ├── day >= 19723 [signed]
+    └── day < 20089 [signed]

@@ -122,6 +122,14 @@ impl Parser<'_> {
             && (crate::scalar::Func::of(&field.column).is_some()
                 || field.column.eq_ignore_ascii_case("toStartOfInterval"))
         {
+            // **Except a rounding, which is answered by inverting it.** Every value whose month
+            // is January is every value in `[2024-01-01, 2024-02-01)`, and a range is a read the
+            // bit planes already have - so the statement is answered by asking a different
+            // question with the same answer. See [`super::rounded`] for which calls that is true
+            // of and why the rest are still refused here.
+            if let Some(cond) = self.rounded(&field, at)? {
+                return Ok(cond);
+            }
             return Err(self.refuse_at(Refused::ScalarFilter, at));
         }
 
