@@ -109,6 +109,16 @@ fn expand_select(select: &mut Select, catalog: &Catalog) -> Result<()> {
         let filter = body.filter.map(|c| qualify_cond(c, &label));
         select.filter = and(filter, select.filter.take());
     }
+    // **Segments last, and that ordering is the whole of why they compose.** A view read through
+    // `FROM` or joined in changes what the sources *are* and can itself merge a condition into
+    // this `WHERE` - so a segment resolved earlier would be matched against a source about to be
+    // replaced, or missed entirely because it arrived from a body.
+    if let Some(filter) = select.filter.take() {
+        let sources: Vec<Source> = std::iter::once(select.from.clone())
+            .chain(select.joins.iter().map(|j| j.source.clone()))
+            .collect();
+        select.filter = Some(expand_segments(filter, &sources, catalog, 0)?);
+    }
     Ok(())
 }
 
@@ -349,6 +359,9 @@ fn remap_cond(cond: &mut Cond, exposed: &Exposed) -> Result<()> {
             remap_cond(b, exposed)
         }
         Cond::Not(a) => remap_cond(a, exposed),
+        // A segment names a view, not a column - there is nothing here to rename, and it is
+        // substituted after this runs anyway. See `expand_segments`.
+        Cond::Segment { .. } => Ok(()),
         // **Only the outer column goes through the view.** The filter inside a semi-join is
         // written about the table it names, which this view exposes nothing of - renaming its
         // columns here would rewrite one table's names with another's.
@@ -375,6 +388,8 @@ fn qualify_cond(cond: Cond, label: &str) -> Cond {
                 walk(b, label);
             }
             Cond::Not(a) => walk(a, label),
+            // A view name, not a column. Nothing to qualify.
+            Cond::Segment { .. } => {}
             // The inner filter is left alone for the reason `remap_cond` leaves it alone: its
             // bare names mean the table the semi-join reads, not the one being merged into.
             Cond::InRecords { field, .. } => {
@@ -393,6 +408,85 @@ fn qualify_cond(cond: Cond, label: &str) -> Cond {
 }
 
 /// Two filters, either of which may be absent.
+/// Replaces every `SEGMENT(<view>)` with the condition that view selects by.
+///
+/// **A segment is a `WHERE` with a name, and this is the whole of what one is.** The view names
+/// a table the statement already reads, so nothing crosses between tables and no records are
+/// carried anywhere: the term becomes that view's own condition, and two segments combined with
+/// `AND`, `OR` or `NOT` become the `Intersect`, `Union` and `Difference` the lowering already
+/// emits - one bitmap operation apiece, over sets neither of them had to materialise.
+///
+/// The view's condition is written about its own table with nothing qualified, so it is
+/// qualified with the label of the source it matched before it joins a `WHERE` where a bare name
+/// may mean a different table. Which source that is has to be exactly one: a segment over a
+/// table the statement does not read is a set of records that are not in the answer, and one
+/// matching two sources is a term nothing here could place.
+///
+/// A view whose body is only a projection - no `WHERE` at all - is every record of its table,
+/// which as a term is no narrowing. Answered rather than refused: `SEGMENT(everyone)` is a
+/// legitimate thing to write and a legitimate thing for it to mean.
+fn expand_segments(
+    cond: Cond,
+    sources: &[Source],
+    catalog: &Catalog,
+    depth: usize,
+) -> Result<Cond> {
+    Ok(match cond {
+        Cond::Segment { view, .. } => {
+            let Some(saved) = resolve(&view, catalog) else {
+                // Not a view at all. The same refusal a `FROM` naming nothing would earn, said
+                // where it was written.
+                return Err(refused(Refused::SegmentTable));
+            };
+            let body = body_of(&saved, catalog, depth)?;
+            // Which source this segment is about: the one reading the view's table. Compared on
+            // the qualified name, because two databases may each have an `orders`.
+            let wanted = body.from.qualified();
+            let mut matched = sources.iter().filter(|s| s.qualified() == wanted);
+            let (Some(source), None) = (matched.next(), matched.next()) else {
+                return Err(refused(Refused::SegmentTable));
+            };
+            let label = source.label().to_string();
+            // A view with no `WHERE` selects every record of its table, so there is no set for
+            // it to be. Refused rather than answered as "no narrowing": a segment is defined by
+            // what it selects by, and a view that selects by nothing defines none.
+            let Some(filter) = body.filter else { return Err(refused(Refused::SegmentTable)) };
+            qualify_cond(expand_segments(filter, sources, catalog, depth + 1)?, &label)
+        }
+        Cond::And(a, b) => Cond::And(
+            Box::new(expand_segments(*a, sources, catalog, depth)?),
+            Box::new(expand_segments(*b, sources, catalog, depth)?),
+        ),
+        Cond::Or(a, b) => Cond::Or(
+            Box::new(expand_segments(*a, sources, catalog, depth)?),
+            Box::new(expand_segments(*b, sources, catalog, depth)?),
+        ),
+        Cond::Not(a) => Cond::Not(Box::new(expand_segments(*a, sources, catalog, depth)?)),
+        // The inner set of a semi-join is about the table *it* names, which is not one of these
+        // sources - so a segment in there would be matched against the wrong list.
+        Cond::InRecords { field, table, filter, at } => {
+            if let Some(f) = &filter {
+                if has_segment(f) {
+                    return Err(refused(Refused::SegmentTable));
+                }
+            }
+            Cond::InRecords { field, table, filter, at }
+        }
+        other => other,
+    })
+}
+
+/// Whether a condition holds a segment anywhere under it.
+fn has_segment(cond: &Cond) -> bool {
+    match cond {
+        Cond::Segment { .. } => true,
+        Cond::And(a, b) | Cond::Or(a, b) => has_segment(a) || has_segment(b),
+        Cond::Not(a) => has_segment(a),
+        Cond::InRecords { filter, .. } => filter.as_deref().is_some_and(has_segment),
+        _ => false,
+    }
+}
+
 fn and(view: Option<Cond>, outer: Option<Cond>) -> Option<Cond> {
     match (view, outer) {
         (Some(v), Some(o)) => Some(Cond::And(Box::new(v), Box::new(o))),

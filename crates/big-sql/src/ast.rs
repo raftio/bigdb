@@ -554,6 +554,28 @@ pub enum Cond {
         /// because SQL does not accept one either.
         values: Vec<Literal>,
     },
+    /// `SEGMENT(<view>)`: a named set of records of *this* table, used as a term.
+    ///
+    /// **A segment is a `WHERE` with a name, and composing two of them is one bitmap
+    /// operation.** The view it names is over the same table, so nothing crosses between
+    /// tables and no ids travel: the term is replaced by that view's own condition, and
+    /// `SEGMENT(a) AND NOT SEGMENT(b)` becomes the `Difference` the lowering already emits for
+    /// any other conjunction. Which is the whole point - a set that costs nothing to name, and
+    /// whose intersection with another set is the operation this engine is built out of.
+    ///
+    /// Distinct from reading the view as a table. `FROM v` answers *the view's* statement, one
+    /// per statement, and two of them cannot be combined; `SEGMENT(v)` takes only the records
+    /// and leaves the question to the reader, which is what makes it composable.
+    ///
+    /// **Expanded before the lowering, in `big_embed::views`**, because it needs the catalog -
+    /// the same place and the same depth bound a view read through `FROM` gets. Nothing below
+    /// that layer ever sees one.
+    Segment {
+        /// The view named, as a source so it carries a database the way every other name does.
+        view: Source,
+        /// Byte offset, for the refusal.
+        at: usize,
+    },
     /// `<column> IN (SELECT _record_id FROM <table> [WHERE ...])`: the semi-join.
     ///
     /// **This is the one join shape a bitmap engine is actually built for.** The column holds

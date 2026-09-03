@@ -52,6 +52,11 @@ pub(super) fn rows(cond: &Cond) -> Expr {
             ],
         ),
 
+        // Refused by `no_segments` before anything reaches here, which is what keeps this
+        // function total. A segment is a view's condition and there is no catalog at this
+        // layer to read one from.
+        Cond::Segment { .. } => unreachable!("a segment is expanded or refused before lowering"),
+
         // A pattern is the union of the keys that match it, worked out at the owner that holds
         // the dictionary. Nothing to build here: the whole of it is one call.
         Cond::Like { field, pattern, fold } => like(field, pattern, *fold),

@@ -361,6 +361,15 @@ impl Parser<'_> {
     }
 
     /// The word `n` tokens ahead, for the two-token keywords: `GROUP BY`, `NOT IN`, `IS NULL`.
+    /// Whether the token `n` ahead is exactly this one.
+    ///
+    /// The companion to [`Parser::word_at_is`], for the one place a keyword is only a keyword
+    /// when a bracket follows it: `SEGMENT(v)` is a term and `segment` is a column, and the
+    /// difference is the token after the word.
+    pub(super) fn tok_at_is(&self, n: usize, tok: &Tok) -> bool {
+        self.t.get(self.i + n).map(|t| &t.tok) == Some(tok)
+    }
+
     pub(super) fn word_at_is(&self, n: usize, kw: &str) -> bool {
         matches!(self.t.get(self.i + n).map(|t| &t.tok), Some(Tok::Word(w)) if w.eq_ignore_ascii_case(kw))
     }

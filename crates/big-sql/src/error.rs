@@ -47,6 +47,10 @@ pub enum Refused {
     SetTooLarge,
     /// `EXPLAIN` over a statement containing a semi-join.
     ExplainSet,
+    /// A `SEGMENT(...)` that reached the lowering, which means nothing expanded it.
+    Segment,
+    /// A `SEGMENT(...)` naming a view of a table this statement does not read.
+    SegmentTable,
     /// A subquery, a CTE, or `UNION` between two selects.
     Subquery,
     /// A `HAVING` that names an aggregate the answer does not carry.
@@ -184,7 +188,7 @@ impl Refused {
     /// Kept honest by [`Refused::rank`] below, whose exhaustive match will not compile until a
     /// new variant is named - and by a test asserting that every rank appears here exactly once,
     /// which is what catches naming one and forgetting to add it.
-    pub const ALL: [Self; 51] = [
+    pub const ALL: [Self; 53] = [
         Self::Joins,
         Self::OuterJoin,
         Self::JoinOn,
@@ -221,6 +225,8 @@ impl Refused {
         Self::ScalarFilter,
         Self::SetTooLarge,
         Self::ExplainSet,
+        Self::Segment,
+        Self::SegmentTable,
         Self::Constraint,
         Self::DecimalScale,
         Self::BitDepth,
@@ -298,6 +304,8 @@ impl Refused {
             Self::ScalarFilter => 47,
             Self::SetTooLarge => 49,
             Self::ExplainSet => 50,
+            Self::Segment => 51,
+            Self::SegmentTable => 52,
         }
     }
 
@@ -310,6 +318,8 @@ impl Refused {
         match self {
             Self::SetTooLarge => "sql_set_too_large",
             Self::ExplainSet => "sql_explain_set",
+            Self::Segment => "sql_segment_unexpanded",
+            Self::SegmentTable => "sql_segment_table",
             Self::Joins => "sql_no_joins",
             Self::OuterJoin => "sql_no_outer_joins",
             Self::JoinOn => "sql_join_condition",
@@ -408,6 +418,17 @@ impl Refused {
                 "a `WHERE` over a join is each table's own conditions, combined with `AND`. A \
                  term that names two of them under `OR` or `NOT` selects records neither side \
                  can be filtered to on its own"
+            }
+            Self::Segment => {
+                "a segment is a named `WHERE` over one table, and expanding it needs the \
+                 catalog the view is stored in - which this translation does not have. Reached \
+                 through a server, `SEGMENT(...)` is substituted before anything is planned"
+            }
+            Self::SegmentTable => {
+                "`SEGMENT(...)` names a view whose `WHERE` becomes a term of this one, so the \
+                 view has to exist, has to be over exactly one table this statement reads, and \
+                 has to select by something - a view with no `WHERE` is every record of its \
+                 table and defines no set"
             }
             Self::ExplainSet => {
                 "a statement with `IN (SELECT ...)` has no plan until it has run: the outer \

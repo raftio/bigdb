@@ -96,6 +96,16 @@ impl Parser<'_> {
 
     pub(super) fn predicate(&mut self) -> Result<Cond> {
         let at = self.at();
+        // **`SEGMENT(<view>)` is a term, not a column.** Recognised before a name is read
+        // because it is the one predicate whose argument is a *view* rather than a value - and
+        // recognised by the bracket as well as the word, so a column called `segment` is still
+        // a column. `WHERE segment = 'a'` and `WHERE segment` both go the ordinary way.
+        if self.word_is("SEGMENT") && self.tok_at_is(1, &Tok::LParen) {
+            self.i += 2;
+            let view = self.source("a view name inside SEGMENT")?;
+            self.expect(&Tok::RParen, ") to close SEGMENT")?;
+            return Ok(Cond::Segment { view, at });
+        }
         let field = self.name("a column name")?;
         // A scalar call where a column belongs. Caught by name so it is refused as what it is -
         // a computation asked for before there is anything to compute it on - rather than as a

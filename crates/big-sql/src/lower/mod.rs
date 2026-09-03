@@ -25,7 +25,7 @@
 //! Every failure in this module is about the *statement*: a shape with no plan behind it, or a
 //! construct the engine refuses.
 
-use crate::ast::{Item, Name, Proj, Query, Select};
+use crate::ast::{Cond, Item, Name, Proj, Query, Select};
 use crate::error::{Refused, Result, SqlError};
 use crate::shape::{Answer, Shape};
 use big_plan::ast::{Call, Expr};
@@ -206,8 +206,29 @@ fn branch_at(select: &Select) -> usize {
     select.items.first().map_or(0, |i| i.at)
 }
 
+/// Refuses a `SEGMENT(...)` that nothing expanded.
+///
+/// **The guard that keeps [`cond::rows`] total.** A segment stands for a view's condition, and
+/// reading one needs the catalog it is stored in - which this crate deliberately does not have,
+/// for the same reason every test in it is a parser test. A server substitutes them in
+/// `big_embed::views` before anything here runs, so this is reached only by a caller translating
+/// without one.
+fn no_segments(cond: &Cond) -> Result<()> {
+    match cond {
+        Cond::Segment { at, .. } => Err(SqlError::Refused { what: Refused::Segment, at: *at }),
+        Cond::And(a, b) | Cond::Or(a, b) => no_segments(a).and_then(|()| no_segments(b)),
+        Cond::Not(a) => no_segments(a),
+        // The inner set of a semi-join is a condition like any other, and may hold one too.
+        Cond::InRecords { filter, .. } => filter.as_deref().map_or(Ok(()), no_segments),
+        Cond::Cmp { .. } | Cond::In { .. } | Cond::Between { .. } | Cond::Like { .. } => Ok(()),
+    }
+}
+
 /// Translates one `SELECT`.
 fn lower_one(select: &Select) -> Result<Statement> {
+    if let Some(cond) = &select.filter {
+        no_segments(cond)?;
+    }
     // **A join on the other table's record id is not a join here, it is a `WHERE`.** Folded
     // before anything else looks at the statement, because what comes out has no join in it and
     // is lowered by whichever ordinary path its `GROUP BY` calls for. The fold removes every

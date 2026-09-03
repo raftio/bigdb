@@ -587,6 +587,10 @@ fn touches(cond: &Cond, scope: &Scope<'_>, at: usize) -> Result<u32> {
         // join's sides at all - it is a set this term is narrowed by. So the side is the one
         // the column belongs to, exactly as it is for every other predicate.
         Cond::InRecords { field, .. } => 1 << scope.side(field, at)?,
+        // Refused before the lowering, for the reason `lower::no_segments` gives.
+        Cond::Segment { at, .. } => {
+            return Err(SqlError::Refused { what: Refused::Segment, at: *at })
+        }
     })
 }
 

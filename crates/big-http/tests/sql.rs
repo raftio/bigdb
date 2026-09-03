@@ -1679,3 +1679,153 @@ fn a_folded_join_refuses_a_number_and_a_grouping_about_the_table_it_folded() {
     assert_eq!(status, 400, "{body}");
     assert!(body.contains("sql_no_outer_joins"), "{body}");
 }
+
+/// Segments: named sets of records, composed with one bitmap operation apiece.
+///
+/// **This is what a view cannot do, and the difference is composition.** `FROM v` answers the
+/// view's own statement - one per statement, and two of them cannot be combined without a join
+/// or a subquery. `SEGMENT(v)` takes only the records and leaves the question to the reader, so
+/// `SEGMENT(a) AND NOT SEGMENT(b)` is an intersection and a subtraction over sets neither of
+/// them materialised, which is the operation this engine is built out of.
+///
+/// Nothing is stored and nothing goes stale: a segment is a `WHERE` with a name, substituted
+/// before the statement is planned. The five orders below are picked so that every combination
+/// gives a different number - a wrong composition cannot land on the right answer by luck.
+#[test]
+fn segments_are_named_sets_that_compose_into_one_bitmap_operation() {
+    let addr = spawn(14);
+    assert_eq!(send(addr, "POST", "/table/orders", "").0, 200);
+    assert_eq!(send(addr, "POST", "/table/orders/field/amount?kind=int&bit_depth=32", "").0, 200);
+    assert_eq!(send(addr, "POST", "/table/orders/field/channel?kind=set", "").0, 200);
+
+    // amount:      100  200  600  700  800
+    // channel:     web  app  web  app  web
+    assert_eq!(
+        send(
+            addr,
+            "POST",
+            "/table/orders/import",
+            "amount 1 100\nchannel 1 web\namount 2 200\nchannel 2 app\n\
+             amount 3 600\nchannel 3 web\namount 4 700\nchannel 4 app\n\
+             amount 5 800\nchannel 5 web\n",
+        )
+        .0,
+        200
+    );
+
+    // Two segments, each an ordinary view. Nothing about creating one is new.
+    assert_eq!(
+        send(
+            addr,
+            "POST",
+            "/sql",
+            "CREATE VIEW big_spenders AS SELECT amount, channel FROM orders WHERE amount >= 600",
+        )
+        .0,
+        200
+    );
+    assert_eq!(
+        send(
+            addr,
+            "POST",
+            "/sql",
+            "CREATE VIEW on_app AS SELECT amount, channel FROM orders WHERE channel = 'app'"
+        )
+        .0,
+        200
+    );
+
+    // Each on its own: 3 big spenders, 2 on the app.
+    let (status, body) =
+        send(addr, "POST", "/sql", "SELECT count(*) FROM orders WHERE SEGMENT(big_spenders)");
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body, r#"{"columns":["count"],"rows":[[3]]}"#);
+
+    let (_, body) = send(addr, "POST", "/sql", "SELECT count(*) FROM orders WHERE SEGMENT(on_app)");
+    assert_eq!(body, r#"{"columns":["count"],"rows":[[2]]}"#);
+
+    // **The intersection**: order 4 alone is both. One `Matches::and`.
+    let (_, body) = send(
+        addr,
+        "POST",
+        "/sql",
+        "SELECT count(*) FROM orders WHERE SEGMENT(big_spenders) AND SEGMENT(on_app)",
+    );
+    assert_eq!(body, r#"{"columns":["count"],"rows":[[1]]}"#);
+
+    // **The subtraction**: big spenders not on the app are orders 3 and 5. One `Matches::andnot`,
+    // which is the `Difference` the lowering already emits for `AND NOT`.
+    let (_, body) = send(
+        addr,
+        "POST",
+        "/sql",
+        "SELECT count(*) FROM orders WHERE SEGMENT(big_spenders) AND NOT SEGMENT(on_app)",
+    );
+    assert_eq!(body, r#"{"columns":["count"],"rows":[[2]]}"#);
+
+    // **The union**: orders 2, 3, 4 and 5.
+    let (_, body) = send(
+        addr,
+        "POST",
+        "/sql",
+        "SELECT count(*) FROM orders WHERE SEGMENT(big_spenders) OR SEGMENT(on_app)",
+    );
+    assert_eq!(body, r#"{"columns":["count"],"rows":[[4]]}"#);
+
+    // A segment beside an ordinary predicate, which is the point of it being a term rather than
+    // a statement: orders 3 and 5 are big spenders on the web.
+    let (_, body) = send(
+        addr,
+        "POST",
+        "/sql",
+        "SELECT count(*) FROM orders WHERE SEGMENT(big_spenders) AND channel = 'web'",
+    );
+    assert_eq!(body, r#"{"columns":["count"],"rows":[[2]]}"#);
+
+    // And it answers any question, not only a count - a segment narrows the records and changes
+    // nothing else about the statement.
+    let (_, body) = send(
+        addr,
+        "POST",
+        "/sql",
+        "SELECT channel, count(*) FROM orders WHERE SEGMENT(big_spenders) GROUP BY channel",
+    );
+    assert_eq!(body, r#"{"columns":["channel","count"],"rows":[["app",1],["web",2]]}"#);
+}
+
+/// What a segment refuses, and why each is about the set rather than about the syntax.
+#[test]
+fn a_segment_refuses_a_view_that_is_not_a_set_of_this_statements_records() {
+    let addr = spawn(9);
+    assert_eq!(send(addr, "POST", "/table/orders", "").0, 200);
+    assert_eq!(send(addr, "POST", "/table/orders/field/amount?kind=int&bit_depth=32", "").0, 200);
+    assert_eq!(send(addr, "POST", "/table/shops", "").0, 200);
+    assert_eq!(send(addr, "POST", "/table/shops/field/staff?kind=int&bit_depth=16", "").0, 200);
+    assert_eq!(
+        send(addr, "POST", "/sql", "CREATE VIEW busy AS SELECT staff FROM shops WHERE staff >= 5")
+            .0,
+        200
+    );
+    assert_eq!(
+        send(addr, "POST", "/sql", "CREATE VIEW everyone AS SELECT amount FROM orders").0,
+        200
+    );
+
+    // A segment over a table this statement does not read.
+    let (status, body) =
+        send(addr, "POST", "/sql", "SELECT count(*) FROM orders WHERE SEGMENT(busy)");
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("sql_segment_table"), "{body}");
+
+    // A view with no `WHERE` selects every record, so there is no set for it to be.
+    let (status, body) =
+        send(addr, "POST", "/sql", "SELECT count(*) FROM orders WHERE SEGMENT(everyone)");
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("sql_segment_table"), "{body}");
+
+    // A name that is no view at all.
+    let (status, body) =
+        send(addr, "POST", "/sql", "SELECT count(*) FROM orders WHERE SEGMENT(nope)");
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("sql_segment_table"), "{body}");
+}

@@ -852,3 +852,17 @@ error
 SELECT count(*) FROM t WHERE amount IN (SELECT _record_id FROM u LIMIT 10)
 ----
 sql_unsupported
+
+## A segment is a named `WHERE` over one table, and expanding one needs the catalog the view is
+## stored in. This translation has none - which is what makes every case in this file a parser
+## test - so a statement naming a segment is refused here and substituted by a server.
+
+error
+SELECT count(*) FROM t WHERE SEGMENT(big_spenders)
+----
+sql_segment_unexpanded
+
+error
+SELECT count(*) FROM t WHERE amount > 5 AND NOT SEGMENT(churned)
+----
+sql_segment_unexpanded
