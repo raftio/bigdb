@@ -5,10 +5,16 @@
 # stable code and a sentence saying what exists instead. The codes are what a client branches
 # on, so they are what this file pins; the sentences are checked where they are written.
 #
-# The reasons have collapsed into a few. Outer joins, rows of a join, window functions,
-# `groupArray`, `SELECT *` with values - every one of them asks for **a row**, and a record here
-# is a set of bits at `(row, record)` with no row of values to hand back. That is not
-# engineering time; it is the shape of the index.
+# The reasons have collapsed into a few. Rows of a join, window functions, `groupArray`,
+# `SELECT *` with values - every one of them asks for **a row**, and a record here is a set of
+# bits at `(row, record)` with no row of values to hand back. That is not engineering time; it is
+# the shape of the index.
+#
+# An outer join used to be on that list and is not any more, which is worth saying out loud: it
+# reads as a row with half of it nulled out, but what it *is* is a side that stops removing keys
+# from the space, and a missing side multiplying by one. That is the same arithmetic the inner
+# join already was. What is still refused is a `FULL` mixed with any other kind, because one flag
+# per side cannot tell that nesting apart from the union of every side.
 
 ## A join is one equality between two keyed columns two tables share.
 
@@ -18,8 +24,8 @@ SELECT count(*) FROM t, u
 sql_no_joins
 
 # A cross join and a natural join name no key to pair on, which is what a comma between tables
-# is - so they carry that refusal rather than the outer join one, whose sentence is about
-# producing a row for a record with no partner.
+# is - so they carry that refusal rather than the outer join one, which is about which sides of a
+# key space have to match.
 error
 SELECT count(*) FROM t CROSS JOIN u
 ----
@@ -49,17 +55,7 @@ SELECT count(*) FROM t JOIN u ON t.category = v.category JOIN v ON t.category = 
 sql_join_condition
 
 error
-SELECT count(*) FROM t LEFT JOIN u ON t.category = u.category
-----
-sql_no_outer_joins
-
-error
-SELECT count(*) FROM t RIGHT JOIN u ON t.category = u.category
-----
-sql_no_outer_joins
-
-error
-SELECT count(*) FROM t FULL OUTER JOIN u ON t.category = u.category
+SELECT count(*) FROM t JOIN u ON t.category = u.category FULL JOIN v ON t.category = v.category
 ----
 sql_no_outer_joins
 
@@ -834,3 +830,25 @@ error
 SELECT count(*) FROM tx WHERE date_trunc('month', seen) = '2024-01-01'
 ----
 sql_scalar_in_filter
+
+## A semi-join narrows one table by the record ids another table's `WHERE` selected. Two things
+## about it are refused, and both are about the ids rather than about the syntax.
+
+## The inner select may only ask for `_record_id`: a record id is the only thing one table can
+## hold about another's records, and every other select list asks for a number or a value that
+## the outer column could not be one of.
+
+error
+SELECT count(*) FROM t WHERE amount IN (SELECT country FROM u)
+----
+sql_unsupported
+
+error
+SELECT count(*) FROM t WHERE amount IN (SELECT _record_id FROM u GROUP BY country)
+----
+sql_unsupported
+
+error
+SELECT count(*) FROM t WHERE amount IN (SELECT _record_id FROM u LIMIT 10)
+----
+sql_unsupported

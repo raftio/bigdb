@@ -35,7 +35,9 @@ use super::cond::rows;
 use super::measure::{field_measured, having_tree, measure_of, names, Measure};
 use super::pql::{as_expr, call, call_of, field_arg, named};
 use super::{answer, Calls, Statement, MAX_CALLS};
-use crate::ast::{Agg, Cond, HavingAgg, Item, Join, Name, OrderKey, Proj, Select, Source};
+use crate::ast::{
+    Agg, Cond, HavingAgg, Item, Join, JoinKind, Name, OrderKey, Proj, Select, Source,
+};
 use crate::error::{Refused, Result, SqlError};
 use crate::shape::{
     Cell, Cut, GroupOrder, Having, JoinSide, Keying, Of, OrderBy, Pairing, Shape, Units,
@@ -95,6 +97,38 @@ impl<'a> Scope<'a> {
         }
         Ok(())
     }
+}
+
+/// Which sides a key has to be held by for it to be a row, one per table in `FROM` order.
+///
+/// **An outer join is a side that stops removing keys from the space, and nothing else.** Each
+/// `JOIN` decides this for the table it brings in, and `RIGHT` additionally clears it for every
+/// table already in scope - which is what "all the rows of the right-hand side" means once the
+/// rows are keys. The flat list represents `INNER`, `LEFT` and `RIGHT` in any mixture exactly,
+/// because each of those only ever *removes* a requirement from a side already in scope.
+///
+/// `FULL` is the one that does not compose. `(a JOIN b) FULL JOIN c` is the keys `a` and `b`
+/// share, unioned with `c`'s - and a flat list of three optional sides says the union of all
+/// three instead, which is a larger space and a wrong number. So a `FULL` is answered only when
+/// every join in the statement is one, where the flat list and the nesting agree.
+fn required_sides(joins: &[Join], width: usize, at: usize) -> Result<Vec<bool>> {
+    let fulls = joins.iter().filter(|j| matches!(j.kind, JoinKind::Full)).count();
+    if fulls != 0 && fulls != joins.len() {
+        let at = joins.iter().find(|j| !matches!(j.kind, JoinKind::Full)).map_or(at, |j| j.at);
+        return Err(SqlError::Refused { what: Refused::OuterJoin, at });
+    }
+    let mut required = vec![true; width];
+    for (n, join) in joins.iter().enumerate() {
+        let new = n + 1;
+        match join.kind {
+            // The default, and the only kind that leaves every side as it found it.
+            JoinKind::Inner => {}
+            JoinKind::Left => required[new] = false,
+            JoinKind::Right => required[..new].fill(false),
+            JoinKind::Full => required[..=new].fill(false),
+        }
+    }
+    Ok(required)
 }
 
 /// One key column per table, which is what makes several joins a star rather than a chain.
@@ -179,6 +213,19 @@ pub(super) fn joined(
     let rows_of: Vec<Expr> =
         conds.iter().map(|c| c.as_ref().map_or_else(|| call("All", vec![]), rows)).collect();
 
+    // **A `WHERE` on an optional side makes it required, and that is SQL's own rule rather than
+    // a simplification.** The rows an outer join adds are null on that side, so any predicate
+    // about one of its columns is false there and drops them - which is the difference between
+    // `LEFT JOIN u ON … WHERE u.x = 1` and the same predicate written in the `ON`. The one
+    // exception everywhere else is `IS NULL`, the anti-join idiom, and this surface has no
+    // nulls to write it with - see [`Refused::Null`] - so there is no case left to get wrong.
+    let mut required = required_sides(&select.joins, scope.sources.len(), at)?;
+    for (side, cond) in conds.iter().enumerate() {
+        if cond.is_some() {
+            required[side] = true;
+        }
+    }
+
     let mut calls = Calls::new(at);
     // The plans whose keys are the join. Pushed first and unconditionally, in `FROM` order: they
     // are what says which keys are in it, and every cell is arithmetic against them.
@@ -248,9 +295,10 @@ pub(super) fn joined(
                 sides: sides
                     .counts
                     .iter()
-                    .map(|plan| JoinSide {
+                    .zip(&required)
+                    .map(|(plan, required)| JoinSide {
                         keyed: Keying::By { plan: *plan, axis: 0 },
-                        required: true,
+                        required: *required,
                     })
                     .collect(),
                 cells,
@@ -535,6 +583,10 @@ fn touches(cond: &Cond, scope: &Scope<'_>, at: usize) -> Result<u32> {
         | Cond::In { field, .. }
         | Cond::Between { field, .. }
         | Cond::Like { field, .. } => 1 << scope.side(field, at)?,
+        // A semi-join term names the *outer* column, and the table inside it is not one of the
+        // join's sides at all - it is a set this term is narrowed by. So the side is the one
+        // the column belongs to, exactly as it is for every other predicate.
+        Cond::InRecords { field, .. } => 1 << scope.side(field, at)?,
     })
 }
 

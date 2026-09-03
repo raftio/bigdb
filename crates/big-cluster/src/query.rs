@@ -321,6 +321,25 @@ impl<P: PagerMut + Sync> Cluster<P> {
             big_embed::Sql::Explain { mode, inner } => return self.sql_explain(mode, *inner),
             big_embed::Sql::Query(s) => s,
         };
+        let started = Instant::now();
+        // **The semi-joins first, and they fan out like everything else - which is the whole
+        // reason they are here rather than in a plan.** `IN (SELECT _record_id FROM b ...)`
+        // narrows this table by the ids `b` holds, and a per-node share of those ids would
+        // narrow one node's records by a fraction of the set: a smaller answer that looks
+        // exactly like a correct one. So the inner set is fanned out and merged in full before
+        // the outer call is planned, the same way a join's arithmetic waits for both sides.
+        let mut statement = statement;
+        big_embed::resolve_sets(
+            &mut statement.calls,
+            |t, c| self.api.plan_call(t, c).map_err(ClusterError::Local),
+            |p| self.execute(p, &big_embed::remaining(opts, started)),
+            |_, _| {
+                ClusterError::Local(big_embed::ApiError::Sql(big_embed::SqlError::Refused {
+                    what: big_embed::Refused::SetTooLarge,
+                    at: 0,
+                }))
+            },
+        )?;
         let (plans, probes, answer) = self.api.plan_statement(statement)?;
         // One fan-out and one merge per plan, each exactly the fan-out and merge that plan
         // would have got written on its own. A statement that asks two questions costs two
@@ -329,7 +348,6 @@ impl<P: PagerMut + Sync> Cluster<P> {
         // The timeout bounds the statement rather than each plan in it, which matters more here
         // than it does un-clustered: what is being held is a worker on every owner, not only on
         // this node. See `big_embed::remaining`.
-        let started = Instant::now();
         let mut values = Vec::with_capacity(plans.len());
         for plan in &plans {
             values.push(self.execute(plan, &big_embed::remaining(opts, started))?);
@@ -367,6 +385,20 @@ impl<P: PagerMut + Sync> Cluster<P> {
         // it resolves, and hands over.
         let (planned, format) = match inner {
             big_embed::Sql::Query(statement) => {
+                // **A semi-join has no plan to draw until it has run, and this says so rather
+                // than drawing a different one.** The outer call is narrowed by the ids the
+                // inner set holds, so its tree is not a fact about the statement - it is a fact
+                // about the other table's contents at the moment it was asked. Standing in an
+                // `All()` would print a tree that is never the one that runs, and running the
+                // inner set would break the one promise an `EXPLAIN` makes.
+                if statement.calls.iter().any(|a| big_embed::has_set(&a.call)) {
+                    return Err(ClusterError::Local(big_embed::ApiError::Sql(
+                        big_embed::SqlError::Refused {
+                            what: big_embed::Refused::ExplainSet,
+                            at: 0,
+                        },
+                    )));
+                }
                 let (plans, probes, answer) = self.api.plan_statement(statement)?;
                 // A search's records are an ordinary call, resolved so the tree under it is the
                 // one the search would actually walk. Without this a statement that is only a

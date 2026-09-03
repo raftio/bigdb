@@ -406,14 +406,26 @@ impl<'a> Reader<'a> {
         Self { sides, by_plan }
     }
 
-    /// The points of the join: the keys every side holds, in key order.
+    /// The points of the join: the keys every *required* side holds, in key order.
     ///
-    /// A `BTreeMap`'s keys are already sorted, so the intersection comes out sorted too - which
-    /// the ordering and the cut both rely on.
+    /// **This is where inner and outer differ, and it is the only place either word appears.**
+    /// A point is a row of the join when every required side holds it; a side that need not
+    /// match cannot remove one. With no side required at all - a `FULL JOIN` - there is nothing
+    /// left to intersect, and the space is every key any side holds.
+    ///
+    /// A `BTreeMap`'s keys are already sorted, so both the intersection and the union come out
+    /// sorted - which the ordering and the cut both rely on.
     fn row_space(&self) -> Vec<Point<'a>> {
-        let sides: Vec<&ByKey<'a>> =
-            self.sides.iter().filter_map(|s| self.by_plan.get(&s.keyed.plan())).collect();
-        let Some((first, rest)) = sides.split_first() else { return Vec::new() };
+        let of = |s: &JoinSide| self.by_plan.get(&s.keyed.plan());
+        let required: Vec<&ByKey<'a>> =
+            self.sides.iter().filter(|s| s.required).filter_map(of).collect();
+        // No side required: the union, which a `BTreeSet` keeps in the same order the
+        // intersection below comes out in.
+        let Some((first, rest)) = required.split_first() else {
+            let keys: std::collections::BTreeSet<&str> =
+                self.sides.iter().filter_map(of).flat_map(|m| m.keys().copied()).collect();
+            return keys.into_iter().map(Point::One).collect();
+        };
         first
             .keys()
             .copied()
@@ -433,8 +445,18 @@ impl<'a> Reader<'a> {
     /// The one function every kind of side goes through: the number it multiplies into the
     /// product, or `None` where the side holds nothing there. Today every side is keyed on the
     /// one axis, so this is a lookup - which is the point of naming it rather than inlining it.
+    ///
+    /// **A side that is not required contributes one where it holds nothing**, because that is
+    /// exactly what an outer join produces there: one row, with that side's columns null. One
+    /// is the identity of the product, so an unmatched optional side leaves every other side's
+    /// number standing - and it is not `None`, which is what would drop the point.
     fn side_num(&self, side: usize, at: Point<'_>) -> Option<Num> {
-        self.num(self.sides.get(side)?.keyed.plan(), at)
+        let side = self.sides.get(side)?;
+        match self.num(side.keyed.plan(), at) {
+            Some(n) => Some(n),
+            None if !side.required => Some(Num::Int(1)),
+            None => None,
+        }
     }
 
     /// One number a join's cell holds: at one point, or folded over the whole space.
@@ -498,7 +520,15 @@ impl<'a> Reader<'a> {
         if side >= self.sides.len() {
             return None;
         }
-        let mine = self.num(plan, at)?;
+        // **Which plan this is decides what a missing number means.** A side's own count at a
+        // point it does not hold is the one null-filled partner an outer join puts there, and
+        // that is one. Any *other* plan of that side is an aggregate over records that do not
+        // exist - `sum` of nothing, `min` of nothing - which is null and stays null.
+        let mine = if plan == self.sides.get(side)?.keyed.plan() {
+            self.side_num(side, at)?
+        } else {
+            self.num(plan, at)?
+        };
         match how {
             // Every record on one side pairs with every record on every other, at this point.
             // Checked, because sixteen sides of counts is a product `i128` need not hold - and

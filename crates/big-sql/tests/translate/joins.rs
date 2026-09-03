@@ -124,3 +124,84 @@ fn a_join_groups_by_its_key_and_nothing_else() {
         "sql_unsupported"
     );
 }
+
+/// The sides of a join, as the shape says whether each one has to match.
+fn required_of(sql: &str) -> Vec<bool> {
+    let s = translate(sql).unwrap();
+    let Shape::Join { sides, .. } = &s.answer.shape else { panic!("expected a join") };
+    sides.iter().map(|s| s.required).collect()
+}
+
+/// **An outer join is one flag per side, and the plans below it do not change at all.**
+///
+/// Each side is still the ordinary grouping it would have been written alone; what `LEFT` says
+/// is that a key the right side is missing is still a row, which is a fact about the key space
+/// and is settled after the merge. That is why this costs a word in the shape rather than a
+/// second lowering.
+#[test]
+fn an_outer_join_changes_which_sides_must_match_and_nothing_below_it() {
+    let inner = "SELECT count(*) FROM t JOIN u ON t.category = u.category";
+    let left = "SELECT count(*) FROM t LEFT JOIN u ON t.category = u.category";
+
+    assert_eq!(required_of(inner), vec![true, true]);
+    assert_eq!(required_of(left), vec![true, false]);
+    // The same two calls, spelled the same way, for both.
+    assert_eq!(resolved(left, 0), resolved(inner, 0));
+    assert_eq!(resolved(left, 1), resolved(inner, 1));
+}
+
+#[test]
+fn right_clears_every_side_already_in_scope_and_full_clears_them_all() {
+    assert_eq!(
+        required_of("SELECT count(*) FROM t RIGHT JOIN u ON t.category = u.category"),
+        vec![false, true]
+    );
+    assert_eq!(
+        required_of("SELECT count(*) FROM t FULL OUTER JOIN u ON t.category = u.category"),
+        vec![false, false]
+    );
+    // A star of three, joined in one at a time: `RIGHT` is about every table written before it,
+    // which is what "all the rows of the right-hand side" means once the rows are keys.
+    assert_eq!(
+        required_of(
+            "SELECT count(*) FROM t JOIN u ON t.category = u.category \
+             RIGHT JOIN v ON t.category = v.category"
+        ),
+        vec![false, false, true]
+    );
+    // A `LEFT` only ever excuses the table it brings in, so an inner join after one still has
+    // to match.
+    assert_eq!(
+        required_of(
+            "SELECT count(*) FROM t LEFT JOIN u ON t.category = u.category \
+             JOIN v ON t.category = v.category"
+        ),
+        vec![true, false, true]
+    );
+}
+
+/// **A `WHERE` on an optional side makes it required, which is SQL's own rule.**
+///
+/// The rows an outer join adds are null on that side, so a predicate about one of its columns
+/// is false there and drops them - the difference between putting a condition in the `WHERE`
+/// and putting it in the `ON`. The one thing that would escape this is `IS NULL`, and there are
+/// no nulls here to write it with.
+#[test]
+fn a_where_on_an_optional_side_makes_it_required_again() {
+    assert_eq!(
+        required_of(
+            "SELECT count(*) FROM t a LEFT JOIN u b ON a.category = b.category \
+             WHERE b.amount > 5"
+        ),
+        vec![true, true]
+    );
+    // A predicate on the required side leaves the optional one optional: it narrows which of
+    // the left's records are there, not whether an unmatched key is a row.
+    assert_eq!(
+        required_of(
+            "SELECT count(*) FROM t a LEFT JOIN u b ON a.category = b.category \
+             WHERE a.amount > 5"
+        ),
+        vec![true, false]
+    );
+}

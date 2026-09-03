@@ -43,6 +43,10 @@ pub enum Refused {
     Ambiguous,
     /// A `WHERE` term that names two of a join's tables where they cannot be separated.
     JoinFilter,
+    /// A semi-join whose inner set is larger than the union it would expand into.
+    SetTooLarge,
+    /// `EXPLAIN` over a statement containing a semi-join.
+    ExplainSet,
     /// A subquery, a CTE, or `UNION` between two selects.
     Subquery,
     /// A `HAVING` that names an aggregate the answer does not carry.
@@ -180,7 +184,7 @@ impl Refused {
     /// Kept honest by [`Refused::rank`] below, whose exhaustive match will not compile until a
     /// new variant is named - and by a test asserting that every rank appears here exactly once,
     /// which is what catches naming one and forgetting to add it.
-    pub const ALL: [Self; 49] = [
+    pub const ALL: [Self; 51] = [
         Self::Joins,
         Self::OuterJoin,
         Self::JoinOn,
@@ -215,6 +219,8 @@ impl Refused {
         Self::TruncUnit,
         Self::Interval,
         Self::ScalarFilter,
+        Self::SetTooLarge,
+        Self::ExplainSet,
         Self::Constraint,
         Self::DecimalScale,
         Self::BitDepth,
@@ -290,6 +296,8 @@ impl Refused {
             Self::TruncUnit => 45,
             Self::Interval => 46,
             Self::ScalarFilter => 47,
+            Self::SetTooLarge => 49,
+            Self::ExplainSet => 50,
         }
     }
 
@@ -300,6 +308,8 @@ impl Refused {
     /// the same rule `PlanError` applies to its four parse variants.
     pub fn code(self) -> &'static str {
         match self {
+            Self::SetTooLarge => "sql_set_too_large",
+            Self::ExplainSet => "sql_explain_set",
             Self::Joins => "sql_no_joins",
             Self::OuterJoin => "sql_no_outer_joins",
             Self::JoinOn => "sql_join_condition",
@@ -370,10 +380,11 @@ impl Refused {
                  pass over the second per value of the first"
             }
             Self::OuterJoin => {
-                "only an inner join is answered. An outer join has to produce a row for a \
-                 record with no partner, and what this engine computes about a join is \
-                 arithmetic over the records each key holds on both sides - there is no row to \
-                 null out half of"
+                "`LEFT`, `RIGHT` and `FULL` are answered, but a `FULL JOIN` only where every \
+                 join in the statement is one. `(a JOIN b) FULL JOIN c` pairs on the keys `a` \
+                 and `b` share unioned with `c`'s, and what this engine carries is one flag per \
+                 side saying whether it has to match - which cannot tell that nesting from the \
+                 union of all three. Write the full join over one pair of tables"
             }
             Self::JoinOn => {
                 "a join is one equality between two keyed columns, as `ON a.k = b.k`, \
@@ -397,6 +408,18 @@ impl Refused {
                 "a `WHERE` over a join is each table's own conditions, combined with `AND`. A \
                  term that names two of them under `OR` or `NOT` selects records neither side \
                  can be filtered to on its own"
+            }
+            Self::ExplainSet => {
+                "a statement with `IN (SELECT ...)` has no plan until it has run: the outer \
+                 call is narrowed by the ids the inner set holds, so its tree is a fact about \
+                 the other table's contents rather than about the statement. Explaining the \
+                 inner set on its own says everything that is fixed about it"
+            }
+            Self::SetTooLarge => {
+                "`IN (SELECT _record_id FROM ...)` narrows a bit-sliced column by the ids the \
+                 inner set holds, and that is one equality per id - each of them a read per bit \
+                 plane. A set this large is a scan wearing a `WHERE`, so it is refused with the \
+                 number rather than answered slowly. Narrow the inner `WHERE`"
             }
             Self::Subquery => {
                 "subqueries, CTEs and `UNION` between selects are not supported; a set of \

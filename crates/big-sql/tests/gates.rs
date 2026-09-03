@@ -93,7 +93,7 @@ fn every_refusal_is_reached_by_a_statement_in_the_corpus() {
     /// because it was the refusal a window earned before the planner had a field class that
     /// could tell a set from a time quantum, and the window it refused is now answered. This
     /// gate found that, and the variant is gone.
-    const EXCUSED: [(&str, &str); 4] = [
+    const EXCUSED: [(&str, &str); 6] = [
         ("sql_insert_too_large", "needs 10,001 tuples; covered in tests/translate/writes.rs"),
         // The two refusals a view is expanded into. `translate` holds no catalog - which is
         // what makes every test in this crate a parser test - so no statement here can reach a
@@ -105,6 +105,11 @@ fn every_refusal_is_reached_by_a_statement_in_the_corpus() {
         // accepts every `EXPLAIN` the dialect has - that is the whole point of the wrapper - so
         // no statement here can reach the one refusal that is about which surface was asked.
         ("sql_explain_rows", "raised in big-embed::plan_sql_in; covered in big-embed/tests/sql.rs"),
+        // The two a semi-join earns, and both need the other table to have answered. How many
+        // ids came back is a fact about that table's contents, not about the text, so neither
+        // can be reached by a statement alone.
+        ("sql_set_too_large", "needs the inner set to have run; covered in big-http/tests/sql.rs"),
+        ("sql_explain_set", "needs a resolved statement; covered in big-http/tests/sql.rs"),
     ];
 
     let reached: BTreeSet<&str> = statements()

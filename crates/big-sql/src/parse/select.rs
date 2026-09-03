@@ -16,7 +16,7 @@
 
 use super::Parser;
 use crate::ast::{
-    Cond, Having, HavingAgg, HavingOperand, Join, Order, OrderKey, Proj, Select, Source,
+    Cond, Having, HavingAgg, HavingOperand, Join, JoinKind, Order, OrderKey, Proj, Select, Source,
 };
 use crate::error::{Refused, Result, SqlError};
 use crate::lex::Tok;
@@ -247,19 +247,37 @@ impl Parser<'_> {
     /// One `JOIN`, or nothing when the next word does not begin one.
     fn join(&mut self) -> Result<Option<Join>> {
         let at = self.at();
-        for kw in ["LEFT", "RIGHT", "FULL"] {
-            if self.word_is(kw) {
-                return Err(self.refuse(Refused::OuterJoin));
-            }
-        }
         for kw in ["CROSS", "NATURAL"] {
             if self.word_is(kw) {
                 return Err(self.refuse(Refused::Joins));
             }
         }
-        self.eat_word("INNER");
-        if !self.eat_word("JOIN") {
-            return Ok(None);
+        // **An outer join names a key and asks which sides have to hold it**, which is a fact
+        // about the key space rather than a second kind of answer - so it is one word here and
+        // one flag per side in the shape. `OUTER` is noise in all three spellings: it says
+        // what `LEFT`, `RIGHT` and `FULL` already say.
+        let kind = if self.eat_word("LEFT") {
+            self.eat_word("OUTER");
+            JoinKind::Left
+        } else if self.eat_word("RIGHT") {
+            self.eat_word("OUTER");
+            JoinKind::Right
+        } else if self.eat_word("FULL") {
+            self.eat_word("OUTER");
+            JoinKind::Full
+        } else {
+            self.eat_word("INNER");
+            JoinKind::Inner
+        };
+        // After one of those three words a `JOIN` is the only thing that can follow, so it is
+        // expected rather than peeked at: returning `None` here would leave the word eaten and
+        // the clause silently skipped.
+        if matches!(kind, JoinKind::Inner) {
+            if !self.eat_word("JOIN") {
+                return Ok(None);
+            }
+        } else {
+            self.expect_word("JOIN", "JOIN after the kind of join")?;
         }
         let source = self.source("a table name after JOIN")?;
         if self.word_is("USING") {
@@ -278,7 +296,7 @@ impl Parser<'_> {
         if self.word_is("AND") || self.word_is("OR") {
             return Err(self.refuse(Refused::JoinOn));
         }
-        Ok(Some(Join { source, left, right, at }))
+        Ok(Some(Join { kind, source, left, right, at }))
     }
 
     pub(super) fn order(&mut self) -> Result<Order> {

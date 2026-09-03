@@ -141,6 +141,142 @@ pub fn remaining(opts: &QueryOptions, started: Instant) -> QueryOptions {
     }
 }
 
+/// The most record ids a semi-join expands into before it is refused.
+///
+/// **The cost of this expansion is the number of ids, and it is paid in bit-plane reads.** The
+/// outer column is bit-sliced, so `b_id IN (…)` is a union of one equality per id, and each
+/// equality costs one read per plane. A set of a few thousand is a query; a set of a few million
+/// is a scan wearing a `WHERE`, and it is refused with the number rather than answered slowly.
+pub const MAX_SET: u64 = 4_096;
+
+/// Whether a call has a semi-join anywhere under it.
+///
+/// Its own function because two callers need the question and neither should have to know the
+/// name: `Api::sql` and the coordinator resolve one, and an `EXPLAIN` refuses one.
+pub fn has_set(call: &big_plan::ast::Call) -> bool {
+    fn walk(e: &big_plan::ast::Expr) -> bool {
+        match e {
+            big_plan::ast::Expr::Call(c) => c.name == "InRecords" || c.args.iter().any(walk),
+            big_plan::ast::Expr::Named { value, .. } => walk(value),
+            _ => false,
+        }
+    }
+    call.name == "InRecords" || call.args.iter().any(walk)
+}
+
+/// Answers the `InRecords` calls inside a statement, turning each into the union of ids it means.
+///
+/// **This is the one call that names a table other than its own, and it is resolved here rather
+/// than in a plan.** A record is a set of bits in one table and the ids in the outer column are
+/// coordinates in another, so the inner set has to be *fanned out and merged in full* before the
+/// outer question can be asked: a per-node answer is a share of the set, and narrowing one node's
+/// records by another node's share of the ids is a smaller answer that looks exactly like a
+/// correct one. The same argument a join's arithmetic makes, one step earlier.
+///
+/// Planning and running are passed in for the reason [`run_probe`] takes them: the caller decides
+/// whether a step runs on this node or across every owner, and the resolution is the same either
+/// way. What it costs is one extra round trip per `IN (SELECT …)`, said in `EXPLAIN`.
+pub fn resolve_sets<E>(
+    calls: &mut [big_sql::lower::Ask],
+    plan_of: impl Fn(&str, &big_plan::ast::Call) -> core::result::Result<Plan, E>,
+    mut run: impl FnMut(&Plan) -> core::result::Result<Value, E>,
+    too_many: impl Fn(&str, u64) -> E,
+) -> core::result::Result<(), E> {
+    for ask in calls.iter_mut() {
+        let mut expr = big_plan::ast::Expr::Call(ask.call.clone());
+        resolve_expr(&mut expr, &plan_of, &mut run, &too_many)?;
+        ask.call = match expr {
+            big_plan::ast::Expr::Call(c) => c,
+            _ => unreachable!("an `InRecords` only ever replaces a call with a call"),
+        };
+    }
+    Ok(())
+}
+
+/// One expression, with every `InRecords` under it replaced by the ids it selected.
+fn resolve_expr<E>(
+    expr: &mut big_plan::ast::Expr,
+    plan_of: &impl Fn(&str, &big_plan::ast::Call) -> core::result::Result<Plan, E>,
+    run: &mut impl FnMut(&Plan) -> core::result::Result<Value, E>,
+    too_many: &impl Fn(&str, u64) -> E,
+) -> core::result::Result<(), E> {
+    use big_plan::ast::{Call, Expr, Literal};
+
+    let Expr::Call(call) = expr else {
+        if let Expr::Named { value, .. } = expr {
+            return resolve_expr(value, plan_of, run, too_many);
+        }
+        return Ok(());
+    };
+    if call.name != "InRecords" {
+        for arg in &mut call.args {
+            resolve_expr(arg, plan_of, run, too_many)?;
+        }
+        return Ok(());
+    }
+
+    // `InRecords(field=<column>, table='<db.table>', <the inner set>)`, in that order: the
+    // lowering is the only thing that builds one, so the shape is known rather than searched for.
+    let (mut field, mut table, mut inner) = (None, None, None);
+    for arg in std::mem::take(&mut call.args) {
+        match arg {
+            Expr::Named { name, value } if name == "field" => match *value {
+                Expr::Ident(f) => field = Some(f),
+                _ => return Ok(()),
+            },
+            Expr::Named { name, value } if name == "table" => match *value {
+                Expr::Literal(Literal::Str(t)) => table = Some(t),
+                _ => return Ok(()),
+            },
+            other => inner = Some(other),
+        }
+    }
+    let (Some(field), Some(table), Some(inner)) = (field, table, inner) else { return Ok(()) };
+
+    // Nested semi-joins resolve innermost first, which is the order they have to run in.
+    let mut inner = inner;
+    resolve_expr(&mut inner, plan_of, run, too_many)?;
+
+    // **The inner set is asked as itself.** A bitmap call with no aggregate around it is
+    // already a `Plan::Rows` to the planner, so there is no wrapper to add - which is the same
+    // reason a `WHERE` never grows one.
+    let Expr::Call(rows) = inner else { return Ok(()) };
+    let ids = match run(&plan_of(&table, &rows)?)? {
+        Value::Rows(m) => m,
+        // A bare bitmap call is the one thing the planner answers with a record set.
+        _ => unreachable!("the inner set of a semi-join is a `Plan::Rows`"),
+    };
+    if ids.cardinality() > MAX_SET {
+        return Err(too_many(&table, ids.cardinality()));
+    }
+
+    // **An empty set is an empty answer, not a missing filter.** `Union()` of nothing has no
+    // identity the planner will take, so it is written as the complement of everything - the
+    // one spelling of "no records" every plan already answers.
+    let terms: Vec<Expr> = ids
+        .records()
+        .map(|id| {
+            Expr::Call(Call {
+                name: "Row".to_string(),
+                args: vec![Expr::Compare {
+                    field: field.clone(),
+                    op: "=".to_string(),
+                    value: Literal::Int(id),
+                }],
+            })
+        })
+        .collect();
+    *expr = match terms.len() {
+        0 => Expr::Call(Call {
+            name: "Not".to_string(),
+            args: vec![Expr::Call(Call { name: "All".to_string(), args: Vec::new() })],
+        }),
+        1 => terms.into_iter().next().expect("just measured"),
+        _ => Expr::Call(Call { name: "Union".to_string(), args: terms }),
+    };
+    Ok(())
+}
+
 /// Runs one [`SqlProbe`] to convergence, given a way to plan and a way to run.
 ///
 /// **A quantile is a search, not a question.** No plan answers "the value at rank k"; what a
@@ -694,11 +830,37 @@ impl<P: PagerMut + Sync> Api<P> {
         // Against the request's database, so an unqualified name means what `?database=` said.
         // Taken from `opts` rather than from a second parameter because it belongs with the
         // other things that are true of the request and not of the text.
-        let (plans, probes, answer) = self.plan_sql_in(text, opts.database())?;
+        let started = Instant::now();
+        // **The semi-joins first, because a call that names another table cannot be planned
+        // until that table has answered.** Each is one extra round trip, and it is the whole
+        // cost of `IN (SELECT …)`: what comes back is a set of ids, and the outer call is
+        // narrowed by the union they mean.
+        let (plans, probes, answer) = match self.translate_in(text, opts.database())? {
+            big_sql::Sql::Query(mut statement) => {
+                {
+                    let catalog = self.db.catalog();
+                    let schema = big_exec::CatalogSchema(&catalog);
+                    resolve_sets(
+                        &mut statement.calls,
+                        |t, c| big_plan::plan(t, c, &schema).map_err(|e| ApiError::Query(e.into())),
+                        |p| self.execute(p, &remaining(opts, started)),
+                        |_, _| {
+                            ApiError::Sql(big_sql::SqlError::Refused {
+                                what: big_sql::Refused::SetTooLarge,
+                                at: 0,
+                            })
+                        },
+                    )?;
+                }
+                self.plan_statement(statement)?
+            }
+            // Every other statement has no calls to resolve, and says so through the same
+            // refusals `plan_sql_in` gives. Routed through it rather than repeated here.
+            _ => self.plan_sql_in(text, opts.database())?,
+        };
         // One answer per plan, in the order the shape names them. Run in sequence rather than
         // concurrently: each already fans out across every fragment this node holds, and a
         // second layer of parallelism would contend with the first for the same threads.
-        let started = Instant::now();
         let mut values = Vec::with_capacity(plans.len());
         for plan in &plans {
             values.push(self.execute(plan, &remaining(opts, started))?);

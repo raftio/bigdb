@@ -285,3 +285,44 @@ Join keys=(#0, #1) per_key
 ├── m = ratio(#2 / #0, #1)
 ├── order: ratio(#2 / #0, #1) desc
 └── cut: limit 3
+
+## An outer join is one flag per side and the same two plans.
+##
+## `#1?` is the whole difference: the right side need not hold a key for that key to be a row,
+## and where it holds none it contributes one null-filled partner. So `count(*)` over a
+## `LEFT JOIN` is the same product it always was, with `max(|B_s|, 1)` in place of `|B_s|`.
+
+plan
+SELECT count(*) FROM t LEFT JOIN u ON t.category = u.category
+----
+Distinct t.category
+└── all
+Distinct u.category
+└── all
+
+shape
+SELECT count(*) FROM t LEFT JOIN u ON t.category = u.category
+----
+Join keys=(#0, #1?)
+└── count = product(#0, #1)
+
+shape
+SELECT count(*) FROM t RIGHT OUTER JOIN u ON t.category = u.category
+----
+Join keys=(#0?, #1)
+└── count = product(#0, #1)
+
+shape
+SELECT count(*) FROM t FULL JOIN u ON t.category = u.category
+----
+Join keys=(#0?, #1?)
+└── count = product(#0, #1)
+
+## A `WHERE` about the optional side makes it required: the rows the outer join adds are null
+## there, so any predicate on one of its columns drops them.
+
+shape
+SELECT count(*) FROM t a LEFT JOIN u b ON a.category = b.category WHERE b.amount > 5
+----
+Join keys=(#0, #1)
+└── count = product(#0, #1)

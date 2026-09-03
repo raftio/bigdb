@@ -32,7 +32,13 @@ fn every_refusal_names_itself() {
         code("SELECT count(*) FROM t JOIN u ON t.a = u.a JOIN v ON u.b = v.b"),
         "sql_no_joins"
     );
-    assert_eq!(code("SELECT count(*) FROM t LEFT JOIN u ON t.a = u.a"), "sql_no_outer_joins");
+    // A `FULL` mixed with any other kind: `(t JOIN u) FULL JOIN v` pairs on the keys `t` and
+    // `u` share unioned with `v`'s, and one flag per side cannot tell that from the union of
+    // all three. Every other outer join is answered - see `joins.rs`.
+    assert_eq!(
+        code("SELECT count(*) FROM t JOIN u ON t.a = u.a FULL JOIN v ON t.a = v.a"),
+        "sql_no_outer_joins"
+    );
     // A cross join and a natural join name no key at all, which is what a comma between tables
     // is - so they get that refusal and not the outer join one, whose sentence is about
     // producing a row for a record with no partner.

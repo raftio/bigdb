@@ -349,6 +349,10 @@ fn remap_cond(cond: &mut Cond, exposed: &Exposed) -> Result<()> {
             remap_cond(b, exposed)
         }
         Cond::Not(a) => remap_cond(a, exposed),
+        // **Only the outer column goes through the view.** The filter inside a semi-join is
+        // written about the table it names, which this view exposes nothing of - renaming its
+        // columns here would rewrite one table's names with another's.
+        Cond::InRecords { field, .. } => exposed.rename(field),
         Cond::Cmp { field, .. }
         | Cond::In { field, .. }
         | Cond::Between { field, .. }
@@ -371,6 +375,11 @@ fn qualify_cond(cond: Cond, label: &str) -> Cond {
                 walk(b, label);
             }
             Cond::Not(a) => walk(a, label),
+            // The inner filter is left alone for the reason `remap_cond` leaves it alone: its
+            // bare names mean the table the semi-join reads, not the one being merged into.
+            Cond::InRecords { field, .. } => {
+                field.qualifier.get_or_insert_with(|| label.to_string());
+            }
             Cond::Cmp { field, .. }
             | Cond::In { field, .. }
             | Cond::Between { field, .. }

@@ -1329,3 +1329,211 @@ fn a_record_id_is_allocated_when_the_statement_does_not_name_one() {
     let (_, body) = send(addr, "POST", "/sql", "SELECT count(*) FROM t WHERE country = 'GB'");
     assert_eq!(body, r#"{"columns":["count"],"rows":[[1]]}"#);
 }
+
+/// An outer join over the same two tables, checked against the join written out by hand.
+///
+/// **The four numbers differ from each other and from the inner join, which is the test.**
+/// `orders` holds 3 records under `GB`, 1 under `US` and 1 under `FR`; `shops` holds 2 under
+/// `GB`, 2 under `US` and 1 under `DE`. The inner join is `3·2 + 1·2 = 8`. A `LEFT JOIN` keeps
+/// `FR` and gives it the one null-filled shop SQL puts there, so it is `8 + 1 = 9`; a `RIGHT`
+/// keeps `DE` on the same terms, also 9 but from the other end; a `FULL` keeps both, 10. An
+/// implementation that quietly answered the inner join would pass none of these.
+#[test]
+fn an_outer_join_keeps_the_keys_one_side_holds_alone() {
+    let addr = spawn(10);
+    assert_eq!(send(addr, "POST", "/table/orders", "").0, 200);
+    assert_eq!(send(addr, "POST", "/table/orders/field/country?kind=set", "").0, 200);
+    assert_eq!(send(addr, "POST", "/table/shops", "").0, 200);
+    assert_eq!(send(addr, "POST", "/table/shops/field/country?kind=set", "").0, 200);
+
+    assert_eq!(
+        send(
+            addr,
+            "POST",
+            "/table/orders/import",
+            "country 1 GB\ncountry 2 GB\ncountry 3 GB\ncountry 4 US\ncountry 5 FR\n",
+        )
+        .0,
+        200
+    );
+    assert_eq!(
+        send(
+            addr,
+            "POST",
+            "/table/shops/import",
+            "country 1 GB\ncountry 2 GB\ncountry 3 US\ncountry 4 US\ncountry 5 DE\n",
+        )
+        .0,
+        200
+    );
+
+    // 3·2 + 1·2 + 1·1 = 9. `FR` pairs with one null shop rather than with nothing.
+    let (status, body) = send(
+        addr,
+        "POST",
+        "/sql",
+        "SELECT count(*) FROM orders o LEFT JOIN shops s ON o.country = s.country",
+    );
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body, r#"{"columns":["count"],"rows":[[9]]}"#);
+
+    // The same arithmetic from the other end: `DE` is the shops' alone.
+    let (_, body) = send(
+        addr,
+        "POST",
+        "/sql",
+        "SELECT count(*) FROM orders o RIGHT JOIN shops s ON o.country = s.country",
+    );
+    assert_eq!(body, r#"{"columns":["count"],"rows":[[9]]}"#);
+
+    // Both unmatched keys: 6 + 2 + 1 + 1 = 10.
+    let (_, body) = send(
+        addr,
+        "POST",
+        "/sql",
+        "SELECT count(*) FROM orders o FULL OUTER JOIN shops s ON o.country = s.country",
+    );
+    assert_eq!(body, r#"{"columns":["count"],"rows":[[10]]}"#);
+
+    // Per key, where the unmatched one is visible as its own row rather than folded into a
+    // total: `FR` is 1, which is the left's own count times the one null partner.
+    let (_, body) = send(
+        addr,
+        "POST",
+        "/sql",
+        "SELECT o.country, count(*) FROM orders o LEFT JOIN shops s ON o.country = s.country \
+         GROUP BY o.country",
+    );
+    assert_eq!(body, r#"{"columns":["country","count"],"rows":[["FR",1],["GB",6],["US",2]]}"#);
+}
+
+/// A semi-join: one table narrowed by the set of record ids another table's `WHERE` selected.
+///
+/// **This is the join a bitmap engine is built for, and it costs one extra round trip.** The
+/// inner statement is an ordinary set of records - the same thing every `WHERE` already
+/// produces - and the outer column holds ids of those records, so what crosses between the two
+/// tables is a *set*, which is the one thing this engine merges natively. Nothing is grouped,
+/// nothing is paired, and no per-key counts travel.
+///
+/// `shops` records 1 and 2 are in `GB`, 3 and 4 in `US`. `orders` carries the shop it belongs
+/// to in `shop_id`: two orders at shop 1, one at shop 3, one at shop 4, and one at shop 9 which
+/// does not exist. So the `GB` shops hold 2 orders, the `US` ones 2, and the dangling one is in
+/// neither - which is what makes the three numbers below different from each other and from 5.
+#[test]
+fn a_semi_join_narrows_one_table_by_another_tables_record_ids() {
+    let addr = spawn(12);
+    assert_eq!(send(addr, "POST", "/table/shops", "").0, 200);
+    assert_eq!(send(addr, "POST", "/table/shops/field/country?kind=set", "").0, 200);
+    assert_eq!(send(addr, "POST", "/table/orders", "").0, 200);
+    assert_eq!(send(addr, "POST", "/table/orders/field/shop_id?kind=int&bit_depth=32", "").0, 200);
+    assert_eq!(send(addr, "POST", "/table/orders/field/amount?kind=int&bit_depth=32", "").0, 200);
+
+    assert_eq!(
+        send(
+            addr,
+            "POST",
+            "/table/shops/import",
+            "country 1 GB\ncountry 2 GB\ncountry 3 US\ncountry 4 US\n",
+        )
+        .0,
+        200
+    );
+    assert_eq!(
+        send(
+            addr,
+            "POST",
+            "/table/orders/import",
+            "shop_id 1 1\namount 1 100\nshop_id 2 1\namount 2 200\nshop_id 3 3\namount 3 300\n\
+             shop_id 4 4\namount 4 400\nshop_id 5 9\namount 5 500\n",
+        )
+        .0,
+        200
+    );
+
+    // Shops 1 and 2 are `GB`; orders 1 and 2 point at shop 1. Not 5, and not 4.
+    let (status, body) = send(
+        addr,
+        "POST",
+        "/sql",
+        "SELECT count(*) FROM orders \
+         WHERE shop_id IN (SELECT _record_id FROM shops WHERE country = 'GB')",
+    );
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body, r#"{"columns":["count"],"rows":[[2]]}"#);
+
+    // The other half, which a wrong implementation that ignored the inner `WHERE` would make
+    // equal to the first.
+    let (_, body) = send(
+        addr,
+        "POST",
+        "/sql",
+        "SELECT sum(amount) FROM orders \
+         WHERE shop_id IN (SELECT _record_id FROM shops WHERE country = 'US')",
+    );
+    assert_eq!(body, r#"{"columns":["sum"],"rows":[[700]]}"#);
+
+    // **`NOT IN` is the anti-join, and it comes free**: it is the `Not` a negated term already
+    // was. Order 5 points at a shop that does not exist, and orders 3 and 4 are at `US` shops.
+    let (_, body) = send(
+        addr,
+        "POST",
+        "/sql",
+        "SELECT count(*) FROM orders \
+         WHERE shop_id NOT IN (SELECT _record_id FROM shops WHERE country = 'GB')",
+    );
+    assert_eq!(body, r#"{"columns":["count"],"rows":[[3]]}"#);
+
+    // No inner `WHERE` is every record the table holds, which leaves the dangling id out.
+    let (_, body) = send(
+        addr,
+        "POST",
+        "/sql",
+        "SELECT count(*) FROM orders WHERE shop_id IN (SELECT _record_id FROM shops)",
+    );
+    assert_eq!(body, r#"{"columns":["count"],"rows":[[4]]}"#);
+}
+
+/// The two things a semi-join refuses, and both are about the ids rather than the text.
+///
+/// **Neither can be decided before the other table has answered**, which is why they are raised
+/// at the coordinator and not by `translate`. How many ids came back is a fact about that
+/// table's contents; whether the outer call has a tree to draw depends on the same thing.
+#[test]
+fn a_semi_join_refuses_a_set_too_large_to_expand_and_an_explain_of_one() {
+    let addr = spawn(6 + (big_embed::MAX_SET as usize + 2));
+    assert_eq!(send(addr, "POST", "/table/shops", "").0, 200);
+    assert_eq!(send(addr, "POST", "/table/shops/field/country?kind=set", "").0, 200);
+    assert_eq!(send(addr, "POST", "/table/orders", "").0, 200);
+    assert_eq!(send(addr, "POST", "/table/orders/field/shop_id?kind=int&bit_depth=32", "").0, 200);
+
+    // One more shop than the union will expand into.
+    let mut body = String::new();
+    for id in 1..=big_embed::MAX_SET + 1 {
+        body.push_str(&format!("country {id} GB\n"));
+    }
+    assert_eq!(send(addr, "POST", "/table/shops/import", &body).0, 200);
+    assert_eq!(send(addr, "POST", "/table/orders/import", "shop_id 1 1\n").0, 200);
+
+    let (status, body) = send(
+        addr,
+        "POST",
+        "/sql",
+        "SELECT count(*) FROM orders \
+         WHERE shop_id IN (SELECT _record_id FROM shops WHERE country = 'GB')",
+    );
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("sql_set_too_large"), "{body}");
+
+    // **An `EXPLAIN` says there is no plan rather than drawing a different one.** The outer
+    // call's tree depends on ids that do not exist until the inner set has run, and running it
+    // would break the one promise an explanation makes.
+    let (status, body) = send(
+        addr,
+        "POST",
+        "/sql",
+        "EXPLAIN SELECT count(*) FROM orders \
+         WHERE shop_id IN (SELECT _record_id FROM shops WHERE country = 'GB')",
+    );
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("sql_explain_set"), "{body}");
+}

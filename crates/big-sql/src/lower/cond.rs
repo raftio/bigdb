@@ -17,7 +17,7 @@
 //! Total: every shape the parser accepts has a set operation behind it, which is why nothing
 //! here returns a `Result`. Everything that does not was refused in the parser.
 
-use super::pql::{call, like, row, window};
+use super::pql::{call, field_arg, like, named, row, window};
 use crate::ast::{Cond, Name};
 use big_plan::ast::Expr;
 use big_plan::Literal;
@@ -36,6 +36,21 @@ pub(super) fn rows(cond: &Cond) -> Expr {
             [one] => row(field, "=", one.clone()),
             many => call("Union", many.iter().map(|v| row(field, "=", v.clone())).collect()),
         },
+
+        // **A call that names another table, which the coordinator answers before this one.**
+        // It is left standing here rather than expanded, because what it expands *to* is a
+        // union over the ids that came back - and those are not known until the inner set has
+        // been fanned out and merged. That is the same reason a join's arithmetic waits and a
+        // quantile's bound moves: an answer that needs another table's answer cannot be a leaf
+        // of one plan. See `big_embed::resolve_sets`.
+        Cond::InRecords { field, table, filter, .. } => call(
+            "InRecords",
+            vec![
+                field_arg(field),
+                named("table", Expr::Literal(Literal::Str(table.qualified()))),
+                filter.as_ref().map_or_else(|| call("All", vec![]), |c| rows(c)),
+            ],
+        ),
 
         // A pattern is the union of the keys that match it, worked out at the owner that holds
         // the dictionary. Nothing to build here: the whole of it is one call.
