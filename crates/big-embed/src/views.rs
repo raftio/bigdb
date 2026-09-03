@@ -369,6 +369,7 @@ fn remap_cond(cond: &mut Cond, exposed: &Exposed) -> Result<()> {
         Cond::Cmp { field, .. }
         | Cond::In { field, .. }
         | Cond::Between { field, .. }
+        | Cond::Rounded { field, .. }
         | Cond::Like { field, .. } => exposed.rename(field),
     }
 }
@@ -398,6 +399,7 @@ fn qualify_cond(cond: Cond, label: &str) -> Cond {
             Cond::Cmp { field, .. }
             | Cond::In { field, .. }
             | Cond::Between { field, .. }
+            | Cond::Rounded { field, .. }
             | Cond::Like { field, .. } => {
                 field.qualifier.get_or_insert_with(|| label.to_string());
             }

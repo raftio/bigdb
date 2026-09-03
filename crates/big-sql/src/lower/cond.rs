@@ -17,8 +17,8 @@
 //! Total: every shape the parser accepts has a set operation behind it, which is why nothing
 //! here returns a `Result`. Everything that does not was refused in the parser.
 
-use super::pql::{call, field_arg, like, named, row, window};
-use crate::ast::{Cond, Name};
+use super::pql::{call, field_arg, like, named, rounded, row, window};
+use crate::ast::{Cond, Name, Rounding};
 use big_plan::ast::Expr;
 use big_plan::Literal;
 
@@ -60,6 +60,17 @@ pub(super) fn rows(cond: &Cond) -> Expr {
         // A pattern is the union of the keys that match it, worked out at the owner that holds
         // the dictionary. Nothing to build here: the whole of it is one call.
         Cond::Like { field, pattern, fold } => like(field, pattern, *fold),
+
+        // Handed on with the rounding still on it: what it becomes depends on the field's scale,
+        // which is the planner's to know. See `crate::ast::Cond::Rounded`.
+        Cond::Rounded { field, round, op, value } => {
+            let (by, digits) = match round {
+                Rounding::Round { digits } => ("round", Some(*digits)),
+                Rounding::Floor => ("floor", None),
+                Rounding::Ceil => ("ceil", None),
+            };
+            rounded(field, by, digits, op, value.clone())
+        }
 
         Cond::Between { field, low, high } => {
             call("Intersect", vec![row(field, ">=", low.clone()), row(field, "<=", high.clone())])

@@ -624,4 +624,44 @@ pub enum Cond {
         /// The upper bound.
         high: Literal,
     },
+    /// `round(<column>, <digits>) <op> <value>`, and `floor`/`ceil`, in a `WHERE`.
+    ///
+    /// **Carried rather than rewritten, which is the opposite of what a rounded *date* does.**
+    /// A date's bounds are two written dates, and a written date means the same thing to a
+    /// column counting days and to one counting seconds - so the parser can compute them and
+    /// this dialect keeps one rewrite for both. A number's bounds are not like that:
+    /// `round(x, 2) > 5` is `x >= 5.01` on a `DECIMAL(10,2)`, `x >= 5.005` on a `DECIMAL(10,4)`,
+    /// `x >= 6` on an `INT`, and plain `x > 5` on a `SIGNED`, where rounding to two digits is
+    /// the identity. Every one of those is a different question, and which one it is depends on
+    /// the field's scale - so the term travels as written and the arithmetic happens in
+    /// `big_plan`, in the field's own units, where every bound comes out an exact integer.
+    Rounded {
+        /// The column.
+        field: Name,
+        /// Which rounding was written.
+        round: Rounding,
+        /// One of `=`, `!=`, `<`, `<=`, `>`, `>=`, already normalised by the lexer.
+        op: &'static str,
+        /// The value the rounded column is compared against, exactly as written.
+        value: Literal,
+    },
+}
+
+/// A rounding of a number that a `WHERE` can be answered through.
+///
+/// All three are non-decreasing, which is the property that matters: the values that round into
+/// one answer are contiguous, so the records behind it are a range rather than a scatter. `abs`
+/// is not on this list for exactly that reason.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Rounding {
+    /// `round(x)` and `round(x, digits)`: half away from zero, which is what a `DECIMAL` does
+    /// everywhere else in this engine.
+    Round {
+        /// Digits kept after the point. `round(x)` is `round(x, 0)`.
+        digits: u8,
+    },
+    /// `floor(x)`: the whole number at or below.
+    Floor,
+    /// `ceil(x)`: the whole number at or above.
+    Ceil,
 }

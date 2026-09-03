@@ -38,7 +38,7 @@
 //! planner's to check, and it still checks it.
 
 use super::Parser;
-use crate::ast::{Cond, Name};
+use crate::ast::{Cond, Name, Rounding};
 use crate::error::{Refused, Result};
 use crate::lex::Tok;
 use big_civil::Unit;
@@ -59,6 +59,12 @@ enum Round {
     /// January of every year answers `1` - so the values behind an answer are not contiguous and
     /// there is no range to rewrite them into. They keep the refusal.
     Year,
+    /// `round(<column>[, <digits>])`, `floor(<column>)`, `ceil(<column>)`.
+    ///
+    /// **Carried rather than computed here**, which is where a number parts company with a date.
+    /// See [`Cond::Rounded`] for why: a date's two bounds are written dates and mean the same
+    /// thing to either temporal class, while a number's depend on the field's scale.
+    Number(Rounding),
 }
 
 impl Round {
@@ -69,6 +75,12 @@ impl Round {
             }
             n if n.eq_ignore_ascii_case("toDate") => Self::Day,
             n if n.eq_ignore_ascii_case("toYear") => Self::Year,
+            // Digits are filled in below, where the second argument can be read.
+            n if n.eq_ignore_ascii_case("round") => Self::Number(Rounding::Round { digits: 0 }),
+            n if n.eq_ignore_ascii_case("floor") => Self::Number(Rounding::Floor),
+            n if n.eq_ignore_ascii_case("ceil") || n.eq_ignore_ascii_case("ceiling") => {
+                Self::Number(Rounding::Ceil)
+            }
             _ => return None,
         })
     }
@@ -83,6 +95,27 @@ impl Parser<'_> {
     pub(super) fn rounded(&mut self, name: &Name, at: usize) -> Result<Option<Cond>> {
         let Some(round) = Round::of(&name.column) else { return Ok(None) };
         self.i += 1;
+
+        // A number's rounding is read and handed on; only its digits are settled here, because
+        // only here is the second argument still in the text.
+        if let Round::Number(kind) = round {
+            let column = self.name("a column name")?;
+            let round = match (kind, self.eat(&Tok::Comma)) {
+                (Rounding::Round { .. }, true) => match self.literal("a number of digits")? {
+                    Literal::Int(d) if d <= u64::from(u8::MAX) => {
+                        Rounding::Round { digits: d as u8 }
+                    }
+                    _ => return Err(self.syntax("a number of digits")),
+                },
+                // `floor(x, 2)` is not a rounding this dialect has, and reading the argument as
+                // digits would answer a question nobody asked.
+                (_, true) => return Err(self.syntax(") to close the rounding")),
+                (kind, false) => kind,
+            };
+            self.expect(&Tok::RParen, ") to close the rounding")?;
+            let (op, value) = self.compared_against()?;
+            return Ok(Some(Cond::Rounded { field: column, round, op, value }));
+        }
 
         let (column, unit) = match round {
             Round::Trunc => {
@@ -100,19 +133,28 @@ impl Parser<'_> {
             }
             Round::Day => (self.name("a column name")?, Unit::Day),
             Round::Year => (self.name("a column name")?, Unit::Year),
+            Round::Number(_) => unreachable!("a number's rounding returned above"),
         };
         self.expect(&Tok::RParen, ") to close the rounding")?;
-
         let op_at = self.at();
+        let (op, value) = self.compared_against()?;
+
+        let bucket = self.bucket(unit, &value, matches!(round, Round::Year), op_at)?;
+        Ok(Some(bucket.compare(&column, op, op_at)?))
+    }
+
+    /// The `<op> <value>` a rounding is tested by.
+    ///
+    /// Only the six comparisons: a rounding is a value, and `IN`, `BETWEEN` and `LIKE` over one
+    /// would each be a second rewrite with its own edges to get wrong. They are refused as
+    /// syntax, which points at the word that was written.
+    fn compared_against(&mut self) -> Result<(&'static str, Literal)> {
         let Some(Tok::Op(op)) = self.peek() else {
             return Err(self.syntax("a comparison against the rounded value"));
         };
         let op = *op;
         self.i += 1;
-        let value = self.literal("a value to compare against")?;
-
-        let bucket = self.bucket(unit, &value, matches!(round, Round::Year), op_at)?;
-        Ok(Some(bucket.compare(&column, op, op_at)?))
+        Ok((op, self.literal("a value to compare against")?))
     }
 
     /// The half-open range of written values that round to the one compared against.

@@ -610,11 +610,18 @@ SELECT CASE amount WHEN 5 THEN 1 ELSE 0 END FROM t
 ----
 sql_unsupported
 
-## A scalar in a `WHERE` runs before there is anything to run it on - unchanged by the select
-## list gaining an evaluator.
+## A scalar in a `WHERE` runs before there is anything to run it on. The roundings escape that
+## by being inverted rather than run - see `where.test` - and what is left here is every scalar
+## that gathers no range: `upper` scatters its answers through the dictionary, and `abs` folds
+## two stretches of a signed column onto one answer, so neither is a range to rewrite into.
 
 error
-SELECT count(*) FROM t WHERE round(amount, 2) > 5
+SELECT count(*) FROM t WHERE upper(country) = 'GB'
+----
+sql_scalar_in_filter
+
+error
+SELECT count(*) FROM t WHERE abs(balance) > 5
 ----
 sql_scalar_in_filter
 

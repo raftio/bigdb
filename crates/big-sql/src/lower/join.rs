@@ -582,6 +582,7 @@ fn touches(cond: &Cond, scope: &Scope<'_>, at: usize) -> Result<u32> {
         Cond::Cmp { field, .. }
         | Cond::In { field, .. }
         | Cond::Between { field, .. }
+        | Cond::Rounded { field, .. }
         | Cond::Like { field, .. } => 1 << scope.side(field, at)?,
         // A semi-join term names the *outer* column, and the table inside it is not one of the
         // join's sides at all - it is a set this term is narrowed by. So the side is the one

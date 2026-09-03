@@ -220,7 +220,11 @@ fn no_segments(cond: &Cond) -> Result<()> {
         Cond::Not(a) => no_segments(a),
         // The inner set of a semi-join is a condition like any other, and may hold one too.
         Cond::InRecords { filter, .. } => filter.as_deref().map_or(Ok(()), no_segments),
-        Cond::Cmp { .. } | Cond::In { .. } | Cond::Between { .. } | Cond::Like { .. } => Ok(()),
+        Cond::Cmp { .. }
+        | Cond::In { .. }
+        | Cond::Between { .. }
+        | Cond::Rounded { .. }
+        | Cond::Like { .. } => Ok(()),
     }
 }
 

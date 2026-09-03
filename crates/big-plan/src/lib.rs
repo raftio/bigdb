@@ -27,6 +27,7 @@ pub mod error;
 pub mod explain;
 pub mod parse;
 pub mod plan;
+pub mod rounded;
 pub mod schema;
 
 pub use ast::{Call, Expr, Literal};

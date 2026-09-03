@@ -609,6 +609,7 @@ impl<S: Schema> Ctx<'_, S> {
     fn rows(&self, call: &Call) -> Result<Rows> {
         match call.name.as_str() {
             "Row" => self.row(call),
+            "Rounded" => self.rounded(call),
             "All" => match call.args.len() {
                 0 => Ok(Rows::All),
                 n => Err(PlanError::Arity { call: "All", want: "no arguments", got: n }),
@@ -732,6 +733,37 @@ impl<S: Schema> Ctx<'_, S> {
         }
     }
 
+    /// `Rounded(<field> <op> <value>, by='round', digits=<n>)`.
+    ///
+    /// The one comparison whose bound this layer computes rather than converts, because the bound
+    /// depends on the field's scale. See [`mod@crate::rounded`].
+    fn rounded(&self, call: &Call) -> Result<Rows> {
+        const WANT: &str = "a comparison, by=<round|floor|ceil>, and digits=<n> for a round";
+        let (mut compare, mut by, mut digits) = (None, None, None);
+        for arg in &call.args {
+            match arg {
+                Expr::Compare { field, op, value } => compare = Some((field, op, value)),
+                Expr::Named { name, value } if name == "by" => match value.as_ref() {
+                    Expr::Literal(Literal::Str(s)) => by = Some(s.as_str()),
+                    _ => return Err(PlanError::BadArgument { call: "Rounded", want: WANT }),
+                },
+                Expr::Named { name, value } if name == "digits" => match value.as_ref() {
+                    Expr::Literal(Literal::Int(d)) if *d <= u64::from(u8::MAX) => {
+                        digits = Some(*d as u8)
+                    }
+                    _ => return Err(PlanError::BadArgument { call: "Rounded", want: WANT }),
+                },
+                _ => return Err(PlanError::BadArgument { call: "Rounded", want: WANT }),
+            }
+        }
+        let (Some((field, op, value)), Some(by)) = (compare, by) else {
+            return Err(PlanError::Arity { call: "Rounded", want: WANT, got: call.args.len() });
+        };
+        let by = crate::rounded::By::parse(by, digits)
+            .ok_or(PlanError::BadArgument { call: "Rounded", want: WANT })?;
+        crate::rounded::rows(field, self.class(field)?, by, op, value)
+    }
+
     fn row(&self, call: &Call) -> Result<Rows> {
         // A time window is the only form with more than one argument, so it is recognised
         // before the shapes that insist on exactly one.
@@ -850,7 +882,7 @@ fn str_arg(call: &'static str, value: &Expr) -> Result<String> {
     }
 }
 
-fn int_op(op: &str) -> Option<CmpOp> {
+pub(crate) fn int_op(op: &str) -> Option<CmpOp> {
     Some(match op {
         ">" => CmpOp::Gt,
         ">=" => CmpOp::Ge,
@@ -912,7 +944,7 @@ fn aggregable(class: FieldClass, name: &str) -> bool {
     }
 }
 
-fn class_name(c: FieldClass) -> &'static str {
+pub(crate) fn class_name(c: FieldClass) -> &'static str {
     match c {
         FieldClass::Integer { .. } => "an integer field",
         FieldClass::Signed => "a signed integer field",
