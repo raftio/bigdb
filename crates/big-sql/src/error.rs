@@ -145,6 +145,13 @@ pub enum Refused {
     Interval,
     /// A scalar call in a `WHERE`, where there are no values yet to apply it to.
     ScalarFilter,
+    /// A `GROUP BY` term that is neither a column nor a calendar rounding of one.
+    ///
+    /// Its own refusal rather than a [`Self::Shape`], because the two say different things: a
+    /// shape refusal is about the statement asking more than one question, and this is about a
+    /// term the engine has no way to group *by*. What it names is also different - the two terms
+    /// that do work - which is the whole reason the list is enumerated.
+    GroupExpression,
     /// A rounding in a `WHERE` compared against a value it can never produce:
     /// `date_trunc('month', ts) = '2024-01-15'`, which no month begins on.
     ///
@@ -231,7 +238,7 @@ impl Refused {
     /// Kept honest by [`Refused::rank`] below, whose exhaustive match will not compile until a
     /// new variant is named - and by a test asserting that every rank appears here exactly once,
     /// which is what catches naming one and forgetting to add it.
-    pub const ALL: [Self; 62] = [
+    pub const ALL: [Self; 63] = [
         Self::Joins,
         Self::OuterJoin,
         Self::JoinOn,
@@ -267,6 +274,7 @@ impl Refused {
         Self::Interval,
         Self::ScalarFilter,
         Self::Round,
+        Self::GroupExpression,
         Self::SetTooLarge,
         Self::ExplainSet,
         Self::Segment,
@@ -367,6 +375,7 @@ impl Refused {
             Self::GrantOption => 59,
             Self::ReservedRole => 60,
             Self::Round => 61,
+            Self::GroupExpression => 62,
         }
     }
 
@@ -411,6 +420,7 @@ impl Refused {
             Self::Interval => "sql_unsupported",
             Self::ScalarFilter => "sql_scalar_in_filter",
             Self::Round => "sql_rounded_value",
+            Self::GroupExpression => "sql_group_expression",
             Self::Constraint => "sql_no_constraints",
             Self::DecimalScale => "sql_decimal_scale",
             Self::BitDepth => "sql_bit_depth",
@@ -715,6 +725,12 @@ impl Refused {
                  one cannot be turned around: `lower(country) = 'gb'` and `abs(balance) > 5` \
                  each have answers scattered across the column rather than gathered into a \
                  range. Write the comparison against the column itself"
+            }
+            Self::GroupExpression => {
+                "a `GROUP BY` term is a column, or `date_trunc(<boundary>, <column>)` over a \
+                 DATE or DATETIME column - those are the two the engine has a plan for. Any \
+                 other expression over a column relabels its values without merging them, which \
+                 answers one row per stored value with all of them printed under one name"
             }
             Self::Round => {
                 "no rounding ever produces this value, so nothing could match it: \

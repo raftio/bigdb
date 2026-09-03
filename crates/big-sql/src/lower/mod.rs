@@ -25,10 +25,10 @@
 //! Every failure in this module is about the *statement*: a shape with no plan behind it, or a
 //! construct the engine refuses.
 
-use crate::ast::{Cond, Item, Name, Proj, Query, Select};
+use crate::ast::{Cond, Grouping, Item, Proj, Query, Select};
 use crate::error::{Refused, Result, SqlError};
 use crate::shape::{Answer, Shape};
-use big_plan::ast::{Call, Expr};
+use big_plan::ast::{Call, Expr, Literal};
 
 /// How many plans one statement may ask for.
 ///
@@ -47,7 +47,7 @@ mod pql;
 mod ungrouped;
 
 use cond::rows;
-use pql::{call, call_of, field_arg};
+use pql::{call, call_of, field_arg, named};
 
 /// One query-language call, and the table it is asked of.
 ///
@@ -302,22 +302,56 @@ fn rows_of(rows: &Expr, item: &Item) -> Expr {
     }
 }
 
-/// **A scalar on a grouped column relabels rows without merging them.**
+/// Whether a select-list entry names a grouping term **written the same way**.
 ///
-/// The grouping happened over the stored key, so `date_trunc('month', ts)` beside `GROUP BY ts`
-/// would answer with one row per instant, every one of them printed as the same month - an answer
-/// that looks aggregated and is not. Refused rather than rendered, because a client cannot see the
-/// difference. Group by the rounded value instead, once there is a plan that can.
+/// The grouping happened over the values the term describes, so an entry describing anything else
+/// relabels rows without merging them: `date_trunc('month', ts)` beside `GROUP BY ts` answers one
+/// row per instant with every one of them printed as the same month, and `date_trunc('day', ts)`
+/// beside `GROUP BY date_trunc('month', ts)` prints a day the rows were not merged on. Both look
+/// aggregated and are not, which is a difference no client could see.
 ///
 /// **One function because there are two groupings**, and they did not agree: the one-column path
-/// refused this and the two-column path rendered it, so `SELECT substring(country, 1, 1), city,
-/// count(*) FROM t GROUP BY country, city` was answered with one row per country, each printed as
-/// a letter. Written out here so the two cannot drift again.
-fn no_scalar_on_a_grouped_column(columns: &[(&Item, Name)]) -> Result<()> {
-    match columns.iter().find(|(item, _)| item.apply().is_some()) {
-        Some((item, _)) => Err(SqlError::Refused { what: Refused::Shape, at: item.at }),
-        None => Ok(()),
+/// refused a scalar here and the two-column path rendered it, so `SELECT substring(country, 1, 1),
+/// city, count(*) FROM t GROUP BY country, city` was answered with one row per country, each
+/// printed as a letter. Written out here so the two cannot drift again.
+fn agrees(item: &Item, group: &Grouping) -> bool {
+    match group.bucket {
+        // A bare column is named by a bare column, and by nothing else.
+        None => item.apply().is_none(),
+        // A bucket is named by the same rounding. `date_trunc` and `dateTrunc` compare equal
+        // because both parse to one call, which is the right leniency and costs nothing.
+        Some(unit) => crate::parse::bucket_of(item.apply()) == Some(unit),
     }
+}
+
+/// How many calendar buckets one statement's grouping may walk.
+///
+/// **Ten years of days is 3653 and fourteen months of hours is about ten thousand**, and both are
+/// ordinary dashboard questions - so the bound is set where those fit and `date_trunc('second',
+/// ts)` over a decade, which is three hundred million, does not. Per node, exactly as
+/// `pairs::MAX_LEFT` is: each walks the range of the values it holds.
+pub(super) const MAX_BUCKETS: u64 = 10_000;
+
+/// The call that turns a column's values into groups, and the arguments saying how.
+///
+/// **One function because every measure has to make the same choice.** A `count`, a `sum` and
+/// both halves of an `avg` each build a grouping call, and if one of them forgot the boundary the
+/// statement would answer with two different groupings merged on a row id that meant different
+/// things in each.
+pub(super) fn group_call(group: &Grouping, rows: Expr, aggregate: Option<Expr>) -> Call {
+    let mut args = vec![rows, field_arg(&group.name)];
+    let name = match group.bucket {
+        None => "GroupBy",
+        Some(unit) => {
+            args.push(named("unit", Expr::Literal(Literal::Str(unit.name().to_string()))));
+            args.push(named("n", Expr::Literal(Literal::Int(MAX_BUCKETS))));
+            "GroupByBucket"
+        }
+    };
+    if let Some(aggregate) = aggregate {
+        args.push(named("aggregate", aggregate));
+    }
+    call_of(name, args)
 }
 
 /// The plan behind a written `count(*)` over a grouping, which several cells can share.
@@ -329,6 +363,6 @@ fn no_scalar_on_a_grouped_column(columns: &[(&Item, Name)]) -> Result<()> {
 /// is measured against a PQL `GroupBy`, and a phase that adds clauses should not quietly change
 /// what is being measured. `SELECT c FROM t GROUP BY c`, which nobody has benchmarked, already
 /// takes the cheaper one.
-fn count_plan(calls: &mut Calls, table: &str, rows: &Expr, group: &Name) -> Result<usize> {
-    calls.push(table, call_of("GroupBy", vec![rows.clone(), field_arg(group)]))
+fn count_plan(calls: &mut Calls, table: &str, rows: &Expr, group: &Grouping) -> Result<usize> {
+    calls.push(table, group_call(group, rows.clone(), None))
 }

@@ -16,10 +16,12 @@
 
 use super::Parser;
 use crate::ast::{
-    Cond, Having, HavingAgg, HavingOperand, Join, JoinKind, Order, OrderKey, Proj, Select, Source,
+    Cond, Grouping, Having, HavingAgg, HavingOperand, Join, JoinKind, Order, OrderKey, Proj,
+    Select, Source,
 };
 use crate::error::{Refused, Result, SqlError};
 use crate::lex::Tok;
+use crate::scalar::{Func, Scalar};
 use big_plan::Literal;
 
 impl Parser<'_> {
@@ -69,9 +71,9 @@ impl Parser<'_> {
         let group_at = self.at();
         let group_by = if self.eat_word("GROUP") {
             self.expect_word("BY", "BY after GROUP")?;
-            let mut by = vec![self.name("a column to group by")?];
+            let mut by = vec![self.grouping()?];
             while self.eat(&Tok::Comma) {
-                by.push(self.name("a column to group by")?);
+                by.push(self.grouping()?);
             }
             if by.len() > 2 {
                 return Err(self.refuse_at(Refused::Shape, group_at));
@@ -92,7 +94,19 @@ impl Parser<'_> {
                 let mut by = Vec::new();
                 for item in &items {
                     match &item.proj {
-                        Proj::Column(name) => by.push(name.clone()),
+                        Proj::Column(name) => {
+                            by.push(Grouping { name: name.clone(), bucket: None, at: item.at })
+                        }
+                        // `SELECT DISTINCT date_trunc('month', ts)` is the distinct months, and
+                        // is the same grouping the written-out form is - so it reads as one.
+                        Proj::Scalar { .. } => match (item.leaf(), bucket_of(item.apply())) {
+                            (Proj::Column(name), Some(unit)) => by.push(Grouping {
+                                name: name.clone(),
+                                bucket: Some(unit),
+                                at: item.at,
+                            }),
+                            _ => return Err(self.refuse_at(Refused::GroupExpression, item.at)),
+                        },
                         // `SELECT DISTINCT count(*)`, `SELECT DISTINCT *`: distinct over
                         // something that is already one value, or over identities that are
                         // already distinct.
@@ -436,4 +450,54 @@ impl Parser<'_> {
             Some(_) | None => return Err(self.refuse_at(Refused::Having, at)),
         }))
     }
+}
+
+impl Parser<'_> {
+    /// One `GROUP BY` term: a column, or a calendar rounding of one.
+    ///
+    /// **Parsed with the same code a select-list entry is**, which is the point rather than a
+    /// convenience: the lowering has to check that the two agree, and a comparison is only
+    /// meaningful between things read the same way. It also means the unit is already checked
+    /// here - `parse::scalar` raises `TruncUnit` for a boundary the calendar does not have - so
+    /// this only has to decide whether the shape is one there is a plan for.
+    pub(super) fn grouping(&mut self) -> Result<Grouping> {
+        let at = self.at();
+        let parsed = self.expr()?;
+        let [leaf] = parsed.leaves.as_slice() else {
+            // No column, or two of them: `GROUP BY 1 + 1` groups by nothing, and
+            // `GROUP BY a + b` by a value no column holds.
+            return Err(self.refuse_at(Refused::GroupExpression, at));
+        };
+        let Proj::Column(name) = &leaf.proj else {
+            // `GROUP BY count(*)`, which is the answer rather than something to group it by.
+            return Err(self.refuse_at(Refused::GroupExpression, at));
+        };
+        let name = name.clone();
+        match parsed.expr.is_identity() {
+            true => Ok(Grouping { name, bucket: None, at }),
+            false => match bucket_of(Some(&parsed.expr)) {
+                Some(unit) => Ok(Grouping { name, bucket: Some(unit), at }),
+                None => Err(self.refuse_at(Refused::GroupExpression, at)),
+            },
+        }
+    }
+}
+
+/// The column and boundary a `date_trunc` over a bare column names, when that is what it is.
+///
+/// **One shape-matcher, used from three places**: parsing a `GROUP BY` term, normalising a
+/// `SELECT DISTINCT`, and checking in the lowering that the select list and the `GROUP BY` agree.
+/// Written once because the third of those is a comparison against the first two, and a second
+/// spelling of the pattern would eventually accept something they did not.
+///
+/// `date_trunc` and ClickHouse's `dateTrunc` both parse to `Func::DateTrunc`, so they compare
+/// equal here without either being named - which is the right leniency, for free.
+/// The column itself is not in the expression - [`Scalar::Value`] stands in for it - so only the
+/// boundary comes back, and the caller takes the column from the item's leaf.
+pub(crate) fn bucket_of(apply: Option<&Scalar>) -> Option<big_civil::Unit> {
+    let Scalar::Call { func: Func::DateTrunc, args } = apply? else { return None };
+    let [Scalar::Literal(Literal::Str(unit)), Scalar::Value] = args.as_slice() else {
+        return None;
+    };
+    big_civil::Unit::parse(unit)
 }

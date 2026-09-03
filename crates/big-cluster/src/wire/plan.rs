@@ -225,7 +225,7 @@ pub fn put_plan(out: &mut Vec<u8>, plan: &Plan) {
             put_aggregate(out, plan_tag::GROUP_BY_BUCKET, table, rows, field);
             // The boundary travels as its own name rather than as an index into the enum, so
             // that reordering `big_civil::Unit` cannot silently turn a month into a week.
-            put_str(out, unit_name(*unit));
+            put_str(out, unit.name());
             put_u64(out, *max_buckets as u64);
             put_plan(out, aggregate);
         }
@@ -355,19 +355,4 @@ fn get_plan_at(r: &mut Reader<'_>, depth: usize) -> Result<Plan> {
 
 fn get_aggregate(r: &mut Reader<'_>) -> Result<(String, Rows, String)> {
     Ok((r.str()?, get_rows(r)?, r.str()?))
-}
-
-/// The boundary's name, which is what travels rather than its position in the enum.
-fn unit_name(unit: big_civil::Unit) -> &'static str {
-    use big_civil::Unit;
-    match unit {
-        Unit::Year => "year",
-        Unit::Quarter => "quarter",
-        Unit::Month => "month",
-        Unit::Week => "week",
-        Unit::Day => "day",
-        Unit::Hour => "hour",
-        Unit::Minute => "minute",
-        Unit::Second => "second",
-    }
 }

@@ -187,12 +187,12 @@ pub struct Select {
     pub joins: Vec<Join>,
     /// `WHERE`, absent when every record is in play.
     pub filter: Option<Cond>,
-    /// `GROUP BY`, at most one column.
+    /// `GROUP BY`: the columns, and the boundary each is rounded to.
     ///
     /// Also carries `SELECT DISTINCT c`, which standard SQL defines as `SELECT c GROUP BY c`
     /// and which this engine answers with the same plan. The parser normalises one into the
     /// other so the lowering has a single path to `Distinct`.
-    pub group_by: Vec<Name>,
+    pub group_by: Vec<Grouping>,
     /// `HAVING count(*) <op> <n>`, absent when every group is kept.
     pub having: Option<Having>,
     /// `ORDER BY`, at most one key.
@@ -645,6 +645,25 @@ pub enum Cond {
         /// The value the rounded column is compared against, exactly as written.
         value: Literal,
     },
+}
+
+/// One `GROUP BY` term.
+///
+/// **Not an expression, and the type is the refusal.** The engine has a plan for exactly two
+/// terms - a column, and a calendar rounding of one - so those are the two this holds. Letting a
+/// general expression in would push "which of these has a plan" down into the lowering, where it
+/// would be a list somebody maintains rather than a shape the compiler already knows.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Grouping {
+    /// The column being grouped.
+    pub name: Name,
+    /// The boundary its values are rounded to before they are grouped.
+    ///
+    /// `None` is the bare column, which is every grouping that existed before buckets did - and
+    /// is why `GROUP BY a, b` needs no rewriting to keep working.
+    pub bucket: Option<big_civil::Unit>,
+    /// Byte offset, so a refusal can point at the term.
+    pub at: usize,
 }
 
 /// A rounding of a number that a `WHERE` can be answered through.

@@ -612,4 +612,6 @@ mod item;
 mod rounded;
 mod scalar;
 mod select;
+/// The shape-matcher a `GROUP BY` term and a select-list entry are compared through.
+pub(crate) use select::bucket_of;
 mod show;

@@ -23,7 +23,7 @@
 use super::measure::{field_of, having_tree, measure_of, names, units_of, Measure};
 use super::pql::{as_expr, call_of, field_arg, named};
 use super::{answer, rows_of, Calls, Statement};
-use crate::ast::{HavingAgg, Item, Name, OrderKey, Proj, Select};
+use crate::ast::{Grouping, HavingAgg, Item, Name, OrderKey, Proj, Select};
 use crate::error::{Refused, Result, SqlError};
 use crate::shape::{Cell, Cut, GroupOrder, Of, OrderBy, Shape};
 use big_plan::ast::{Expr, Literal};
@@ -41,7 +41,7 @@ pub(super) fn pairs(
     select: &Select,
     table: &str,
     rows: &Expr,
-    by: (&Name, &Name),
+    by: (&Grouping, &Grouping),
     stars: &[&Item],
     columns: &[(&Item, Name)],
     aggregates: &[&Item],
@@ -51,19 +51,27 @@ pub(super) fn pairs(
     if let Some(item) = stars.first() {
         return Err(SqlError::Refused { what: Refused::Shape, at: item.at });
     }
-    if left.column == right.column {
+    if left.name.column == right.name.column {
         // `GROUP BY c, c` is `GROUP BY c` written twice, and the pair of one column with itself
         // is every record paired with itself. Refused rather than answered as either.
         return Err(SqlError::Refused { what: Refused::Shape, at });
     }
     // Every bare column must be one of the two grouped ones - the classic SQL rule, and a real
     // one here: a column that is neither grouped nor aggregated has no single value per pair.
+    // Each bare column must be one of the two grouped ones, and must describe the same values
+    // that grouping term does. See `super::agrees` for what the second half rules out.
     for (item, name) in columns {
-        if name.column != left.column && name.column != right.column {
-            return Err(SqlError::Refused { what: Refused::Shape, at: item.at });
+        let matched = [left, right].into_iter().find(|g| g.name.column == name.column);
+        match matched {
+            Some(g) if super::agrees(item, g) => {}
+            _ => return Err(SqlError::Refused { what: Refused::Shape, at: item.at }),
         }
     }
-    super::no_scalar_on_a_grouped_column(columns)?;
+    // A pair grouping has no bucket plan behind it, so a rounded term is refused by name rather
+    // than by falling into the agreement check above with nothing to match.
+    if let Some(g) = [left, right].into_iter().find(|g| g.bucket.is_some()) {
+        return Err(SqlError::Refused { what: Refused::Shape, at: g.at });
+    }
 
     let mut calls = Calls::new(at);
     let mut measures: Vec<(Measure, Of)> = Vec::new();
@@ -71,8 +79,8 @@ pub(super) fn pairs(
         let rows = rows_of(rows, item);
         let mut args = vec![
             rows,
-            named("left", Expr::Ident(left.column.clone())),
-            named("right", Expr::Ident(right.column.clone())),
+            named("left", Expr::Ident(left.name.column.clone())),
+            named("right", Expr::Ident(right.name.column.clone())),
             named("n", Expr::Literal(Literal::Int(MAX_LEFT))),
         ];
         match &item.proj {
@@ -98,8 +106,8 @@ pub(super) fn pairs(
                 "GroupByPair",
                 vec![
                     rows.clone(),
-                    named("left", Expr::Ident(left.column.clone())),
-                    named("right", Expr::Ident(right.column.clone())),
+                    named("left", Expr::Ident(left.name.column.clone())),
+                    named("right", Expr::Ident(right.name.column.clone())),
                     named("n", Expr::Literal(Literal::Int(MAX_LEFT))),
                 ],
             ),
@@ -115,7 +123,7 @@ pub(super) fn pairs(
         .map(|i| Cell {
             column: i.column(),
             of: match i.leaf() {
-                Proj::Column(n) if n.column == left.column => Of::Key,
+                Proj::Column(n) if n.column == left.name.column => Of::Key,
                 Proj::Column(_) => Of::RightKey,
                 _ => next.next().expect("one measure per aggregate, in select-list order"),
             },
@@ -174,7 +182,7 @@ fn absent_of(item: &Item) -> crate::shape::Absent {
 /// already bounds.
 fn ordering(
     select: &Select,
-    by: (&Name, &Name),
+    by: (&Grouping, &Grouping),
     measures: &[(Measure, Of)],
 ) -> Result<Option<GroupOrder>> {
     let Some(order) = &select.order_by else { return Ok(None) };
@@ -197,7 +205,7 @@ fn ordering(
         OrderKey::Name(n) => match value_names.iter().find(|(c, _)| *c == n.column) {
             Some((_, of)) => Some(*of),
             // Either grouped column, or an alias the select list gave one.
-            None if n.column == by.0.column || n.column == by.1.column => {
+            None if n.column == by.0.name.column || n.column == by.1.name.column => {
                 return Ok(match order.desc {
                     // Pairs arrive in key order, left then right, which is what ascending asks
                     // for.

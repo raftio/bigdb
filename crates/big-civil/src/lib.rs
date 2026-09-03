@@ -231,6 +231,23 @@ impl Unit {
         matches!(self, Self::Year | Self::Quarter | Self::Month | Self::Week | Self::Day)
     }
 
+    /// The one spelling this crate answers to, which is the one [`Self::parse`] takes back.
+    ///
+    /// **The name is what travels**, not the position in this enum: a plan crosses the wire and
+    /// is printed by `EXPLAIN`, and reordering the variants must not turn a month into a week.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Year => "year",
+            Self::Quarter => "quarter",
+            Self::Month => "month",
+            Self::Week => "week",
+            Self::Day => "day",
+            Self::Hour => "hour",
+            Self::Minute => "minute",
+            Self::Second => "second",
+        }
+    }
+
     /// Every spelling, for the refusal that has to list them.
     pub const NAMES: &'static str = "year, quarter, month, week, day, hour, minute or second";
 }

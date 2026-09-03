@@ -22,7 +22,7 @@
 use super::{Datum, Row};
 use crate::{
     Absent, Cell, Cut, Group, GroupAt, GroupOrder, Having, JoinSide, Of, OrderBy, Pair, Pairing,
-    Value,
+    TimeUnit, Value,
 };
 
 use super::num::{as_f64, cmp_num, int_of, number, scalar_num, Num};
@@ -108,10 +108,9 @@ pub(super) fn grouped(
                         match c.of {
                             // A row with no interned name is a `null`, not an empty string: it is a
                             // group whose key this node has never been told, and the two are different
-                            // facts.
-                            Of::Key => find(&of_each, row)
-                                .and_then(|g| g.key.as_deref())
-                                .map_or(Datum::Null, Datum::text),
+                            // facts. A *bucket* is neither - it names itself, so it comes back as
+                            // the date it stands for rather than as a name nobody stored.
+                            Of::Key => key_datum(find(&of_each, row)),
                             of => Datum::num(number(of, values, Some(row)), &c.units),
                         },
                     )
@@ -631,4 +630,22 @@ fn sort_rows(rows: &mut [GroupAt], order: GroupOrder, of_each: &[&[Group]], valu
 fn key_order<'a>(of_each: &[&'a [Group]], row: GroupAt) -> (bool, Option<&'a str>, GroupAt) {
     let key = find(of_each, row).and_then(|g| g.key.as_deref());
     (key.is_none(), key, row)
+}
+
+/// What a group is called, in the shape a cell should hold it.
+///
+/// **A bucket names itself and a row does not.** A keyed group's name is a string somebody
+/// interned, so it comes back as text and as `null` where this node was never told it. A calendar
+/// bucket has no dictionary and needs none: the moment it starts *is* the name, and it comes back
+/// as the `DATE` or `DATETIME` the column holds - which is what lets `INSERT ... SELECT` of a
+/// rollup write back a column of the same type it read.
+fn key_datum(group: Option<&Group>) -> Datum {
+    match group {
+        Some(Group { at: GroupAt::Bucket { start, unit }, .. }) => match unit {
+            TimeUnit::Days => Datum::Date(*start),
+            TimeUnit::Seconds => Datum::Timestamp(*start),
+        },
+        Some(g) => g.key.as_deref().map_or(Datum::Null, Datum::text),
+        None => Datum::Null,
+    }
 }
