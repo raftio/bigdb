@@ -10,10 +10,21 @@ readme = "readme.md"
 keywords = ["bitmap","index","database","server","http"]
 categories = ["database-implementations","web-programming::http-server"]
 
+# Off by default, and forwarded rather than turned on here. `big-bin` decides, because the
+# binary is what an operator runs; a library that dragged rustls in behind them would take the
+# choice away. `cargo tree -p big-http --no-default-features` is asserted in CI to have no
+# rustls in it.
+[features]
+default = []
+tls = ["big-tls/tls"]
+
 # No web framework. The surface is a dozen routes and a JSON writer; pulling in an async
 # runtime for that would be a larger commitment than the whole engine has made so far.
 [dependencies]
 big-embed.workspace = true
+# The socket, plain or TLS, and the identity a client certificate proved. With `tls` off this
+# is a `TcpStream` behind one `match` and brings nothing with it.
+big-tls.workspace = true
 # The coordinator. Every route goes through it, including on a node with no peers: a second
 # path for the un-clustered case would be the path nobody tests.
 big-cluster.workspace = true
@@ -28,9 +39,20 @@ big-plan.workspace = true
 # For the status a refused SQL statement deserves. `status.rs` is the one place that knows both
 # HTTP and the whole error tree, so it is the one place that has to name this error.
 big-sql.workspace = true
+# **The first hard dependency the engine has taken on for its own sake**, and the reason is that
+# a password file has to be hashed and a hand-written password hash is not a thing anybody should
+# write. argon2id at OWASP's second profile; the cost parameters are read back out of each stored
+# hash, so a file may hold a mix and an older cheap entry still works.
+argon2 = { version = "0.5", features = ["std"] }
+# For the cache key, which must not be the password. Already in the tree underneath argon2, which
+# is built on it - so naming it here costs nothing and makes the use visible to an audit.
+blake2 = "0.10"
 
 [dev-dependencies]
 # `auth` writes a token file and then checks its mode, and the cluster tests give a restarting
 # node somewhere to keep the state a restart may not lose.
 tempfile = "3"
 big-testfile.workspace = true
+# Certificates for `tests/tls.rs`, generated per run rather than checked in: a fixture
+# certificate expires, and a test that starts failing in 2036 is a landmine.
+rcgen = "0.13"

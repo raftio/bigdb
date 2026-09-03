@@ -2,10 +2,16 @@
 # why it is that shape.
 #
 #   cd deploy/cluster
-#   ./tokens.sh                 # writes secrets/tokens and secrets/peer.token, mode 600
+#   ./users.sh                  # writes secrets/users, mode 600, and prints the passwords
+#   ./certs.sh                  # writes secrets/peer-ca.pem and one certificate per node
 #   docker compose up -d
-#   curl -H "Authorization: Bearer $(cat secrets/peer.token)" localhost:7654/ready
-#   curl -H "Authorization: Bearer $(cat secrets/peer.token)" localhost:7654/verify
+#   curl -u ops:$PASSWORD localhost:7654/ready
+#   curl -u ops:$PASSWORD localhost:7654/verify
+#
+# The published port is plaintext on loopback, which is why it is published on 127.0.0.1 and
+# nowhere else. Nodes speak TLS to each other regardless - that is what the certificates are
+# for - and a deployment reachable from anywhere else needs --tls-cert on the published node
+# too, or a proxy in front of it.
 #
 # Any node answers any request: the one that receives it plans the query and fans it out. Only
 # `a` is published, because publishing three ports would suggest a client has to choose, and it
@@ -30,9 +36,10 @@ services:
     volumes:
       - a-data:/data
       - ./cluster.toml:/etc/big/cluster.toml:ro
-      # `tokens` is who may talk to this node and what they may do; `peer.token` is the single
-      # credential it presents to the others. The directory is mounted, never the files - see
-      # deploy/entrypoint.sh for both halves of why.
+      # `users` is who may talk to this node and what they may do. The certificates are how the
+      # nodes prove themselves to each other, which is a separate question with a separate
+      # answer - there is no shared credential here at all. The directory is mounted, never the
+      # files: see deploy/entrypoint.sh for both halves of why.
       - ./secrets:/etc/big/secrets:ro
     command:
       - /data/big.db
@@ -43,10 +50,16 @@ services:
       # 0.0.0.0:7654 - is not the address the others reach it on.
       - --node
       - a
-      - --tokens
+      - --users
       # Staged from the mount by the entrypoint, which reads it as root and writes a private
       # copy: a bind mount carries the host's ownership, which the image cannot predict.
-      - /run/big/tokens
+      - /run/big/users
+      # What this node presents to the other two. The CA that checks it is named in cluster.toml,
+      # because that half is the same everywhere; these two are this node's alone.
+      - --peer-cert
+      - /run/big/peer.pem
+      - --peer-key
+      - /run/big/peer.key
       # **Set it on a new deployment.** There is no default, on purpose - a query that used to
       # finish must not start failing because the server was upgraded - but a daemon with no
       # ceiling is a daemon one expensive query can hold a worker on for as long as it likes.
@@ -66,10 +79,16 @@ services:
       - /etc/big/cluster.toml
       - --node
       - b
-      - --tokens
+      - --users
       # Staged from the mount by the entrypoint, which reads it as root and writes a private
       # copy: a bind mount carries the host's ownership, which the image cannot predict.
-      - /run/big/tokens
+      - /run/big/users
+      # What this node presents to the other two. The CA that checks it is named in cluster.toml,
+      # because that half is the same everywhere; these two are this node's alone.
+      - --peer-cert
+      - /run/big/peer.pem
+      - --peer-key
+      - /run/big/peer.key
       # **Set it on a new deployment.** There is no default, on purpose - a query that used to
       # finish must not start failing because the server was upgraded - but a daemon with no
       # ceiling is a daemon one expensive query can hold a worker on for as long as it likes.
@@ -89,10 +108,16 @@ services:
       - /etc/big/cluster.toml
       - --node
       - a-spare
-      - --tokens
+      - --users
       # Staged from the mount by the entrypoint, which reads it as root and writes a private
       # copy: a bind mount carries the host's ownership, which the image cannot predict.
-      - /run/big/tokens
+      - /run/big/users
+      # What this node presents to the other two. The CA that checks it is named in cluster.toml,
+      # because that half is the same everywhere; these two are this node's alone.
+      - --peer-cert
+      - /run/big/peer.pem
+      - --peer-key
+      - /run/big/peer.key
       # **Set it on a new deployment.** There is no default, on purpose - a query that used to
       # finish must not start failing because the server was upgraded - but a daemon with no
       # ceiling is a daemon one expensive query can hold a worker on for as long as it likes.

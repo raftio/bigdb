@@ -124,7 +124,7 @@ use ops::*;
 use peer::*;
 use query::*;
 
-use crate::auth::{Auth, Outcome, Role};
+use crate::auth::{Auth, Credential, Identity, Outcome, Principal, Role};
 use crate::metrics::ServerMetrics;
 use crate::{json, Request, Response};
 use big_cluster::wire::{self, OwnedFact};
@@ -145,6 +145,12 @@ pub struct Ctx<'a, P: PagerMut> {
     pub cluster: &'a Cluster<P>,
     /// Who may do what.
     pub auth: &'a Auth,
+    /// What the *connection* proved, before a single header was read.
+    ///
+    /// `Identity::None` on a plaintext connection and on a server-only TLS one, which between
+    /// them are every client connection. Only a peer presenting a client certificate this node's
+    /// CA signed arrives as anything else.
+    pub identity: &'a Identity,
     /// The server's own counters, because `/metrics` is a route like any other and rendering
     /// them is what it does. Borrowed rather than reached for through a global: a second
     /// server in one process - which every test that binds two ports is - must not share them.
@@ -160,6 +166,22 @@ pub struct Ctx<'a, P: PagerMut> {
     /// Whether a backup is already walking this node's file. Shared with the server rather
     /// than owned here, because a `Ctx` lives for one request and the flag has to outlive it.
     pub backup_running: &'a AtomicBool,
+}
+
+/// What a request has to be to reach a route.
+///
+/// Three kinds rather than an `Option<Role>`, because a peer is not a very privileged person -
+/// it is a different kind of caller. See `Target::guard` for why that distinction is the one
+/// that shrinks the blast radius of a leaked node key.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Guard {
+    /// Never authenticated: `/health` and `/ready`, which have to answer while the database is
+    /// unhealthy - exactly when a credential check might not.
+    Open,
+    /// A person holding at least this role.
+    User(Role),
+    /// Another node of this cluster, proven by its client certificate during the handshake.
+    Node,
 }
 
 impl<P: PagerMut + Sync> Ctx<'_, P> {
@@ -244,17 +266,30 @@ impl Target<'_> {
         )
     }
 
-    /// The least role that may reach this route. `None` means no credential is required.
-    fn role(&self) -> Option<Role> {
+    /// What a request has to *be* to reach this route.
+    ///
+    /// **Not a role for the peer routes, and that is the change worth reading twice.** A role is
+    /// a statement about a person's authority over data; a node certificate is a statement about
+    /// which process is speaking. Mapping the certificate onto `Role::Admin` would make a leaked
+    /// node key an admin credential on the *public* routes - `DELETE /table/x` would work with
+    /// it. Going the other way, a username and password, however privileged, must not reach
+    /// `/internal/*`: those routes take binary bodies a coordinator produced and assume the
+    /// sender passed `mismatched()`. Under tokens an `admin` credential could post to them;
+    /// this closes that, and it closes it for free.
+    ///
+    /// The read/write/admin distinctions that used to separate the peer routes from each other
+    /// are gone with it. They only ever meant something while a peer presented the same *kind*
+    /// of credential a person did.
+    fn guard(&self) -> Guard {
         match self {
-            Self::Health | Self::Ready => None,
+            Self::Health | Self::Ready => Guard::Open,
             Self::Metrics
             | Self::Schema
             | Self::Query(_)
             | Self::Sql
             | Self::Records(_)
-            | Self::Verify => Some(Role::Read),
-            Self::Import(_) | Self::DeleteRecords(_) => Some(Role::Write),
+            | Self::Verify => Guard::User(Role::Read),
+            Self::Import(_) | Self::DeleteRecords(_) => Guard::User(Role::Write),
             Self::CreateTable(_)
             | Self::CreateField(..)
             | Self::DropTable(_)
@@ -263,42 +298,33 @@ impl Target<'_> {
             // a weaker one that could drop a database would be a way round the stronger one
             // that guards dropping the tables in it.
             | Self::CreateDatabase(_)
-            | Self::DropDatabase(_) => Some(Role::Admin),
+            | Self::DropDatabase(_) => Guard::User(Role::Admin),
 
-            // A peer is a client with a token, not a trusted origin. Each of these needs what
-            // the public route it serves needs, and interning is a write because it commits: a
-            // read token that could assign row ids would be a read token that can change what
-            // every other node means by a string.
+            // Every one of these is a peer, and being a peer is the whole requirement. What
+            // proves it is a client certificate this node's peer CA signed, checked during the
+            // handshake and before a byte of HTTP was read - so a request that reaches here
+            // with a username and password, however privileged, is refused.
             Self::PeerQuery
             | Self::PeerRecords
             | Self::PeerDigest
             | Self::PeerFragments
             | Self::PeerFragment
             | Self::PeerKeys
-            | Self::PeerSchema => Some(Role::Read),
-            Self::PeerImport | Self::PeerDelete | Self::PeerIntern | Self::PeerAllocate => {
-                Some(Role::Write)
-            }
-            // Reading how far a table's ids reach is a read, and it is asked of every node
-            // rather than of the leader.
-            Self::PeerNextRecord => Some(Role::Read),
-            Self::PeerDdl => Some(Role::Admin),
-            // The agreement decides which node serves which range. A credential that can vote
-            // is a credential that can decide where every read goes, which is more than write.
-            //
-            // Replacing a fragment outright is the same size of power: it is not writing a
-            // fact, it is replacing what a node holds. So is saying a copy has caught up,
-            // which is what lets that copy start answering reads.
-            Self::PeerRaft
+            | Self::PeerSchema
+            | Self::PeerNextRecord
+            | Self::PeerImport
+            | Self::PeerDelete
+            | Self::PeerIntern
+            | Self::PeerAllocate
+            | Self::PeerDdl
+            | Self::PeerRaft
             | Self::PeerFragmentPut
             | Self::PeerKeysPut
-            | Self::PeerRepaired
-            | Self::Repair => Some(Role::Admin),
-            // Reading every live page and writing it somewhere the operator named. `admin`
-            // rather than `read` because what it produces is a second copy of the whole
-            // database, and a credential that can make one is a credential that can carry the
-            // data out of here.
-            Self::Backup => Some(Role::Admin),
+            | Self::PeerRepaired => Guard::Node,
+            // `POST /repair` is the public one, asked for by an operator rather than by a node,
+            // so it stays a role. It is `admin` because a repair copies fragments between nodes.
+            Self::Repair => Guard::User(Role::Admin),
+            Self::Backup => Guard::User(Role::Admin),
         }
     }
 }
@@ -362,17 +388,47 @@ pub fn may_run_long(req: &Request) -> bool {
     )
 }
 
+/// A response, and who this server decided asked for it.
+///
+/// The second half is new. This server has never logged *who* made a request - the resolved role
+/// was computed and thrown away - which was tolerable when a credential was an anonymous string
+/// and is not once it belongs to a person. An audit line that says a table was dropped, without
+/// saying by whom, is half a line.
+pub struct Answered {
+    /// What to send back.
+    pub response: Response,
+    /// What to put in the log: the field name - `"user"` or `"node"` - and the name itself.
+    ///
+    /// The kind is carried rather than guessed from the name. An earlier draft inferred it from
+    /// a `node-` prefix, which is a convention nothing enforces and which would have mislabelled
+    /// a person unlucky enough to be called `node-ops`.
+    pub who: Option<(&'static str, String)>,
+}
+
+impl From<Response> for Answered {
+    fn from(response: Response) -> Self {
+        Self { response, who: None }
+    }
+}
+
 /// Routes one request and runs it, or answers `404`, `401` or `403` without running anything.
-pub fn dispatch<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request) -> Response {
+pub fn dispatch<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request) -> Answered {
     let segments = req.segments();
     let borrowed: Vec<&str> = segments.iter().map(std::convert::AsRef::as_ref).collect();
     let Some(target) = resolve(req.method.as_str(), &borrowed) else {
-        return Response::failure(404, "no_such_route", "no such route");
+        return Response::failure(404, "no_such_route", "no such route").into();
     };
 
-    if let Some(refusal) = refuse(ctx.auth, req, target.role()) {
-        return refusal;
-    }
+    let principal = match refuse(ctx, req, target.guard()) {
+        Ok(p) => p,
+        Err(refusal) => return refusal.into(),
+    };
+    // Recorded before the handler runs, so that a request which panics still says who made it.
+    let who = match &principal {
+        Principal::Anonymous => None,
+        p @ Principal::Node { .. } => Some(("node", p.display().to_string())),
+        p => Some(("user", p.display().to_string())),
+    };
 
     // **Before any body is decoded.** A peer running a different build sends bytes this one
     // would read as something else - a length where a tag was - and the result is not a
@@ -381,17 +437,19 @@ pub fn dispatch<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request) -> Response
     // Both are cheap to check and impossible to notice afterwards.
     if target.is_internal() {
         if let Some(refusal) = mismatched(ctx, req) {
-            return refusal;
+            return Answered { response: refusal, who };
         }
     }
 
-    match target {
+    let response = match target {
         Target::Health => health(),
         Target::Ready => ready(ctx),
         Target::Metrics => {
             let mut text = ctx.metrics.render(&ctx.api().metrics());
             crate::metrics::render_keys(&mut text, &ctx.api().key_stats());
             crate::metrics::render_cluster(&mut text, &ctx.cluster.counters());
+            let (verifications, hits, throttled) = ctx.auth.counters();
+            crate::metrics::render_auth(&mut text, verifications, hits, throttled);
             Response::text(
                 // The version suffix is part of the contract: a scraper reads it to decide how
                 // to parse, and omitting it makes some of them guess.
@@ -402,7 +460,7 @@ pub fn dispatch<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request) -> Response
         Target::Schema => Response::ok(json::schema(&ctx.cluster.schema())),
         Target::Verify => Response::ok(json::verify(&ctx.cluster.verify())),
         Target::Query(t) => query(ctx, req, t),
-        Target::Sql => sql(ctx, req),
+        Target::Sql => sql(ctx, req, &principal),
         Target::Records(t) => records(ctx, req, t),
         Target::Import(t) => import(ctx, req, t),
         Target::DeleteRecords(t) => delete(ctx, req, t),
@@ -435,37 +493,134 @@ pub fn dispatch<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request) -> Response
         }
         Target::Repair => repair(ctx),
         Target::Backup => backup(ctx, req),
-    }
+    };
+    Answered { response, who }
 }
 
-/// `None` when the request may proceed.
 /// The same check, for a route whose static role is only a floor.
 ///
 /// `POST /sql` is authorised as `read` because that is what almost every statement needs, and
 /// the check runs before the body is decoded. A statement that changes the schema needs more,
 /// and this is how it asks - see `routes::query::sql`.
-pub(super) fn require(auth: &Auth, req: &Request, needed: Role) -> Option<Response> {
-    refuse(auth, req, Some(needed))
+///
+/// **Takes the principal, not the request.** Under bearer tokens this re-ran the whole check and
+/// the comment here said it cost one constant-time comparison, which was true. Under argon2 it
+/// would cost a second fifty-millisecond hash on every single `POST /sql` - so the principal is
+/// resolved once by [`refuse`] and compared against here. This function does no verification and
+/// must never grow any.
+pub(super) fn require(principal: &Principal, needed: Role) -> Option<Response> {
+    match principal.holds(needed) {
+        Ok(()) => None,
+        Err(held) => Some(forbidden(principal, held, needed)),
+    }
 }
 
-fn refuse(auth: &Auth, req: &Request, needed: Option<Role>) -> Option<Response> {
-    let needed = needed?;
-    match auth.authorize(req.bearer(), needed) {
-        Outcome::Allowed(_) => None,
-        Outcome::Unauthenticated => Some(
-            Response::failure(401, "unauthenticated", "a bearer token is required")
-                // Without this header a client cannot tell a 401 it can fix from one it
-                // cannot, and every HTTP client library looks for it.
-                .with_header("WWW-Authenticate", "Bearer realm=\"big\""),
-        ),
-        // Deliberately says what was needed. Hiding it does not stop anyone holding a valid
-        // token from finding out, and it stops a legitimate operator from understanding why.
-        Outcome::Forbidden { held, needed } => Some(Response::failure(
+/// Who this request is, or the response explaining why it is nobody.
+///
+/// Returns the principal rather than a yes, which is what lets the per-statement check above be
+/// free. The old signature returned `Option<Response>` and threw the resolved role away.
+/// A `Response` is a couple of hundred bytes, which clippy would rather see boxed. Not here: the
+/// `Err` arm is the refused path, it is taken once per refused request and never in a loop, and
+/// boxing it would add an allocation to the path that is already answering "no" - to save moving
+/// bytes that are about to be written to a socket anyway.
+#[allow(clippy::result_large_err)]
+fn refuse<P: PagerMut + Sync>(
+    ctx: &Ctx<'_, P>,
+    req: &Request,
+    guard: Guard,
+) -> Result<Principal, Response> {
+    let needed = match guard {
+        // Never authenticated, and never even looked at: the probes have to answer while the
+        // database is unhealthy, which is exactly when a credential check might not.
+        Guard::Open => return Ok(Principal::Anonymous),
+        Guard::User(role) => role,
+        // A peer route. `Role::Read` is passed only because `authorize` takes one; what decides
+        // this is the identity, checked immediately below.
+        Guard::Node => Role::Read,
+    };
+
+    let presented = req.basic();
+    let credential = presented.as_ref().map(|b| big_http_credential(b));
+    let principal = match ctx.auth.authorize(ctx.identity, credential, needed) {
+        Outcome::Allowed(p) => p,
+        Outcome::Unauthenticated => {
+            return Err(Response::failure(
+                401,
+                "unauthenticated",
+                "a username and password are required",
+            )
+            // Without this header a client cannot tell a 401 it can fix from one it cannot, and
+            // every HTTP client library looks for it. `charset` is RFC 7617 and tells a client
+            // to encode the credential as UTF-8 rather than latin-1.
+            .with_header("WWW-Authenticate", "Basic realm=\"big\", charset=\"UTF-8\""));
+        }
+        Outcome::Forbidden { held, needed } => {
+            return Err(Response::failure(
+                403,
+                "forbidden",
+                &format!(
+                    "user `{}` is `{}`; this route needs `{}`",
+                    presented.as_ref().map_or("-", |b| b.user.as_str()),
+                    held.as_str(),
+                    needed.as_str()
+                ),
+            ))
+        }
+        // Not a 401. A 401 tells a client to stop and fix its credentials; this one was never
+        // looked at, and retrying is exactly the right thing to do.
+        Outcome::Overloaded => {
+            return Err(Response::failure(
+                503,
+                "busy_authenticating",
+                "too many passwords are being checked at once; retry shortly",
+            )
+            .with_header("Retry-After", 1))
+        }
+    };
+
+    // **The peer gate, and it goes both ways.** A person cannot reach `/internal/*` however
+    // privileged they are, and a node cannot reach a public route however good its certificate
+    // is. When authentication is switched off entirely, `Guard::Node` is satisfied by anything -
+    // "auth off means allow all" is an existing contract and this extends it rather than
+    // carving an exception into it.
+    match guard {
+        Guard::Node if ctx.auth.is_enabled() && !principal.is_node() => Err(Response::failure(
             403,
-            "forbidden",
-            &format!("this token is `{}`; this route needs `{}`", held.as_str(), needed.as_str()),
+            "not_a_peer",
+            "this route is reachable only by another node of this cluster, which proves itself \
+             with a client certificate rather than with a password",
         )),
+        Guard::User(_) if principal.is_node() => Err(Response::failure(
+            403,
+            "not_a_user",
+            "this route is reachable only by a person; a node certificate grants no role",
+        )),
+        _ => Ok(principal),
     }
+}
+
+/// The `403` a principal that does not reach far enough gets.
+///
+/// Names the user as well as the two roles. That is new, and it is the right call: a `403` is
+/// only ever seen by somebody who has already authenticated, so there is nothing here they did
+/// not already know - and an operator with two credentials in their shell history needs to be
+/// told which one they just used.
+fn forbidden(principal: &Principal, held: Role, needed: Role) -> Response {
+    Response::failure(
+        403,
+        "forbidden",
+        &format!(
+            "user `{}` is `{}`; this needs `{}`",
+            principal.display(),
+            held.as_str(),
+            needed.as_str()
+        ),
+    )
+}
+
+/// Borrows a parsed header as the credential `Auth` wants.
+fn big_http_credential(b: &crate::request::Basic) -> Credential<'_> {
+    Credential { user: &b.user, password: &b.password }
 }
 
 /// `None` when this peer is running the same build and reading the same cluster file.

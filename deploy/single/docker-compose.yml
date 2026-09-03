@@ -2,9 +2,9 @@
 # a four-machine deployment runs.
 #
 #   cd deploy/single
-#   mkdir -p secrets && printf 'change-me-please admin\n' > secrets/tokens
+#   mkdir -p secrets && printf 'change-me-please admin\n' > secrets/users
 #   docker compose up -d
-#   curl -H 'Authorization: Bearer change-me-please' localhost:7654/ready
+#   curl -u change-me-please:$PASSWORD localhost:7654/ready
 
 services:
   big:
@@ -24,10 +24,10 @@ services:
     command:
       - /data/big.db
       - 0.0.0.0:7654
-      - --tokens
+      - --users
       # Staged from the mount by the entrypoint, which reads it as root and writes a private
       # copy: a bind mount carries the host's ownership, which the image cannot predict.
-      - /run/big/tokens
+      - /run/big/users
       # **Set it on a new deployment.** There is no default, on purpose - a query that used to
       # finish must not start failing because the server was upgraded - but a daemon with no
       # ceiling is a daemon one expensive query can hold a worker on for as long as it likes.

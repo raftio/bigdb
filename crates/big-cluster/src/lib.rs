@@ -186,7 +186,13 @@ impl<P: PagerMut + Sync> Cluster<P> {
         Self::new(api, ClusterConfig::solo("127.0.0.1:7654"), None, Box::new(raft::Forgetful))
     }
 
-    /// A node in a configured cluster. `token` is the bearer token presented to peers.
+    /// A node in a configured cluster. `tls` is what this node presents to its peers.
+    ///
+    /// **A client certificate, not a shared secret.** The cluster used to hand every node the
+    /// same `admin` bearer token, so one leaked credential was every node - a gap
+    /// `docs/clustering.md` recorded and could not close, because a token has no way to say
+    /// which node is holding it. A certificate does: the peer CA signs one per node, the name in
+    /// it is the name in the cluster file, and revoking one node revokes one node.
     ///
     /// `store` is where this node's vote is kept, and it is a parameter rather than a default
     /// because there is no safe default: a node that forgets its vote can cast a second one in
@@ -195,10 +201,10 @@ impl<P: PagerMut + Sync> Cluster<P> {
     pub fn new(
         api: Api<P>,
         config: ClusterConfig,
-        token: Option<String>,
+        tls: Option<Arc<big_tls::ClientTls>>,
         store: Box<dyn raft::Store>,
     ) -> Self {
-        Self::with_timing(api, config, token, store, raft::Timing::default(), Leases::default())
+        Self::with_timing(api, config, tls, store, raft::Timing::default(), Leases::default())
     }
 
     /// The same, with the clocks the agreement runs on.
@@ -210,15 +216,16 @@ impl<P: PagerMut + Sync> Cluster<P> {
     pub fn with_timing(
         api: Api<P>,
         config: ClusterConfig,
-        token: Option<String>,
+        tls: Option<Arc<big_tls::ClientTls>>,
         store: Box<dyn raft::Store>,
         timing: raft::Timing,
         leases: Leases,
     ) -> Self {
         let peers = Arc::new(client::HttpPeers::new(
+            config.nodes().iter().map(|n| n.name.clone()),
             config.nodes().iter().map(|n| n.addr.clone()),
             config.this_index(),
-            token,
+            tls,
             config.fingerprint(),
         ));
         Self::with_peers(api, config, peers, store, timing, leases)

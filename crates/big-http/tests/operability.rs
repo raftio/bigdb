@@ -72,11 +72,15 @@ fn send_with(
     method: &str,
     target: &str,
     body: &str,
-    token: Option<&str>,
+    user: Option<&str>,
 ) -> Reply {
     let mut stream = TcpStream::connect(addr).unwrap();
-    let auth = match token {
-        Some(t) => format!("Authorization: Bearer {t}\r\n"),
+    // The password is the username - see `users_file` for why the fixture is arranged that way.
+    let auth = match user {
+        Some(u) => format!(
+            "Authorization: Basic {}\r\n",
+            big_tls::base64::encode(format!("{u}:{u}").as_bytes())
+        ),
         None => String::new(),
     };
     let request = format!(
@@ -129,7 +133,7 @@ fn ready_reports_what_the_engine_can_see() {
 /// every environment that has a probe - which is more places than the data it guards.
 #[test]
 fn the_probes_stay_open_when_authentication_is_on() {
-    let (_dir, path) = token_file("secret admin\n");
+    let (_dir, path) = users_file("secret admin\n");
     let addr = spawn(3, ServerConfig { auth: Auth::from_file(&path).unwrap(), ..config() });
 
     assert_eq!(send(addr, "GET", "/health", "").status, 200);
@@ -208,10 +212,25 @@ fn metrics_report_what_the_storage_backend_did() {
 // Credentials
 // ---------------------------------------------------------------------------
 
-fn token_file(body: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+/// A users file from `name role` shorthand, **hashing each name as its own password**.
+///
+/// A fixture convention, and a deliberate one: it keeps every call site below reading
+/// `Some("ro")` the way it did when a credential was one string, so these tests stay about roles
+/// rather than about passwords. The thing they are testing did not change; only the credential
+/// carrying it did.
+fn users_file(body: &str) -> (tempfile::TempDir, std::path::PathBuf) {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("tokens");
-    std::fs::write(&path, body).unwrap();
+    let path = dir.path().join("users");
+    let text: String = body
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|line| {
+            let mut parts = line.split_whitespace();
+            let (name, role) = (parts.next().unwrap(), parts.next().unwrap());
+            format!("{name} {role} {}\n", big_http::auth::hash_password(name).unwrap())
+        })
+        .collect();
+    std::fs::write(&path, text).unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -222,22 +241,27 @@ fn token_file(body: &str) -> (tempfile::TempDir, std::path::PathBuf) {
 
 #[test]
 fn a_missing_token_is_a_401_that_says_how_to_fix_it() {
-    let (_dir, path) = token_file("secret admin\n");
+    let (_dir, path) = users_file("secret admin\n");
     let addr = spawn(1, ServerConfig { auth: Auth::from_file(&path).unwrap(), ..config() });
 
     let r = send(addr, "GET", "/schema", "");
     assert_eq!(r.status, 401);
     assert!(r.body.contains(r#""code":"unauthenticated""#), "{}", r.body);
     assert!(
-        r.headers.contains("WWW-Authenticate: Bearer"),
+        r.headers.contains("WWW-Authenticate: Basic"),
         "every HTTP client library looks for this header: {}",
+        r.headers
+    );
+    assert!(
+        r.headers.contains("charset=\"UTF-8\""),
+        "RFC 7617, so a client encodes the credential as UTF-8 rather than latin-1: {}",
         r.headers
     );
 }
 
 #[test]
 fn a_token_that_does_not_reach_far_enough_is_a_403() {
-    let (_dir, path) = token_file("ro read\nrw write\nsecret admin\n");
+    let (_dir, path) = users_file("ro read\nrw write\nsecret admin\n");
     let addr = spawn(4, ServerConfig { auth: Auth::from_file(&path).unwrap(), ..config() });
 
     // `read` reaches the query and schema routes.
@@ -259,7 +283,7 @@ fn a_token_that_does_not_reach_far_enough_is_a_403() {
 /// which - it is also the reason `Sql` has a variant per kind rather than a flag somewhere.
 #[test]
 fn a_sql_statement_raises_the_role_the_route_asks_for() {
-    let (_dir, path) = token_file("ro read\nrw write\nsecret admin\n");
+    let (_dir, path) = users_file("ro read\nrw write\nsecret admin\n");
     // Eleven, which is how many requests this test makes: the server serves exactly that many
     // and then stops, so a request added below without this moving answers `connection
     // refused` rather than anything about roles.
@@ -310,7 +334,7 @@ fn a_sql_statement_raises_the_role_the_route_asks_for() {
 /// the test that says so is here rather than left to the reader of the match.
 #[test]
 fn an_explain_needs_the_role_of_the_statement_it_describes() {
-    let (_dir, path) = token_file("ro read\nrw write\nsecret admin\n");
+    let (_dir, path) = users_file("ro read\nrw write\nsecret admin\n");
     // Eight, which is how many requests this test makes.
     let addr = spawn(8, ServerConfig { auth: Auth::from_file(&path).unwrap(), ..config() });
     assert_eq!(
@@ -345,7 +369,7 @@ fn an_explain_needs_the_role_of_the_statement_it_describes() {
 
 #[test]
 fn an_unknown_token_is_not_distinguishable_from_no_token() {
-    let (_dir, path) = token_file("secret admin\n");
+    let (_dir, path) = users_file("secret admin\n");
     let addr = spawn(1, ServerConfig { auth: Auth::from_file(&path).unwrap(), ..config() });
     let r = send_with(addr, "GET", "/schema", "", Some("guess"));
     assert_eq!(r.status, 401);
@@ -559,7 +583,7 @@ fn a_backup_refuses_to_overwrite_one_that_is_already_there() {
 #[test]
 fn a_read_token_cannot_take_a_backup() {
     let dir = tempfile::tempdir().unwrap();
-    let (_tokens, path) = token_file("scraper read\n");
+    let (_tokens, path) = users_file("scraper read\n");
     let addr = spawn(
         1,
         ServerConfig {
@@ -582,7 +606,7 @@ fn a_read_token_cannot_take_a_backup() {
 /// read-only token the power `POST /table/{t}` demands `admin` for.
 #[test]
 fn a_read_only_token_cannot_change_the_schema_through_sql() {
-    let (_dir, path) = token_file("ro read\nrw write\nsecret admin\n");
+    let (_dir, path) = users_file("ro read\nrw write\nsecret admin\n");
     let addr = spawn(6, ServerConfig { auth: Auth::from_file(&path).unwrap(), ..config() });
 
     // A query is what `read` is for, and still works.

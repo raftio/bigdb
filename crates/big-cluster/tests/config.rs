@@ -240,13 +240,13 @@ fn one_node_owns_everything_and_leads_the_schema() {
 fn a_comment_inside_a_quoted_value_is_not_a_comment() {
     let text = r#"
 schema_leader = "a"
-peer_token_file = "/etc/big/tok#en"
+peer_ca_file = "/etc/big/ca#1.pem"
 [[node]]
 name = "a"
 addr = "1:1"
 shards = "0.."
 "#;
-    assert_eq!(ClusterFile::parse(text).unwrap().peer_token_file(), Some("/etc/big/tok#en"));
+    assert_eq!(ClusterFile::parse(text).unwrap().peer_ca_file(), Some("/etc/big/ca#1.pem"));
 }
 
 // -------------------------------------------------------------------------------------------

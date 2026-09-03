@@ -156,23 +156,23 @@ fn a_dry_run_sends_nothing() {
 }
 
 #[test]
-fn a_token_is_read_from_a_file_and_never_taken_as_a_flag() {
-    // An argument is visible in `ps` and in shell history, so a bearer token in either is a
-    // token that has leaked. There is deliberately no `--token`.
+fn a_password_is_read_from_a_file_and_never_taken_as_a_flag() {
+    // An argument is visible in `ps` and in shell history, so a password in either has already
+    // leaked - and a password leaks further than a token did, because it is a thing a person
+    // also uses somewhere else. There is deliberately no `--password`.
     let workspace = Workspace::new();
-    let tokens = token_file(workspace.path(), "sekrit admin\n");
-    let daemon = workspace.daemon(&["--tokens", &tokens.display().to_string()]);
+    let users = users_file(workspace.path(), "sekrit admin\n");
+    let daemon = workspace.daemon(&["--users", &users.display().to_string()]);
 
     let refused = daemon.bigctl(&["schema"]);
     assert_ne!(refused.code, 0, "no credential, no schema");
 
-    // The client's token file is a different file with the same contents rule: mode 600, and
-    // it holds the token itself rather than a `token role` line.
+    // The client's file is a different file with the same rule: mode 600, and it holds
+    // `user:password` rather than the server's `username role hash`.
     let held = tempfile::tempdir().unwrap();
-    let mine = held.path().join("token");
-    std::fs::write(&mine, "sekrit").unwrap();
-    set_mode(&mine, 0o600);
+    let mine = credentials_file(held.path(), "sekrit");
 
-    let allowed = daemon.bigctl(&["--token-file", &mine.display().to_string(), "schema"]).expect(0);
-    assert!(allowed.code == 0, "with the token it answers: {}", allowed.err);
+    let allowed =
+        daemon.bigctl(&["--credentials-file", &mine.display().to_string(), "schema"]).expect(0);
+    assert!(allowed.code == 0, "with the credential it answers: {}", allowed.err);
 }

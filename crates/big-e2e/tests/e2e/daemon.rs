@@ -51,9 +51,9 @@ fn an_unknown_option_names_the_option_it_did_not_know() {
 #[test]
 fn a_flag_without_its_value_says_which_flag() {
     // The difference between a usable error and "invalid arguments".
-    let run = run("big", &["serve", "/tmp/nothing.big", "--tokens"]).expect(2);
+    let run = run("big", &["serve", "/tmp/nothing.big", "--users"]).expect(2);
 
-    assert!(run.said("--tokens needs a value"), "{}", run.err);
+    assert!(run.said("--users needs a value"), "{}", run.err);
 }
 
 #[test]
@@ -66,17 +66,73 @@ fn a_durability_that_is_not_one_of_the_three_is_refused_with_the_three() {
 
 #[test]
 fn a_public_port_with_no_authentication_is_refused() {
-    // **The load-bearing refusal.** There is no TLS and there will not be, so what keeps that
-    // from being an excuse is this: a port anyone can reach, with no token file, does not open.
+    // **The load-bearing refusal.** A port anyone can reach, with no credentials, does not open.
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("data.big");
     let run = run("big", &["serve", &path.display().to_string(), "0.0.0.0:0"]).expect(2);
 
     assert!(run.said("refusing to serve"), "{}", run.err);
     // All three ways out, because a refusal that does not say how to proceed is a wall.
-    assert!(run.said("--tokens"), "offers a token file: {}", run.err);
+    assert!(run.said("--users"), "offers a users file: {}", run.err);
     assert!(run.said("reverse proxy"), "offers a proxy: {}", run.err);
     assert!(run.said("--insecure-no-auth"), "offers the override: {}", run.err);
+}
+
+#[test]
+fn a_public_port_in_the_clear_is_refused_even_when_it_is_authenticated() {
+    // **The second refusal, and the reason it is a second one.** Authentication was enough while
+    // the credential was a bearer token belonging to this database. It is not enough for a
+    // password, which is a thing a person also uses somewhere else - so a port that has
+    // credentials and no transport is refused too, and separately.
+    let dir = tempfile::tempdir().unwrap();
+    let tokens = users_file(dir.path(), "sekrit admin\n");
+    let path = dir.path().join("data.big");
+    let run = run(
+        "big",
+        &[
+            "serve",
+            &path.display().to_string(),
+            "0.0.0.0:0",
+            "--users",
+            &tokens.display().to_string(),
+        ],
+    )
+    .expect(2);
+
+    assert!(run.said("refusing to serve"), "{}", run.err);
+    assert!(run.said("in the clear"), "names what is wrong: {}", run.err);
+    assert!(run.said("--tls-cert"), "offers a certificate: {}", run.err);
+    assert!(run.said("reverse proxy"), "offers a proxy: {}", run.err);
+    assert!(run.said("--insecure-no-tls"), "offers the override: {}", run.err);
+}
+
+#[test]
+fn the_transport_override_does_not_excuse_having_no_credentials() {
+    // The two refusals are two decisions, and each override answers only its own. An operator
+    // who reaches for `--insecure-no-tls` because a proxy terminates TLS in front must not get
+    // "and no authentication either" thrown in with it.
+    //
+    // Only the refusing half is asserted here. The half that starts is a daemon that runs until
+    // it is killed, which `run` cannot wait for - `loopback_with_no_authentication_is_allowed`
+    // and every test built on `Workspace::daemon` cover a daemon that does start.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("data.big");
+    let run = run("big", &["serve", &path.display().to_string(), "0.0.0.0:0", "--insecure-no-tls"])
+        .expect(2);
+    assert!(run.said("no authentication"), "{}", run.err);
+    assert!(!run.said("in the clear"), "the transport refusal was answered: {}", run.err);
+}
+
+#[test]
+fn a_certificate_without_its_key_says_which_one_is_missing() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("data.big");
+    let run = run(
+        "big",
+        &["serve", &path.display().to_string(), "127.0.0.1:0", "--tls-cert", "/tmp/cert.pem"],
+    )
+    .expect(2);
+    assert!(run.said("--tls-cert needs --tls-key"), "{}", run.err);
 }
 
 #[test]
@@ -92,11 +148,12 @@ fn loopback_with_no_authentication_is_allowed_and_says_so() {
 }
 
 #[test]
-fn a_token_file_anyone_can_read_is_refused() {
-    // A bearer token in a world-readable file is a token every process on the box has. Refused
+fn a_users_file_anyone_can_read_is_refused() {
+    // A password hash in a world-readable file is one every process on the box can attack
+    // offline. Refused
     // rather than warned about: a warning on startup is a line nobody reads twice.
     let dir = tempfile::tempdir().unwrap();
-    let tokens = token_file(dir.path(), "sekrit admin\n");
+    let tokens = users_file(dir.path(), "sekrit admin\n");
     set_mode(&tokens, 0o644);
     let path = dir.path().join("data.big");
 
@@ -106,7 +163,7 @@ fn a_token_file_anyone_can_read_is_refused() {
             "serve",
             &path.display().to_string(),
             "127.0.0.1:0",
-            "--tokens",
+            "--users",
             &tokens.display().to_string(),
         ],
     );
@@ -116,13 +173,13 @@ fn a_token_file_anyone_can_read_is_refused() {
 }
 
 #[test]
-fn a_daemon_with_tokens_says_how_many_it_loaded() {
+fn a_daemon_with_users_says_how_many_it_loaded() {
     let workspace = Workspace::new();
-    let tokens = token_file(workspace.path(), "alpha admin\nbeta read\n");
-    let daemon = workspace.daemon(&["--tokens", &tokens.display().to_string()]);
+    let tokens = users_file(workspace.path(), "alpha admin\nbeta read\n");
+    let daemon = workspace.daemon(&["--users", &tokens.display().to_string()]);
 
-    until("the daemon to report its tokens", || daemon.log().contains("tokens loaded"));
-    assert!(daemon.log().contains("2 tokens loaded"), "{}", daemon.log());
+    until("the daemon to report its users", || daemon.log().contains("users loaded"));
+    assert!(daemon.log().contains("2 users loaded"), "{}", daemon.log());
 
     // The probes stay open with authentication on, which is what makes this observable at all.
     assert_eq!(daemon.bigctl(&["health"]).code, 0);

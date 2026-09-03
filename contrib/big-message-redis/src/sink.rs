@@ -149,7 +149,8 @@ pub struct Config {
     /// pending list, and two processes sharing a name would each recover the other's work.
     pub consumer: String,
     pub addr: String,
-    pub token: Option<String>,
+    /// `user:password` for bigdb, read out of a file - never a flag.
+    pub credential: Option<String>,
     pub table: String,
     pub map: Vec<Mapping>,
     /// The column the entry's own stream id is written to.
@@ -252,13 +253,13 @@ impl Sink {
             &config.addr,
             &config.table,
             &refs,
-            config.token.as_deref(),
+            config.credential.as_deref(),
             producer.clone(),
         )?;
         let reader = config
             .dedup_field
             .as_ref()
-            .map(|_| Reader::open(&config.addr, config.token.as_deref(), &producer));
+            .map(|_| Reader::open(&config.addr, config.credential.as_deref(), &producer));
 
         Ok(Self { redis, producer: producer_handle, reader, config, report: Report::default() })
     }
@@ -470,7 +471,7 @@ mod tests {
             group: String::new(),
             consumer: String::new(),
             addr: String::new(),
-            token: None,
+            credential: None,
             table: String::new(),
             map: vec![
                 Mapping::parse("amount:int=amount").unwrap(),

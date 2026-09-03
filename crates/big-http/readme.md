@@ -7,8 +7,8 @@ HTTP/1.1 with a `Content-Length` body — deliberately the least server that cou
 the decision to have one at all stays cheap to revisit.
 
 ```console
-$ big serve data.big 127.0.0.1:7654 --tokens tokens.txt
-$ curl -H 'Authorization: Bearer …' -d 'Count(Row(country="GB"))' \
+$ big serve data.big 127.0.0.1:7654 --users tokens.txt
+$ curl -u ops:… -d 'Count(Row(country="GB"))' \
       localhost:7654/table/tx/query
 ```
 
@@ -61,7 +61,7 @@ answer; queueing it only moves the failure somewhere harder to see.**
 **Transport security is not here and is not going to be.** Termination belongs to a reverse proxy
 — see `runbook.md`. A TLS stack would be a larger dependency than the entire engine, and a
 hand-written one is out of the question. What *is* enforced is the half that keeps that from
-being an excuse: `big serve` **refuses to bind anywhere but loopback without a token file**, and
+being an excuse: `big serve` **refuses to bind anywhere but loopback without a users file**, and
 overriding that needs `--insecure-no-auth`, a flag that says what it is.
 
 **Tokens are a file, not a database.** One `token role` per line, roles `read` / `write` /

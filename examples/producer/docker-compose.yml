@@ -30,13 +30,13 @@ services:
     # `deploy/single` is right to mount instead: a real credential belongs in a file the
     # deployment manages, not in the compose file. This one is neither real nor a secret.
     configs:
-      - source: tokens
-        target: /etc/big/secrets/tokens
+      - source: users
+        target: /etc/big/secrets/users
     command:
       - /data/big.db
       - 0.0.0.0:7654
-      - --tokens
-      - /run/big/tokens
+      - --users
+      - /run/big/users
       - --query-timeout
       - "30"
     stop_grace_period: 2s
@@ -51,11 +51,17 @@ services:
       big:
         condition: service_healthy
     environment:
-      # The token itself, not a path - see the note in examples/produce.rs. It is written here
-      # in the open because it is a demo credential for a daemon published on loopback, and
-      # pretending otherwise would teach the wrong lesson more effectively than saying so.
+      # A path to a file holding one `user:password` line, which is what this name means
+      # everywhere - the client, the sink and this demo all read it the same way. The file is
+      # written below, in the open, because it is a demo credential for a daemon published on
+      # loopback; pretending otherwise would teach the wrong lesson more effectively than
+      # saying so.
       # `demo-writer` holds `write`, which is all an INSERT needs; DDL below runs as `demo-admin`.
-      BIG_MESSAGE_TOKEN: demo-writer
+      BIG_MESSAGE_CREDENTIALS: /etc/big/demo.cred
+    configs:
+      - source: writer-credential
+        target: /etc/big/demo.cred
+        mode: 0600
     # Never started by `up`, which is for things that stay up. run.sh reaches it with
     # `compose run --rm`, and that enables this profile on its own.
     profiles: ["run"]
@@ -63,14 +69,21 @@ services:
 volumes:
   data:
 
-# Two tokens rather than one, because the server distinguishes them: `CREATE TABLE` is DDL and
+# Two users rather than one, because the server distinguishes them: `CREATE TABLE` is DDL and
 # needs `admin`, an `INSERT` needs `write`, and the producer above holds only the second. A demo
 # where everything is admin would not show that.
 #
+# The hashes are argon2id and were made by `big passwd`, which is the only thing that writes a
+# users file. Both passwords are the username - `demo-admin:demo-admin` and
+# `demo-writer:demo-writer` - which is a thing that is only ever true of a demo.
+#
 # The image's entrypoint copies this to mode 600 owned by the daemon's user before `big serve`
-# reads it, because `big serve` refuses a token file anyone else can read.
+# reads it, because `big serve` refuses a users file anyone else can read.
 configs:
-  tokens:
+  users:
     content: |
-      demo-admin  admin
-      demo-writer write
+      demo-admin admin $argon2id$v=19$m=19456,t=2,p=1$P/TNADEv8I+/sZu3sw8PZA$IjQynYfCSrGyf2EB6+S9GKT+jLyaassQrUQIdyg88tE
+      demo-writer write $argon2id$v=19$m=19456,t=2,p=1$Xks2eOLbzmqsLZ5EBjOdnw$ftGznJDkoAYvZ6DIrmaU/H+T+xn/kf5gF9PITDnTSuQ
+  writer-credential:
+    content: |
+      demo-writer:demo-writer

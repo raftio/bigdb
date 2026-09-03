@@ -14,17 +14,23 @@
 
 //! `big serve <file> [addr] [options]` - serve one database over HTTP.
 //!
-//! **Binding off loopback without a token file is refused.** It used to print a warning and
-//! bind anyway, which is a warning nobody reads on a port anybody can reach. A warning is the
-//! right shape for something recoverable; this is not, so it is an error with a flag to
-//! override it deliberately.
+//! **Binding off loopback without a users file is refused**, and so is binding off loopback in
+//! the clear. Both used to print a warning and bind anyway, which is a warning nobody reads on a
+//! port anybody can reach. A warning is the right shape for something recoverable; neither of
+//! these is, so each is an error with its own flag to override it deliberately.
 //!
-//! There is no TLS here and there will not be. Terminate it at a reverse proxy - `runbook.md`
-//! has a configuration that works.
+//! **TLS is here now, and this paragraph used to say it never would be.** The old answer -
+//! terminate at a reverse proxy - was the right one while the credential was a bearer token that
+//! belonged to this database and to nothing else. A password is not that: it is a thing a person
+//! also uses somewhere else, so sending one in the clear risks something that was never ours to
+//! risk. The proxy is still supported and is still a perfectly good deployment; it is just no
+//! longer the only answer. See `--tls-cert` and `--insecure-no-tls`.
 
 use big_cluster::{Cluster, ClusterFile};
 use big_embed::Api;
 use big_http::{log, Auth, Server, ServerConfig};
+use big_tls::TlsConfig;
+use std::path::Path;
 use std::time::Duration;
 
 const DEFAULT_ADDR: &str = "127.0.0.1:7654";
@@ -34,15 +40,25 @@ usage: big serve <file> [addr] [options]
 
   addr                        defaults to 127.0.0.1:7654
 
-  --tokens <file>             bearer tokens, one `token role` per line
+  --users <file>              one `username role hash` per line, made by `big passwd`
                               roles: read, write, admin; file must be mode 600
+  --tls-cert <file>           PEM certificate chain this server presents
+  --tls-key <file>            PEM private key for it; file must be mode 600
+                              both need a build with the `tls` feature
+  --peer-cert <file>          PEM chain this node presents to its peers
+  --peer-key <file>           PEM private key for it; file must be mode 600
+                              a cluster whose file names a peer CA needs both. Nodes
+                              prove themselves to each other with a certificate, not a
+                              shared secret, so one leaked key is one node
   --cluster <file>            who owns which shards; see docs/clustering.md
                               without it, this node owns every shard and has no peers
                               a node owns a range (shards) or copies one (replica)
                               a cluster with any replica needs three nodes or more
   --node <name>               which node in the cluster file this daemon is
                               defaults to the one whose addr is the addr above
-  --insecure-no-auth          allow a non-loopback bind with no tokens. Says what it is.
+  --insecure-no-auth          allow a non-loopback bind with no users. Says what it is.
+  --insecure-no-tls           allow a non-loopback bind in the clear. Says what it is.
+                              what you want when a reverse proxy terminates TLS in front
   --workers <n>               requests handled at once
   --queue <n>                 connections allowed to wait; past this, 503
   --read-timeout <seconds>    how long a client may take to send a request
@@ -71,20 +87,20 @@ Listing:
 
 Replication:
   GET  /verify   do the copies of every range still hold the same facts
-                 a scan, not a probe; needs a `read` token
+                 a scan, not a probe; needs a `read` user
   POST /repair   catch up every copy the agreement has marked behind
-                 a scan and a copy; needs an `admin` token
+                 a scan and a copy; needs an `admin` user
 
 Backup:
   POST /admin/backup?name=<f>  an online, compact copy of this node's file
-                 needs --backup-dir and an `admin` token; one at a time
+                 needs --backup-dir and an `admin` user; one at a time
                  a cluster is backed up one node at a time, and the copies
                  are not one snapshot - see docs/clustering.md
 
 Probes and metrics:
   GET /health    liveness, never authenticated
   GET /ready     readiness, never authenticated
-  GET /metrics   Prometheus text; needs a `read` token when tokens are configured
+  GET /metrics   Prometheus text; needs a `read` user when --users is configured
 ";
 
 /// `big serve`, with the word already stripped by the dispatcher.
@@ -104,7 +120,14 @@ pub fn main(args: &[String]) -> std::io::Result<()> {
         }
     };
 
+    // The cluster file is read here, **before anything is bound and before the certificate is
+    // loaded**, because it holds two things the listener needs: which CA signs a peer's
+    // certificate, and the names those certificates are allowed to claim. A file that disagrees
+    // with itself is a fact the operator has to fix, and finding that out after the port is open
+    // would mean a node answering for a range nobody agreed it owns.
+    let cluster_file = read_cluster_file(&opts)?;
     let auth = authenticator(&opts)?;
+    let tls = transport(&opts, cluster_file.as_ref())?;
 
     // One process per file: the engine takes an exclusive lock, so a second daemon on the same
     // path fails here rather than fighting over it later.
@@ -113,7 +136,7 @@ pub fn main(args: &[String]) -> std::io::Result<()> {
 
     api.set_key_limit(opts.max_row_keys);
 
-    let cluster = assemble(api, &opts)?;
+    let cluster = assemble(api, &opts, cluster_file)?;
     if let Some(d) = opts.durability {
         cluster
             .local()
@@ -121,7 +144,7 @@ pub fn main(args: &[String]) -> std::io::Result<()> {
             .map_err(|e| std::io::Error::other(format!("could not set durability: {e}")))?;
     }
 
-    let server = Server::bind_cluster(cluster, opts.addr.as_str(), serving(auth, &opts))?;
+    let server = Server::bind_cluster(cluster, opts.addr.as_str(), serving(auth, tls, &opts))?;
     let bound = server.local_addr()?;
     refuse_an_open_port(&server, bound, &opts);
     announce(&server, bound, &opts);
@@ -129,12 +152,51 @@ pub fn main(args: &[String]) -> std::io::Result<()> {
     server.serve()
 }
 
-/// The tokens, or the decision to have none.
+/// The certificate this listener presents, or the decision to serve in the clear.
+///
+/// Read **before the listener is bound**, like the cluster file and for the same reason: a
+/// certificate that cannot be loaded is a fact the operator has to fix, and finding it out after
+/// the port is open would mean a port that accepts connections it can never complete.
+fn transport(opts: &Options, cluster: Option<&ClusterFile>) -> std::io::Result<Option<TlsConfig>> {
+    match (&opts.tls_cert, &opts.tls_key) {
+        // The half-configured cases are refused by `Options::parse`, which is where a flag that
+        // needs another flag belongs: that path exits 2 and reprints the usage, and this one
+        // does neither.
+        (None, _) | (_, None) => Ok(None),
+        (Some(cert), Some(key)) => {
+            // **The cluster file is the roster.** A client certificate this node's peer CA signed
+            // that names none of these is refused at accept: a certificate that got that far was
+            // meant to be a node, and letting it through as an anonymous client would hide a
+            // renamed node behind a `401` nobody can explain.
+            let peer_ca = cluster.and_then(ClusterFile::peer_ca_file);
+            let roster: Vec<String> = cluster
+                .map(|c| c.nodes().iter().map(|n| n.name.clone()).collect())
+                .unwrap_or_default();
+            if peer_ca.is_some() && roster.is_empty() {
+                return Err(std::io::Error::other(
+                    "a peer CA is configured but the cluster file names no nodes",
+                ));
+            }
+            let tls =
+                TlsConfig::load(Path::new(cert), Path::new(key), peer_ca.map(Path::new), roster)
+                    .map_err(|e| {
+                        std::io::Error::new(e.kind(), format!("could not load {cert}: {e}"))
+                    })?;
+            eprintln!("big: tls certificate from {cert}");
+            if tls.checks_peers() {
+                eprintln!("big: peers are checked against the names in the cluster file");
+            }
+            Ok(Some(tls))
+        }
+    }
+}
+
+/// The users, or the decision to have none.
 fn authenticator(opts: &Options) -> std::io::Result<Auth> {
-    let Some(path) = &opts.tokens else { return Ok(Auth::disabled()) };
+    let Some(path) = &opts.users else { return Ok(Auth::disabled()) };
     let auth = Auth::from_file(path)
         .map_err(|e| std::io::Error::new(e.kind(), format!("could not read {path}: {e}")))?;
-    eprintln!("big: {} tokens loaded from {path}", auth.len());
+    eprintln!("big: {} users loaded from {path}", auth.len());
     Ok(auth)
 }
 
@@ -143,20 +205,22 @@ fn authenticator(opts: &Options) -> std::io::Result<Auth> {
 /// The cluster file is read here, **before the listener is bound**. A file that disagrees with
 /// itself is a fact the operator has to fix, and finding that out after the port is open would
 /// mean a node answering for a range nobody agreed it owns.
+/// The cluster file, parsed once and used twice: by the listener, for the peer CA and the
+/// roster, and by the coordinator, for who owns what.
+fn read_cluster_file(opts: &Options) -> std::io::Result<Option<ClusterFile>> {
+    let Some(path) = &opts.cluster else { return Ok(None) };
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| std::io::Error::new(e.kind(), format!("could not read {path}: {e}")))?;
+    ClusterFile::parse(&text).map(Some).map_err(|e| std::io::Error::other(format!("{path}: {e}")))
+}
+
 fn assemble(
     api: Api<big_embed::MmapPager>,
     opts: &Options,
+    file: Option<ClusterFile>,
 ) -> std::io::Result<Cluster<big_embed::MmapPager>> {
-    let Some(path) = &opts.cluster else { return Ok(Cluster::solo(api)) };
-    let text = std::fs::read_to_string(path)
-        .map_err(|e| std::io::Error::new(e.kind(), format!("could not read {path}: {e}")))?;
-    let file =
-        ClusterFile::parse(&text).map_err(|e| std::io::Error::other(format!("{path}: {e}")))?;
-    let token = file
-        .peer_token_file()
-        .map(big_http::auth::read_secret_file)
-        .transpose()
-        .map_err(|e| std::io::Error::new(e.kind(), format!("{path}: {e}")))?;
+    let (Some(path), Some(file)) = (&opts.cluster, file) else { return Ok(Cluster::solo(api)) };
+    let peer_ca = file.peer_ca_file().map(str::to_string);
     let config = file
         .for_node(opts.node.as_deref(), &opts.addr)
         .map_err(|e| std::io::Error::other(format!("{path}: {e}")))?;
@@ -167,27 +231,65 @@ fn assemble(
         config.leader().name,
         config.nodes().len() - 1
     );
-    if token.is_none() && config.nodes().len() > 1 {
-        // Not refused: a private network with no tokens anywhere is a configuration this daemon
-        // already allows, and refusing it here would refuse it only for clusters. Said out loud,
-        // because a peer that presents nothing can only talk to a peer that asks for nothing.
-        eprintln!(
-            "big: no peer_token_file in {path}; this node presents no credential to its peers"
-        );
-    }
+
+    let clustered = config.nodes().len() > 1;
+    let tls = match (&peer_ca, &opts.peer_cert, &opts.peer_key) {
+        (None, _, _) => {
+            if clustered {
+                // Not refused: a private network with no credentials anywhere is a configuration
+                // this daemon already allowed, and refusing it here would refuse it only for
+                // clusters. Said out loud, because a peer that presents nothing can only talk to
+                // a peer that asks for nothing.
+                eprintln!(
+                    "big: no peer_ca_file in {path}; this node presents no credential to its peers"
+                );
+            }
+            None
+        }
+        // **Refused, where the missing peer token used to be a warning.** Under a shared token, a
+        // node with none could still be reached by peers that asked for none. Under mutual TLS a
+        // node with no client certificate cannot reach `/internal/*` on any peer at all, so every
+        // fan-out would return 403 and the cluster would be silently broken - which is worse than
+        // the old case, and so it is an error rather than a line in a log.
+        (Some(_), None, _) | (Some(_), _, None) if clustered => {
+            return Err(std::io::Error::other(format!(
+                "{path} names a peer CA, so this node needs --peer-cert and --peer-key to \
+                 reach its peers. Without them every request to another node is refused and \
+                 the cluster is broken in a way that only shows up under load."
+            )))
+        }
+        (Some(ca), Some(cert), Some(key)) => {
+            let tls = big_tls::ClientTls::new(
+                Some(Path::new(ca)),
+                Some((Path::new(cert), Path::new(key))),
+            )
+            .map_err(|e| std::io::Error::new(e.kind(), format!("{path}: {e}")))?;
+            // Printed rather than folded into the cluster fingerprint. Two nodes trusting
+            // different CAs cannot exchange the header that carries a fingerprint - the handshake
+            // fails first - so a `409` for it would be unreachable. This is what lets an operator
+            // compare two nodes without provoking a handshake to find out.
+            eprintln!("big: peer CA {ca}");
+            Some(std::sync::Arc::new(tls))
+        }
+        // A solo node with a peer CA configured and no certificate of its own. Nothing to reach,
+        // so nothing to refuse.
+        (Some(_), _, _) => None,
+    };
+
     // Next to the database, because it belongs to this node and to this file: two daemons on one
     // machine are two databases, and giving them one vote between them would be giving one node
     // two.
     let state = format!("{}.raft", opts.path);
     eprintln!("big: agreement state in {state}");
-    Ok(Cluster::new(api, config, token, Box::new(big_cluster::raft::FileStore::new(state))))
+    Ok(Cluster::new(api, config, tls, Box::new(big_cluster::raft::FileStore::new(state))))
 }
 
 /// The listener's settings: the defaults, with whatever the operator overrode.
-fn serving(auth: Auth, opts: &Options) -> ServerConfig {
+fn serving(auth: Auth, tls: Option<TlsConfig>, opts: &Options) -> ServerConfig {
     let base = ServerConfig::default();
     ServerConfig {
         auth,
+        tls,
         backup_dir: opts.backup_dir.clone(),
         query_timeout: opts.query_timeout,
         workers: opts.workers.unwrap_or(base.workers),
@@ -207,17 +309,35 @@ fn refuse_an_open_port(
     bound: std::net::SocketAddr,
     opts: &Options,
 ) {
-    if bound.ip().is_loopback() || server.config().auth.is_enabled() || opts.insecure {
+    if bound.ip().is_loopback() {
         return;
     }
-    eprintln!(
-        "big: refusing to serve {bound} with no authentication.\n\
-         \n\
-         Anyone who can reach this port can read and delete everything in the database.\n\
-         Either pass --tokens <file>, or bind to loopback and put a reverse proxy in\n\
-         front of it, or pass --insecure-no-auth if the port really is private."
-    );
-    std::process::exit(2);
+    if !server.config().auth.is_enabled() && !opts.insecure {
+        eprintln!(
+            "big: refusing to serve {bound} with no authentication.\n\
+             \n\
+             Anyone who can reach this port can read and delete everything in the database.\n\
+             Either pass --users <file>, or bind to loopback and put a reverse proxy in\n\
+             front of it, or pass --insecure-no-auth if the port really is private."
+        );
+        std::process::exit(2);
+    }
+    // **A second refusal, and a second flag, because these are two decisions.** An operator with
+    // a TLS-terminating proxy in front wants exactly `--insecure-no-tls` and wants to keep their
+    // credentials; folding the two into one flag would make them buy the second with the first.
+    if server.config().tls.is_none() && !opts.insecure_no_tls {
+        eprintln!(
+            "big: refusing to serve {bound} in the clear.\n\
+             \n\
+             A password sent in the clear is worse than a bearer token sent in the clear.\n\
+             A token belongs to this database; a password is one a person also uses\n\
+             somewhere else.\n\
+             \n\
+             Either pass --tls-cert and --tls-key, or bind to loopback and terminate TLS\n\
+             at a reverse proxy, or pass --insecure-no-tls if the port really is private."
+        );
+        std::process::exit(2);
+    }
 }
 
 /// What a starting daemon says about itself.
@@ -226,7 +346,16 @@ fn refuse_an_open_port(
 /// reading a log after an incident needs to know what the setting *was*, and a line that only
 /// appears sometimes is one they have to remember the absence of.
 fn announce(server: &Server<big_embed::MmapPager>, bound: std::net::SocketAddr, opts: &Options) {
-    eprintln!("big serving {} on http://{bound}", opts.path);
+    let scheme = if server.config().tls.is_some() { "https" } else { "http" };
+    eprintln!("big serving {} on {scheme}://{bound}", opts.path);
+    // Printed on every start, whichever it is. Which binary an operator was running is a thing
+    // they have to be able to read out of a log after the fact, and a line that only appears
+    // sometimes is one they have to remember the absence of.
+    if big_tls::built_with_tls() {
+        eprintln!("big: tls built in");
+    } else {
+        eprintln!("big: no tls in this build");
+    }
     eprintln!("big: durability {}", server.api().durability().label());
     // Printed on every start for the same reason durability is: the ceiling that made a write
     // fail is one an operator has to be able to read out of a log after the fact, and a line
@@ -242,6 +371,11 @@ fn announce(server: &Server<big_embed::MmapPager>, bound: std::net::SocketAddr, 
     if !server.config().auth.is_enabled() {
         eprintln!("big: no authentication; this port must not be reachable from anywhere else");
     }
+    if server.config().tls.is_none() {
+        eprintln!(
+            "big: serving in the clear; terminate TLS in front of this port or use --tls-cert"
+        );
+    }
     log::emit(
         log::Level::Info,
         "starting",
@@ -252,8 +386,13 @@ fn announce(server: &Server<big_embed::MmapPager>, bound: std::net::SocketAddr, 
 struct Options {
     path: String,
     addr: String,
-    tokens: Option<String>,
+    users: Option<String>,
+    tls_cert: Option<String>,
+    peer_cert: Option<String>,
+    peer_key: Option<String>,
+    tls_key: Option<String>,
     insecure: bool,
+    insecure_no_tls: bool,
     workers: Option<usize>,
     queue: Option<usize>,
     read_timeout: Option<Duration>,
@@ -274,8 +413,13 @@ impl Default for Options {
         Self {
             path: String::new(),
             addr: String::new(),
-            tokens: None,
+            users: None,
+            tls_cert: None,
+            peer_cert: None,
+            peer_key: None,
+            tls_key: None,
             insecure: false,
+            insecure_no_tls: false,
             workers: None,
             queue: None,
             read_timeout: None,
@@ -304,8 +448,33 @@ impl Options {
             // difference between a usable error and "invalid arguments".
             let value = || args.get(i + 1).cloned().ok_or_else(|| format!("{arg} needs a value"));
             match arg {
+                "--users" => {
+                    out.users = Some(value()?);
+                    i += 2;
+                }
+                // Recognised for one release so that it can say what happened. A flag that has
+                // been removed and explains itself is worth more than a clean parser: falling
+                // through to "unknown option" would send an operator to check their spelling.
                 "--tokens" => {
-                    out.tokens = Some(value()?);
+                    return Err("--tokens is gone: bearer tokens were replaced by usernames and \
+                         passwords. Make a users file with `big passwd <file> set <user>` and \
+                         pass --users."
+                        .to_string())
+                }
+                "--tls-cert" => {
+                    out.tls_cert = Some(value()?);
+                    i += 2;
+                }
+                "--tls-key" => {
+                    out.tls_key = Some(value()?);
+                    i += 2;
+                }
+                "--peer-cert" => {
+                    out.peer_cert = Some(value()?);
+                    i += 2;
+                }
+                "--peer-key" => {
+                    out.peer_key = Some(value()?);
                     i += 2;
                 }
                 "--cluster" => {
@@ -362,6 +531,10 @@ impl Options {
                     out.insecure = true;
                     i += 1;
                 }
+                "--insecure-no-tls" => {
+                    out.insecure_no_tls = true;
+                    i += 1;
+                }
                 "-h" | "--help" => return Err("".to_string()),
                 other if other.starts_with('-') => return Err(format!("unknown option {other}")),
                 other => {
@@ -369,6 +542,21 @@ impl Options {
                     i += 1;
                 }
             }
+        }
+
+        // Flags that need other flags, checked here so they exit 2 and reprint the usage the way
+        // every other usage error does.
+        match (&out.tls_cert, &out.tls_key) {
+            (Some(_), Some(_)) | (None, None) => {}
+            // Named individually rather than "both are required": the operator passed one of
+            // them, so the useful sentence is which one is missing, not what the pair is called.
+            (Some(_), None) => return Err("--tls-cert needs --tls-key".to_string()),
+            (None, Some(_)) => return Err("--tls-key needs --tls-cert".to_string()),
+        }
+        match (&out.peer_cert, &out.peer_key) {
+            (Some(_), Some(_)) | (None, None) => {}
+            (Some(_), None) => return Err("--peer-cert needs --peer-key".to_string()),
+            (None, Some(_)) => return Err("--peer-key needs --peer-cert".to_string()),
         }
 
         match positional.as_slice() {

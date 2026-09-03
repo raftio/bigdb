@@ -22,6 +22,60 @@ jobs:
       # building the rival engines it was written to skip.
       - run: cargo test --workspace --exclude big-bench
 
+  # **The zero-dependency tree, asserted rather than claimed.**
+  #
+  # TLS is a cargo feature, off by default for the libraries and on for the binaries. The whole
+  # value of that arrangement is that the old tree still exists for anybody who wants a reverse
+  # proxy instead - and a claim like that decays into a comment within one release unless
+  # something fails when it stops being true.
+  no-tls:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # It has to build, and its tests have to pass. A configuration that only compiles is a
+      # configuration nobody has run.
+      - run: cargo test -p big-http -p big-cluster -p big-tls --no-default-features
+      - run: cargo check -p big-bin --no-default-features --all-targets
+      # And with the feature on, because the tests behind it are the ones that exercise a real
+      # handshake and are skipped by every other job here.
+      - run: cargo test -p big-tls -p big-http --features tls
+
+  # The two claims this repository makes about its dependencies, checked by a machine.
+  #
+  # Both were prose until TLS arrived, and prose is what they would have gone back to being.
+  deps:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: big-http has no TLS without the feature
+        run: |
+          if cargo tree -p big-http --no-default-features -e normal | grep -q rustls; then
+            echo "rustls reached big-http with the tls feature off" >&2
+            cargo tree -p big-http --no-default-features -e normal | grep -B 5 rustls >&2
+            exit 1
+          fi
+      - name: the contrib clients depend on nothing third-party
+        run: |
+          # These crates are written against the HTTP surface the way somebody outside this
+          # repository would write them, and the empty manifest is what makes that checkable
+          # rather than aspirational.
+          #
+          # A crate from a registry prints as `name v1.2.3`; one from this repository prints with
+          # its path in parentheses after it. So the test is "every line has a path", not "one
+          # line" - `big-message-redis` legitimately depends on `big-message`, and an earlier
+          # version of this check counted that as a violation.
+          for crate in big-message big-message-redis; do
+            if cargo tree -p "$crate" -e normal | grep -v '(/' | grep -q .; then
+              echo "$crate grew a third-party dependency:" >&2
+              cargo tree -p "$crate" -e normal >&2
+              exit 1
+            fi
+          done
+
   # Two real `big serve` processes and a failover decided by wall-clock heartbeats. Out of the job
   # above because a timing test in the default run is a test that eventually fails for reasons
   # nobody changed - and its own job so that when it does, it says so rather than reddening the
@@ -36,6 +90,10 @@ jobs:
       # unquoted form made this whole file unparseable - and an unparseable workflow is one
       # GitHub skips in silence. Every job below had never run once before this was fixed.
       - run: "cargo test -p big-e2e -- --ignored cluster::"
+      # Mutual TLS between two real nodes, including a node holding a certificate this cluster's
+      # CA did not sign. Here rather than in the default job for the same reason as above: two
+      # processes and real sockets.
+      - run: "cargo test -p big-e2e -- --ignored cluster_mtls::"
 
   # The tree was not rustfmt-clean when this file was written, which is why this job did not
   # exist: gating on `cargo fmt` would have failed on the first push for files nobody touched.

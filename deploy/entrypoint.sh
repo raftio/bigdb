@@ -5,8 +5,8 @@
 # list every compose file already writes into the subcommand `big` now needs, and putting it in
 # one place means a compose file that predates the rename still starts.
 #
-# **Why this starts as root.** Two things are true at once: `big serve` refuses a token file that
-# anyone but its owner can read, and a bind-mounted file arrives with whatever ownership and
+# **Why this starts as root.** Two things are true at once: `big serve` refuses a users file or a
+# private key that anyone but its owner can read, and a bind-mounted file arrives with whatever ownership and
 # mode the *host* gave it - root-owned `600` on one machine, `0755` on Docker Desktop, uid 1000
 # somewhere else. Nothing the image can do makes those two agree. Reading the file as root and
 # writing a private copy makes them agree, and costs the container root for the length of one
@@ -36,8 +36,30 @@ stage() {
     fi
 }
 
-stage /etc/big/secrets/tokens /run/big/tokens
-stage /etc/big/secrets/peer.token /run/big/peer.token
+stage /etc/big/secrets/users /run/big/users
+# The CA is not a secret - it is what everybody checks against - but it is staged the same way so
+# that one rule covers the directory. The per-node key is a secret, and gets the same mode 600.
+stage /etc/big/secrets/peer-ca.pem /run/big/peer-ca.pem
+
+# Which node this is, read out of the arguments rather than out of a second environment variable.
+# The name is already in the command line as `--node`, and a deployment that had to write it
+# twice is a deployment where the two can disagree - which would present as a node holding a
+# certificate for somebody else and being refused by every peer.
+node=""
+want=""
+for arg do
+    if [ -n "$want" ]; then
+        node=$arg
+        want=""
+    elif [ "$arg" = "--node" ]; then
+        want=1
+    fi
+done
+
+if [ -n "$node" ]; then
+    stage "/etc/big/secrets/$node.pem" /run/big/peer.pem
+    stage "/etc/big/secrets/$node.key" /run/big/peer.key
+fi
 
 if [ "$me" = 0 ]; then
     # `setpriv` rather than `su`: no shell in between, no session, no signal indirection - the

@@ -64,14 +64,54 @@ impl std::fmt::Display for Error {
     }
 }
 
+/// A username and password, already resolved out of a file or off the terminal.
+///
+/// No `Debug`: the second field is a password.
+pub struct Credentials {
+    pub user: String,
+    pub password: String,
+}
+
 /// Where to send, and what to present.
 pub struct Client {
-    /// `host:port`.
+    /// `host:port`, with any scheme already stripped by [`transport`].
     pub addr: String,
-    /// The bearer token, already read out of its file.
-    pub token: Option<String>,
+    /// What to put in the `Authorization` header, or nothing.
+    pub credentials: Option<Credentials>,
+    /// What to trust and what to present, when the address said `https://`.
+    pub tls: Option<big_tls::ClientTls>,
     /// Applied to the connect, the write and the read. `None` waits as long as the server does.
     pub timeout: Option<Duration>,
+}
+
+/// Splits the scheme off the address and builds the transport it asked for.
+///
+/// **By scheme, not by guess.** A bare `host:port` is plaintext - exactly what it has always
+/// meant, so nothing that works today stops working - and `https://` is not.
+pub fn transport(
+    options: &crate::client::args::Options,
+) -> Result<(String, Option<big_tls::ClientTls>), String> {
+    let (addr, wants_tls) = match options.addr.split_once("://") {
+        None => (options.addr.clone(), false),
+        Some(("https", rest)) => (rest.to_string(), true),
+        Some(("http", rest)) => (rest.to_string(), false),
+        Some((scheme, _)) => {
+            return Err(format!("`{scheme}://` is not a scheme this client speaks; use https://"))
+        }
+    };
+    if !wants_tls {
+        if options.ca_file.is_some() {
+            return Err("--ca-file only means something with an https:// address".to_string());
+        }
+        return Ok((addr, None));
+    }
+    let tls = if options.insecure_skip_verify {
+        big_tls::ClientTls::insecure(None)
+    } else {
+        big_tls::ClientTls::new(options.ca_file.as_ref().map(std::path::Path::new), None)
+    }
+    .map_err(|e| e.to_string())?;
+    Ok((addr, Some(tls)))
 }
 
 impl Client {
@@ -83,8 +123,13 @@ impl Client {
     pub fn send(&self, method: &str, target: &str, body: &str) -> Result<Response, Error> {
         let mut stream = self.connect()?;
 
-        let auth = match &self.token {
-            Some(t) => format!("Authorization: Bearer {t}\r\n"),
+        let auth = match &self.credentials {
+            // The same encoder the server's decoder is round-trip tested against, rather than a
+            // second one that agrees until it does not.
+            Some(c) => format!(
+                "Authorization: Basic {}\r\n",
+                big_tls::base64::encode(format!("{}:{}", c.user, c.password).as_bytes())
+            ),
             None => String::new(),
         };
         let request = format!(
@@ -105,7 +150,7 @@ impl Client {
         read_response(BufReader::new(stream))
     }
 
-    fn connect(&self) -> Result<TcpStream, Error> {
+    fn connect(&self) -> Result<big_tls::ClientWire, Error> {
         // Resolution can yield several addresses; `TcpStream::connect` tries each, which is
         // what a hostname in `--addr` needs. The per-address connect timeout is only reachable
         // through the single-address call, so the deadline below is applied to the socket
@@ -117,12 +162,16 @@ impl Client {
                 Error::Unreachable(format!("could not set a timeout on {}: {e}", self.addr))
             })?;
         }
-        Ok(stream)
+        // The name the certificate has to be valid for is the host out of the address, without
+        // the port: a certificate is issued to a name, and `example:7654` is not one.
+        let name = self.addr.rsplit_once(':').map_or(self.addr.as_str(), |(host, _)| host);
+        big_tls::ClientWire::connect(stream, self.tls.as_ref(), name)
+            .map_err(|e| Error::Unreachable(format!("could not connect to {}: {e}", self.addr)))
     }
 }
 
 /// The status line, the headers, and exactly as many body bytes as were promised.
-fn read_response(mut reader: BufReader<TcpStream>) -> Result<Response, Error> {
+fn read_response(mut reader: BufReader<big_tls::ClientWire>) -> Result<Response, Error> {
     let mut line = String::new();
     reader
         .read_line(&mut line)

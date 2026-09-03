@@ -33,7 +33,11 @@
 pub mod client;
 pub mod ingest;
 pub mod offline;
+pub mod passwd;
 pub mod serve;
+/// Reading a password from a terminal without printing it, shared by `big passwd` and the
+/// client's interactive prompt.
+pub mod tty;
 
 use std::io::{BufRead, Write};
 

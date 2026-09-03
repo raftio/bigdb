@@ -65,8 +65,11 @@ impl Watchdog {
                         cancel.store(true, Ordering::Relaxed);
                         return;
                     }
-                    // Bytes are waiting. The peer is still there; this server answers one
-                    // request per connection, so whatever it sent is not going to be read.
+                    // Bytes are waiting. The peer is still there, and this is a peek at the raw
+                    // socket, so under TLS these are ciphertext - a pipelined request, or a key
+                    // update. Ignoring them is right in every one of those cases: the question
+                    // this thread asks is "has the client gone", and bytes arriving are the
+                    // strongest possible answer of "no".
                     Ok(_) => {}
                     // Nothing has arrived yet, which is the normal case for a live socket.
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}

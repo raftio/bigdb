@@ -14,6 +14,7 @@ members = [
     "crates/big-testfile",
     "crates/big-exec",
     "crates/big-embed",
+    "crates/big-tls",
     "crates/big-cluster",
     "crates/big-http",
     # Everything that ships as an executable: `big` and `bigctl`, and nothing else.
@@ -56,6 +57,7 @@ big-page = { path = "crates/big-page", version = "0.1.0" }
 big-pager = { path = "crates/big-pager", version = "0.1.0" }
 big-plan = { path = "crates/big-plan", version = "0.1.0" }
 big-sql = { path = "crates/big-sql", version = "0.1.0" }
+big-tls = { path = "crates/big-tls", version = "0.1.0" }
 # No version: `publish = false`, so it can only ever be reached by path.
 big-testfile = { path = "crates/big-testfile" }
 big-message = { path = "contrib/big-message" }

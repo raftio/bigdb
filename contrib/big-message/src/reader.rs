@@ -55,8 +55,8 @@ pub struct Reader {
 
 impl Reader {
     /// Opens a reader against one server. No connection is made until something is asked.
-    pub fn open(addr: &str, token: Option<&str>, config: &Config) -> Self {
-        Self { conn: Conn::new(addr, token, Some(config.io_timeout)), retries: config.retries }
+    pub fn open(addr: &str, credential: Option<&str>, config: &Config) -> Self {
+        Self { conn: Conn::new(addr, credential, Some(config.io_timeout)), retries: config.retries }
     }
 
     /// Which of `keys` the table already holds in `field`.

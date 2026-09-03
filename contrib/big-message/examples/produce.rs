@@ -36,16 +36,21 @@ fn main() -> Result<(), Error> {
     // The token, if the server wants one. Read from the environment rather than a flag so it
     // does not end up in a shell history or a process listing.
     //
-    // **`BIG_MESSAGE_TOKEN`, not `BIG_TOKEN`**, and the difference is the point: `bigctl` reads
+    // **`BIG_MESSAGE_CREDENTIALS`, not `BIG_TOKEN`**, and the difference is the point: `bigctl` reads
     // `BIG_TOKEN` as the *path* to a mode-600 file, because a long-lived client should not carry
     // a secret in its environment. This is an example that has to run in a container beside the
     // server, where the mode of a mounted file is whatever the runtime decided - so it takes the
     // token itself. Two spellings because they are two things; one name for both is how a demo
     // teaches somebody to leak a credential.
-    let token = std::env::var("BIG_MESSAGE_TOKEN").ok();
+    let credential = std::env::var("BIG_MESSAGE_CREDENTIALS").ok();
 
-    let mut producer =
-        Producer::open(addr, table, &["amount", "country"], token.as_deref(), Config::default())?;
+    let mut producer = Producer::open(
+        addr,
+        table,
+        &["amount", "country"],
+        credential.as_deref(),
+        Config::default(),
+    )?;
 
     let countries = ["GB", "US", "VN", "JP"];
     for i in 0..count {

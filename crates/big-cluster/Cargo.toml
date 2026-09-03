@@ -11,7 +11,13 @@ readme = "readme.md"
 # Above `big-embed` and below `big-http`, which is the whole reason this is its own crate: the
 # merge has to be written somewhere that has never heard of a socket handler and somewhere
 # `big-db` has never heard of. Neither of those places existed.
+[features]
+default = []
+tls = ["big-tls/tls"]
+
 [dependencies]
+# The socket a peer is reached over, plain or TLS. Forwarded, not turned on: `big-bin` decides.
+big-tls.workspace = true
 big-embed.workspace = true
 big-container.workspace = true
 big-db.workspace = true

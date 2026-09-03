@@ -13,7 +13,7 @@ The design, including everything it deliberately does not give, is
 
 ```rust
 Cluster::solo(api)                    // every shard, no peers, its own schema leader
-Cluster::new(api, config, token)      // one node of a configured cluster
+Cluster::new(api, config, tls)        // one node of a configured cluster
 ```
 
 `big-http`'s `Server` holds a `Cluster`, never an `Api`, so a `big serve` started without `--cluster`
@@ -51,7 +51,9 @@ anything is allocated, recursion is bounded by the query parser's own `MAX_DEPTH
 bytes are refused rather than ignored.
 
 **`client`** — one `POST`, a `Content-Length` body, a status and a body back. No redirects, no
-chunked encoding, no TLS. Connections are not reused because `big-http` answers one request per
+chunked encoding. TLS when the cluster file names a peer CA - a node proves itself with a
+client certificate, not with a shared secret. Connections are not reused because `big-http`
+answers one request per
 connection; what is pooled is permission to have a request in flight at all, so a saturated
 coordinator does not open one connection per worker per peer and have most of them shed.
 

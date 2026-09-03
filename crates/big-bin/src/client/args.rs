@@ -117,7 +117,16 @@ pub enum Command {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Options {
     pub addr: String,
-    pub token_file: Option<String>,
+    /// A file holding one `user:password` line, mode 600.
+    pub credentials_file: Option<String>,
+    /// A username on its own, for the interactive path: the password is then asked for on the
+    /// terminal. A username is not a secret and is logged by the server anyway, so unlike the
+    /// password it is allowed to be a flag.
+    pub user: Option<String>,
+    /// The CA a server's certificate must chain to, when the address is `https://`.
+    pub ca_file: Option<String>,
+    /// Connect without checking the server's certificate at all. Announced on every run.
+    pub insecure_skip_verify: bool,
     /// `None` means "decide from where the output is going" - see [`crate::client::render`].
     pub format: Option<Format>,
     pub timeout: Option<Duration>,
@@ -182,13 +191,23 @@ Operations:
 
 Options:
   --addr <host:port>          default 127.0.0.1:7654, or $BIG_ADDR
-  --token-file <file>         a bearer token, mode 600; or $BIG_TOKEN
+                              `https://host:port` speaks TLS; a bare host:port does not
+  --credentials-file <file>   one `user:password` line, mode 600; or $BIG_CREDENTIALS
+  --user <name>               ask for the password on the terminal
+  --ca-file <file>            the CA a server's certificate must chain to
+  --insecure-skip-verify      do not check the certificate at all. Says so on every run
   --format table|tsv|json     default: table to a terminal, tsv to a pipe
   --timeout <seconds>         give up on the exchange; default is to wait
   -h, --help
 
-A token is read from a file and never taken as a flag: an argument is visible in `ps` and in
-shell history, and a bearer token in either is a token that has leaked.
+A password is read from a file or from the terminal and never taken as a flag: an argument is
+visible in `ps` and in shell history, and a password in either has already leaked. A username
+is not a secret and may be a flag.
+
+TLS is chosen by the scheme, not guessed. A bare `host:port` is plaintext, exactly as it has
+always been, and `https://host:port` is not - because a default that guessed from whether the
+host looked like loopback would be the kind of cleverness that fails in the one deployment
+nobody tested.
 
 `bigctl shell` has no line editing on purpose. `rlwrap bigctl shell` gives it history and arrow
 keys, and does it better than a hand-rolled termios mode would.
@@ -210,7 +229,20 @@ Exit codes: 0 answered, 1 the server refused, 2 usage, 3 nothing was listening.
 /// Parses `argv`. `Err("")` means `--help` was asked for, which is not a failure.
 pub fn parse(args: &[String], env: &dyn Fn(&str) -> Option<String>) -> Result<Options, String> {
     let mut addr = env("BIG_ADDR").unwrap_or_else(|| DEFAULT_ADDR.to_string());
-    let mut token_file = env("BIG_TOKEN");
+    let mut credentials_file = env("BIG_CREDENTIALS");
+    let mut user = None;
+    let mut ca_file = env("BIG_CA");
+    let mut insecure_skip_verify = false;
+
+    // **Refused, not ignored.** The worst outcome here is a script that keeps working against a
+    // loopback development server and silently stops authenticating in production, which is
+    // exactly what silently dropping a now-meaningless variable would produce.
+    if env("BIG_TOKEN").is_some() && credentials_file.is_none() {
+        return Err("BIG_TOKEN is no longer used: bearer tokens were replaced by usernames and \
+                    passwords. Set BIG_CREDENTIALS to a file holding one `user:password` line, \
+                    readable only by you."
+            .to_string());
+    }
     let mut format = None;
     let mut timeout = None;
     // Flags that belong to a subcommand rather than to the client. Collected here because they
@@ -230,9 +262,29 @@ pub fn parse(args: &[String], env: &dyn Fn(&str) -> Option<String>) -> Result<Op
                 addr = value()?;
                 i += 2;
             }
-            "--token-file" => {
-                token_file = Some(value()?);
+            "--credentials-file" => {
+                credentials_file = Some(value()?);
                 i += 2;
+            }
+            "--user" => {
+                user = Some(value()?);
+                i += 2;
+            }
+            "--ca-file" => {
+                ca_file = Some(value()?);
+                i += 2;
+            }
+            "--insecure-skip-verify" => {
+                insecure_skip_verify = true;
+                i += 1;
+            }
+            // Recognised for one release so that it can say what happened, rather than falling
+            // through to "unknown option" and sending somebody to check their spelling.
+            "--token-file" => {
+                return Err("--token-file is gone: bearer tokens were replaced by usernames and \
+                            passwords. Use --credentials-file with a file holding one \
+                            `user:password` line."
+                    .to_string())
             }
             "--format" => {
                 let v = value()?;
@@ -279,7 +331,16 @@ pub fn parse(args: &[String], env: &dyn Fn(&str) -> Option<String>) -> Result<Op
     }
 
     let command = command(&positional, scoped)?;
-    Ok(Options { addr, token_file, format, timeout, command })
+    Ok(Options {
+        addr,
+        credentials_file,
+        user,
+        ca_file,
+        insecure_skip_verify,
+        format,
+        timeout,
+        command,
+    })
 }
 
 /// The flag name as it was typed, for an error message. The list stores query-parameter names,

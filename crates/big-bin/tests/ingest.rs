@@ -113,7 +113,7 @@ fn number(body: &str, key: &str) -> u64 {
 
 /// How many records hold `country = GB`, asked the way a user would.
 fn counted(addr: SocketAddr) -> u64 {
-    let client = Client { addr: addr.to_string(), token: None, timeout: None };
+    let client = Client { addr: addr.to_string(), credentials: None, tls: None, timeout: None };
     let response = client.send("POST", "/table/tx/query", "Count(Row(country=\"GB\"))").unwrap();
     assert!(response.ok(), "the query was refused: {}", response.body);
     number(&response.body, "count")

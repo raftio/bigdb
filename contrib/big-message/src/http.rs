@@ -96,7 +96,9 @@ pub(crate) enum Failure {
 /// One server, and the connection currently open to it.
 pub(crate) struct Conn {
     addr: String,
-    token: Option<String>,
+    /// `user:password`, already joined - this is what goes into the header and there is nothing
+    /// to be gained from carrying the halves separately.
+    credential: Option<String>,
     timeout: Option<Duration>,
     /// `None` until the first request, and after every retirement.
     open: Option<Open>,
@@ -111,8 +113,13 @@ struct Open {
 }
 
 impl Conn {
-    pub(crate) fn new(addr: &str, token: Option<&str>, timeout: Option<Duration>) -> Self {
-        Self { addr: addr.to_string(), token: token.map(str::to_string), timeout, open: None }
+    pub(crate) fn new(addr: &str, credential: Option<&str>, timeout: Option<Duration>) -> Self {
+        Self {
+            addr: addr.to_string(),
+            credential: credential.map(str::to_string),
+            timeout,
+            open: None,
+        }
     }
 
     /// Sends one request and reads the whole answer.
@@ -197,8 +204,8 @@ impl Conn {
     }
 
     fn request(&self, method: &str, target: &str, body: &str) -> String {
-        let auth = match &self.token {
-            Some(t) => format!("Authorization: Bearer {t}\r\n"),
+        let auth = match &self.credential {
+            Some(c) => format!("Authorization: Basic {}\r\n", base64(c.as_bytes())),
             None => String::new(),
         };
         format!(
@@ -281,4 +288,51 @@ fn read_response(reader: &mut BufReader<TcpStream>) -> Result<Response, Failure>
         .map_err(|_| Failure::Protocol("the response body is not UTF-8".to_string()))?;
 
     Ok(Response { status, body, closing })
+}
+
+/// Base64, the standard alphabet, with padding.
+///
+/// **Twenty lines rather than a dependency, and that is the whole point of this crate.** Its
+/// `[dependencies]` section is empty on purpose: it is the machine-checkable form of "this is
+/// what somebody outside that repository could write against the wire". A crate for this would
+/// delete the claim to save twenty lines, and the claim is worth more.
+fn base64(input: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let n = u32::from(b[0]) << 16 | u32::from(b[1]) << 8 | u32::from(b[2]);
+        out.push(ALPHABET[(n >> 18) as usize & 63] as char);
+        out.push(ALPHABET[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 { ALPHABET[(n >> 6) as usize & 63] as char } else { '=' });
+        out.push(if chunk.len() > 2 { ALPHABET[n as usize & 63] as char } else { '=' });
+    }
+    out
+}
+
+#[cfg(test)]
+mod base64_tests {
+    use super::base64;
+
+    /// RFC 4648 section 10. The server's decoder is strict, so an encoder that disagreed here
+    /// would fail as "wrong password" - which is the least helpful way this could break.
+    #[test]
+    fn the_rfc_4648_vectors() {
+        for (plain, encoded) in [
+            ("", ""),
+            ("f", "Zg=="),
+            ("fo", "Zm8="),
+            ("foo", "Zm9v"),
+            ("foob", "Zm9vYg=="),
+            ("fooba", "Zm9vYmE="),
+            ("foobar", "Zm9vYmFy"),
+        ] {
+            assert_eq!(base64(plain.as_bytes()), encoded, "encoding {plain:?}");
+        }
+    }
+
+    #[test]
+    fn a_credential_encodes_the_way_the_server_reads_one() {
+        assert_eq!(base64(b"alice:s3cret"), "YWxpY2U6czNjcmV0");
+    }
 }

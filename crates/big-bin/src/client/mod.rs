@@ -57,17 +57,31 @@ pub fn run(args: &[String], io: &mut Io<'_>, env: &dyn Fn(&str) -> Option<String
         }
     };
 
-    let token = match &options.token_file {
-        None => None,
-        Some(path) => match read_token(path) {
-            Ok(t) => Some(t),
-            Err(e) => {
-                let _ = writeln!(io.err, "bigctl: {e}");
-                return exit::USAGE;
-            }
-        },
+    let credentials = match resolve_credentials(&options) {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = writeln!(io.err, "bigctl: {e}");
+            return exit::USAGE;
+        }
     };
-    let client = Client { addr: options.addr.clone(), token, timeout: options.timeout };
+    // The scheme decides the transport, and the transport is built before anything is sent so
+    // that a missing CA file is a usage error rather than a failed connection.
+    let (addr, tls) = match http::transport(&options) {
+        Ok(t) => t,
+        Err(e) => {
+            let _ = writeln!(io.err, "bigctl: {e}");
+            return exit::USAGE;
+        }
+    };
+    if options.insecure_skip_verify && tls.is_some() {
+        // Every run, not once. An operator who turned this on during bring-up and forgot is the
+        // person this line is for.
+        let _ = writeln!(
+            io.err,
+            "bigctl: certificate verification is off; anyone on the path can read this"
+        );
+    }
+    let client = Client { addr, credentials, tls, timeout: options.timeout };
     let format = options.format.unwrap_or_else(|| render::default_for(io.out_tty));
 
     if options.command == Command::Shell {
@@ -259,15 +273,34 @@ pub fn escape(s: &str) -> String {
     out
 }
 
-/// Reads a bearer token from a file, refusing one anybody can read.
+/// The credential this run will present, from a file or from the terminal.
 ///
-/// The mode check is `big_http::auth`'s, **copied rather than depended on**. Linking the server
-/// to read one file would put the whole engine in this binary's dependency graph and undo the
-/// property the empty `[dependencies]` section exists to guarantee. Two implementations of a
-/// three-line check is the cheaper of the two prices.
-/// Public for the same reason [`escape`] is: `bigctl` presents the same credential from the
-/// same file, and a second reader is a second opinion about what mode 600 means.
-pub fn read_token(path: &str) -> Result<String, String> {
+/// Three ways, in the order somebody reaches for them: a file, a username with the password
+/// asked for interactively, or nothing at all - which is what a loopback server with no users
+/// file wants and is still a perfectly ordinary way to run this.
+fn resolve_credentials(options: &args::Options) -> Result<Option<http::Credentials>, String> {
+    if let Some(path) = &options.credentials_file {
+        let (user, password) = read_credentials(path)?;
+        return Ok(Some(http::Credentials { user, password }));
+    }
+    if let Some(user) = &options.user {
+        let password = crate::tty::read_password(&format!("password for {user}: "))
+            .map_err(|e| format!("could not read a password: {e}"))?;
+        return Ok(Some(http::Credentials { user: user.clone(), password }));
+    }
+    Ok(None)
+}
+
+/// Reads `user:password` from a file, refusing one anybody can read.
+///
+/// The mode check is `big_tls::mode`'s, **copied rather than depended on**. The rule this crate
+/// is protecting is that the client stays something somebody outside this repository could have
+/// written, and reaching into the server's crates to read one file would undo it. Two
+/// implementations of a three-line check is the cheaper of the two prices.
+///
+/// Split on the first colon, the same way the server splits a `Basic` header, so that a file and
+/// a header cannot disagree about where a password starts.
+pub fn read_credentials(path: &str) -> Result<(String, String), String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -278,20 +311,26 @@ pub fn read_token(path: &str) -> Result<String, String> {
             & 0o777;
         if mode & 0o077 != 0 {
             return Err(format!(
-                "{path} is mode {mode:o}; a token file must not be readable by anyone else \
-                 (chmod 600 {path})"
+                "{path} is mode {mode:o}; a credentials file must not be readable by anyone \
+                 else (chmod 600 {path})"
             ));
         }
     }
     let text = std::fs::read_to_string(path).map_err(|e| format!("could not read {path}: {e}"))?;
     for line in text.lines() {
-        // The same reading the server gives its own token file: a comment is stripped, and the
-        // first non-empty line is the secret.
+        // A comment is stripped and the first non-empty line is the credential - the same
+        // reading the server gives its own files, so that one habit covers both.
         let line = line.split('#').next().unwrap_or("").trim();
-        if !line.is_empty() {
-            // The server's file is `token role` per line; a client presents only the token.
-            return Ok(line.split_whitespace().next().unwrap_or(line).to_string());
+        if line.is_empty() {
+            continue;
         }
+        let Some((user, password)) = line.split_once(':') else {
+            return Err(format!("{path}: expected one `user:password` line"));
+        };
+        if user.is_empty() {
+            return Err(format!("{path}: the username is empty"));
+        }
+        return Ok((user.to_string(), password.to_string()));
     }
-    Err(format!("{path}: no token in this file"))
+    Err(format!("{path}: no credential in this file"))
 }
