@@ -21,7 +21,7 @@
 
 use std::collections::BTreeMap;
 
-use big_plan::{explain, parse, plan, FieldClass, Keyed, Plan, Rows, Schema};
+use big_plan::{explain, parse, plan, FieldClass, Keyed, Plan, Rows, Schema, TimeUnit};
 
 struct Fake(BTreeMap<(&'static str, &'static str), FieldClass>);
 
@@ -35,6 +35,8 @@ impl Fake {
             (("tx", "city"), FieldClass::Keyed(Keyed::Set)),
             (("tx", "visit"), FieldClass::Keyed(Keyed::Time)),
             (("tx", "active"), FieldClass::Boolean),
+            (("tx", "day"), FieldClass::Temporal { unit: TimeUnit::Days }),
+            (("tx", "seen"), FieldClass::Temporal { unit: TimeUnit::Seconds }),
         ]))
     }
 }
@@ -142,9 +144,23 @@ GroupBy tx.country -> sum(amount)
 └── active = true",
     );
     prints(
-        "GroupByPair(All(), left=country, right=city, n=100, aggregate=Max(field=amount))",
+        "GroupByTuple(All(), by=country, by=city, n=100, aggregate=Max(field=amount))",
         "\
-GroupByPair tx.(country, city) left_max=100 -> max(amount)
+GroupByTuple tx.(country, city) max_passes=100 -> max(amount)
+└── all",
+    );
+    // A bucket level prints the boundary it cuts on, so the head line says what the groups are
+    // rather than only which column they came from.
+    prints(
+        "GroupByTuple(All(), by=country, by=Bucket(field=day, unit=\"month\", n=1000), n=100)",
+        "\
+GroupByTuple tx.(country, day by month) max_passes=100 -> count
+└── all",
+    );
+    prints(
+        "GroupByBucket(All(), field=seen, unit=\"year\", n=1000, aggregate=Sum(field=amount))",
+        "\
+GroupByBucket tx.seen by year n=1000 -> sum(amount)
 └── all",
     );
 }

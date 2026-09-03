@@ -15,7 +15,10 @@
 //! Each shape reads the answers it names, and nothing else.
 
 use crate::common::*;
-use big_embed::{result_set, Absent, Columns, Cut, Datum, Of, Projected, Projection, Shape, Value};
+use big_embed::{
+    result_set, Absent, Columns, Cut, Datum, GroupAt, GroupKey, Of, Projected, Projection, Shape,
+    TimeUnit, Tuple, Value,
+};
 
 #[test]
 fn a_single_row_reads_one_cell_per_plan() {
@@ -229,29 +232,40 @@ fn a_grouping_joins_its_plans_on_the_row_id() {
 }
 
 #[test]
-fn a_pair_grouping_carries_both_halves_of_its_key() {
-    let shape = Shape::Pairs {
+fn a_tuple_grouping_carries_every_axis_of_its_key() {
+    let shape = Shape::Tuples {
+        axes: 3,
         keys: vec![0],
         cells: vec![
-            cell("country", Of::Key),
-            cell("city", Of::RightKey),
+            cell("country", Of::KeyAt { axis: 0 }),
+            cell("city", Of::KeyAt { axis: 1 }),
+            cell("month", Of::KeyAt { axis: 2 }),
             cell("count()", Of::Group { plan: 0, absent: Absent::Zero }),
         ],
         having: None,
         order: None,
         cut: Cut::default(),
     };
-    let values = vec![Value::Pairs(vec![pair(
-        group(1, Some("GB"), Value::Count(0)),
-        group(7, Some("London"), Value::Count(4)),
-    )])];
+    // The third axis is a calendar bucket, which names itself: it comes back as the date it
+    // stands for rather than as a key nobody interned.
+    let values = vec![Value::Tuples(vec![Tuple {
+        keys: vec![
+            GroupKey { at: GroupAt::Row(1), key: Some("GB".to_string()) },
+            GroupKey { at: GroupAt::Row(7), key: Some("London".to_string()) },
+            GroupKey { at: GroupAt::Bucket { start: 19723, unit: TimeUnit::Days }, key: None },
+        ],
+        value: Box::new(Value::Count(4)),
+    }])];
 
     let set = result_set(&answer(shape), &values);
 
     assert_eq!(
         set.rows,
-        vec![
-            vec![Datum::Text("GB".to_string()), Datum::Text("London".to_string()), Datum::Int(4),]
-        ]
+        vec![vec![
+            Datum::Text("GB".to_string()),
+            Datum::Text("London".to_string()),
+            Datum::Date(19723),
+            Datum::Int(4),
+        ]]
     );
 }

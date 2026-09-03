@@ -640,3 +640,137 @@ fn more_buckets_than_the_plan_allows_is_refused_rather_than_cut() {
     let err = query(&r, "tx", "GroupByBucket(All(), field=d, unit=\"month\", n=3)").unwrap_err();
     assert!(format!("{err}").contains("coarser"), "{err}");
 }
+
+// ------------------------------------------------------------------------------------------
+// Grouping by three or more columns
+// ------------------------------------------------------------------------------------------
+
+/// A table with three keyed columns and a date, for the tuple walk to nest.
+fn three(rows: &[(u64, &str, &str, &str, &str)]) -> Db<MemPager> {
+    let db = Db::in_memory().unwrap();
+    db.create_table("tx").unwrap();
+    for f in ["country", "city", "kind"] {
+        db.create_field("tx", f, FieldKind::Set, 0).unwrap();
+    }
+    db.create_field("tx", "d", FieldKind::Date, 32).unwrap();
+    let mut w = db.write();
+    for (rec, country, city, kind, day) in rows {
+        w.set_key("tx", "country", *rec, country).unwrap();
+        w.set_key("tx", "city", *rec, city).unwrap();
+        w.set_key("tx", "kind", *rec, kind).unwrap();
+        w.set_signed("tx", "d", *rec, big_civil::parse_date(day).unwrap()).unwrap();
+    }
+    w.commit().unwrap();
+    db
+}
+
+/// Each combination as `(the keys, the count)`, which is what the grouping means in plain terms.
+fn tuples(db: &Db<MemPager>, text: &str) -> Vec<(Vec<String>, u64)> {
+    let r = db.read();
+    match query(&r, "tx", text).unwrap() {
+        Value::Tuples(ts) => ts
+            .iter()
+            .map(|t| {
+                let keys = t
+                    .keys
+                    .iter()
+                    .map(|k| match (&k.key, k.at) {
+                        (Some(s), _) => s.clone(),
+                        (None, big_exec::GroupAt::Bucket { start, .. }) => {
+                            big_civil::format_date(start)
+                        }
+                        (None, other) => panic!("a keyless row: {other:?}"),
+                    })
+                    .collect();
+                (keys, t.value.as_count().unwrap())
+            })
+            .collect(),
+        other => panic!("expected tuples, got {other:?}"),
+    }
+}
+
+/// **Three columns, which the pair grouping had no shape for.** The walk is a tree: the records
+/// holding a country are a set, grouping those by city is an ordinary grouping over a narrower
+/// set, and grouping those by kind is one again.
+#[test]
+fn three_columns_group_by_every_combination_any_record_holds() {
+    let db = three(&[
+        (1, "GB", "LDN", "web", "2024-01-05"),
+        (2, "GB", "LDN", "app", "2024-01-06"),
+        (3, "GB", "MAN", "web", "2024-02-05"),
+        (SHARD + 4, "US", "NYC", "web", "2024-02-06"),
+        (SHARD + 5, "GB", "LDN", "web", "2024-03-07"),
+    ]);
+    assert_eq!(
+        tuples(&db, "GroupByTuple(All(), by=country, by=city, by=kind, n=1000)"),
+        vec![
+            (vec!["GB".into(), "LDN".into(), "app".into()], 1),
+            (vec!["GB".into(), "LDN".into(), "web".into()], 2),
+            (vec!["GB".into(), "MAN".into(), "web".into()], 1),
+            (vec!["US".into(), "NYC".into(), "web".into()], 1),
+        ]
+    );
+}
+
+/// **A keyed column and a calendar bucket in one grouping**, which is what `Level` earned itself
+/// for: the walk asks each level only for "the sets your values make", so mixing them is free.
+#[test]
+fn a_grouping_may_mix_a_key_and_a_bucket() {
+    let db = three(&[
+        (1, "GB", "LDN", "web", "2024-01-05"),
+        (2, "GB", "LDN", "app", "2024-01-20"),
+        (3, "GB", "MAN", "web", "2024-02-05"),
+        (SHARD + 4, "US", "NYC", "web", "2024-02-06"),
+    ]);
+    assert_eq!(
+        tuples(
+            &db,
+            "GroupByTuple(All(), by=country, by=Bucket(field=d, unit=\"month\", n=100), n=1000)"
+        ),
+        vec![
+            (vec!["GB".into(), "2024-01-01".into()], 2),
+            (vec!["GB".into(), "2024-02-01".into()], 1),
+            (vec!["US".into(), "2024-02-01".into()], 1),
+        ]
+    );
+}
+
+/// The counts of every combination sum to the records the filter selected, because every record
+/// holds one value of each keyed column here. That is the partition the metamorphic tests check.
+#[test]
+fn the_combinations_partition_the_records() {
+    let db = three(&[
+        (1, "GB", "LDN", "web", "2024-01-05"),
+        (2, "GB", "LDN", "app", "2024-01-06"),
+        (3, "GB", "MAN", "web", "2024-02-05"),
+        (SHARD + 4, "US", "NYC", "web", "2024-02-06"),
+        (SHARD + 5, "GB", "LDN", "web", "2024-03-07"),
+    ]);
+    let total: u64 = tuples(&db, "GroupByTuple(All(), by=country, by=city, by=kind, n=1000)")
+        .iter()
+        .map(|(_, n)| n)
+        .sum();
+    assert_eq!(total, 5);
+}
+
+/// The budget is the *frontier*, checked at the top of each level - so it bounds the product of
+/// the cardinalities and not only the first column's.
+#[test]
+fn the_pass_budget_bounds_the_product_and_not_just_the_first_column() {
+    let db = three(&[
+        (1, "GB", "LDN", "web", "2024-01-05"),
+        (2, "GB", "MAN", "app", "2024-01-06"),
+        (3, "US", "NYC", "web", "2024-02-05"),
+        (SHARD + 4, "FR", "PAR", "app", "2024-02-06"),
+    ]);
+    let r = db.read();
+    // Four countries is under the budget, but the four (country, city) pairs it expands into
+    // are not - and that frontier is what the third level would cost.
+    assert!(query(&r, "tx", "GroupByTuple(All(), by=country, by=city, by=kind, n=10)").is_ok());
+    let err =
+        query(&r, "tx", "GroupByTuple(All(), by=country, by=city, by=kind, n=3)").unwrap_err();
+    // The message names the column about to be passed over and how many combinations of the
+    // earlier ones there are - which is the number that actually broke the budget.
+    let text = format!("{err}");
+    assert!(text.contains("`kind`") && text.contains("4 of those"), "{text}");
+}

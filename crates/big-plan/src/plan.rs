@@ -115,6 +115,30 @@ pub enum Rows {
     All,
 }
 
+/// One column a grouping is over, and how its values become sets of records.
+///
+/// **The two ways a column can have groups at all**, which is why they are one type rather than
+/// two plans: a keyed column has a dictionary to walk, and a bit-sliced temporal one has an
+/// ordering to cut into calendar buckets. Mixing them in one grouping - `GROUP BY country,
+/// date_trunc('month', ts)` - then costs nothing extra, because the walk asks each level only
+/// for "the sets your values make".
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Level {
+    /// A keyed column: one set per row of its dictionary.
+    Keyed { field: String },
+    /// A bit-sliced temporal column: one set per calendar bucket. See [`Plan::GroupByBucket`].
+    Bucket { field: String, unit: big_civil::Unit, max_buckets: usize },
+}
+
+impl Level {
+    /// The column this level groups by.
+    pub fn field(&self) -> &str {
+        match self {
+            Self::Keyed { field } | Self::Bucket { field, .. } => field,
+        }
+    }
+}
+
 /// A resolved query, and what kind of answer it produces.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Plan {
@@ -194,25 +218,28 @@ pub enum Plan {
         /// [`Plan::GroupBy`]'s aggregate is.
         aggregate: Box<Plan>,
     },
-    /// The same over a pair of keyed columns: one group per combination both hold records for.
+    /// One group per combination of values two or more columns hold records for.
     ///
-    /// **Not a composite key, which this index never stored.** For each value of the left
-    /// column the records holding it are a set; grouping those by the right column is an
-    /// ordinary grouping over a narrower set. So a pair grouping is one grouping per value of
-    /// the left column, which is why `left_max` is part of the plan: the number of them is what
-    /// it costs, and a cut applied to the answer would be a cut applied after paying for it.
-    GroupByPair {
+    /// **Not a composite key, which this index never stored.** For each value of the first column
+    /// the records holding it are a set; grouping *those* by the second is an ordinary grouping
+    /// over a narrower set, and grouping those by the third is one again. So an N-column grouping
+    /// is a walk of a tree, and what it costs is the number of *passes* - one per node of every
+    /// level but the last.
+    ///
+    /// That number is what [`Self::GroupByTuple::max_passes`] bounds, and why the bound is in the
+    /// plan rather than applied to the answer. Checking it at the top of each level bounds the
+    /// product as well as the first column: the frontier after level one *is* the pass count for
+    /// level two.
+    GroupByTuple {
         table: String,
         rows: Rows,
-        /// The outer column: one pass over the right column per value of this one.
-        left: String,
-        /// The inner column.
-        right: String,
-        /// What each pair carries, planned against a placeholder bitmap exactly as a
+        /// The columns, outermost first. Never fewer than two - one is a [`Plan::GroupBy`].
+        levels: Vec<Level>,
+        /// What each combination carries, planned against a placeholder bitmap exactly as a
         /// [`Plan::GroupBy`]'s aggregate is.
         aggregate: Box<Plan>,
-        /// How many values of the left column to group by. Never absent.
-        left_max: usize,
+        /// How many passes over an inner column this may make. Never absent.
+        max_passes: usize,
     },
     /// The stored values of some columns, for the first `limit` matching records - or for every
     /// one of them where there is no limit.
@@ -251,7 +278,7 @@ impl Plan {
             | Self::TopN { table, .. }
             | Self::GroupBy { table, .. }
             | Self::GroupByBucket { table, .. }
-            | Self::GroupByPair { table, .. }
+            | Self::GroupByTuple { table, .. }
             | Self::Project { table, .. } => table,
         }
     }
@@ -276,7 +303,7 @@ pub fn plan(table: &str, call: &Call, schema: &impl Schema) -> Result<Plan> {
         "Distinct" | "TopN" => ctx.grouped(call),
         "GroupBy" => ctx.group_by(call),
         "GroupByBucket" => ctx.group_by_bucket(call),
-        "GroupByPair" => ctx.group_by_pair(call),
+        "GroupByTuple" => ctx.group_by_tuple(call),
         "Project" => ctx.project(call),
         _ => Ok(Plan::Rows { table: table.to_string(), rows: ctx.rows(call)? }),
     }
@@ -526,28 +553,25 @@ impl<S: Schema> Ctx<'_, S> {
         })
     }
 
-    /// `GroupByPair(<bitmap>, left=<name>, right=<name>, n=<count>, [aggregate=<call>])`.
+    /// `GroupByTuple(<bitmap>, by=<name>, by=Bucket(field=<name>, unit=..., n=...), ...,
+    /// n=<passes>, [aggregate=<call>])`.
     ///
-    /// Two named columns rather than a repeated `field=`, because the two are not
-    /// interchangeable: the left one decides how many passes over the right one this costs.
-    fn group_by_pair(&self, call: &Call) -> Result<Plan> {
-        const WANT: &str = "a bitmap, left=<name>, right=<name> and n=<count>";
-        let (mut rows, mut left, mut right, mut n, mut aggregate) = (None, None, None, None, None);
+    /// A **repeating** `by=`, the way `Project` repeats `field=`, because the levels are an
+    /// ordered list rather than a fixed pair - and because a level is either a bare name or a
+    /// `Bucket(...)`, which the argument loop already tells apart by whether it is a call.
+    fn group_by_tuple(&self, call: &Call) -> Result<Plan> {
+        const WANT: &str = "a bitmap, two or more by=<name> or by=Bucket(...), and n=<passes>";
+        let (mut rows, mut levels, mut n, mut aggregate) = (None, Vec::new(), None, None);
         for arg in &call.args {
             match arg {
                 Expr::Call(c) if rows.is_none() => rows = Some(self.rows(c)?),
-                Expr::Named { name, value } if name == "left" => {
-                    left = Some(str_arg("GroupByPair", value)?)
-                }
-                Expr::Named { name, value } if name == "right" => {
-                    right = Some(str_arg("GroupByPair", value)?)
-                }
+                Expr::Named { name, value } if name == "by" => levels.push(self.level(value)?),
                 Expr::Named { name, value } if name == "n" => match value.as_ref() {
                     Expr::Literal(Literal::Int(v)) => n = Some(*v as usize),
                     _ => {
                         return Err(PlanError::BadArgument {
-                            call: "GroupByPair",
-                            want: "n=<count>",
+                            call: "GroupByTuple",
+                            want: "n=<passes>",
                         })
                     }
                 },
@@ -555,25 +579,99 @@ impl<S: Schema> Ctx<'_, S> {
                     Expr::Call(c) => aggregate = Some(self.bare_aggregate(c)?),
                     _ => {
                         return Err(PlanError::BadArgument {
-                            call: "GroupByPair",
+                            call: "GroupByTuple",
                             want: "aggregate=<Sum|Min|Max>(field=...)",
                         })
                     }
                 },
-                _ => return Err(PlanError::BadArgument { call: "GroupByPair", want: WANT }),
+                _ => return Err(PlanError::BadArgument { call: "GroupByTuple", want: WANT }),
             }
         }
 
-        let (Some(rows), Some(left), Some(right), Some(left_max)) = (rows, left, right, n) else {
-            return Err(PlanError::Arity { call: "GroupByPair", want: WANT, got: call.args.len() });
+        let (Some(rows), Some(max_passes)) = (rows, n) else {
+            return Err(PlanError::Arity {
+                call: "GroupByTuple",
+                want: WANT,
+                got: call.args.len(),
+            });
         };
-        // Grouping counts rows, and only a keyed field has rows to count.
-        self.expect_keyed("GroupByPair", &left)?;
-        self.expect_keyed("GroupByPair", &right)?;
+        // One level is a `GroupBy` and none is a `Count`; naming this a tuple would be a second
+        // spelling of a plan that already exists.
+        if levels.len() < 2 {
+            return Err(PlanError::Arity {
+                call: "GroupByTuple",
+                want: WANT,
+                got: call.args.len(),
+            });
+        }
 
         let table = self.table.to_string();
         let aggregate = aggregate.unwrap_or(Plan::Count { table: table.clone(), rows: Rows::All });
-        Ok(Plan::GroupByPair { table, rows, left, right, aggregate: Box::new(aggregate), left_max })
+        Ok(Plan::GroupByTuple { table, rows, levels, aggregate: Box::new(aggregate), max_passes })
+    }
+
+    /// One `by=` argument: a bare column name, or `Bucket(field=..., unit=..., n=...)`.
+    fn level(&self, value: &Expr) -> Result<Level> {
+        match value {
+            Expr::Ident(field) | Expr::Literal(Literal::Str(field)) => {
+                self.expect_keyed("GroupByTuple", field)?;
+                Ok(Level::Keyed { field: field.clone() })
+            }
+            Expr::Call(c) if c.name == "Bucket" => {
+                let (mut field, mut unit, mut n) = (None, None, None);
+                for arg in &c.args {
+                    match arg {
+                        Expr::Named { name, value } if name == "field" => {
+                            field = Some(str_arg("Bucket", value)?)
+                        }
+                        Expr::Named { name, value } if name == "unit" => match value.as_ref() {
+                            Expr::Literal(Literal::Str(u)) => {
+                                unit = Some(big_civil::Unit::parse(u).ok_or(
+                                    PlanError::BadRounding {
+                                        call: format!("date_trunc('{u}', ...)"),
+                                        why: "a boundary the calendar has",
+                                    },
+                                )?)
+                            }
+                            _ => {
+                                return Err(PlanError::BadArgument {
+                                    call: "Bucket",
+                                    want: "unit=<year|month|day|...>",
+                                })
+                            }
+                        },
+                        Expr::Named { name, value } if name == "n" => match value.as_ref() {
+                            Expr::Literal(Literal::Int(v)) => n = Some(*v as usize),
+                            _ => {
+                                return Err(PlanError::BadArgument {
+                                    call: "Bucket",
+                                    want: "n=<count>",
+                                })
+                            }
+                        },
+                        _ => {
+                            return Err(PlanError::BadArgument {
+                                call: "Bucket",
+                                want: "field=<name>, unit=<boundary> and n=<count>",
+                            })
+                        }
+                    }
+                }
+                let (Some(field), Some(unit), Some(max_buckets)) = (field, unit, n) else {
+                    return Err(PlanError::Arity {
+                        call: "Bucket",
+                        want: "field=<name>, unit=<boundary> and n=<count>",
+                        got: c.args.len(),
+                    });
+                };
+                check_boundary(&field, self.class(&field)?, unit)?;
+                Ok(Level::Bucket { field, unit, max_buckets })
+            }
+            _ => Err(PlanError::BadArgument {
+                call: "GroupByTuple",
+                want: "by=<name> or by=Bucket(field=..., unit=..., n=...)",
+            }),
+        }
     }
 
     /// `Project(<bitmap>, field=<name>, field=<name>, ..., [n=<count>])`.

@@ -159,10 +159,10 @@ TopN t.country n=2
 # The bound is the number of values on the left, which is what the pair grouping costs. SQL
 # writes no number for it, so the lowering supplies the default - and the PQL has to name it,
 # because a plan that cut at a different bound would be a different plan.
-same GroupByPair(All(), left=category, right=country, n=1000)
+same GroupByTuple(All(), by=category, by=country, n=1000)
 SELECT category, country, count(*) FROM t GROUP BY category, country
 ----
-GroupByPair t.(category, country) left_max=1000 -> count
+GroupByTuple t.(category, country) max_passes=1000 -> count
 └── all
 
 same Project(All(), field=amount, field=price, n=10)

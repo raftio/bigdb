@@ -152,9 +152,9 @@ mod value_tag {
     pub const SIGNED_EXTREME: u8 = 5;
     pub const GROUPS: u8 = 6;
     pub const TABLE: u8 = 7;
-    pub const PAIRS: u8 = 8;
     pub const REAL_SUM: u8 = 9;
     pub const REAL_EXTREME: u8 = 10;
+    pub const TUPLES: u8 = 11;
 }
 
 pub fn put_value(out: &mut Vec<u8>, v: &Value) {
@@ -201,12 +201,17 @@ pub fn put_value(out: &mut Vec<u8>, v: &Value) {
                 put_group(out, group);
             }
         }
-        Value::Pairs(pairs) => {
-            put_u8(out, value_tag::PAIRS);
-            put_count(out, pairs.len());
-            for p in pairs {
-                put_group(out, &p.left);
-                put_group(out, &p.right);
+        // The keys carry their own count, which is what makes the arity a number rather than a
+        // shape: a reader takes as many as it is told rather than as many as its version knows.
+        Value::Tuples(tuples) => {
+            put_u8(out, value_tag::TUPLES);
+            put_count(out, tuples.len());
+            for t in tuples {
+                put_count(out, t.keys.len());
+                for k in &t.keys {
+                    put_group_key(out, k);
+                }
+                put_value(out, &t.value);
             }
         }
         Value::Table(rows) => {
@@ -295,8 +300,23 @@ mod unit_tag {
     pub const SECONDS: u8 = 1;
 }
 
+fn put_group_key(out: &mut Vec<u8>, k: &GroupKey) {
+    put_group_at(out, k.at);
+    put_opt_str(out, k.key.as_deref());
+}
+
+fn get_group_key(r: &mut Reader<'_>) -> Result<GroupKey> {
+    Ok(GroupKey { at: get_group_at(r)?, key: r.opt_str()? })
+}
+
 fn put_group(out: &mut Vec<u8>, g: &Group) {
-    match g.at {
+    put_group_at(out, g.at);
+    put_opt_str(out, g.key.as_deref());
+    put_value(out, &g.value);
+}
+
+fn put_group_at(out: &mut Vec<u8>, at: GroupAt) {
+    match at {
         GroupAt::Row(row) => {
             out.push(group_tag::ROW);
             put_u64(out, row);
@@ -310,12 +330,18 @@ fn put_group(out: &mut Vec<u8>, g: &Group) {
             });
         }
     }
-    put_opt_str(out, g.key.as_deref());
-    put_value(out, &g.value);
 }
 
 fn get_group(r: &mut Reader<'_>, depth: usize) -> Result<Group> {
-    let at = match r.u8()? {
+    Ok(Group {
+        at: get_group_at(r)?,
+        key: r.opt_str()?,
+        value: Box::new(get_value_at(r, depth + 1)?),
+    })
+}
+
+fn get_group_at(r: &mut Reader<'_>) -> Result<GroupAt> {
+    Ok(match r.u8()? {
         group_tag::ROW => GroupAt::Row(r.u64()?),
         group_tag::BUCKET => {
             let start = r.u64()? as i64;
@@ -327,8 +353,7 @@ fn get_group(r: &mut Reader<'_>, depth: usize) -> Result<Group> {
             GroupAt::Bucket { start, unit }
         }
         tag => return Err(WireError::BadTag { what: "a group's identity", tag }),
-    };
-    Ok(Group { at, key: r.opt_str()?, value: Box::new(get_value_at(r, depth + 1)?) })
+    })
 }
 
 pub fn get_value(r: &mut Reader<'_>) -> Result<Value> {
@@ -357,13 +382,18 @@ fn get_value_at(r: &mut Reader<'_>, depth: usize) -> Result<Value> {
             }
             Value::Groups(groups)
         }
-        value_tag::PAIRS => {
+        value_tag::TUPLES => {
             let n = r.count()?;
-            let mut pairs = Vec::with_capacity(n);
+            let mut tuples = Vec::with_capacity(n);
             for _ in 0..n {
-                pairs.push(Pair { left: get_group(r, depth)?, right: get_group(r, depth)? });
+                let arity = r.count()?;
+                let mut keys = Vec::with_capacity(arity);
+                for _ in 0..arity {
+                    keys.push(get_group_key(r)?);
+                }
+                tuples.push(Tuple { keys, value: Box::new(get_value_at(r, depth + 1)?) });
             }
-            Value::Pairs(pairs)
+            Value::Tuples(tuples)
         }
         value_tag::TABLE => {
             let n = r.count()?;

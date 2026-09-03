@@ -92,11 +92,20 @@ fn every_refusal_names_itself() {
     // column - two of them in a cell, or none at all.
     assert_eq!(code("SELECT concat(country, category) FROM t"), "sql_unsupported");
     assert_eq!(code("SELECT 1 + 1 FROM t"), "sql_unsupported");
-    // One column and two are both answered; three would be a pass over the third per pair of
-    // the first two.
-    assert_eq!(code("SELECT DISTINCT category, country, active FROM t"), "sql_unsupported");
+    // Any arity up to the cap is answered now - the real bound is the passes, checked per level
+    // by the executor. What the cap refuses is a statement naming more columns than an answer's
+    // arity is allowed to be, which is refused at the text rather than after building a frontier.
     assert_eq!(
-        code("SELECT category, count(*) FROM t GROUP BY category, country, active"),
+        code("SELECT DISTINCT category, country, active, device, city FROM t"),
+        "sql_unsupported"
+    );
+    assert_eq!(
+        code("SELECT count(*) FROM t GROUP BY category, country, active, device, city"),
+        "sql_unsupported"
+    );
+    // A column that is neither grouped nor aggregated is still the classic SQL error.
+    assert_eq!(
+        code("SELECT category, count(*) FROM t GROUP BY country, active"),
         "sql_unsupported"
     );
     assert_eq!(code("SELECT DISTINCT count(*) FROM t"), "sql_unsupported");

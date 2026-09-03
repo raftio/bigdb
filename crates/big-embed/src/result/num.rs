@@ -60,7 +60,7 @@ pub(super) fn scalar_cell(c: &Cell, values: &[Value], probes_at: usize) -> Datum
 pub(super) fn number(of: Of, values: &[Value], row: Option<GroupAt>) -> Option<Num> {
     match of {
         // A key is a string, not a number. Reached only by a hand-built shape.
-        Of::Key | Of::RightKey => None,
+        Of::Key | Of::KeyAt { .. } => None,
         // Reached only by a hand-built shape: `scalar_cell` reads a probe, because only it
         // knows where the searches' answers begin.
         Of::Probe { .. } => None,
@@ -120,7 +120,7 @@ pub(super) fn scalar_num(v: &Value) -> Option<Num> {
         // is the one `sum_float_where` documents.
         Value::RealSum(n) => Num::Real(*n),
         Value::RealExtreme(v) => Num::Real((*v)?),
-        Value::Groups(_) | Value::Rows(_) | Value::Table(_) | Value::Pairs(_) => return None,
+        Value::Groups(_) | Value::Rows(_) | Value::Table(_) | Value::Tuples(_) => return None,
     })
 }
 

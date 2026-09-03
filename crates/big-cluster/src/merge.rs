@@ -61,7 +61,7 @@ impl<'a> Merge<'a> {
             | Plan::Sum { .. }
             | Plan::Min { .. }
             | Plan::Max { .. }
-            | Plan::GroupByPair { .. }
+            | Plan::GroupByTuple { .. }
             | Plan::Project { .. } => false,
         };
         let groups = is_grouping.then(BTreeMap::new);
@@ -119,54 +119,22 @@ impl<'a> Merge<'a> {
     }
 }
 
-/// Two nodes' pair groupings, folded on the pair of rows.
-fn merge_pairs(
-    aggregate: &Plan,
-    node: &str,
-    a: Vec<big_embed::Pair>,
-    b: Vec<big_embed::Pair>,
-) -> Result<Vec<big_embed::Pair>> {
-    let mut held: BTreeMap<(GroupAt, GroupAt), big_embed::Pair> = BTreeMap::new();
-    for p in a.into_iter().chain(b) {
-        match held.get_mut(&(p.left.at, p.right.at)) {
-            None => {
-                held.insert((p.left.at, p.right.at), p);
-            }
-            Some(there) => {
-                let merged =
-                    combine(aggregate, node, (*there.right.value).clone(), *p.right.value)?;
-                *there.right.value = merged;
-                // A node that holds the row but not its name cannot exist today; taking
-                // whichever name exists costs nothing and keeps the shape honest.
-                for (into, from) in
-                    [(&mut there.left.key, p.left.key), (&mut there.right.key, p.right.key)]
-                {
-                    if into.is_none() {
-                        *into = from;
-                    }
-                }
-            }
-        }
-    }
-    let mut out: Vec<big_embed::Pair> = held.into_values().collect();
-    big_exec::sort_pairs(&mut out);
-    Ok(out)
-}
-
-/// Which plan decides how one group's measurement combines with another's.
+/// The aggregate a grouping measures its groups with.
 ///
-/// `Distinct` and `TopN` measure with a count, which they do not spell out anywhere in the
-/// plan; `GroupBy` carries the aggregate it was given. Standing in a `Count` for the first two
-/// is what lets one function handle all three.
+/// `Distinct` and `TopN` measure with a count, which they do not spell out anywhere in the plan;
+/// the rest carry the aggregate they were given. Standing in a `Count` for the first two is what
+/// lets one function handle them all.
+///
+/// A grouping plan that carries an aggregate must be named here, not left to the fallback.
+/// Falling through would hand [`combine`] the *grouping* rather than what it measures, so `min`
+/// over one would be refused as "an extreme, for a query that is not Min or Max" - and only ever
+/// on a cluster.
 fn group_aggregate(plan: &Plan) -> &Plan {
     match plan {
-        Plan::GroupBy { aggregate, .. } | Plan::GroupByBucket { aggregate, .. } => aggregate,
+        Plan::GroupBy { aggregate, .. }
+        | Plan::GroupByBucket { aggregate, .. }
+        | Plan::GroupByTuple { aggregate, .. } => aggregate,
         // Any `Count` will do: `combine` reads the variant, never the table or the rows.
-        //
-        // A grouping plan that carries an aggregate must be named above, not left to this arm.
-        // Falling through would hand `combine` the *grouping* rather than what it measures, so
-        // `min` over two nodes would be refused as "an extreme, for a query that is not Min or
-        // Max" - and only ever on a cluster.
         other => other,
     }
 }
@@ -188,11 +156,12 @@ fn combine(plan: &Plan, node: &str, a: Value, b: Value) -> Result<Value> {
             Value::Table(big_exec::merge_projected(x, y, *limit))
         }
 
-        // A pair holds records from one node or from several, so the two lists are folded
-        // together on the pair of rows before anything is ordered. The same argument
-        // `count(DISTINCT x)` makes one level up: a pair two nodes both hold is one pair.
-        (Plan::GroupByPair { aggregate, .. }, Value::Pairs(x), Value::Pairs(y)) => {
-            Value::Pairs(merge_pairs(aggregate, node, x, y)?)
+        // A combination holds records from one node or from several, so the two lists are
+        // folded together on the combination of identities before anything is ordered. The same
+        // argument `count(DISTINCT x)` makes one level up: a combination two nodes both hold is
+        // one combination.
+        (Plan::GroupByTuple { aggregate, .. }, Value::Tuples(x), Value::Tuples(y)) => {
+            Value::Tuples(merge_tuples(aggregate, node, x, y)?)
         }
 
         (_, Value::Count(x), Value::Count(y)) => {
@@ -261,4 +230,40 @@ pub fn merge_records(pages: Vec<Vec<u64>>, limit: usize) -> Vec<u64> {
         out.push(heads[i].next().expect("peek said there was one"));
     }
     out
+}
+
+/// Two nodes' tuples, folded on the combination of keys.
+///
+/// Keyed on the identities rather than on the names, for the reason the group map is: a node may
+/// hold a row without having been told the string it was interned from, and folding on the name
+/// would fuse every combination whose key is unknown into one.
+fn merge_tuples(
+    plan: &Plan,
+    node: &str,
+    a: Vec<big_embed::Tuple>,
+    b: Vec<big_embed::Tuple>,
+) -> Result<Vec<big_embed::Tuple>> {
+    let mut held: BTreeMap<Vec<GroupAt>, big_embed::Tuple> = BTreeMap::new();
+    for t in a.into_iter().chain(b) {
+        let at: Vec<GroupAt> = t.keys.iter().map(|k| k.at).collect();
+        match held.get_mut(&at) {
+            None => {
+                held.insert(at, t);
+            }
+            Some(there) => {
+                let merged = combine(plan, node, (*there.value).clone(), *t.value)?;
+                *there.value = merged;
+                // A node that holds the combination but not one of its names takes whichever
+                // name exists, exactly as the group map does.
+                for (held, incoming) in there.keys.iter_mut().zip(t.keys) {
+                    if held.key.is_none() {
+                        held.key = incoming.key;
+                    }
+                }
+            }
+        }
+    }
+    let mut out: Vec<big_embed::Tuple> = held.into_values().collect();
+    big_exec::sort_tuples(&mut out);
+    Ok(out)
 }

@@ -34,5 +34,5 @@ pub use ast::{Call, Expr, Literal};
 pub use error::{PlanError, Result};
 pub use explain::explain;
 pub use parse::parse;
-pub use plan::{plan, to_units, CmpOp, Plan, Rows};
+pub use plan::{plan, to_units, CmpOp, Level, Plan, Rows};
 pub use schema::{expanded_columns, FieldClass, Keyed, Schema, TimeUnit};

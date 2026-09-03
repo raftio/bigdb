@@ -19,7 +19,7 @@
 
 use big_cluster::{RangeVerdict, RepairReport, WriteOutcome};
 use big_db::RecordId;
-use big_embed::{Datum, Format, GroupAt, ResultSet, TableInfo, TimeUnit};
+use big_embed::{Datum, Format, GroupAt, GroupKey, ResultSet, TableInfo, TimeUnit};
 use big_exec::{Group, Value};
 
 /// Escapes a string into a JSON string literal, including the quotes.
@@ -151,12 +151,17 @@ pub fn value_paged(v: &Value, page: Page) -> String {
         Value::Rows(m) => rows(m, page),
         // A pair grouping asked for in the query language. One object per pair, naming both
         // halves, because this route's answers name what they hold.
-        Value::Pairs(pairs) => {
-            let items: Vec<String> = pairs
+        // A list of keys rather than named halves, because the arity is a number here:
+        // `left`/`right` had nothing to call a third.
+        Value::Tuples(tuples) => {
+            let items: Vec<String> = tuples
                 .iter()
-                .map(|p| format!("{{\"left\":{},\"right\":{}}}", group(&p.left), group(&p.right)))
+                .map(|t| {
+                    let keys: Vec<String> = t.keys.iter().map(group_key).collect();
+                    format!("{{\"keys\":[{}],\"value\":{}}}", keys.join(","), value(&t.value))
+                })
                 .collect();
-            format!("{{\"pairs\":[{}]}}", items.join(","))
+            format!("{{\"tuples\":[{}]}}", items.join(","))
         }
         // A projection asked for in the query language rather than in SQL. One object per
         // record rather than an array of cells, because this route's answers name what they
@@ -311,16 +316,25 @@ fn projection(p: &big_embed::Projection) -> String {
     }
 }
 
+fn group_key(k: &GroupKey) -> String {
+    let (key, row) = named_at(k.at, k.key.as_deref());
+    format!("{{\"key\":{key},\"row\":{row}}}")
+}
+
 fn group(g: &Group) -> String {
-    // **A bucket names itself.** A row id is meaningless without the dictionary that issued it,
-    // so a keyed group carries the string beside it and this route hands back both. A calendar
-    // bucket has no dictionary and needs none: the moment it starts *is* its name, so it is
-    // written out as the date it stands for rather than as a number a reader would have to know
-    // the unit of to interpret.
-    let (key, row) = match g.at {
-        GroupAt::Row(row) => {
-            (g.key.as_deref().map_or_else(|| "null".to_string(), string), row.to_string())
-        }
+    let (key, row) = named_at(g.at, g.key.as_deref());
+    format!("{{\"key\":{key},\"row\":{row},\"value\":{}}}", value(&g.value))
+}
+
+/// What a group is called on this route, and the number it is addressed by.
+///
+/// **A bucket names itself.** A row id is meaningless without the dictionary that issued it, so a
+/// keyed group carries the string beside it and this route hands back both. A calendar bucket has
+/// no dictionary and needs none: the moment it starts *is* its name, so it is written out as the
+/// date it stands for rather than as a number a reader would have to know the unit of to read.
+fn named_at(at: GroupAt, key: Option<&str>) -> (String, String) {
+    match at {
+        GroupAt::Row(row) => (key.map_or_else(|| "null".to_string(), string), row.to_string()),
         GroupAt::Bucket { start, unit } => (
             string(&match unit {
                 TimeUnit::Days => big_civil::format_date(start),
@@ -328,8 +342,7 @@ fn group(g: &Group) -> String {
             }),
             start.to_string(),
         ),
-    };
-    format!("{{\"key\":{key},\"row\":{row},\"value\":{}}}", value(&g.value))
+    }
 }
 
 /// The schema snapshot as JSON: tables, each with its fields, kinds and bit depths.

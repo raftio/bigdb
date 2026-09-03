@@ -42,8 +42,8 @@ mod cond;
 mod grouped;
 mod join;
 mod measure;
-mod pairs;
 mod pql;
+mod tuples;
 mod ungrouped;
 
 use cond::rows;
@@ -270,12 +270,10 @@ fn lower_one(select: &Select) -> Result<Statement> {
     match select.group_by.as_slice() {
         [] => ungrouped::ungrouped(select, table, &rows, &stars, &columns, &aggregates),
         [one] => grouped::grouped(select, table, &rows, one, &stars, &columns, &aggregates),
-        // Two columns: one pass over the second per value of the first. See `pairs`.
-        [left, right] => {
-            pairs::pairs(select, table, &rows, (left, right), &stars, &columns, &aggregates)
-        }
-        // The parser allows at most two, so this is unreachable rather than a third refusal.
-        _ => unreachable!("at most two grouped columns"),
+        // Two or more: one pass over the next column per combination of the ones before it.
+        // See `tuples`. Total, which is the point - there is no arity left for an `unreachable!`
+        // to stand for.
+        by => tuples::tuples(select, table, &rows, by, &stars, &columns, &aggregates),
     }
 }
 

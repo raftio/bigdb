@@ -936,9 +936,3 @@ SELECT date_trunc('day', seen), count(*) FROM t GROUP BY date_trunc('month', see
 ----
 sql_unsupported
 
-## A pair grouping has no bucket plan behind it, so a rounded term in one is refused by name.
-
-error
-SELECT date_trunc('month', seen), country, count(*) FROM t GROUP BY date_trunc('month', seen), country
-----
-sql_unsupported

@@ -22,6 +22,15 @@ use crate::ast::{
 use crate::error::{Refused, Result, SqlError};
 use crate::lex::Tok;
 use crate::scalar::{Func, Scalar};
+
+/// How many columns one `GROUP BY` may name.
+///
+/// **The real bound is the passes**, which the executor checks per level against
+/// `lower::tuples::MAX_PASSES` - a grouping's cost is the number of combinations it walks, not
+/// the number of columns it names. This exists so that the answer's arity stays a small number
+/// the shape can carry in a byte, and so a statement naming twenty columns is refused at the
+/// text rather than after building a frontier.
+pub const MAX_GROUP_COLUMNS: usize = 4;
 use big_plan::Literal;
 
 impl Parser<'_> {
@@ -66,8 +75,6 @@ impl Parser<'_> {
             (None, None) => None,
         };
 
-        // Two columns at most. A third would be a pass over the second column per pair of the
-        // first two, which is a cost that grows with the product of three cardinalities.
         let group_at = self.at();
         let group_by = if self.eat_word("GROUP") {
             self.expect_word("BY", "BY after GROUP")?;
@@ -75,7 +82,7 @@ impl Parser<'_> {
             while self.eat(&Tok::Comma) {
                 by.push(self.grouping()?);
             }
-            if by.len() > 2 {
+            if by.len() > MAX_GROUP_COLUMNS {
                 return Err(self.refuse_at(Refused::Shape, group_at));
             }
             by
@@ -113,8 +120,8 @@ impl Parser<'_> {
                         _ => return Err(self.refuse_at(Refused::Shape, item.at)),
                     }
                 }
-                if by.len() > 2 {
-                    return Err(self.refuse_at(Refused::MultiDistinct, items[2].at));
+                if by.len() > MAX_GROUP_COLUMNS {
+                    return Err(self.refuse_at(Refused::MultiDistinct, items[MAX_GROUP_COLUMNS].at));
                 }
                 by
             }

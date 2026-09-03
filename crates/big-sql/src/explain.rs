@@ -208,7 +208,9 @@ fn shape_head(shape: &Shape) -> String {
             ),
         },
         Shape::Union { .. } => "Union".to_string(),
-        Shape::Pairs { keys, .. } => format!("Pairs keys={}", plans(keys)),
+        Shape::Tuples { axes, keys, .. } => {
+            format!("Tuples axes={axes} keys={}", plans(keys))
+        }
         // Printed as `keys=`, which is what these are: the plans whose keys make the rows.
         // The word outlives the field name so that widening the sides churns no golden line.
         Shape::Join { sides: s, per_key, .. } => {
@@ -242,7 +244,7 @@ fn shape_kids(shape: &Shape) -> Vec<Line<'_>> {
         Shape::Join { sides, cells, having, order, cut, .. } => {
             clauses(sides, cells, having, order, cut)
         }
-        Shape::Pairs { cells, having, order, cut, .. }
+        Shape::Tuples { cells, having, order, cut, .. }
         | Shape::Groups { cells, having, order, cut, .. } => {
             clauses(&[], cells, having, order, cut)
         }
@@ -313,7 +315,10 @@ fn of(of: Of, sides: &[JoinSide]) -> String {
         // different questions, and a printer that hid that would print them the same.
         Of::Now { unix_seconds } => format!("now '{}'", big_civil::format_datetime(unix_seconds)),
         Of::Key => "key".to_string(),
-        Of::RightKey => "right key".to_string(),
+        // Axis 0 prints as the bare word, so a one-key grouping reads the way it always has and
+        // only the axes above it carry a number.
+        Of::KeyAt { axis: 0 } => "key".to_string(),
+        Of::KeyAt { axis } => format!("key #{axis}"),
         Of::Probe { probe } => format!("probe #{probe}"),
         // The fallback matters: it is the whole of what a `FILTER` leaves behind, and two
         // shapes that differ only in it are two different answers for an emptied group.
