@@ -42,10 +42,11 @@ impl<P: PagerMut + Sync> Cluster<P> {
 
     /// What this text is, resolved against the request but run nowhere.
     ///
-    /// The edge needs the answer before it can decide what the request costs: `POST /sql` is
-    /// authorised as `read`, and a schema change written in SQL needs `admin` - see
-    /// [`big_embed::Sql::authority`]. Exposed here rather than having the edge parse for itself,
-    /// so that what decides the role and what decides the action are one definition.
+    /// The edge needs the value before it can decide what the request costs: the route's guard is
+    /// a floor, and which privileges a statement actually needs - on which objects - is
+    /// [`big_embed::Sql::demands`]'s to say, next to the variants it is about. Exposed here rather
+    /// than having the edge parse for itself, so that what decides the privilege and what decides
+    /// the action are one definition.
     ///
     /// **`opts` rather than nothing, and the statement rather than a verdict.** The edge used to
     /// classify against the default database and then hand the *text* back for [`Cluster::sql`]

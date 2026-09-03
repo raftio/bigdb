@@ -25,11 +25,11 @@
 //! being fuzzed - if it is ever removed this target stops returning and starts crashing, which
 //! is the point.
 //!
-//! **A statement is five different things.** A query, an insert, a listing and a schema change
-//! leave by four different doors, an `EXPLAIN` wraps whichever of them it was given, and each
-//! carries structure the others do not. So a successful translation is walked afterwards:
-//! printing it traverses the same tree every reader downstream will, and a value the parser can
-//! build but nothing else can look at fails here rather than in a request.
+//! **A statement is six different things.** A query, an insert, a listing, a schema change and a
+//! change to who may do what leave by five different doors, an `EXPLAIN` wraps whichever of them
+//! it was given, and each carries structure the others do not. So a successful translation is
+//! walked afterwards: printing it traverses the same tree every reader downstream will, and a
+//! value the parser can build but nothing else can look at fails here rather than in a request.
 //!
 //! `crates/big-sql/tests/gates.rs` runs the same contract over every prefix and one-byte cut of
 //! the test corpus, in the ordinary test suite. This one has no bound on its inputs.
@@ -109,6 +109,8 @@ fuzz_target!(|data: &[u8]| {
             assert!(!big_sql::explain::insert(&i).is_empty());
         }
         big_sql::Sql::Show(s) => assert!(!big_sql::explain::show(&s).is_empty()),
+        // A grant is wholly in the parse tree, so the only thing left to walk is its printer.
+        big_sql::Sql::Acl(a) => assert!(!big_sql::explain::acl(&a).is_empty()),
         big_sql::Sql::Ddl(d) => {
             // A schema change is written back out and read again, which is the round trip
             // `render` and `parse::column_type` are two halves of.
@@ -153,6 +155,9 @@ fuzz_target!(|data: &[u8]| {
                 }
                 big_sql::Sql::Show(s) => {
                     (big_sql::explain::Explained::Show(s), big_sql::explain::show(s))
+                }
+                big_sql::Sql::Acl(a) => {
+                    (big_sql::explain::Explained::Acl(a), big_sql::explain::acl(a))
                 }
                 // A query's half needs a schema to resolve, and this target links none. Its
                 // plans and shape are fuzzed through the `Sql::Query` arm above instead.
