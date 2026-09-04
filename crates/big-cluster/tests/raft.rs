@@ -663,7 +663,11 @@ fn the_shipped_clocks_do_not_re_elect_a_healthy_leader() {
 // -------------------------------------------------------------------------------------------
 
 fn learner(name: &str) -> Member {
-    Member { name: name.to_string(), addr: "10.0.0.9:7654".to_string(), state: MemberState::Learner }
+    Member {
+        name: name.to_string(),
+        addr: "10.0.0.9:7654".to_string(),
+        state: MemberState::Learner,
+    }
 }
 
 /// **A configuration change takes effect when it is appended, not when it commits.**

@@ -1679,3 +1679,101 @@ fn leader_of(ports: &[SocketAddr]) -> SocketAddr {
     let index = ["a", "b", "a-spare"].iter().position(|n| *n == name).expect("a known node");
     ports[index]
 }
+
+// -------------------------------------------------------------------------------------------
+// Who is in the cluster, changed while it runs
+// -------------------------------------------------------------------------------------------
+
+/// **A node joins as a learner and holds nothing.** It replicates the log without voting,
+/// because a node still catching up cannot help elect anybody and counting it would raise the
+/// bar for every election.
+#[test]
+fn a_node_joins_as_a_learner_and_is_promoted_when_it_has_something_to_serve() {
+    let (a, b, spare) = (free_port(), free_port(), free_port());
+    let d = free_port();
+    let file = format!(
+        "schema_leader = \"a\"\n\
+         [[node]]\nname = \"a\"\naddr = \"{a}\"\nshards = \"0..64\"\n\
+         [[node]]\nname = \"b\"\naddr = \"{b}\"\nshards = \"64..\"\n\
+         [[node]]\nname = \"a-spare\"\naddr = \"{spare}\"\nreplica = \"a\"\n"
+    );
+    let _a = start_agreeing(&file, "a", a);
+    let _b = start_agreeing(&file, "b", b);
+    let _spare = start_agreeing(&file, "a-spare", spare);
+    until("an elected leader", || ready(a).contains(r#""leader":""#));
+
+    let leader = leader_of(&[a, b, spare]);
+    let body = ok(leader, "POST", &format!("/admin/cluster/node?name=d&addr={d}"), "");
+    assert!(body.contains(r#""node":"d""#), "{body}");
+
+    until("every node to know about it", || {
+        [a, b, spare].iter().all(|p| ok(*p, "GET", "/cluster/topology", "").contains(r#""d""#))
+    });
+    let seen = ok(a, "GET", "/cluster/topology", "");
+    assert!(seen.contains(r#""name":"d","addr""#), "{seen}");
+    assert!(seen.contains(r#""state":"learner""#), "a joining node does not vote yet: {seen}");
+
+    // It holds no range, so nothing reads from it and nothing is at risk while it catches up.
+    assert!(!seen.contains(r#""primary":"d""#), "{seen}");
+
+    // Promoted deliberately, which is what lets it take a range.
+    ok(leader, "POST", "/admin/cluster/admit?name=d", "");
+    until("it to become a full member", || {
+        ok(a, "GET", "/cluster/topology", "").contains(r#""name":"d","addr""#)
+            && !ok(a, "GET", "/cluster/topology", "").contains(r#""state":"learner""#)
+    });
+}
+
+/// **A node that still holds a range is not removed**, because removing it removes the only
+/// copy of what it holds and leaves the map naming a node nobody talks to.
+#[test]
+fn a_node_that_still_holds_a_range_cannot_be_removed() {
+    let (a, b, spare) = (free_port(), free_port(), free_port());
+    let file = format!(
+        "schema_leader = \"a\"\n\
+         [[node]]\nname = \"a\"\naddr = \"{a}\"\nshards = \"0..64\"\n\
+         [[node]]\nname = \"b\"\naddr = \"{b}\"\nshards = \"64..\"\n\
+         [[node]]\nname = \"a-spare\"\naddr = \"{spare}\"\nreplica = \"a\"\n"
+    );
+    let _a = start_agreeing(&file, "a", a);
+    let _b = start_agreeing(&file, "b", b);
+    let _spare = start_agreeing(&file, "a-spare", spare);
+    until("an elected leader", || ready(a).contains(r#""leader":""#));
+
+    let leader = leader_of(&[a, b, spare]);
+    let (status, body) = send(leader, "DELETE", "/admin/cluster/node?name=b", "");
+    assert_eq!(status, 409, "{body}");
+    assert!(body.contains("still holds shards 64.."), "{body}");
+    assert!(body.contains("drain it first"), "{body}");
+}
+
+/// A draining node keeps answering: it still votes and still coordinates, so the one address a
+/// client is holding does not go dark halfway through a scale-in.
+#[test]
+fn a_draining_node_still_answers_for_what_it_has_not_handed_over() {
+    let (a, b, spare) = (free_port(), free_port(), free_port());
+    let file = format!(
+        "schema_leader = \"a\"\n\
+         [[node]]\nname = \"a\"\naddr = \"{a}\"\nshards = \"0..64\"\n\
+         [[node]]\nname = \"b\"\naddr = \"{b}\"\nshards = \"64..\"\n\
+         [[node]]\nname = \"a-spare\"\naddr = \"{spare}\"\nreplica = \"a\"\n"
+    );
+    let _a = start_agreeing(&file, "a", a);
+    let _b = start_agreeing(&file, "b", b);
+    let _spare = start_agreeing(&file, "a-spare", spare);
+    until("an elected leader", || ready(a).contains(r#""leader":""#));
+
+    ok(a, "POST", "/table/tx", "");
+    ok(a, "POST", "/table/tx/field/amount?kind=int&bit_depth=32", "");
+    ok(a, "POST", "/table/tx/import", &format!("amount {} 5\n", 70 * (1 << 20)));
+
+    let leader = leader_of(&[a, b, spare]);
+    ok(leader, "POST", "/admin/cluster/drain?name=b", "");
+    until("the drain to be recorded", || {
+        ok(a, "GET", "/cluster/topology", "").contains(r#""state":"draining""#)
+    });
+
+    // Still serving its range, and still usable as the node a client happens to reach.
+    assert_eq!(ok(a, "POST", "/table/tx/query", "Count(All())"), r#"{"count":1}"#);
+    assert_eq!(ok(b, "POST", "/table/tx/query", "Count(All())"), r#"{"count":1}"#);
+}

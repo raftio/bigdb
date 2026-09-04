@@ -231,6 +231,13 @@ impl<P: PagerMut + Sync + Send + 'static> Server<P> {
         // Once, here, because the ceiling on concurrent password verifications is a fact about
         // the worker pool and `Auth` cannot know the pool from where it is built.
         config.auth.size_for(config.workers);
+        // **The agreement is the roster, and this is where the two meet.** The listener decides
+        // which peer certificates to admit and the agreement decides who is in the cluster; a
+        // node that joined would otherwise present a certificate this listener refuses, because
+        // it names somebody the file it read has never heard of.
+        if let Some(tls) = config.tls.clone() {
+            cluster.follow_roster(tls);
+        }
         Ok(Self {
             state: Arc::new(State {
                 cluster,

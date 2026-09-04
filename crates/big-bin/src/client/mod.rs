@@ -231,6 +231,19 @@ fn request(command: &Command, input: &mut dyn BufRead) -> Result<Request, String
         Command::ClusterMerge { range } => {
             Request::new("POST", format!("/admin/cluster/merge?range={range}"), String::new())
         }
+        Command::ClusterAddNode { name, addr } => Request::new(
+            "POST",
+            format!("/admin/cluster/node?name={name}&addr={addr}"),
+            String::new(),
+        ),
+        // `remove` is the only one that takes a node away for good, so it is the only one
+        // written as a deletion.
+        Command::ClusterMember { verb: "remove", name } => {
+            Request::new("DELETE", format!("/admin/cluster/node?name={name}"), String::new())
+        }
+        Command::ClusterMember { verb, name } => {
+            Request::new("POST", format!("/admin/cluster/{verb}?name={name}"), String::new())
+        }
         Command::Health => Request::new("GET", "/health".to_string(), String::new()),
         Command::Ready => Request::new("GET", "/ready".to_string(), String::new()),
         Command::Metrics => Request {

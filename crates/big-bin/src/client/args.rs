@@ -118,6 +118,16 @@ pub enum Command {
     ClusterMerge {
         range: u64,
     },
+    /// `cluster add-node <name> <addr>` - a node joins, as a learner.
+    ClusterAddNode {
+        name: String,
+        addr: String,
+    },
+    /// `cluster admit|drain|remove <name>` - the three one-node changes.
+    ClusterMember {
+        verb: &'static str,
+        name: String,
+    },
     Health,
     Ready,
     Metrics,
@@ -516,6 +526,22 @@ fn command(positional: &[String], scoped: Vec<(String, String)>) -> Result<Comma
                 .parse()
                 .map_err(|_| format!("`{at}` is not a shard number; write `cluster split 900`"))?;
             Command::ClusterSplit { at, to: Some((*node).to_string()) }
+        }
+        ["cluster", "add-node", name, addr] => {
+            only(&scoped, "cluster add-node", &[])?;
+            Command::ClusterAddNode { name: (*name).to_string(), addr: (*addr).to_string() }
+        }
+        ["cluster", "admit", name] => {
+            only(&scoped, "cluster admit", &[])?;
+            Command::ClusterMember { verb: "admit", name: (*name).to_string() }
+        }
+        ["cluster", "drain", name] => {
+            only(&scoped, "cluster drain", &[])?;
+            Command::ClusterMember { verb: "drain", name: (*name).to_string() }
+        }
+        ["cluster", "remove", name] => {
+            only(&scoped, "cluster remove", &[])?;
+            Command::ClusterMember { verb: "remove", name: (*name).to_string() }
         }
         ["cluster", "merge", range] => {
             only(&scoped, "cluster merge", &[])?;

@@ -117,12 +117,110 @@ impl<P: PagerMut + Sync> Cluster<P> {
     }
 
     /// A node's index by name, refusing a name the cluster does not have.
+    ///
+    /// **From the agreement, not the file.** A node that joined at runtime is not in the file
+    /// this process read, and looking it up there would make it unaddressable by the very
+    /// commands that manage it.
     fn node_named(&self, name: &str) -> Result<usize> {
-        self.config
-            .nodes()
+        self.members()
             .iter()
-            .position(|n| n.name == name)
+            .position(|n| n.name == name && n.state != raft::MemberState::Gone)
             .ok_or_else(|| ClusterError::Refused(format!("there is no node called `{name}`")))
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Who is in the cluster
+    // ---------------------------------------------------------------------------------------
+
+    /// Adds a node, as a learner holding nothing.
+    ///
+    /// **A learner, not a voter.** A node that has just arrived holds no range and has not
+    /// caught up on the log; counting it towards a majority would raise the bar for every
+    /// election while it contributed nothing to one. The balancer promotes it once it has
+    /// something to serve - or an operator does, with `admit`.
+    pub fn add_node(&self, name: &str, addr: &str) -> Result<()> {
+        let mut next = self.members();
+        if let Some(existing) = next.iter_mut().find(|m| m.name == name) {
+            // A node coming back after being removed takes its slot again rather than a new
+            // one, so no `NodeId` ever means two machines.
+            if existing.state != raft::MemberState::Gone {
+                return Err(ClusterError::Refused(format!("`{name}` is already in this cluster")));
+            }
+            existing.addr = addr.to_string();
+            existing.state = raft::MemberState::Learner;
+        } else {
+            next.push(raft::Member {
+                name: name.to_string(),
+                addr: addr.to_string(),
+                state: raft::MemberState::Learner,
+            });
+        }
+        self.propose_members(next)
+    }
+
+    /// Makes a learner a full member, which is what lets it hold a range and vote.
+    pub fn admit(&self, name: &str) -> Result<()> {
+        self.set_state(name, raft::MemberState::Voter)
+    }
+
+    /// Starts taking a node out of the cluster.
+    ///
+    /// **It keeps answering.** A draining node still votes and still coordinates - which is
+    /// what keeps the one address a client is holding from going dark halfway through - but the
+    /// balancer moves its ranges away and gives it no new ones. `remove` is the step after,
+    /// once it holds nothing.
+    pub fn drain_node(&self, name: &str) -> Result<()> {
+        self.set_state(name, raft::MemberState::Draining)
+    }
+
+    /// Takes a node out for good. Refused while it still holds a range.
+    ///
+    /// The refusal is the point: removing a node that still serves something is removing the
+    /// only copy of it, and the map would go on naming a node nobody talks to.
+    pub fn remove_node(&self, name: &str) -> Result<()> {
+        let node = self.node_named(name)?;
+        let map = self.map();
+        let held = map.held_by(node);
+        if !held.is_empty() {
+            let shards: Vec<String> =
+                held.iter().map(|r| map.ranges[*r].shards.to_string()).collect();
+            return Err(ClusterError::Refused(format!(
+                "`{name}` still holds shards {}; drain it first, or those records leave with it",
+                shards.join(", ")
+            )));
+        }
+        self.set_state(name, raft::MemberState::Gone)
+    }
+
+    fn set_state(&self, name: &str, state: raft::MemberState) -> Result<()> {
+        let mut next = self.members();
+        let node = self.node_named(name)?;
+        let Some(member) = next.get_mut(node) else {
+            return Err(ClusterError::Refused(format!("there is no node called `{name}`")));
+        };
+        if member.state == state {
+            return Ok(());
+        }
+        member.state = state;
+        self.propose_members(next)
+    }
+
+    /// Who the agreement believes is in the cluster.
+    pub fn members(&self) -> Vec<raft::Member> {
+        match &self.controller {
+            Some(c) => c.members(),
+            None => self.config.seed_members(),
+        }
+    }
+
+    fn propose_members(&self, next: Vec<raft::Member>) -> Result<()> {
+        let Some(controller) = &self.controller else {
+            return Err(ClusterError::Refused(
+                "this cluster runs no agreement, so its membership is whatever its file says"
+                    .to_string(),
+            ));
+        };
+        controller.propose_members(next).map_err(|e| ClusterError::Refused(e.to_string()))
     }
 
     /// What the cluster looks like right now: every range, who holds it, and what is moving.
@@ -135,6 +233,21 @@ impl<P: PagerMut + Sync> Cluster<P> {
             epoch: map.epoch,
             leader: self.controller.as_ref().and_then(|c| c.leader()).and_then(|n| self.name_of(n)),
             schema_leader: self.name_of(map.schema_leader).unwrap_or_default(),
+            members: self
+                .members()
+                .iter()
+                .filter(|m| m.state != raft::MemberState::Gone)
+                .map(|m| MemberReport {
+                    name: m.name.clone(),
+                    addr: m.addr.clone(),
+                    state: match m.state {
+                        raft::MemberState::Learner => "learner",
+                        raft::MemberState::Voter => "voter",
+                        raft::MemberState::Draining => "draining",
+                        raft::MemberState::Gone => "gone",
+                    },
+                })
+                .collect(),
             ranges: map
                 .ranges
                 .iter()
@@ -162,9 +275,18 @@ pub struct Topology {
     /// Who leads the agreement, when this node knows.
     pub leader: Option<String>,
     pub schema_leader: String,
+    pub members: Vec<MemberReport>,
     pub ranges: Vec<RangeReport>,
     /// Copies the agreement will not promote until a repair has been run.
     pub behind: Vec<String>,
+}
+
+/// One node, as the agreement sees it.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct MemberReport {
+    pub name: String,
+    pub addr: String,
+    pub state: &'static str,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]

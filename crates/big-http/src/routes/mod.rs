@@ -251,6 +251,11 @@ enum Target<'a> {
     ClusterSplit,
     /// Join a range to the one after it.
     ClusterMerge,
+    /// Add a node, promote it, start taking one out, or take it out for good.
+    ClusterAddNode,
+    ClusterAdmit,
+    ClusterDrain,
+    ClusterRemove,
 }
 
 impl<'a> Target<'a> {
@@ -325,9 +330,13 @@ impl<'a> Target<'a> {
             }
             // Reshaping the cluster is the same privilege as repairing it: about the process
             // and its peers, not about anybody's rows.
-            Self::ClusterTopology | Self::ClusterSplit | Self::ClusterMerge => {
-                Guard::Needs(Privilege::Operate, ObjectRef::Server)
-            }
+            Self::ClusterTopology
+            | Self::ClusterSplit
+            | Self::ClusterMerge
+            | Self::ClusterAddNode
+            | Self::ClusterAdmit
+            | Self::ClusterDrain
+            | Self::ClusterRemove => Guard::Needs(Privilege::Operate, ObjectRef::Server),
             Self::Query(t) | Self::Records(t) => Guard::Needs(Privilege::Select, table(t)),
             Self::Import(t) => Guard::Needs(Privilege::Insert, table(t)),
             // Deleting records is not inserting them: a credential that may add facts is not
@@ -407,6 +416,10 @@ fn resolve<'a>(method: &str, segments: &[&'a str]) -> Option<Target<'a>> {
         ("GET", ["cluster", "topology"]) => Target::ClusterTopology,
         ("POST", ["admin", "cluster", "split"]) => Target::ClusterSplit,
         ("POST", ["admin", "cluster", "merge"]) => Target::ClusterMerge,
+        ("POST", ["admin", "cluster", "node"]) => Target::ClusterAddNode,
+        ("POST", ["admin", "cluster", "admit"]) => Target::ClusterAdmit,
+        ("POST", ["admin", "cluster", "drain"]) => Target::ClusterDrain,
+        ("DELETE", ["admin", "cluster", "node"]) => Target::ClusterRemove,
         ("POST", ["admin", "backup"]) => Target::Backup,
         _ => return None,
     })
@@ -537,6 +550,10 @@ pub fn dispatch<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request) -> Answered
         Target::ClusterTopology => cluster_topology(ctx),
         Target::ClusterSplit => cluster_split(ctx, req),
         Target::ClusterMerge => cluster_merge(ctx, req),
+        Target::ClusterAddNode => cluster_add_node(ctx, req),
+        Target::ClusterAdmit => cluster_member(ctx, req, Membership::Admit),
+        Target::ClusterDrain => cluster_member(ctx, req, Membership::Drain),
+        Target::ClusterRemove => cluster_member(ctx, req, Membership::Remove),
         Target::Backup => backup(ctx, req),
     };
     Answered { response, who }

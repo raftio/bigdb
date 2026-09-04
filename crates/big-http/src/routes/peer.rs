@@ -293,6 +293,52 @@ pub(super) fn cluster_merge<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request)
     }
 }
 
+/// `POST /admin/cluster/node?name=<name>&addr=<host:port>` - a node joins, as a learner.
+///
+/// **A learner, not a voter.** A node that has just arrived holds no range and has not caught
+/// up on the log; counting it towards a majority would raise the bar for every election while
+/// it contributed nothing to one. `admit` is the step that makes it a full member.
+pub(super) fn cluster_add_node<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request) -> Response {
+    let (Some(name), Some(addr)) = (req.param("name"), req.param("addr")) else {
+        return Response::failure(
+            400,
+            "bad_request",
+            "adding a node needs ?name=<name>&addr=<host:port>",
+        );
+    };
+    match ctx.cluster.add_node(&name, &addr) {
+        Ok(()) => Response::ok(format!("{{\"node\":{}}}", json::string(&name))),
+        Err(e) => from_cluster(&e),
+    }
+}
+
+/// Which of the three one-node changes a request is.
+pub(super) enum Membership {
+    Admit,
+    Drain,
+    Remove,
+}
+
+/// `POST /admin/cluster/{admit,drain}` and `DELETE /admin/cluster/node`, all `?name=<node>`.
+pub(super) fn cluster_member<P: PagerMut + Sync>(
+    ctx: &Ctx<'_, P>,
+    req: &Request,
+    what: Membership,
+) -> Response {
+    let Some(name) = req.param("name") else {
+        return Response::failure(400, "bad_request", "this needs ?name=<node>");
+    };
+    let done = match what {
+        Membership::Admit => ctx.cluster.admit(&name),
+        Membership::Drain => ctx.cluster.drain_node(&name),
+        Membership::Remove => ctx.cluster.remove_node(&name),
+    };
+    match done {
+        Ok(()) => Response::ok(format!("{{\"node\":{}}}", json::string(&name))),
+        Err(e) => from_cluster(&e),
+    }
+}
+
 /// Every fragment of a table, with the count that stands in for its contents.
 pub(super) fn peer_fragments<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request) -> Response {
     let request = match wire::FragmentsRequest::decode(&req.body) {

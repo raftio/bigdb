@@ -86,6 +86,13 @@ pub struct Controller {
     this: NodeId,
     /// How the other nodes are reached. Held so that a node which joins can be added to it.
     peers: Arc<dyn Peers>,
+    /// The listener's peer roster, when this node has one.
+    ///
+    /// **Set after construction**, because the listener is built by the layer above and this
+    /// node has to exist before it can be listened for. Shared rather than copied: a
+    /// `TlsConfig` is a handle onto one `Arc`, so writing the roster here is the same roster
+    /// the accept path reads.
+    roster: RwLock<Option<big_tls::TlsConfig>>,
     /// Milliseconds since this process started, at the last moment this node could prove it
     /// was still in touch with a majority. The lease, in one number.
     lease_at: AtomicU64,
@@ -235,6 +242,7 @@ impl Controller {
             members: Arc::new(RwLock::new(members)),
             this,
             peers: Arc::clone(&peers),
+            roster: RwLock::new(None),
             lease_at: AtomicU64::new(0),
             started,
             inbox: tx,
@@ -248,6 +256,22 @@ impl Controller {
             .spawn(move || driver.run(rx))
             .expect("one driver thread");
         Ok(controller)
+    }
+
+    /// Hands this controller the listener's peer roster to keep current.
+    ///
+    /// **Without it a node that joins can never connect.** Its certificate is signed by the
+    /// right CA and names a node the listener has never heard of, which is precisely what the
+    /// roster refuses - so the roster has to follow the agreement rather than the file.
+    pub fn follow_roster(&self, tls: big_tls::TlsConfig) {
+        let names = self.member_names();
+        tls.set_roster(names);
+        *self.roster.write().expect("no panic holds this lock") = Some(tls);
+    }
+
+    /// The names of every node still in the cluster.
+    fn member_names(&self) -> Vec<String> {
+        self.members().iter().filter(|m| m.reachable()).map(|m| m.name.clone()).collect()
     }
 
     /// The map, as last committed.
@@ -387,7 +411,15 @@ impl Controller {
                 self.peers.extend(&addrs);
                 self.outbox.reach(membership.len());
             }
+            let changed = *self.members.read().expect("no panic holds this lock") != membership;
             *self.members.write().expect("no panic holds this lock") = membership;
+            if changed {
+                // A node that joined has to be let through the handshake, and one that left has
+                // to stop being: a certificate is not revoked by editing a file nobody re-reads.
+                if let Some(tls) = self.roster.read().expect("no panic holds this lock").as_ref() {
+                    tls.set_roster(self.member_names());
+                }
+            }
 
             for decision in out.applied {
                 match decision {

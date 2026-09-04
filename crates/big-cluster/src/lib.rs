@@ -50,7 +50,7 @@
 #![deny(unsafe_code)]
 
 mod admin;
-pub use admin::{RangeReport, Topology};
+pub use admin::{MemberReport, RangeReport, Topology};
 mod ddl;
 // The one item a sibling borrows across the split: `repair` recreates a field exactly as
 // another node has it, and that is a `Ddl` rather than a repair concern.
@@ -324,6 +324,17 @@ impl<P: PagerMut + Sync> Cluster<P> {
     pub fn stop(&self) {
         if let Some(c) = &self.controller {
             c.stop();
+        }
+    }
+
+    /// Hands the listener's peer roster to the agreement, so that it follows the membership.
+    ///
+    /// Called by whoever built the listener, because this node has to exist before it can be
+    /// listened for. A cluster with no agreement keeps whatever roster it was built with,
+    /// which is right: nothing can change its membership either.
+    pub fn follow_roster(&self, tls: big_tls::TlsConfig) {
+        if let Some(c) = &self.controller {
+            c.follow_roster(tls);
         }
     }
 

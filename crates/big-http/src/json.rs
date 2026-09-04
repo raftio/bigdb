@@ -482,16 +482,30 @@ pub fn topology(t: &Topology) -> String {
             )
         })
         .collect();
+    let members: Vec<String> = t
+        .members
+        .iter()
+        .map(|m| {
+            format!(
+                "{{\"name\":{},\"addr\":{},\"state\":{}}}",
+                string(&m.name),
+                string(&m.addr),
+                string(m.state)
+            )
+        })
+        .collect();
     let behind: Vec<String> = t.behind.iter().map(|b| string(b)).collect();
     let leader = match &t.leader {
         Some(l) => string(l),
         None => "null".to_string(),
     };
     format!(
-        "{{\"epoch\":{},\"leader\":{},\"schema_leader\":{},\"ranges\":[{}],\"behind\":[{}]}}",
+        "{{\"epoch\":{},\"leader\":{},\"schema_leader\":{},\"members\":[{}],\"ranges\":[{}],\
+         \"behind\":[{}]}}",
         t.epoch,
         leader,
         string(&t.schema_leader),
+        members.join(","),
         ranges.join(","),
         behind.join(",")
     )
