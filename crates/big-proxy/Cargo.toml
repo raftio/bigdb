@@ -1,0 +1,44 @@
+[package]
+name = "big-proxy"
+description = "One address in front of many nodes: health-aware forwarding and a route allowlist"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "readme.md"
+keywords = ["database", "proxy", "load-balancer", "http", "cluster"]
+categories = ["database", "web-programming::http-server"]
+
+[[bin]]
+name = "bigproxy"
+path = "src/main.rs"
+
+# Forwarded, not turned on here, for the same reason `big-http` forwards it: the binary is what
+# an operator runs, and a library that dragged rustls in behind them would take the choice away.
+[features]
+default = []
+tls = ["big-tls/tls"]
+
+# No web framework and no async runtime, matching the rest of the workspace. A proxy is an accept
+# loop, a route table and a socket pool; pulling in a runtime for that would be a larger
+# commitment than the engine it fronts has made.
+[dependencies]
+# `Request`, `Response` and `log` — the HTTP/1.1 framing this proxy speaks on both sides, and the
+# structured log format the daemon already writes, so one X-Request-Id reads across both.
+#
+# **`big-wire` rather than `big-http`**, and that is the whole reason `big-wire` exists: linking
+# the router would link `big-engine`, `big-db`, `big-sql` and argon2, and "this process never
+# verifies a password" would be a sentence in a readme rather than a fact anybody could check.
+# CI greps `cargo tree -p big-proxy -e normal` for exactly those names.
+big-wire.workspace = true
+# The socket, plain or TLS. With `tls` off this is a `TcpStream` behind one `match`.
+big-tls.workspace = true
+
+[dev-dependencies]
+# The tests run real daemons and compare this crate's cluster.toml reader against the daemon's.
+# Dev-only, so none of it reaches the shipped binary — which is the claim the CI grep protects.
+big-http.workspace = true
+big-cluster.workspace = true
+big-embed.workspace = true
+tempfile = "3"

@@ -775,7 +775,7 @@ fn mismatched<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request) -> Option<Res
 /// first thing an operator needs and the one thing they cannot work out from a `503`.
 fn from_cluster(e: &ClusterError) -> Response {
     match e {
-        ClusterError::Local(api) => Response::from_error(api),
+        ClusterError::Local(api) => crate::status::response_for(api),
         other => Response::failure(other.status(), other.code(), &other.to_string()),
     }
 }

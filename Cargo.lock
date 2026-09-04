@@ -719,6 +719,7 @@ dependencies = [
  "big-sql",
  "big-testfile",
  "big-tls",
+ "big-wire",
  "blake2",
  "rcgen",
  "tempfile",
@@ -781,6 +782,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "big-proxy"
+version = "0.1.0"
+dependencies = [
+ "big-cluster",
+ "big-embed",
+ "big-http",
+ "big-tls",
+ "big-wire",
+ "tempfile",
+]
+
+[[package]]
 name = "big-rbac"
 version = "0.1.0"
 
@@ -806,6 +819,13 @@ dependencies = [
  "rustls",
  "rustls-webpki",
  "tempfile",
+]
+
+[[package]]
+name = "big-wire"
+version = "0.1.0"
+dependencies = [
+ "big-tls",
 ]
 
 [[package]]

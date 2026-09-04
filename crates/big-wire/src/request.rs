@@ -231,8 +231,9 @@ impl Request {
     /// is nothing in the request to borrow from.
     ///
     /// **Split on the first colon**, per RFC 7617: a password may contain one, a username may
-    /// not - which [`crate::auth`] enforces when it loads the users file, so that the two rules
-    /// cannot disagree.
+    /// not - which `big_http::auth` enforces when it loads the users file, so that the two rules
+    /// cannot disagree. Named rather than linked: that module is a layer up, and a link the
+    /// other way would be a dependency this crate must not have.
     pub fn basic(&self) -> Option<Basic> {
         let value = self.header("authorization")?;
         let (scheme, encoded) = value.split_once(' ')?;
