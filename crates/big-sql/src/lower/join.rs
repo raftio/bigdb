@@ -444,8 +444,12 @@ impl<'a> Sides<'a> {
         let per_key = match select.group_by.as_slice() {
             [] => false,
             [g] => {
-                let side = self.scope.side(g, at)?;
-                if g.column != self.key(side).column {
+                // A join groups by the key it pairs on, and a bucket of one is not that key.
+                if g.bucket.is_some() {
+                    return Err(SqlError::Refused { what: Refused::JoinShape, at });
+                }
+                let side = self.scope.side(&g.name, at)?;
+                if g.name.column != self.key(side).column {
                     return Err(SqlError::Refused { what: Refused::JoinShape, at });
                 }
                 true
@@ -582,6 +586,7 @@ fn touches(cond: &Cond, scope: &Scope<'_>, at: usize) -> Result<u32> {
         Cond::Cmp { field, .. }
         | Cond::In { field, .. }
         | Cond::Between { field, .. }
+        | Cond::Rounded { field, .. }
         | Cond::Like { field, .. } => 1 << scope.side(field, at)?,
         // A semi-join term names the *outer* column, and the table inside it is not one of the
         // join's sides at all - it is a set this term is narrowed by. So the side is the one
@@ -743,8 +748,8 @@ fn names_outside(select: &Select) -> Vec<(&Name, usize)> {
     for item in &select.items {
         proj_names(&item.proj, item.at, &mut out);
     }
-    for name in &select.group_by {
-        out.push((name, select.items.first().map_or(0, |i| i.at)));
+    for g in &select.group_by {
+        out.push((&g.name, g.at));
     }
     if let Some(order) = &select.order_by {
         match &order.key {

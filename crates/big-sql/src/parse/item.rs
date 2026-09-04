@@ -260,7 +260,7 @@ enum Which {
     /// **All six map to the exact count**, because `Distinct` here walks each fragment once and
     /// counts overlaps without building them - there is nothing an approximation would buy. A
     /// client porting from ClickHouse gets a different number where its sketch was wrong, which
-    /// is worth saying out loud and is said in `docs/sql-plan.md`.
+    /// is worth saying out loud and is said in `olap-sql-surface-cheatsheet.md`.
     Uniq,
     TopKeys,
     /// A quantile, with the level a named spelling fixes - `median` is `quantile(0.5)`.

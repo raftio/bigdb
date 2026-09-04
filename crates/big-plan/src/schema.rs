@@ -66,7 +66,7 @@ pub enum FieldClass {
 /// The two are one type rather than two field classes because every decision the planner makes
 /// about them is the same one; only the conversion from a written date differs, and that is
 /// arithmetic rather than a rule.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub enum TimeUnit {
     /// A `DATE`: whole days, so a written time of day is a value it cannot hold.
     Days,

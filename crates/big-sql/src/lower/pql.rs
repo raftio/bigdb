@@ -32,6 +32,36 @@ pub(super) fn row(field: &Name, op: &str, value: Literal) -> Expr {
     })
 }
 
+/// `Rounded(<field> <op> <value>, by='round', digits=<n>)`: a comparison against a rounded
+/// number, left for the planner to turn into a range.
+///
+/// **The one term this layer hands on rather than resolves**, and the reason is the scale. Every
+/// other rewrite here is exact without a schema; this one is `x >= 5.01` on a `DECIMAL(10,2)`
+/// and `x >= 6` on an `INT`, so the arithmetic has to happen where the field's units are known.
+/// See [`crate::ast::Cond::Rounded`].
+pub(super) fn rounded(
+    field: &Name,
+    by: &str,
+    digits: Option<u8>,
+    op: &str,
+    value: Literal,
+) -> Expr {
+    let mut args = vec![
+        Expr::Compare { field: field.column.clone(), op: op.to_string(), value },
+        Expr::Named {
+            name: "by".to_string(),
+            value: Box::new(Expr::Literal(Literal::Str(by.to_string()))),
+        },
+    ];
+    if let Some(d) = digits {
+        args.push(Expr::Named {
+            name: "digits".to_string(),
+            value: Box::new(Expr::Literal(Literal::Int(u64::from(d)))),
+        });
+    }
+    Expr::Call(Call { name: "Rounded".to_string(), args })
+}
+
 /// `Like(<field>='<pattern>')`, or `ILike` for the folded one.
 ///
 /// Written as a `Compare` for the reason [`row`] gives: nothing is ambiguous on this path, so

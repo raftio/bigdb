@@ -20,7 +20,7 @@
 //! different answers to every question here.
 
 use super::Datum;
-use crate::{Absent, Cell, Of, RowId, Value};
+use crate::{Absent, Cell, GroupAt, Of, Value};
 
 /// One cell of a single-row answer.
 ///
@@ -57,10 +57,10 @@ pub(super) fn scalar_cell(c: &Cell, values: &[Value], probes_at: usize) -> Datum
 /// records, a plan that answered nothing about this group. It is not zero, and every caller
 /// keeps it apart from zero - a `HAVING` drops it, an ordering sorts it last, and a cell
 /// renders `null`.
-pub(super) fn number(of: Of, values: &[Value], row: Option<RowId>) -> Option<Num> {
+pub(super) fn number(of: Of, values: &[Value], row: Option<GroupAt>) -> Option<Num> {
     match of {
         // A key is a string, not a number. Reached only by a hand-built shape.
-        Of::Key | Of::RightKey => None,
+        Of::Key | Of::KeyAt { .. } => None,
         // Reached only by a hand-built shape: `scalar_cell` reads a probe, because only it
         // knows where the searches' answers begin.
         Of::Probe { .. } => None,
@@ -120,13 +120,13 @@ pub(super) fn scalar_num(v: &Value) -> Option<Num> {
         // is the one `sum_float_where` documents.
         Value::RealSum(n) => Num::Real(*n),
         Value::RealExtreme(v) => Num::Real((*v)?),
-        Value::Groups(_) | Value::Rows(_) | Value::Table(_) | Value::Pairs(_) => return None,
+        Value::Groups(_) | Value::Rows(_) | Value::Table(_) | Value::Tuples(_) => return None,
     })
 }
 
 /// One group's number out of one plan's answer.
-fn group_num(v: &Value, row: RowId) -> Option<Num> {
-    v.as_groups()?.iter().find(|g| g.row == row).and_then(|g| scalar_num(&g.value))
+fn group_num(v: &Value, row: GroupAt) -> Option<Num> {
+    v.as_groups()?.iter().find(|g| g.at == row).and_then(|g| scalar_num(&g.value))
 }
 
 /// A number a cell can hold: a count or a total, or the quotient an average is.

@@ -23,44 +23,53 @@
 use super::measure::{field_of, having_tree, measure_of, names, units_of, Measure};
 use super::pql::{as_expr, call_of, field_arg, named};
 use super::{answer, rows_of, Calls, Statement};
-use crate::ast::{HavingAgg, Item, Name, OrderKey, Proj, Select};
+use crate::ast::{Grouping, HavingAgg, Item, Name, OrderKey, Proj, Select};
 use crate::error::{Refused, Result, SqlError};
 use crate::shape::{Cell, Cut, GroupOrder, Of, OrderBy, Shape};
 use big_plan::ast::{Expr, Literal};
 
-/// How many values the outer column may hold.
+/// How many passes over an inner column one grouping may make.
 ///
-/// **A bound on the passes, not a taste in groupings.** Grouping by two columns is one pass over
-/// the inner column per value of the outer one, so this number is what the statement costs. A
-/// thousand is past any dashboard's two dimensions and short of a grouping that would quietly
+/// **A bound on the passes, not a taste in groupings.** Grouping by several columns is one pass
+/// over the next per combination of the ones before it, so this number is what the statement
+/// costs. Checked at the top of every level, which is what makes one budget enough for any
+/// arity: the frontier after the first column *is* the pass count for the second, so the product
+/// is bounded without anybody multiplying cardinalities nobody knows in advance.
+///
+/// A thousand is past any dashboard's dimensions and short of a grouping that would quietly
 /// become a scan; past it the executor refuses by name rather than truncating, because an answer
 /// with fewer groups than exist is one nothing could reveal.
-pub const MAX_LEFT: u64 = 1_000;
+pub const MAX_PASSES: u64 = 1_000;
 
-pub(super) fn pairs(
+pub(super) fn tuples(
     select: &Select,
     table: &str,
     rows: &Expr,
-    by: (&Name, &Name),
+    by: &[Grouping],
     stars: &[&Item],
     columns: &[(&Item, Name)],
     aggregates: &[&Item],
 ) -> Result<Statement> {
-    let (left, right) = by;
     let at = select.items.first().map_or(0, |i| i.at);
     if let Some(item) = stars.first() {
         return Err(SqlError::Refused { what: Refused::Shape, at: item.at });
     }
-    if left.column == right.column {
-        // `GROUP BY c, c` is `GROUP BY c` written twice, and the pair of one column with itself
-        // is every record paired with itself. Refused rather than answered as either.
+    // `GROUP BY c, c` is `GROUP BY c` written twice, and the combination of a column with itself
+    // is every record paired with itself. Refused rather than answered as either.
+    if by
+        .iter()
+        .enumerate()
+        .any(|(i, g)| by[..i].iter().any(|earlier| earlier.name.column == g.name.column))
+    {
         return Err(SqlError::Refused { what: Refused::Shape, at });
     }
-    // Every bare column must be one of the two grouped ones - the classic SQL rule, and a real
-    // one here: a column that is neither grouped nor aggregated has no single value per pair.
+    // Every bare column must be one of the grouped ones - the classic SQL rule, and a real one
+    // here: a column that is neither grouped nor aggregated has no single value per combination
+    // - and must describe the same values that grouping term does. See `super::agrees`.
     for (item, name) in columns {
-        if name.column != left.column && name.column != right.column {
-            return Err(SqlError::Refused { what: Refused::Shape, at: item.at });
+        match by.iter().find(|g| g.name.column == name.column) {
+            Some(g) if super::agrees(item, g) => {}
+            _ => return Err(SqlError::Refused { what: Refused::Shape, at: item.at }),
         }
     }
 
@@ -68,58 +77,52 @@ pub(super) fn pairs(
     let mut measures: Vec<(Measure, Of)> = Vec::new();
     for item in aggregates {
         let rows = rows_of(rows, item);
-        let mut args = vec![
-            rows,
-            named("left", Expr::Ident(left.column.clone())),
-            named("right", Expr::Ident(right.column.clone())),
-            named("n", Expr::Literal(Literal::Int(MAX_LEFT))),
-        ];
+        let mut args = tuple_args(by, rows);
         match &item.proj {
             // A count needs no aggregate argument: a grouping counts its records anyway.
             Proj::Count => {}
             Proj::Agg { func, field } => {
                 args.push(named("aggregate", as_expr(call_of(func.call(), vec![field_arg(field)]))))
             }
-            // Everything else is a second question about the pair rather than a measure of it:
-            // an average is a ratio of two, a distinct count is a third column to group by, and
-            // a ranking is a fourth.
+            // Everything else is a second question about the combination rather than a measure
+            // of it: an average is a ratio of two, a distinct count is another column to group
+            // by, and a ranking is one more.
             _ => return Err(SqlError::Refused { what: Refused::Shape, at: item.at }),
         }
-        let plan = calls.push(table, call_of("GroupByPair", args))?;
+        let plan = calls.push(table, call_of("GroupByTuple", args))?;
         measures.push((measure_of(item), Of::Group { plan, absent: absent_of(item) }));
     }
     // Only the keys were asked for: the counts the grouping produces anyway are what a
     // `HAVING count(*)` reads.
     if measures.is_empty() {
-        calls.push(
-            table,
-            call_of(
-                "GroupByPair",
-                vec![
-                    rows.clone(),
-                    named("left", Expr::Ident(left.column.clone())),
-                    named("right", Expr::Ident(right.column.clone())),
-                    named("n", Expr::Literal(Literal::Int(MAX_LEFT))),
-                ],
-            ),
-        )?;
+        calls.push(table, call_of("GroupByTuple", tuple_args(by, rows.clone())))?;
     }
 
-    // Column order follows the select list. Which half of the key a column is comes from which
-    // of the two it names, so `SELECT b, a ... GROUP BY a, b` renders them in the order asked.
+    // Column order follows the select list. Which axis of the key a column is comes from which of
+    // the grouped ones it names, so `SELECT b, a ... GROUP BY a, b` renders them as asked.
     let mut next = measures.iter().map(|(_, of)| *of);
     let cells: Vec<Cell> = select
         .items
         .iter()
-        .map(|i| Cell {
-            column: i.column(),
-            of: match i.leaf() {
-                Proj::Column(n) if n.column == left.column => Of::Key,
-                Proj::Column(_) => Of::RightKey,
-                _ => next.next().expect("one measure per aggregate, in select-list order"),
-            },
-            units: units_of(table, &i.proj),
-            apply: i.apply().cloned(),
+        .map(|i| {
+            let axis = match i.leaf() {
+                Proj::Column(n) => by.iter().position(|g| g.name.column == n.column),
+                _ => None,
+            };
+            Cell {
+                column: i.column(),
+                of: match axis {
+                    Some(axis) => Of::KeyAt { axis: axis as u8 },
+                    None => next.next().expect("one measure per aggregate, in select-list order"),
+                },
+                units: units_of(table, &i.proj),
+                // The plan already rounded a bucket level, exactly as it does for a grouping of
+                // one column - see `grouped::cells_of`.
+                apply: match (axis.and_then(|a| by.get(a)), i.apply()) {
+                    (Some(g), _) if g.bucket.is_some() => None,
+                    (_, apply) => apply.cloned(),
+                },
+            }
         })
         .collect();
 
@@ -140,7 +143,8 @@ pub(super) fn pairs(
         probes: Vec::new(),
         answer: answer(
             select,
-            Shape::Pairs {
+            Shape::Tuples {
+                axes: by.len() as u8,
                 keys: (0..calls.out.len()).collect(),
                 cells,
                 having,
@@ -155,7 +159,35 @@ pub(super) fn pairs(
     })
 }
 
-/// What a cell holds for a pair its plan said nothing about, which only a `FILTER` can produce.
+/// The bitmap, the levels and the budget: everything a `GroupByTuple` takes but its aggregate.
+///
+/// A repeating `by=`, so the arity is a number rather than a shape. A bucket level is a nested
+/// `Bucket(...)` because it carries a boundary and a budget of its own, and a bare name cannot
+/// say either.
+fn tuple_args(by: &[Grouping], rows: Expr) -> Vec<Expr> {
+    let mut args = vec![rows];
+    for g in by {
+        args.push(named(
+            "by",
+            match g.bucket {
+                None => Expr::Ident(g.name.column.clone()),
+                Some(unit) => as_expr(call_of(
+                    "Bucket",
+                    vec![
+                        field_arg(&g.name),
+                        named("unit", Expr::Literal(Literal::Str(unit.name().to_string()))),
+                        named("n", Expr::Literal(Literal::Int(super::MAX_BUCKETS))),
+                    ],
+                )),
+            },
+        ));
+    }
+    args.push(named("n", Expr::Literal(Literal::Int(MAX_PASSES))));
+    args
+}
+
+/// What a cell holds for a combination its plan said nothing about, which only a `FILTER` can
+/// produce.
 fn absent_of(item: &Item) -> crate::shape::Absent {
     use crate::ast::Agg;
     use crate::shape::Absent;
@@ -173,7 +205,7 @@ fn absent_of(item: &Item) -> crate::shape::Absent {
 /// already bounds.
 fn ordering(
     select: &Select,
-    by: (&Name, &Name),
+    by: &[Grouping],
     measures: &[(Measure, Of)],
 ) -> Result<Option<GroupOrder>> {
     let Some(order) = &select.order_by else { return Ok(None) };
@@ -196,10 +228,10 @@ fn ordering(
         OrderKey::Name(n) => match value_names.iter().find(|(c, _)| *c == n.column) {
             Some((_, of)) => Some(*of),
             // Either grouped column, or an alias the select list gave one.
-            None if n.column == by.0.column || n.column == by.1.column => {
+            None if by.iter().any(|g| g.name.column == n.column) => {
                 return Ok(match order.desc {
-                    // Pairs arrive in key order, left then right, which is what ascending asks
-                    // for.
+                    // Combinations arrive in key order, outermost column first, which is what
+                    // ascending asks for.
                     false => None,
                     true => Some(GroupOrder { by: OrderBy::Key, desc: true }),
                 });

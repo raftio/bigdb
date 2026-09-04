@@ -503,3 +503,274 @@ fn a_projection_reads_the_same_whichever_engine_stored_it() {
     assert_eq!(answers[0][3].values, vec![Projection::Int(111), Projection::Int(-3)]);
     assert_eq!(answers[0][4].values, vec![Projection::Int(148), Projection::Absent]);
 }
+
+// ------------------------------------------------------------------------------------------
+// Grouping by a calendar bucket
+// ------------------------------------------------------------------------------------------
+
+/// A table of dates, shard-spread, for the bucket walk to cut up.
+fn days(rows: &[(u64, &str)]) -> Db<MemPager> {
+    let db = Db::in_memory().unwrap();
+    db.create_table("tx").unwrap();
+    db.create_field("tx", "d", FieldKind::Date, 32).unwrap();
+    db.create_field("tx", "amount", FieldKind::Int, 32).unwrap();
+    let mut w = db.write();
+    for (rec, written) in rows {
+        w.set_signed("tx", "d", *rec, big_civil::parse_date(written).unwrap()).unwrap();
+        w.set_int("tx", "amount", *rec, 10).unwrap();
+    }
+    w.commit().unwrap();
+    db
+}
+
+/// Each bucket as `(written start, count)`, which is what the grouping means in plain terms.
+fn buckets(db: &Db<MemPager>, text: &str) -> Vec<(String, u64)> {
+    let r = db.read();
+    match query(&r, "tx", text).unwrap() {
+        Value::Groups(gs) => gs
+            .iter()
+            .map(|g| match g.at {
+                big_exec::GroupAt::Bucket { start, .. } => (
+                    big_civil::format_date(start),
+                    g.value.as_count().or_else(|| g.value.as_sum().map(|s| s as u64)).unwrap(),
+                ),
+                other => panic!("expected a bucket, got {other:?}"),
+            })
+            .collect(),
+        other => panic!("expected groups, got {other:?}"),
+    }
+}
+
+/// **The boundaries are the whole test.** Every date here is chosen to sit against an edge: the
+/// last day of a month, the first day of the next, a leap day, and a new year. A walk that
+/// closed its ranges at the wrong end would move one of them into the neighbouring bucket, and
+/// the counts are what says it did not.
+#[test]
+fn a_month_grouping_cuts_the_calendar_where_the_months_end() {
+    let db = days(&[
+        (1, "2024-01-01"),
+        (2, "2024-01-31"),
+        (3, "2024-02-01"),
+        (4, "2024-02-29"),
+        (SHARD + 5, "2024-03-01"),
+        (SHARD + 6, "2024-12-31"),
+        (2 * SHARD + 7, "2025-01-01"),
+    ]);
+    assert_eq!(
+        buckets(&db, "GroupByBucket(All(), field=d, unit=\"month\", n=1000)"),
+        vec![
+            ("2024-01-01".to_string(), 2),
+            ("2024-02-01".to_string(), 2),
+            ("2024-03-01".to_string(), 1),
+            ("2024-12-01".to_string(), 1),
+            ("2025-01-01".to_string(), 1),
+        ]
+    );
+}
+
+/// **A month nothing happened in is not a group.** The calendar between March and December has
+/// eight of them and none appears above, which is what keeps a sparse column costing its
+/// contents rather than its span - and is what `GROUP BY` means: the values that are there.
+#[test]
+fn an_empty_bucket_is_not_a_group() {
+    let db = days(&[(1, "2024-01-15"), (2, "2024-06-15")]);
+    let got = buckets(&db, "GroupByBucket(All(), field=d, unit=\"month\", n=1000)");
+    assert_eq!(got, vec![("2024-01-01".to_string(), 1), ("2024-06-01".to_string(), 1)]);
+}
+
+/// A year is the same walk with a coarser step, and the counts must be the sums of the months'.
+#[test]
+fn a_coarser_boundary_is_the_finer_one_s_buckets_added_up() {
+    let db = days(&[
+        (1, "2024-01-01"),
+        (2, "2024-05-05"),
+        (3, "2024-12-31"),
+        (SHARD + 4, "2025-07-07"),
+        (2 * SHARD + 5, "2023-02-02"),
+    ]);
+    let years = buckets(&db, "GroupByBucket(All(), field=d, unit=\"year\", n=1000)");
+    assert_eq!(
+        years,
+        vec![
+            ("2023-01-01".to_string(), 1),
+            ("2024-01-01".to_string(), 3),
+            ("2025-01-01".to_string(), 1),
+        ]
+    );
+    let months = buckets(&db, "GroupByBucket(All(), field=d, unit=\"month\", n=1000)");
+    assert_eq!(months.iter().map(|(_, n)| n).sum::<u64>(), years.iter().map(|(_, n)| n).sum());
+}
+
+/// The filter narrows what is bucketed, and a bucket left with nothing drops out entirely.
+#[test]
+fn the_filter_decides_which_records_are_bucketed_at_all() {
+    let db = days(&[(1, "2024-01-10"), (2, "2024-01-20"), (3, "2024-02-10")]);
+    assert_eq!(
+        buckets(&db, "GroupByBucket(Row(d < \"2024-01-15\"), field=d, unit=\"month\", n=1000)"),
+        vec![("2024-01-01".to_string(), 1)]
+    );
+}
+
+/// A record holding no date is in no bucket, so these counts sum to the number of records that
+/// hold a value rather than to `count(*)`. The likeliest way to get a bucket grouping wrong.
+#[test]
+fn a_record_with_no_value_is_in_no_bucket() {
+    let db = days(&[(1, "2024-01-10"), (2, "2024-01-20")]);
+    // A third record exists in the table, with an amount and no date at all.
+    let mut w = db.write();
+    w.set_int("tx", "amount", 3, 10).unwrap();
+    w.commit().unwrap();
+
+    let total: u64 = buckets(&db, "GroupByBucket(All(), field=d, unit=\"month\", n=1000)")
+        .iter()
+        .map(|(_, n)| n)
+        .sum();
+    assert_eq!(total, 2, "the record with no date must be in no bucket");
+    let r = db.read();
+    assert_eq!(query(&r, "tx", "Count(All())").unwrap().as_count().unwrap(), 3);
+}
+
+/// The bound is on the buckets the values span, not on the groups that come back - so a wide
+/// span of mostly-empty buckets is refused rather than walked.
+#[test]
+fn more_buckets_than_the_plan_allows_is_refused_rather_than_cut() {
+    let db = days(&[(1, "2024-01-01"), (2, "2026-01-01")]);
+    let r = db.read();
+    assert!(query(&r, "tx", "GroupByBucket(All(), field=d, unit=\"month\", n=1000)").is_ok());
+    let err = query(&r, "tx", "GroupByBucket(All(), field=d, unit=\"month\", n=3)").unwrap_err();
+    assert!(format!("{err}").contains("coarser"), "{err}");
+}
+
+// ------------------------------------------------------------------------------------------
+// Grouping by three or more columns
+// ------------------------------------------------------------------------------------------
+
+/// A table with three keyed columns and a date, for the tuple walk to nest.
+fn three(rows: &[(u64, &str, &str, &str, &str)]) -> Db<MemPager> {
+    let db = Db::in_memory().unwrap();
+    db.create_table("tx").unwrap();
+    for f in ["country", "city", "kind"] {
+        db.create_field("tx", f, FieldKind::Set, 0).unwrap();
+    }
+    db.create_field("tx", "d", FieldKind::Date, 32).unwrap();
+    let mut w = db.write();
+    for (rec, country, city, kind, day) in rows {
+        w.set_key("tx", "country", *rec, country).unwrap();
+        w.set_key("tx", "city", *rec, city).unwrap();
+        w.set_key("tx", "kind", *rec, kind).unwrap();
+        w.set_signed("tx", "d", *rec, big_civil::parse_date(day).unwrap()).unwrap();
+    }
+    w.commit().unwrap();
+    db
+}
+
+/// Each combination as `(the keys, the count)`, which is what the grouping means in plain terms.
+fn tuples(db: &Db<MemPager>, text: &str) -> Vec<(Vec<String>, u64)> {
+    let r = db.read();
+    match query(&r, "tx", text).unwrap() {
+        Value::Tuples(ts) => ts
+            .iter()
+            .map(|t| {
+                let keys = t
+                    .keys
+                    .iter()
+                    .map(|k| match (&k.key, k.at) {
+                        (Some(s), _) => s.clone(),
+                        (None, big_exec::GroupAt::Bucket { start, .. }) => {
+                            big_civil::format_date(start)
+                        }
+                        (None, other) => panic!("a keyless row: {other:?}"),
+                    })
+                    .collect();
+                (keys, t.value.as_count().unwrap())
+            })
+            .collect(),
+        other => panic!("expected tuples, got {other:?}"),
+    }
+}
+
+/// **Three columns, which the pair grouping had no shape for.** The walk is a tree: the records
+/// holding a country are a set, grouping those by city is an ordinary grouping over a narrower
+/// set, and grouping those by kind is one again.
+#[test]
+fn three_columns_group_by_every_combination_any_record_holds() {
+    let db = three(&[
+        (1, "GB", "LDN", "web", "2024-01-05"),
+        (2, "GB", "LDN", "app", "2024-01-06"),
+        (3, "GB", "MAN", "web", "2024-02-05"),
+        (SHARD + 4, "US", "NYC", "web", "2024-02-06"),
+        (SHARD + 5, "GB", "LDN", "web", "2024-03-07"),
+    ]);
+    assert_eq!(
+        tuples(&db, "GroupByTuple(All(), by=country, by=city, by=kind, n=1000)"),
+        vec![
+            (vec!["GB".into(), "LDN".into(), "app".into()], 1),
+            (vec!["GB".into(), "LDN".into(), "web".into()], 2),
+            (vec!["GB".into(), "MAN".into(), "web".into()], 1),
+            (vec!["US".into(), "NYC".into(), "web".into()], 1),
+        ]
+    );
+}
+
+/// **A keyed column and a calendar bucket in one grouping**, which is what `Level` earned itself
+/// for: the walk asks each level only for "the sets your values make", so mixing them is free.
+#[test]
+fn a_grouping_may_mix_a_key_and_a_bucket() {
+    let db = three(&[
+        (1, "GB", "LDN", "web", "2024-01-05"),
+        (2, "GB", "LDN", "app", "2024-01-20"),
+        (3, "GB", "MAN", "web", "2024-02-05"),
+        (SHARD + 4, "US", "NYC", "web", "2024-02-06"),
+    ]);
+    assert_eq!(
+        tuples(
+            &db,
+            "GroupByTuple(All(), by=country, by=Bucket(field=d, unit=\"month\", n=100), n=1000)"
+        ),
+        vec![
+            (vec!["GB".into(), "2024-01-01".into()], 2),
+            (vec!["GB".into(), "2024-02-01".into()], 1),
+            (vec!["US".into(), "2024-02-01".into()], 1),
+        ]
+    );
+}
+
+/// The counts of every combination sum to the records the filter selected, because every record
+/// holds one value of each keyed column here. That is the partition the metamorphic tests check.
+#[test]
+fn the_combinations_partition_the_records() {
+    let db = three(&[
+        (1, "GB", "LDN", "web", "2024-01-05"),
+        (2, "GB", "LDN", "app", "2024-01-06"),
+        (3, "GB", "MAN", "web", "2024-02-05"),
+        (SHARD + 4, "US", "NYC", "web", "2024-02-06"),
+        (SHARD + 5, "GB", "LDN", "web", "2024-03-07"),
+    ]);
+    let total: u64 = tuples(&db, "GroupByTuple(All(), by=country, by=city, by=kind, n=1000)")
+        .iter()
+        .map(|(_, n)| n)
+        .sum();
+    assert_eq!(total, 5);
+}
+
+/// The budget is the *frontier*, checked at the top of each level - so it bounds the product of
+/// the cardinalities and not only the first column's.
+#[test]
+fn the_pass_budget_bounds_the_product_and_not_just_the_first_column() {
+    let db = three(&[
+        (1, "GB", "LDN", "web", "2024-01-05"),
+        (2, "GB", "MAN", "app", "2024-01-06"),
+        (3, "US", "NYC", "web", "2024-02-05"),
+        (SHARD + 4, "FR", "PAR", "app", "2024-02-06"),
+    ]);
+    let r = db.read();
+    // Four countries is under the budget, but the four (country, city) pairs it expands into
+    // are not - and that frontier is what the third level would cost.
+    assert!(query(&r, "tx", "GroupByTuple(All(), by=country, by=city, by=kind, n=10)").is_ok());
+    let err =
+        query(&r, "tx", "GroupByTuple(All(), by=country, by=city, by=kind, n=3)").unwrap_err();
+    // The message names the column about to be passed over and how many combinations of the
+    // earlier ones there are - which is the number that actually broke the budget.
+    let text = format!("{err}");
+    assert!(text.contains("`kind`") && text.contains("4 of those"), "{text}");
+}

@@ -23,16 +23,28 @@ pub enum ExecError {
     Plan(PlanError),
     /// The query was fine; storage could not answer it.
     Db(DbError),
-    /// A pair grouping whose outer column holds more values than the plan allowed.
+    /// More calendar buckets than the plan allowed.
     ///
-    /// **Refused rather than truncated.** Grouping by two columns is one pass over the inner
-    /// one per value of the outer, so the number of those values is what it costs - and cutting
-    /// the list to fit would answer with fewer groups than exist, which nothing in the answer
-    /// could show.
-    TooManyGroups {
-        /// The outer column.
+    /// **Refused rather than truncated**, for the reason [`Self::TooManyGroups`] gives: an answer
+    /// with fewer buckets than the data spans is a different answer, and nothing in it could show
+    /// which ones were dropped. The remedy is a different one, though, which is why this is not
+    /// that variant: a coarser boundary, or a narrower `WHERE`.
+    TooManyBuckets {
+        /// The column being bucketed.
         field: String,
-        /// How many values it holds among the records selected.
+        /// How many the plan allowed.
+        limit: usize,
+    },
+    /// A grouping needing more passes over an inner column than the plan allowed.
+    ///
+    /// **Refused rather than truncated.** Grouping by several columns is one pass over the next
+    /// one per combination of the columns before it, so the number of those combinations is what
+    /// it costs - and cutting the list to fit would answer with fewer groups than exist, which
+    /// nothing in the answer could show.
+    TooManyGroups {
+        /// The column about to be passed over, once per combination of the ones before it.
+        field: String,
+        /// How many combinations the columns before it make, among the records selected.
         found: usize,
         /// How many the plan allowed.
         limit: usize,
@@ -56,11 +68,17 @@ impl core::fmt::Display for ExecError {
         match self {
             Self::Plan(e) => write!(f, "{e}"),
             Self::Db(e) => write!(f, "{e}"),
+            Self::TooManyBuckets { field, limit } => write!(
+                f,
+                "grouping `{field}` by a calendar boundary is one range read per bucket, and the \
+                 values here span more than the {limit} this allows. Group by a coarser \
+                 boundary, or narrow the range with a `WHERE`"
+            ),
             Self::TooManyGroups { field, found, limit } => write!(
                 f,
-                "grouping by `{field}` and a second column is one pass over the second per \
-                 value of `{field}`, and `{field}` holds {found} of them here against a limit \
-                 of {limit}. Narrow the query, or group by a column with fewer values"
+                "grouping by more than one column is one pass over `{field}` per combination of \
+                 the columns before it, and there are {found} of those here against a limit of \
+                 {limit}. Narrow the query, or group by columns with fewer values"
             ),
         }
     }
@@ -73,6 +91,7 @@ impl ExecError {
         match self {
             Self::Plan(e) => e.code(),
             Self::Db(e) => e.code(),
+            Self::TooManyBuckets { .. } => "too_many_buckets",
             Self::TooManyGroups { .. } => "too_many_groups",
         }
     }

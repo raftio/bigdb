@@ -262,3 +262,164 @@ country  min
 FR       700
 GB       500
 US       900
+
+# ---------------------------------------------------------------------------------------------
+# Grouping by a calendar bucket
+# ---------------------------------------------------------------------------------------------
+
+statement
+CREATE TABLE ev (d DATE, ts DATETIME, amount UINT(32), country SET)
+
+statement
+INSERT INTO ev (_record_id, d, ts, amount, country) VALUES
+  (1, '2024-01-05', '2024-01-05 09:00:00', 10, 'GB'),
+  (2, '2024-01-31', '2024-01-31 23:59:59', 20, 'GB'),
+  (3, '2024-02-01', '2024-02-01 00:00:00', 30, 'US'),
+  (4, '2024-02-29', '2024-02-29 12:00:00', 40, 'US'),
+  (5, '2024-12-31', '2024-12-31 18:00:00', 50, 'FR'),
+  (6, '2025-01-01', '2025-01-01 00:00:01', 60, 'FR')
+
+# **The query this whole feature exists for.** One row per month, and the two records either side
+# of the January/February boundary have to land in different rows.
+query
+SELECT date_trunc('month', d), count(*) FROM ev GROUP BY date_trunc('month', d)
+----
+date_trunc('month', d)  count
+2024-01-01              2
+2024-02-01              2
+2024-12-01              1
+2025-01-01              1
+
+# The same statement over a DATETIME, which counts seconds rather than days. One second to
+# midnight on New Year's Eve is still December.
+query
+SELECT date_trunc('month', ts), count(*) FROM ev GROUP BY date_trunc('month', ts)
+----
+date_trunc('month', ts)  count
+2024-01-01 00:00:00      2
+2024-02-01 00:00:00      2
+2024-12-01 00:00:00      1
+2025-01-01 00:00:00      1
+
+# An aggregate over each bucket, which is the plan carrying its own measure.
+query
+SELECT date_trunc('year', d), sum(amount) FROM ev GROUP BY date_trunc('year', d)
+----
+date_trunc('year', d)  sum
+2024-01-01             150
+2025-01-01             60
+
+query
+SELECT date_trunc('year', d), count(*), avg(amount) FROM ev GROUP BY date_trunc('year', d)
+----
+date_trunc('year', d)  count  avg
+2024-01-01             5      30
+2025-01-01             1      60
+
+# A `WHERE` narrows what is bucketed, and a month left with nothing is not a row.
+query
+SELECT date_trunc('month', d), count(*) FROM ev WHERE country = 'US' GROUP BY date_trunc('month', d)
+----
+date_trunc('month', d)  count
+2024-02-01              2
+
+# `HAVING` and an ordering ride along after the merge exactly as they do over a keyed grouping -
+# and the ordering is a coordinator sort here, because a ranking is over rows a bucket has none of.
+query
+SELECT date_trunc('month', d), count(*) FROM ev GROUP BY date_trunc('month', d) HAVING count(*) > 1
+----
+date_trunc('month', d)  count
+2024-01-01              2
+2024-02-01              2
+
+query
+SELECT date_trunc('month', d), count(*) AS n FROM ev GROUP BY date_trunc('month', d) ORDER BY n DESC LIMIT 2
+----
+error: sql_unsupported_order
+
+# `SELECT DISTINCT` over a rounding is the same grouping written the other way.
+query
+SELECT DISTINCT date_trunc('year', d) FROM ev
+----
+date_trunc('year', d)
+2024-01-01
+2025-01-01
+
+# The sum of a grouping's counts is the number of records that hold a value - which here is every
+# record, and is the property the metamorphic tests check over generated predicates.
+query
+SELECT count(*) FROM ev
+----
+count
+6
+
+# ---------------------------------------------------------------------------------------------
+# Three columns, and a key beside a bucket
+# ---------------------------------------------------------------------------------------------
+
+statement
+CREATE TABLE ev3 (country SET, city SET, kind SET, d DATE, amount UINT(32))
+
+statement
+INSERT INTO ev3 (_record_id, country, city, kind, d, amount) VALUES
+  (1, 'GB', 'LDN', 'web', '2024-01-05', 10),
+  (2, 'GB', 'LDN', 'app', '2024-01-20', 20),
+  (3, 'GB', 'MAN', 'web', '2024-02-05', 30),
+  (4, 'US', 'NYC', 'web', '2024-02-06', 40),
+  (5, 'GB', 'LDN', 'web', '2024-03-07', 50)
+
+# **Three grouped columns**, which had no plan to be. The walk is a tree: the records holding a
+# country are a set, grouping those by city is an ordinary grouping over a narrower set, and
+# grouping those by kind is one again.
+query
+SELECT country, city, kind, count(*) FROM ev3 GROUP BY country, city, kind
+----
+country  city  kind  count
+GB       LDN   app   1
+GB       LDN   web   2
+GB       MAN   web   1
+US       NYC   web   1
+
+query
+SELECT country, city, kind, sum(amount) FROM ev3 GROUP BY country, city, kind
+----
+country  city  kind  sum
+GB       LDN   app   20
+GB       LDN   web   60
+GB       MAN   web   30
+US       NYC   web   40
+
+# **A key beside a calendar bucket**, which is what made the levels a list rather than two named
+# halves. "Per country, per month" is two dimensions of every dashboard ever drawn.
+query
+SELECT country, date_trunc('month', d), count(*) FROM ev3 GROUP BY country, date_trunc('month', d)
+----
+country  date_trunc('month', d)  count
+GB       2024-01-01              2
+GB       2024-02-01              1
+GB       2024-03-01              1
+US       2024-02-01              1
+
+# The combinations partition the records: every record here holds one value of each column.
+query
+SELECT count(*) FROM ev3
+----
+count
+5
+
+# `HAVING` and the cut ride along after the merge, exactly as they do over one column.
+query
+SELECT country, city, kind, count(*) FROM ev3 GROUP BY country, city, kind HAVING count(*) > 1
+----
+country  city  kind  count
+GB       LDN   web   2
+
+# Two columns still answer what they always did - the plan behind them changed and the rows
+# did not.
+query
+SELECT country, city, count(*) FROM ev3 GROUP BY country, city
+----
+country  city  count
+GB       LDN   3
+GB       MAN   1
+US       NYC   1

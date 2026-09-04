@@ -231,6 +231,23 @@ impl Unit {
         matches!(self, Self::Year | Self::Quarter | Self::Month | Self::Week | Self::Day)
     }
 
+    /// The one spelling this crate answers to, which is the one [`Self::parse`] takes back.
+    ///
+    /// **The name is what travels**, not the position in this enum: a plan crosses the wire and
+    /// is printed by `EXPLAIN`, and reordering the variants must not turn a month into a week.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Year => "year",
+            Self::Quarter => "quarter",
+            Self::Month => "month",
+            Self::Week => "week",
+            Self::Day => "day",
+            Self::Hour => "hour",
+            Self::Minute => "minute",
+            Self::Second => "second",
+        }
+    }
+
     /// Every spelling, for the refusal that has to list them.
     pub const NAMES: &'static str = "year, quarter, month, week, day, hour, minute or second";
 }
@@ -268,6 +285,50 @@ pub fn truncate(unix_seconds: i64, unit: Unit) -> i64 {
         // one has to round *down* rather than towards zero.
         other => truncate_days(unix_seconds.div_euclid(SECONDS_PER_DAY), other) * SECONDS_PER_DAY,
     }
+}
+
+/// The start of the `unit` after the one a day falls in, as a day count.
+///
+/// **The other end of [`truncate_days`], and it exists because a rounding is a half-open range.**
+/// `date_trunc('month', d) = '2024-01-01'` is true of exactly the days from the first of January
+/// up to but not including the first of February, so a caller that has one end always wants the
+/// other - and computing it by adding "a month" to a day count is the arithmetic this module
+/// exists to keep in one place.
+pub fn next_days(days: i64, unit: Unit) -> i64 {
+    let start = truncate_days(days, unit);
+    let (y, m, _) = civil_from_days(start);
+    match unit {
+        Unit::Year => days_from_civil(y + 1, 1, 1),
+        // Months are added to the month number and the year carried, rather than by adding 90 or
+        // 31 days: the length of the step depends on where it starts, which is the whole reason
+        // this is not arithmetic on the count.
+        Unit::Quarter => shift_months(y, m, 3),
+        Unit::Month => shift_months(y, m, 1),
+        Unit::Week => start + 7,
+        _ => start + 1,
+    }
+}
+
+/// The start of the `unit` after the one an instant falls in, as a second count.
+pub fn next(unix_seconds: i64, unit: Unit) -> i64 {
+    let start = truncate(unix_seconds, unit);
+    match unit {
+        Unit::Second => start + 1,
+        Unit::Minute => start + 60,
+        Unit::Hour => start + 3600,
+        // Coarser than a day is a calendar question, answered in days for the reason
+        // `truncate` gives and multiplied back up the same way.
+        other => next_days(start.div_euclid(SECONDS_PER_DAY), other) * SECONDS_PER_DAY,
+    }
+}
+
+/// `n` months after the first of `(y, m)`, as a day count.
+///
+/// Always lands on a first, so there is no day-of-month to clamp - which is what makes this
+/// simpler than the shift a `date_add('month', ...)` needs.
+fn shift_months(y: i64, m: u32, n: u32) -> i64 {
+    let total = (m - 1) + n;
+    days_from_civil(y + i64::from(total / 12), total % 12 + 1, 1)
 }
 
 /// The day an instant falls in, which is what `toDate` answers.
@@ -427,6 +488,42 @@ mod tests {
         assert_eq!(Unit::parse("fortnight"), None);
         assert_eq!(Unit::parse(""), None);
         assert!(Unit::Month.is_whole_days() && !Unit::Hour.is_whole_days());
+    }
+
+    /// The two ends of a rounding, checked as the half-open range they are meant to be.
+    ///
+    /// The claim is that every day in `[truncate(d), next(d))` truncates back to the same start,
+    /// and the day at `next` does not - which is what a `WHERE` rewritten into a range relies on
+    /// being true at a February, at a December, and before the epoch.
+    #[test]
+    fn a_rounding_and_the_boundary_after_it_bracket_exactly_their_own_days() {
+        let day = |y, m, d| days_from_civil(y, m, d);
+        for unit in [Unit::Year, Unit::Quarter, Unit::Month, Unit::Week, Unit::Day] {
+            for d in day(1969, 11, 3)..day(1971, 3, 5) {
+                let (lo, hi) = (truncate_days(d, unit), next_days(d, unit));
+                assert!(lo <= d && d < hi, "{d} outside [{lo}, {hi}) for {unit:?}");
+                assert_eq!(truncate_days(hi, unit), hi, "{hi} is not a start for {unit:?}");
+                assert_eq!(truncate_days(hi - 1, unit), lo, "{unit:?} left a gap before {hi}");
+            }
+        }
+    }
+
+    /// The carries a month step has to get right, named one by one because each is a different
+    /// way to be wrong: a leap February, a December into a January, and a quarter's three.
+    #[test]
+    fn a_month_step_carries_the_year_and_keeps_the_calendar_s_lengths() {
+        let day = |y, m, d| days_from_civil(y, m, d);
+        assert_eq!(next_days(day(2024, 1, 31), Unit::Month), day(2024, 2, 1));
+        assert_eq!(next_days(day(2024, 2, 29), Unit::Month), day(2024, 3, 1));
+        assert_eq!(next_days(day(2024, 12, 25), Unit::Month), day(2025, 1, 1));
+        assert_eq!(next_days(day(2024, 11, 5), Unit::Quarter), day(2025, 1, 1));
+        assert_eq!(next_days(day(2024, 5, 5), Unit::Quarter), day(2024, 7, 1));
+        assert_eq!(next_days(day(2024, 6, 5), Unit::Year), day(2025, 1, 1));
+        // A moment keeps the same answer through the seconds path, times a day's worth.
+        assert_eq!(next(day(2024, 12, 25) * 86_400 + 3661, Unit::Month), day(2025, 1, 1) * 86_400);
+        assert_eq!(next(3661, Unit::Hour), 7200);
+        assert_eq!(next(3661, Unit::Minute), 3720);
+        assert_eq!(next(-1, Unit::Hour), 0);
     }
 
     #[test]

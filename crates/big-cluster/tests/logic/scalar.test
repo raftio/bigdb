@@ -263,9 +263,135 @@ SELECT concat(country, toString(amount)) FROM s
 ----
 error: sql_unsupported
 
-# A scalar in a `WHERE` runs before there is anything to run it on - unchanged by the select
-# list gaining an evaluator.
+# A scalar in a `WHERE` runs before there is anything to run it on. The roundings are the
+# exception, because they are inverted rather than run - and `upper` is not, because the keys
+# answering it are scattered through the dictionary rather than gathered into a range.
 error
-SELECT count(*) FROM s WHERE round(price, 1) > 5
+SELECT count(*) FROM s WHERE upper(country) = 'GB'
 ----
 error: sql_scalar_in_filter
+
+# ---------------------------------------------------------------------------------------------
+# A rounding in a `WHERE`, over the records it selects
+# ---------------------------------------------------------------------------------------------
+
+# **The claim these cases make is that no rounding ran.** The plan is a range on the column, so
+# what is being checked is that the two ends of that range are the right two dates - which the
+# three records above are chosen to catch: a January the 31st, a leap day, and an instant at one
+# second to midnight on New Year's Eve. An off-by-one at either end moves one of them.
+
+# `d` counts whole days and `ts` counts seconds, and the same written statement is right for
+# both - the bounds go out as written dates and each column reads them in its own units.
+query rowsort
+SELECT country FROM s WHERE date_trunc('month', d) = '2024-01-01'
+----
+country
+gb
+
+query rowsort
+SELECT country FROM s WHERE date_trunc('month', ts) = '2024-01-01'
+----
+country
+gb
+
+# The leap day is inside February, and February ends where March begins.
+query rowsort
+SELECT country FROM s WHERE date_trunc('month', d) = '2024-02-01'
+----
+country
+france
+
+# One second before midnight is still the old year. This is the case an inclusive upper bound
+# would get wrong.
+query rowsort
+SELECT country FROM s WHERE toYear(ts) = 2023
+----
+country
+france
+
+query rowsort
+SELECT country FROM s WHERE toYear(d) = 2024
+----
+country
+france
+gb
+
+# A time of day inside the day it names: `toDate` is a rounding on a `DATETIME` and the identity
+# on a `DATE`, and one rewrite answers both.
+query rowsort
+SELECT country FROM s WHERE toDate(ts) = '2024-03-01'
+----
+country
+us
+
+query rowsort
+SELECT country FROM s WHERE date_trunc('year', ts) >= '2024-01-01'
+----
+country
+gb
+us
+
+# The partition: every record is on exactly one side of a rounding, which is the property the
+# metamorphic tests check over generated predicates and this pins at one point.
+query
+SELECT count(*) FROM s WHERE date_trunc('month', d) != '2024-01-01'
+----
+count
+2
+
+# A rounded number, over the records it selects.
+#
+# `price` keeps two digits and holds 12.50, 4.05 and 100.00, and the bounds below are worked out
+# in those units by the planner - the only layer that knows there are two. So what these cases
+# check is that the arithmetic landed on the right side of each value, and 4.05 is the one to
+# watch: it is exactly half way at one digit, and half goes away from zero.
+
+query rowsort
+SELECT country FROM s WHERE round(price, 1) >= 4.1
+----
+country
+france
+gb
+us
+
+# One digit finer, and 4.05 falls out: it rounds to 4.1, not to 4.2.
+query rowsort
+SELECT country FROM s WHERE round(price, 1) > 4.1
+----
+country
+gb
+us
+
+# `round(price)` keeps no digits: 12.50 goes to 13 and 4.05 goes to 4.
+query rowsort
+SELECT country FROM s WHERE round(price) = 13
+----
+country
+gb
+
+query rowsort
+SELECT country FROM s WHERE floor(price) = 12
+----
+country
+gb
+
+query rowsort
+SELECT country FROM s WHERE ceil(price) = 5
+----
+country
+france
+
+# An integer column rounds to itself whatever digits are asked for, which is the case that would
+# have become a range if the scale had been guessed rather than read.
+query rowsort
+SELECT country FROM s WHERE round(amount, 2) > 250
+----
+country
+france
+
+# The partition: every record is on exactly one side of a rounding.
+query
+SELECT count(*) FROM s WHERE floor(price) != 12
+----
+count
+2

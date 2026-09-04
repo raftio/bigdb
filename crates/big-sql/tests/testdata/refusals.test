@@ -490,6 +490,14 @@ CREATE TABLE t (a BIGINT(20))
 ----
 sql_unknown_column_type
 
+# A dictionary over a number. `LowCardinality(String)` is read, because a set here already is a
+# dictionary; a number is bit planes, and there is no dictionary for this to be low cardinality
+# of - so the name is refused rather than widened into a keyed field whose keys are digits.
+error
+CREATE TABLE t (a LowCardinality(Int64))
+----
+sql_unknown_column_type
+
 ## Types with no field kind behind them.
 
 ## A width in brackets on a type whose name already carries one. `FLOAT(10, 2)` is the one
@@ -602,11 +610,18 @@ SELECT CASE amount WHEN 5 THEN 1 ELSE 0 END FROM t
 ----
 sql_unsupported
 
-## A scalar in a `WHERE` runs before there is anything to run it on - unchanged by the select
-## list gaining an evaluator.
+## A scalar in a `WHERE` runs before there is anything to run it on. The roundings escape that
+## by being inverted rather than run - see `where.test` - and what is left here is every scalar
+## that gathers no range: `upper` scatters its answers through the dictionary, and `abs` folds
+## two stretches of a signed column onto one answer, so neither is a range to rewrite into.
 
 error
-SELECT count(*) FROM t WHERE round(amount, 2) > 5
+SELECT count(*) FROM t WHERE upper(country) = 'GB'
+----
+sql_scalar_in_filter
+
+error
+SELECT count(*) FROM t WHERE abs(balance) > 5
 ----
 sql_scalar_in_filter
 
@@ -811,17 +826,34 @@ SELECT date_trunc('fortnight', seen) FROM tx
 ----
 sql_bad_trunc_unit
 
-## A rounding in a `WHERE`. It reads a value per record, and a `WHERE` runs over bitmaps before
-## there are any values - so the refusal names the range to write instead.
+## A rounding in a `WHERE` is answered now, by being turned around rather than run - see
+## `where.test`. What is still refused is a scalar that gathers no range: the values answering
+## `lower(country) = 'gb'` are scattered through the dictionary, and `toMonth` cycles, so every
+## January of every year answers 3 and the records behind that answer are not contiguous either.
+
 error
-SELECT count(*) FROM tx WHERE toDate(seen) = '2024-01-15'
+SELECT count(*) FROM t WHERE lower(country) = 'gb'
 ----
 sql_scalar_in_filter
 
 error
-SELECT count(*) FROM tx WHERE date_trunc('month', seen) = '2024-01-01'
+SELECT count(*) FROM t WHERE toMonth(seen) = 3
 ----
 sql_scalar_in_filter
+
+## And a rounding compared against a value no rounding produces: no month begins on the 15th.
+## Strictly this selects nothing, and another engine answers it that way; it is refused here
+## because this dialect has no bind parameters, so the value was typed rather than substituted.
+
+error
+SELECT count(*) FROM t WHERE date_trunc('month', seen) = '2024-01-15'
+----
+sql_rounded_value
+
+error
+SELECT count(*) FROM t WHERE toDate(seen) != '2024-01-15 10:00:00'
+----
+sql_rounded_value
 
 ## A semi-join narrows one table by the record ids another table's `WHERE` selected. Two things
 ## about it are refused, and both are about the ids rather than about the syntax.
@@ -858,3 +890,49 @@ error
 SELECT count(*) FROM t WHERE amount > 5 AND NOT SEGMENT(churned)
 ----
 sql_segment_unexpanded
+
+## A `GROUP BY` term the engine has no way to group by. Two terms have a plan - a column, and a
+## calendar rounding of one - and everything else would relabel a column's values without merging
+## them, which answers one row per stored value with all of them printed under one name.
+
+error
+SELECT lower(country), count(*) FROM t GROUP BY lower(country)
+----
+sql_group_expression
+
+error
+SELECT count(*) FROM t GROUP BY round(amount, 2)
+----
+sql_group_expression
+
+error
+SELECT count(*) FROM t GROUP BY count(*)
+----
+sql_group_expression
+
+## A term over two columns, and one over none: neither names a column to group by.
+
+error
+SELECT count(*) FROM t GROUP BY amount + price
+----
+sql_group_expression
+
+error
+SELECT count(*) FROM t GROUP BY 1 + 1
+----
+sql_group_expression
+
+## The select list and the `GROUP BY` have to describe the *same* values. A bare column beside a
+## bucket prints instants under a month's name, and a day beside a month prints a day the rows
+## were never merged on - both look aggregated and are not.
+
+error
+SELECT seen, count(*) FROM t GROUP BY date_trunc('month', seen)
+----
+sql_unsupported
+
+error
+SELECT date_trunc('day', seen), count(*) FROM t GROUP BY date_trunc('month', seen)
+----
+sql_unsupported
+

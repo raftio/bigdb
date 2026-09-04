@@ -27,16 +27,43 @@
 use big_db::catalog::{Catalog, FieldKind};
 use big_db::{DbRead, Matches, RangeOp, RecordId, RowId};
 use big_pager::Pager;
-use big_plan::{CmpOp, FieldClass, Keyed, Plan, PlanError, Rows, Schema, TimeUnit};
+use big_plan::{CmpOp, FieldClass, Keyed, Level, Plan, PlanError, Rows, Schema, TimeUnit};
 
 pub mod error;
 pub use error::{ExecError, Result};
 
-/// One group of a `Distinct`, `TopN` or `GroupBy`.
+/// What a group is one of.
+///
+/// **The identity, and only the identity.** The label sits beside it in [`Group`] rather than
+/// inside it, because two nodes' contributions to one group are folded on this - and a node that
+/// was never told a key must not thereby become a different group.
+///
+/// Its own type rather than a bare `RowId` so that a bucket and a row cannot be confused at a
+/// `match` arm that would compile either way. They are addressed quite differently: a row id is
+/// handed out once for the whole cluster and means nothing without the dictionary that issued
+/// it, while a bucket is a pure function of the value and needs no issuer at all.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub enum GroupAt {
+    /// A row of a keyed field's dictionary.
+    Row(RowId),
+    /// A calendar bucket of a bit-sliced temporal field: the first moment in it, in the units the
+    /// field stores - days for a `DATE`, seconds for a `DATETIME`.
+    ///
+    /// **Needs no issuer, which is what lets a grouping exist over a field with no dictionary.**
+    /// Two nodes that saw different halves of one month compute the same number for it, so the
+    /// coordinator's merge folds them together without anybody having coordinated. Ordered by
+    /// `start`, so buckets arrive in calendar order even before a key is attached.
+    Bucket { start: i64, unit: TimeUnit },
+}
+
+/// One group of a `Distinct`, `TopN`, `GroupBy` or `GroupByBucket`.
 #[derive(Clone, Debug)]
 pub struct Group {
-    pub row: RowId,
+    pub at: GroupAt,
     /// The string the row was interned from, when the field has one.
+    ///
+    /// Always `None` for a [`GroupAt::Bucket`]: what a bucket is called is derivable from `at`
+    /// and its unit, and storing it too would be two spellings of one fact that can disagree.
     pub key: Option<String>,
     /// What was measured about this group. A `Value` rather than a number so a group can carry
     /// a count, a sum, or eventually another grouping, without this type changing again.
@@ -101,14 +128,26 @@ pub struct Projected {
     pub values: Vec<Projection>,
 }
 
-/// One group of a `GroupByPair`: a value of each column, and what the records holding both
-/// measured.
+/// One column's value in a tuple grouping: which group it is, and what it is called.
+///
+/// [`Group`] without the measure, because a tuple's measure belongs to the combination rather
+/// than to any one of its columns - which is the awkwardness `Pair` had, where the left half's
+/// `value` existed and was never read.
 #[derive(Clone, Debug)]
-pub struct Pair {
-    /// The left column's row.
-    pub left: Group,
-    /// The right column's row. Its `value` is the pair's, and the left one's is not read.
-    pub right: Group,
+pub struct GroupKey {
+    pub at: GroupAt,
+    /// The string the row was interned from, when the field has one. Always `None` for a bucket.
+    pub key: Option<String>,
+}
+
+/// One group of a `GroupByTuple`: a value of each grouped column, and what the records holding
+/// all of them measured.
+#[derive(Clone, Debug)]
+pub struct Tuple {
+    /// One per level, outermost first. Never fewer than two.
+    pub keys: Vec<GroupKey>,
+    /// What the records under this combination measured.
+    pub value: Box<Value>,
 }
 
 /// What a query answers with.
@@ -140,8 +179,8 @@ pub enum Value {
     /// `SignedExtreme` makes.
     RealExtreme(Option<f64>),
     Groups(Vec<Group>),
-    /// One group per combination of two keyed columns that any record holds both of.
-    Pairs(Vec<Pair>),
+    /// One group per combination of values two or more columns hold records for.
+    Tuples(Vec<Tuple>),
     /// The stored values a `Project` read, one row per record, in record order.
     ///
     /// Ordered by record id rather than by anything the caller chose, because that is the order
@@ -186,9 +225,9 @@ impl Value {
         }
     }
 
-    pub fn as_pairs(&self) -> Option<&[Pair]> {
+    pub fn as_tuples(&self) -> Option<&[Tuple]> {
         match self {
-            Self::Pairs(p) => Some(p),
+            Self::Tuples(t) => Some(t),
             _ => None,
         }
     }
@@ -298,7 +337,7 @@ pub fn execute<P: Pager + Sync>(db: &DbRead<'_, P>, plan: &Plan) -> Result<Value
             let mut out = Vec::with_capacity(groups.len());
             for (row, hits) in groups {
                 out.push(Group {
-                    row,
+                    at: GroupAt::Row(row),
                     key: db.row_key(table, field, row).map(str::to_string),
                     value: Box::new(aggregate_over(db, table, aggregate, &hits)?),
                 });
@@ -307,52 +346,85 @@ pub fn execute<P: Pager + Sync>(db: &DbRead<'_, P>, plan: &Plan) -> Result<Value
             Value::Groups(out)
         }
 
-        // One grouping per value of the left column, over the records holding that value.
+        // One group per calendar bucket the column's values reach into.
         //
-        // **Not a composite key.** Nothing here materialises a pair of rows: the records
-        // holding a left value are a set, and grouping *those* by the right column is the
-        // ordinary grouping the engine already does. The cost is therefore one pass over the
-        // right column per value of the left one, which is what `left_max` bounds - and why
-        // the bound is in the plan rather than applied to the answer.
-        Plan::GroupByPair { rows, left, right, aggregate, left_max, .. } => {
+        // **The buckets come from the calendar, not from the data**, which is what lets this
+        // group a column with no dictionary to walk. The range of values is two `Bsi::extreme`
+        // reads; the calendar says which buckets that range covers; and each bucket's records
+        // are a range on the bit planes, which is the read the field already answers.
+        //
+        // Empty buckets are dropped rather than answered with a zero. A month nothing happened
+        // in is not a group - `GROUP BY` answers about the values present - and keeping them
+        // would make a sparse column cost its whole span rather than its contents.
+        Plan::GroupByBucket { rows, field, unit, max_buckets, aggregate, .. } => {
             let matched = eval(db, table, rows)?;
-            let outer = db.group_matches(table, left, &matched)?;
-            // Refused rather than truncated: see `ExecError::TooManyGroups`.
-            if outer.len() > *left_max {
-                return Err(ExecError::TooManyGroups {
-                    field: left.clone(),
-                    found: outer.len(),
-                    limit: *left_max,
+            let level =
+                Level::Bucket { field: field.clone(), unit: *unit, max_buckets: *max_buckets };
+            let mut out = Vec::new();
+            for (at, key, within) in expand(db, table, &level, &matched)? {
+                out.push(Group {
+                    at,
+                    key,
+                    value: Box::new(aggregate_over(db, table, aggregate, &within)?),
                 });
             }
+            Value::Groups(out)
+        }
+
+        // One grouping per combination of values the levels hold records for, walked as a tree.
+        //
+        // **The frontier is the cost.** Every entry at level `k` is one pass over level `k + 1`,
+        // so checking the frontier's size at the top of each level bounds the product as well as
+        // the first column - the frontier after the first level *is* the pass count for the
+        // second. One budget genuinely suffices, and for two levels it is exactly what
+        // the pair grouping's own bound already checked before this generalised.
+        Plan::GroupByTuple { rows, levels, aggregate, max_passes, .. } => {
+            let matched = eval(db, table, rows)?;
+            let (last, outer) = levels.split_last().expect("a tuple grouping has two or more");
+
+            let mut frontier: Vec<(Vec<GroupKey>, Matches)> = vec![(Vec::new(), matched)];
+            for level in outer {
+                if frontier.len() > *max_passes {
+                    return Err(ExecError::TooManyGroups {
+                        field: level.field().to_string(),
+                        found: frontier.len(),
+                        limit: *max_passes,
+                    });
+                }
+                let mut next = Vec::new();
+                for (keys, within) in frontier {
+                    for (at, key, hits) in expand(db, table, level, &within)? {
+                        let mut keys = keys.clone();
+                        keys.push(GroupKey { at, key });
+                        next.push((keys, hits));
+                    }
+                }
+                frontier = next;
+            }
+            // The last level costs one pass per entry too, so it is checked the same way.
+            if frontier.len() > *max_passes {
+                return Err(ExecError::TooManyGroups {
+                    field: last.field().to_string(),
+                    found: frontier.len(),
+                    limit: *max_passes,
+                });
+            }
+
             let mut out = Vec::new();
-            for (row, hits) in outer {
-                let left_group = Group {
-                    row,
-                    key: db.row_key(table, left, row).map(str::to_string),
-                    // The left half carries no number of its own: the pair's number is the
-                    // right half's, measured over the records both hold.
-                    value: Box::new(Value::Count(hits.cardinality())),
-                };
-                for (inner, both) in db.group_matches(table, right, &hits)? {
-                    out.push(Pair {
-                        left: left_group.clone(),
-                        right: Group {
-                            row: inner,
-                            key: db.row_key(table, right, inner).map(str::to_string),
-                            value: Box::new(aggregate_over(db, table, aggregate, &both)?),
-                        },
+            for (keys, within) in frontier {
+                for (at, key, hits) in expand(db, table, last, &within)? {
+                    let mut keys = keys.clone();
+                    keys.push(GroupKey { at, key });
+                    out.push(Tuple {
+                        keys,
+                        value: Box::new(aggregate_over(db, table, aggregate, &hits)?),
                     });
                 }
             }
-            sort_pairs(&mut out);
-            Value::Pairs(out)
+            sort_tuples(&mut out);
+            Value::Tuples(out)
         }
 
-        // The one arm that reads values back. Bounded by the plan's own limit rather than by a
-        // shape applied afterwards: a projection's cost is a point read per record per column,
-        // so the cut has to happen before the reads, not after them. No limit is a full scan,
-        // which is the caller having asked for one - see [`Plan::Project`].
         Plan::Project { rows, fields, limit, .. } => {
             let matched = eval(db, table, rows)?;
             // An unbounded projection reads every matching record, so it answers to the same
@@ -506,24 +578,6 @@ fn decode_int<P: Pager + Sync>(
     big_db::signed::decode(stored, declared) as i128
 }
 
-/// Orders pairs the way a `GroupByPair` answers them: by the left key, then the right.
-///
-/// Public for the reason [`sort_by_key`] is: the coordinator has to produce this order after
-/// merging, and two implementations of one ordering would be two answers depending on how many
-/// nodes were asked.
-pub fn sort_pairs(pairs: &mut [Pair]) {
-    pairs.sort_by(|a, b| {
-        key_order(&a.left)
-            .cmp(&key_order(&b.left))
-            .then(key_order(&a.right).cmp(&key_order(&b.right)))
-    });
-}
-
-/// A group's place in key order: named groups by name, unnamed after them by row.
-fn key_order(g: &Group) -> (bool, Option<&str>, RowId) {
-    (g.key.is_none(), g.key.as_deref(), g.row)
-}
-
 /// Merges two nodes' projected rows into one page.
 ///
 /// Public for the reason [`rank_top_n`] is: the coordinator has to do exactly this, and two
@@ -554,7 +608,7 @@ pub fn merge_projected(
 pub fn rank_top_n(groups: &mut Vec<Group>, n: usize) {
     groups.sort_by(|a, b| {
         let (an, bn) = (count_of(a), count_of(b));
-        bn.cmp(&an).then_with(|| a.key.cmp(&b.key)).then(a.row.cmp(&b.row))
+        bn.cmp(&an).then_with(|| a.key.cmp(&b.key)).then(a.at.cmp(&b.at))
     });
     groups.truncate(n);
 }
@@ -581,7 +635,7 @@ fn label<P: Pager + Sync>(
     let mut out: Vec<Group> = rows
         .into_iter()
         .map(|(row, n)| Group {
-            row,
+            at: GroupAt::Row(row),
             key: db.row_key(table, field, row).map(str::to_string),
             value: Box::new(measure(n)),
         })
@@ -599,7 +653,7 @@ pub fn sort_by_key(groups: &mut [Group]) {
         (Some(x), Some(y)) => x.cmp(y),
         (Some(_), None) => core::cmp::Ordering::Less,
         (None, Some(_)) => core::cmp::Ordering::Greater,
-        (None, None) => a.row.cmp(&b.row),
+        (None, None) => a.at.cmp(&b.at),
     });
 }
 
@@ -762,4 +816,139 @@ fn range_op(op: CmpOp) -> RangeOp {
         CmpOp::Eq => RangeOp::Eq,
         CmpOp::Ne => RangeOp::Ne,
     }
+}
+
+/// The start of the `unit` that a stored count falls in, in that column's own units.
+///
+/// **The two temporal classes count different things**, so the calendar is asked in the units the
+/// field stores rather than converting both to one: a `DATE` is whole days and a `DATETIME` is
+/// seconds, and rounding a day count through seconds would be two conversions where the calendar
+/// question is the same one. `big_civil` keeps both spellings for exactly this reason.
+fn truncate_to(value: i64, unit: big_civil::Unit, of: TimeUnit) -> i64 {
+    match of {
+        TimeUnit::Days => big_civil::truncate_days(value, unit),
+        TimeUnit::Seconds => big_civil::truncate(value, unit),
+    }
+}
+
+/// The start of the `unit` after the one a stored count falls in. The other end of a bucket.
+fn next_after(value: i64, unit: big_civil::Unit, of: TimeUnit) -> i64 {
+    match of {
+        TimeUnit::Days => big_civil::next_days(value, unit),
+        TimeUnit::Seconds => big_civil::next(value, unit),
+    }
+}
+
+/// Every set of records one level's values make, inside a set the caller already narrowed to.
+///
+/// **The one place a column's values become groups**, whichever way it has them: a keyed column
+/// has a dictionary to walk and a bit-sliced temporal one has an ordering to cut. Written once
+/// because both groupings need it - a bucket grouping is this over one level, and a tuple
+/// grouping is this once per level - and because mixing the two in one statement then costs
+/// nothing: `GROUP BY country, date_trunc('month', ts)` asks each level the same question.
+fn expand<P: Pager + Sync>(
+    db: &DbRead<'_, P>,
+    table: &str,
+    level: &Level,
+    within: &Matches,
+) -> Result<Vec<(GroupAt, Option<String>, Matches)>> {
+    match level {
+        Level::Keyed { field } => Ok(db
+            .group_matches(table, field, within)?
+            .into_iter()
+            .map(|(row, hits)| {
+                (GroupAt::Row(row), db.row_key(table, field, row).map(str::to_string), hits)
+            })
+            .collect()),
+        Level::Bucket { field, unit, max_buckets } => {
+            // The column's own units, which decide whether the calendar is asked in days or in
+            // seconds. Taken from the mapping the planner used, so the two cannot disagree about
+            // what a `DATE` counts.
+            let unit_of = match CatalogSchema(db.catalog()).field_class(table, field) {
+                Some(FieldClass::Temporal { unit }) => unit,
+                // The planner refused every other class before this plan was built.
+                _ => unreachable!("a bucket level is planned only over a temporal column"),
+            };
+            let (lo, hi) = (
+                db.min_signed_where(table, field, within)?,
+                db.max_signed_where(table, field, within)?,
+            );
+            // No record here holds a value, so there is nothing to bucket. Not an empty first
+            // bucket: a record with no value is in no bucket at all.
+            let (Some(lo), Some(hi)) = (lo, hi) else { return Ok(Vec::new()) };
+
+            // **The span is counted before any of it is read.** What this costs is one range read
+            // per bucket the values *span*, not per bucket that turns out to hold something - two
+            // records two years apart still walk every month between them. So the budget is
+            // checked on the calendar alone, and a query past it is refused having read nothing.
+            let first = truncate_to(lo, *unit, unit_of);
+            let mut span = 0usize;
+            let mut edge = first;
+            while edge <= hi {
+                span += 1;
+                if span > *max_buckets {
+                    return Err(ExecError::TooManyBuckets {
+                        field: field.clone(),
+                        limit: *max_buckets,
+                    });
+                }
+                let next = next_after(edge, *unit, unit_of);
+                // Guards the end of the calendar, where the next boundary cannot be past this one
+                // and the walk would not terminate.
+                if next <= edge {
+                    break;
+                }
+                edge = next;
+            }
+
+            let mut out = Vec::with_capacity(span);
+            let mut start = first;
+            while start <= hi {
+                let next = next_after(start, *unit, unit_of);
+                let hits = db
+                    .matching_signed(table, field, RangeOp::Ge, start)?
+                    .and(&db.matching_signed(table, field, RangeOp::Lt, next)?)
+                    .and(within);
+                // An empty bucket is not a group. A month nothing happened in is not something
+                // `GROUP BY` answers about, and keeping it would make a sparse column cost its
+                // whole span in rows as well as in reads.
+                if !hits.is_empty() {
+                    out.push((GroupAt::Bucket { start, unit: unit_of }, None, hits));
+                }
+                if next <= start {
+                    break;
+                }
+                start = next;
+            }
+            Ok(out)
+        }
+    }
+}
+
+/// Tuples in key order, outermost column first.
+///
+/// Public for the reason [`rank_top_n`] is: the coordinator's merge has to produce the order this
+/// produces, and the only way to be sure of that is for it to be this.
+pub fn sort_tuples(tuples: &mut [Tuple]) {
+    tuples.sort_by(|a, b| cmp_tuple_keys(&a.keys, &b.keys));
+}
+
+/// Two tuples' keys, compared level by level.
+///
+/// A zip rather than a fixed tuple of fields, which is what makes the arity a number rather than
+/// a shape: the six-field comparison a pair needed became a nine-field one for a triple, and this
+/// is that generalised. Within a level the rule is [`sort_by_key`]'s - named groups by name,
+/// unnamed after them by identity - so a tuple grouping orders exactly as a nesting of single
+/// ones would.
+pub fn cmp_tuple_keys(a: &[GroupKey], b: &[GroupKey]) -> core::cmp::Ordering {
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| match (&x.key, &y.key) {
+            (Some(p), Some(q)) => p.cmp(q),
+            (Some(_), None) => core::cmp::Ordering::Less,
+            (None, Some(_)) => core::cmp::Ordering::Greater,
+            (None, None) => x.at.cmp(&y.at),
+        })
+        .find(|o| o.is_ne())
+        .unwrap_or(core::cmp::Ordering::Equal)
 }

@@ -145,6 +145,21 @@ pub enum Refused {
     Interval,
     /// A scalar call in a `WHERE`, where there are no values yet to apply it to.
     ScalarFilter,
+    /// A `GROUP BY` term that is neither a column nor a calendar rounding of one.
+    ///
+    /// Its own refusal rather than a [`Self::Shape`], because the two say different things: a
+    /// shape refusal is about the statement asking more than one question, and this is about a
+    /// term the engine has no way to group *by*. What it names is also different - the two terms
+    /// that do work - which is the whole reason the list is enumerated.
+    GroupExpression,
+    /// A rounding in a `WHERE` compared against a value it can never produce:
+    /// `date_trunc('month', ts) = '2024-01-15'`, which no month begins on.
+    ///
+    /// Strictly this selects no records rather than being an error, and that is what another
+    /// engine answers. It is refused here because there are no bind parameters in this dialect,
+    /// so the value was typed rather than substituted - and an empty answer to a typo looks
+    /// exactly like a table with no January in it.
+    Round,
     /// A column constraint - `NOT NULL`, `PRIMARY KEY`, `DEFAULT` - which is a promise about
     /// rows, and there are no rows here to make it about.
     Constraint,
@@ -223,7 +238,7 @@ impl Refused {
     /// Kept honest by [`Refused::rank`] below, whose exhaustive match will not compile until a
     /// new variant is named - and by a test asserting that every rank appears here exactly once,
     /// which is what catches naming one and forgetting to add it.
-    pub const ALL: [Self; 61] = [
+    pub const ALL: [Self; 63] = [
         Self::Joins,
         Self::OuterJoin,
         Self::JoinOn,
@@ -258,6 +273,8 @@ impl Refused {
         Self::TruncUnit,
         Self::Interval,
         Self::ScalarFilter,
+        Self::Round,
+        Self::GroupExpression,
         Self::SetTooLarge,
         Self::ExplainSet,
         Self::Segment,
@@ -357,6 +374,8 @@ impl Refused {
             Self::AclPublic => 58,
             Self::GrantOption => 59,
             Self::ReservedRole => 60,
+            Self::Round => 61,
+            Self::GroupExpression => 62,
         }
     }
 
@@ -400,6 +419,8 @@ impl Refused {
             Self::TruncUnit => "sql_bad_trunc_unit",
             Self::Interval => "sql_unsupported",
             Self::ScalarFilter => "sql_scalar_in_filter",
+            Self::Round => "sql_rounded_value",
+            Self::GroupExpression => "sql_group_expression",
             Self::Constraint => "sql_no_constraints",
             Self::DecimalScale => "sql_decimal_scale",
             Self::BitDepth => "sql_bit_depth",
@@ -695,13 +716,30 @@ impl Refused {
                  about what a month is"
             }
             Self::ScalarFilter => {
-                "`toDate` and `date_trunc` round a value on the way out, where a decimal has \
-                 its point put back - they read nothing the projection did not already read. A \
-                 `WHERE` runs before there are any values to round, over bitmaps rather than \
-                 over records, so a rounded column is not something it could test. Compare the \
-                 column itself instead: `date_trunc('month', ts) = '2024-01-01'` is \
-                 `ts >= '2024-01-01' AND ts < '2024-02-01'`, which is a range this engine \
-                 answers off the bit planes"
+                "a scalar runs on a value that has been read, and a `WHERE` runs before any \
+                 has been: it chooses a set out of bitmaps, so there is nothing here for one to \
+                 apply to. The roundings are the exception, because they can be turned around \
+                 rather than run - `date_trunc('month', ts) = '2024-01-01'` is every value in \
+                 `[2024-01-01, 2024-02-01)`, which is a range off the bit planes - and \
+                 `date_trunc`, `toDate` and `toYear` are answered here for that reason. This \
+                 one cannot be turned around: `lower(country) = 'gb'` and `abs(balance) > 5` \
+                 each have answers scattered across the column rather than gathered into a \
+                 range. Write the comparison against the column itself"
+            }
+            Self::GroupExpression => {
+                "a `GROUP BY` term is a column, or `date_trunc(<boundary>, <column>)` over a \
+                 DATE or DATETIME column - those are the two the engine has a plan for. Any \
+                 other expression over a column relabels its values without merging them, which \
+                 answers one row per stored value with all of them printed under one name"
+            }
+            Self::Round => {
+                "no rounding ever produces this value, so nothing could match it: \
+                 `date_trunc('month', ts)` answers the first day of a month, and \
+                 `'2024-01-15'` is not one. Compare against the boundary that contains it - \
+                 `= '2024-01-01'` - or write the range itself, `ts >= '2024-01-15'`. Another \
+                 engine answers this with no rows; it is refused here because there are no bind \
+                 parameters in this dialect, so the value was typed rather than substituted, \
+                 and an empty answer to a typo reads as a table with nothing in that month"
             }
             Self::ColumnType => {
                 "a column takes one of `SET`, `MUTEX`, `BOOL`, `TIMEQUANTUM`, `SIGNED`, \
@@ -710,7 +748,10 @@ impl Refused {
                  `STRING` are a set, `TINYINT`, `SMALLINT`, `INT`, `INTEGER` and `BIGINT` are \
                  an unsigned integer of 8, 16, 32, 32 and 64 bits, `BOOLEAN` is a bool, \
                  `FLOAT` and `REAL` are a `FLOAT32`, `DOUBLE` is a `FLOAT64`, and `TIMESTAMP` \
-                 is a `DATETIME`. None of them takes a width in brackets that its name does not \
+                 is a `DATETIME`. `LowCardinality(String)` is a set too - that is what a set \
+                 already is here, one bitmap per interned key - but only over a string: a \
+                 number is bit planes, with no dictionary to be low cardinality of. None of \
+                 them takes a width in brackets that its name does not \
                  already carry: `FLOAT(10, 2)` is a `DECIMAL(10, 2)`, which keeps those digits \
                  exactly where a float would not. There is nothing here a blob or a JSON \
                  document lands in"

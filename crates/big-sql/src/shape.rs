@@ -548,10 +548,14 @@ pub enum Of {
         /// Seconds since the Unix epoch.
         unix_seconds: i64,
     },
-    /// The group's key, or a pair's left half.
+    /// The group's key.
     Key,
-    /// A pair's right half. Only meaningful inside [`Shape::Pairs`].
-    RightKey,
+    /// One axis of a tuple grouping's key, counted from the outermost column.
+    ///
+    /// **Indexed rather than named**, which is what makes the arity a number: `Key`/`RightKey`
+    /// had nothing to call a third, and a `ThirdKey` beside them would have had nothing to call
+    /// a fourth. Only meaningful inside [`Shape::Tuples`].
+    KeyAt { axis: u8 },
     /// The answer of one of the statement's searches, which is not a plan at all.
     ///
     /// Indexed into [`crate::Statement::probes`] rather than into its calls, because the two
@@ -665,7 +669,7 @@ pub struct JoinSide {
 /// How a side of a join is keyed, and the plan that says so.
 ///
 /// One enum rather than a plan and a separate arity, because the arity *is* which plan variant
-/// answered: no axis is a `Count`, one is a `Distinct`, and two would be a `GroupByPair`.
+/// answered: no axis is a `Count`, one is a `Distinct`, and two or more are a `GroupByTuple`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Keying {
     /// One axis of the join's key space: a `Distinct` over that column.
@@ -738,7 +742,7 @@ impl Of {
     pub fn plans(self) -> Vec<usize> {
         match self {
             Self::Key
-            | Self::RightKey
+            | Self::KeyAt { .. }
             | Self::Probe { .. }
             | Self::SharedKeys
             | Self::Now { .. } => Vec::new(),
@@ -763,7 +767,7 @@ impl Of {
             | Self::Ratio { plan, .. }
             | Self::PairedRatio { top: plan, .. } => Some(plan),
             Self::Key
-            | Self::RightKey
+            | Self::KeyAt { .. }
             | Self::Probe { .. }
             | Self::SharedKeys
             | Self::Now { .. } => None,
@@ -859,14 +863,21 @@ pub enum Shape {
     /// of the left column the records holding it are a set, and grouping *those* by the right
     /// column is the ordinary grouping the engine already does. The plan pays one pass over the
     /// right column per value of the left, which is why it carries that bound itself.
-    Pairs {
-        /// The plans whose pairs make the rows, in plan order.
+    /// One row per combination of values two or more columns hold records for.
+    ///
+    /// **`axes` is a fact about the answer, not about any one row**, which is the same reason
+    /// [`Shape::Join`] carries one: every row has exactly this many key cells, and a reader that
+    /// had to count them per row would be deriving what the shape already knows.
+    Tuples {
+        /// How many columns the grouping is over. Never fewer than two.
+        axes: u8,
+        /// The plans whose tuples make the rows, in plan order.
         keys: Vec<usize>,
-        /// The columns, in the order written. One is [`Of::Key`] and one [`Of::RightKey`].
+        /// The columns, in the order written. `axes` of them are [`Of::KeyAt`].
         cells: Vec<Cell>,
-        /// `HAVING`, applied per pair after the merge.
+        /// `HAVING`, applied per combination after the merge.
         having: Option<Having>,
-        /// `ORDER BY`, applied to the pairs.
+        /// `ORDER BY`, applied to the combinations.
         order: Option<GroupOrder>,
         /// `OFFSET`, `LIMIT` and `WITH TIES`, applied last.
         cut: Cut,
@@ -973,7 +984,7 @@ impl Shape {
             // SQL names a union's columns after its first branch, whatever the others called
             // theirs.
             Self::Union { branches } => branches.first().map(Shape::columns).unwrap_or_default(),
-            Self::Pairs { cells, .. } => cells.iter().map(|c| c.column.as_str()).collect(),
+            Self::Tuples { cells, .. } => cells.iter().map(|c| c.column.as_str()).collect(),
             Self::Records { column, .. } => vec![column.as_str()],
             Self::Table { columns, .. } => {
                 columns.named().iter().map(|c| c.column.as_str()).collect()
@@ -996,7 +1007,7 @@ impl Shape {
             Self::Union { branches } => branches.iter().flat_map(Shape::cells).collect(),
             Self::Row { cells, .. }
             | Self::Groups { cells, .. }
-            | Self::Pairs { cells, .. }
+            | Self::Tuples { cells, .. }
             | Self::Join { cells, .. } => cells.iter().collect(),
         }
     }
@@ -1010,7 +1021,7 @@ impl Shape {
     /// there are.
     pub fn plans(&self) -> Vec<usize> {
         let driving = match self {
-            Self::Groups { keys, .. } | Self::Pairs { keys, .. } => keys.clone(),
+            Self::Groups { keys, .. } | Self::Tuples { keys, .. } => keys.clone(),
             Self::Join { sides, .. } => sides.iter().flat_map(|s| s.keyed.plans()).collect(),
             Self::Row { .. } | Self::Records { .. } | Self::Table { .. } | Self::Union { .. } => {
                 Vec::new()
@@ -1061,8 +1072,8 @@ impl Shape {
             Self::Groups { keys, cells, having, order, cut } => {
                 Self::Groups { keys, cells: all(cells)?, having: one(having)?, order, cut }
             }
-            Self::Pairs { keys, cells, having, order, cut } => {
-                Self::Pairs { keys, cells: all(cells)?, having: one(having)?, order, cut }
+            Self::Tuples { axes, keys, cells, having, order, cut } => {
+                Self::Tuples { axes, keys, cells: all(cells)?, having: one(having)?, order, cut }
             }
             Self::Join { axes, sides, cells, per_key, having, order, cut } => Self::Join {
                 axes,
@@ -1229,7 +1240,8 @@ impl Shape {
         };
         match self {
             Self::Row { cells: c, having: h } => Self::Row { cells: cells(c), having: having(h) },
-            Self::Pairs { keys, cells: c, having: h, order: o, cut } => Self::Pairs {
+            Self::Tuples { axes, keys, cells: c, having: h, order: o, cut } => Self::Tuples {
+                axes,
                 keys: keys.into_iter().map(|k| k + by).collect(),
                 cells: cells(c),
                 having: having(h),
@@ -1287,7 +1299,7 @@ impl Of {
             // Names no plan of its own: the sides are the join's keys, which the shape rebased.
             Self::SharedKeys => Self::SharedKeys,
             Self::Key => Self::Key,
-            Self::RightKey => Self::RightKey,
+            Self::KeyAt { axis } => Self::KeyAt { axis },
             // A probe is not a plan, and its index moves with the probes rather than the calls.
             Self::Probe { probe } => Self::Probe { probe },
         }

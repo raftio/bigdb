@@ -237,7 +237,7 @@ fn remap_select(select: &mut Select, exposed: &Exposed) -> Result<()> {
         remap_cond(cond, exposed)?;
     }
     for name in &mut select.group_by {
-        exposed.rename(name)?;
+        exposed.rename(&mut name.name)?;
     }
     if let Some(having) = &mut select.having {
         remap_having(having, exposed)?;
@@ -369,6 +369,7 @@ fn remap_cond(cond: &mut Cond, exposed: &Exposed) -> Result<()> {
         Cond::Cmp { field, .. }
         | Cond::In { field, .. }
         | Cond::Between { field, .. }
+        | Cond::Rounded { field, .. }
         | Cond::Like { field, .. } => exposed.rename(field),
     }
 }
@@ -398,6 +399,7 @@ fn qualify_cond(cond: Cond, label: &str) -> Cond {
             Cond::Cmp { field, .. }
             | Cond::In { field, .. }
             | Cond::Between { field, .. }
+            | Cond::Rounded { field, .. }
             | Cond::Like { field, .. } => {
                 field.qualifier.get_or_insert_with(|| label.to_string());
             }

@@ -32,7 +32,7 @@ mod scalar;
 
 use crate::{Answer, Cell, Shape, Units, Value};
 use big_sql::Scalar;
-use group::{grouped, joined, paired};
+use group::{grouped, joined, tupled};
 use num::{int_of, number, scalar_cell, Num};
 pub use scalar::eval;
 
@@ -371,8 +371,8 @@ fn rows_of(shape: &Shape, values: &[Value], probes_at: usize) -> Vec<Row> {
             grouped(keys, cells, having.as_ref(), *order, *cut, values)
         }
 
-        Shape::Pairs { keys, cells, having, order, cut } => {
-            paired(keys, cells, having.as_ref(), *order, *cut, values)
+        Shape::Tuples { keys, cells, having, order, cut, .. } => {
+            tupled(keys, cells, having.as_ref(), *order, *cut, values)
         }
 
         Shape::Join { sides, cells, per_key, having, order, cut, .. } => {

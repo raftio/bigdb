@@ -59,9 +59,9 @@ pub use big_db::{
     Container, ContainerKey, Durability, FragmentAddr, Granularity, Matches, QueryLimits, RecordId,
     RowId, RowSet,
 };
-pub use big_exec::{Group, Pair, Projected, Projection, Value};
+pub use big_exec::{Group, GroupAt, GroupKey, Projected, Projection, Tuple, Value};
 pub use big_pager::{MemPager, Metrics, MmapPager, PagerMut, DEFAULT_MAPSIZE};
-pub use big_plan::{Plan, Rows};
+pub use big_plan::{Level, Plan, Rows, TimeUnit};
 // The SQL surface's two public shapes. `Shape` appears in the return type of `Api::sql`, so a
 // caller that renders an answer has to be able to name it.
 pub use big_plan::Literal;

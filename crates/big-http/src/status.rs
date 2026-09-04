@@ -82,7 +82,7 @@ pub fn status_of(e: &ApiError) -> u16 {
         // The statement is well formed and describes real columns; what it asks for costs more
         // than the plan allowed. `422` for the same reason `query_too_large` is: the body is
         // fine and what it describes is not answerable as written.
-        ApiError::Query(ExecError::TooManyGroups { .. }) => 422,
+        ApiError::Query(ExecError::TooManyGroups { .. } | ExecError::TooManyBuckets { .. }) => 422,
         // The client wrote a value its field cannot hold, which is the same 400 an import line
         // with the same mistake gets.
         ApiError::Value(_) => 400,

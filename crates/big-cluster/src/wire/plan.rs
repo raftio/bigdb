@@ -191,7 +191,8 @@ mod plan_tag {
     pub const TOP_N: u8 = 6;
     pub const GROUP_BY: u8 = 7;
     pub const PROJECT: u8 = 8;
-    pub const GROUP_BY_PAIR: u8 = 9;
+    pub const GROUP_BY_BUCKET: u8 = 10;
+    pub const GROUP_BY_TUPLE: u8 = 11;
 }
 
 pub fn put_plan(out: &mut Vec<u8>, plan: &Plan) {
@@ -220,13 +221,23 @@ pub fn put_plan(out: &mut Vec<u8>, plan: &Plan) {
             put_aggregate(out, plan_tag::GROUP_BY, table, rows, field);
             put_plan(out, aggregate);
         }
-        Plan::GroupByPair { table, rows, left, right, aggregate, left_max } => {
-            put_u8(out, plan_tag::GROUP_BY_PAIR);
+        Plan::GroupByBucket { table, rows, field, unit, max_buckets, aggregate } => {
+            put_aggregate(out, plan_tag::GROUP_BY_BUCKET, table, rows, field);
+            // The boundary travels as its own name rather than as an index into the enum, so
+            // that reordering `big_civil::Unit` cannot silently turn a month into a week.
+            put_str(out, unit.name());
+            put_u64(out, *max_buckets as u64);
+            put_plan(out, aggregate);
+        }
+        Plan::GroupByTuple { table, rows, levels, aggregate, max_passes } => {
+            put_u8(out, plan_tag::GROUP_BY_TUPLE);
             put_str(out, table);
             put_rows(out, rows);
-            put_str(out, left);
-            put_str(out, right);
-            put_u64(out, *left_max as u64);
+            put_count(out, levels.len());
+            for level in levels {
+                put_level(out, level);
+            }
+            put_u64(out, *max_passes as u64);
             put_plan(out, aggregate);
         }
         // The only plan whose field list is a list, so it carries a count rather than reusing
@@ -293,19 +304,36 @@ fn get_plan_at(r: &mut Reader<'_>, depth: usize) -> Result<Plan> {
             let (table, rows, field) = get_aggregate(r)?;
             Plan::GroupBy { table, rows, field, aggregate: Box::new(get_plan_at(r, depth + 1)?) }
         }
-        plan_tag::GROUP_BY_PAIR => {
-            let table = r.str()?;
-            let rows = get_rows(r)?;
-            let left = r.str()?;
-            let right = r.str()?;
-            let left_max = r.u64()?.try_into().unwrap_or(usize::MAX);
-            Plan::GroupByPair {
+        plan_tag::GROUP_BY_BUCKET => {
+            let (table, rows, field) = get_aggregate(r)?;
+            let name = r.str()?;
+            let unit = big_civil::Unit::parse(&name)
+                .ok_or(WireError::Malformed("a calendar boundary this engine does not have"))?;
+            let max_buckets = r.u64()? as usize;
+            Plan::GroupByBucket {
                 table,
                 rows,
-                left,
-                right,
+                field,
+                unit,
+                max_buckets,
                 aggregate: Box::new(get_plan_at(r, depth + 1)?),
-                left_max,
+            }
+        }
+        plan_tag::GROUP_BY_TUPLE => {
+            let table = r.str()?;
+            let rows = get_rows(r)?;
+            let n = r.count()?;
+            let mut levels = Vec::with_capacity(n);
+            for _ in 0..n {
+                levels.push(get_level(r)?);
+            }
+            let max_passes = r.u64()? as usize;
+            Plan::GroupByTuple {
+                table,
+                rows,
+                levels,
+                max_passes,
+                aggregate: Box::new(get_plan_at(r, depth + 1)?),
             }
         }
         plan_tag::PROJECT => {
@@ -331,4 +359,40 @@ fn get_plan_at(r: &mut Reader<'_>, depth: usize) -> Result<Plan> {
 
 fn get_aggregate(r: &mut Reader<'_>) -> Result<(String, Rows, String)> {
     Ok((r.str()?, get_rows(r)?, r.str()?))
+}
+
+mod level_tag {
+    pub const KEYED: u8 = 0;
+    pub const BUCKET: u8 = 1;
+}
+
+fn put_level(out: &mut Vec<u8>, level: &Level) {
+    match level {
+        Level::Keyed { field } => {
+            put_u8(out, level_tag::KEYED);
+            put_str(out, field);
+        }
+        Level::Bucket { field, unit, max_buckets } => {
+            put_u8(out, level_tag::BUCKET);
+            put_str(out, field);
+            // The boundary travels as its own name rather than as an index into the enum, so
+            // that reordering `big_civil::Unit` cannot silently turn a month into a week.
+            put_str(out, unit.name());
+            put_u64(out, *max_buckets as u64);
+        }
+    }
+}
+
+fn get_level(r: &mut Reader<'_>) -> Result<Level> {
+    Ok(match r.u8()? {
+        level_tag::KEYED => Level::Keyed { field: r.str()? },
+        level_tag::BUCKET => {
+            let field = r.str()?;
+            let name = r.str()?;
+            let unit = big_civil::Unit::parse(&name)
+                .ok_or(WireError::Malformed("a calendar boundary this engine does not have"))?;
+            Level::Bucket { field, unit, max_buckets: r.u64()? as usize }
+        }
+        tag => return Err(WireError::BadTag { what: "a grouping level", tag }),
+    })
 }

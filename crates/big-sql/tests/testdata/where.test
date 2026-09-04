@@ -323,3 +323,84 @@ SELECT count(DISTINCT country) FROM t WHERE amount >= 500
 ----
 Distinct t.country
 └── amount >= 500
+
+# ---------------------------------------------------------------------------------------------
+# A rounding, inverted into the range it means.
+#
+# The plan is the thing to read here: none of these mentions `date_trunc`, because none of them
+# runs it. Every value whose month is January is every value in `[2024-01-01, 2024-02-01)`, so
+# the statement is answered by asking a different question with the same answer - a range off
+# the bit planes, at the cost a written range would have.
+
+plan
+SELECT count(*) FROM t WHERE date_trunc('month', seen) = '2024-01-01'
+----
+Count t
+└── intersect
+    ├── seen >= 1704067200 [signed]
+    └── seen < 1706745600 [signed]
+
+plan
+SELECT count(*) FROM t WHERE toDate(seen) = '2024-01-15'
+----
+Count t
+└── intersect
+    ├── seen >= 1705276800 [signed]
+    └── seen < 1705363200 [signed]
+
+plan
+SELECT count(*) FROM t WHERE date_trunc('month', seen) >= '2024-03-01'
+----
+Count t
+└── seen >= 1709251200 [signed]
+
+plan
+SELECT count(*) FROM t WHERE toYear(day) = 2024
+----
+Count t
+└── intersect
+    ├── day >= 19723 [signed]
+    └── day < 20089 [signed]
+
+# A rounded *number*, which unlike a rounded date is left for the planner: what `round(price, 2)`
+# means depends on how many digits `price` keeps, and that is the schema's to say. `price` has
+# two, `amount` none, `balance` is signed and `rate` is a float - four columns, four answers to
+# the same sentence.
+
+plan
+SELECT count(*) FROM t WHERE round(price, 1) > 5
+----
+Count t
+└── price >= 505
+
+plan
+SELECT count(*) FROM t WHERE round(amount, 2) > 5
+----
+Count t
+└── amount > 5
+
+plan
+SELECT count(*) FROM t WHERE round(balance, 2) > 5
+----
+Count t
+└── balance > 5 [signed]
+
+plan
+SELECT count(*) FROM t WHERE floor(price) = 12
+----
+Count t
+└── intersect
+    ├── price >= 1200
+    └── price < 1300
+
+plan
+SELECT count(*) FROM t WHERE ceil(price) <= 3
+----
+Count t
+└── price < 301
+
+plan
+SELECT count(*) FROM t WHERE floor(rate) > 2
+----
+Count t
+└── rate >= 3 [float]

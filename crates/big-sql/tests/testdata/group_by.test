@@ -84,19 +84,19 @@ Distinct t.category
 plan
 SELECT category, country, count(*) FROM t GROUP BY category, country
 ----
-GroupByPair t.(category, country) left_max=1000 -> count
+GroupByTuple t.(category, country) max_passes=1000 -> count
 └── all
 
 plan
 SELECT DISTINCT category, country FROM t
 ----
-GroupByPair t.(category, country) left_max=1000 -> count
+GroupByTuple t.(category, country) max_passes=1000 -> count
 └── all
 
 plan
 SELECT category, country, sum(amount) FROM t GROUP BY category, country
 ----
-GroupByPair t.(category, country) left_max=1000 -> sum(amount)
+GroupByTuple t.(category, country) max_passes=1000 -> sum(amount)
 └── all
 
 # A plain descending ranking with a limit is the one case the plan carries the cut itself.
@@ -227,9 +227,9 @@ Groups keys=[#0]
 shape
 SELECT category, country, count(*) FROM t GROUP BY category, country
 ----
-Pairs keys=[#0]
+Tuples axes=2 keys=[#0]
 ├── category = key
-├── country = right key
+├── country = key #1
 └── count = group #0 else 0
 
 shape
@@ -350,3 +350,83 @@ Groups keys=[#0, #1]
 ├── count = group #0 else 0
 ├── sum = group #1 else 0
 └── having: group #0 else 0 > 5 and (group #1 else 0 < 100 or group #1 else 0 > 900)
+
+# ---------------------------------------------------------------------------------------------
+# Grouping by a calendar bucket
+# ---------------------------------------------------------------------------------------------
+
+# The query this file existed without: one row per month, counted. `seen` is a DATETIME and has
+# no dictionary to walk, so the plan is not a `GroupBy` at all - it is a walk of the calendar,
+# one range read per bucket.
+
+plan
+SELECT date_trunc('month', seen), count(*) FROM t GROUP BY date_trunc('month', seen)
+----
+GroupByBucket t.seen by month n=10000 -> count
+└── all
+
+shape
+SELECT date_trunc('month', seen), count(*) FROM t GROUP BY date_trunc('month', seen)
+----
+Groups keys=[#0]
+├── date_trunc('month', seen) = key
+└── count = group #0 else 0
+
+plan
+SELECT date_trunc('year', day), sum(amount) FROM t GROUP BY date_trunc('year', day)
+----
+GroupByBucket t.day by year n=10000 -> sum(amount)
+└── all
+
+# `SELECT DISTINCT` over a rounding is the same grouping written the other way, exactly as it is
+# over a bare column.
+plan
+SELECT DISTINCT date_trunc('month', seen) FROM t
+----
+GroupByBucket t.seen by month n=10000 -> count
+└── all
+
+# An ordering over a bucket grouping is a coordinator sort, never a `TopN`: a ranking is over the
+# rows of a keyed field and a bucket grouping has none.
+shape
+SELECT date_trunc('month', seen), count(*) FROM t GROUP BY date_trunc('month', seen) ORDER BY count(*) DESC LIMIT 3
+----
+Groups keys=[#0]
+├── date_trunc('month', seen) = key
+├── count = group #0 else 0
+├── order: group #0 else 0 desc
+└── cut: limit 3
+
+# **A keyed column and a calendar bucket in one grouping**, which is what made the levels a list
+# rather than two named halves: the walk asks each level only for the sets its values make, so
+# mixing them costs nothing. This is "per country, per month", which is two dimensions of every
+# dashboard ever drawn.
+plan
+SELECT country, date_trunc('month', seen), count(*) FROM t GROUP BY country, date_trunc('month', seen)
+----
+GroupByTuple t.(country, seen by month) max_passes=1000 -> count
+└── all
+
+shape
+SELECT country, date_trunc('month', seen), count(*) FROM t GROUP BY country, date_trunc('month', seen)
+----
+Tuples axes=2 keys=[#0]
+├── country = key
+├── date_trunc('month', seen) = key #1
+└── count = group #0 else 0
+
+# Three columns, which had no plan to be until the pair became a tuple.
+plan
+SELECT category, country, device, count(*) FROM t GROUP BY category, country, device
+----
+GroupByTuple t.(category, country, device) max_passes=1000 -> count
+└── all
+
+shape
+SELECT category, country, device, count(*) FROM t GROUP BY category, country, device
+----
+Tuples axes=3 keys=[#0]
+├── category = key
+├── country = key #1
+├── device = key #2
+└── count = group #0 else 0

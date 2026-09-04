@@ -16,8 +16,8 @@
 
 use super::measure::{having_of, measure_of, names, units_of, Measure};
 use super::pql::{as_expr, call_of, field_arg, named};
-use super::{answer, count_plan, rows_of, Ask, Calls, Statement};
-use crate::ast::{Agg, HavingAgg, Item, Name, OrderKey, Proj, Select};
+use super::{answer, count_plan, group_call, rows_of, Ask, Calls, Statement};
+use crate::ast::{Agg, Grouping, HavingAgg, Item, Name, OrderKey, Proj, Select};
 use crate::error::{Refused, Result, SqlError};
 use crate::shape::{Absent, Cell, Cut, GroupOrder, Of, OrderBy, Shape};
 use big_plan::ast::{Expr, Literal};
@@ -33,7 +33,7 @@ pub(super) fn grouped(
     select: &Select,
     table: &str,
     rows: &Expr,
-    group: &Name,
+    group: &Grouping,
     stars: &[&Item],
     columns: &[(&Item, Name)],
     aggregates: &[&Item],
@@ -54,10 +54,16 @@ pub(super) fn grouped(
     // this plan the answer would have no row for it, which is a missing group rather than an
     // empty one - a difference no client could see.
     if measures.is_empty() || aggregates.iter().any(|i| i.filter.is_some()) {
-        calls.push(table, call_of("Distinct", vec![rows.clone(), field_arg(group)]))?;
+        // `Distinct` is the cheaper spelling of "the groups, with their counts", but it exists
+        // only for a keyed column - a bucket grouping with no aggregate already counts.
+        let keys = match group.bucket {
+            None => call_of("Distinct", vec![rows.clone(), field_arg(&group.name)]),
+            Some(_) => group_call(group, rows.clone(), None),
+        };
+        calls.push(table, keys)?;
     }
 
-    let cells = cells_of(select, table, &measures);
+    let cells = cells_of(select, table, group, &measures);
     let having = having_of(select, table, &measures)?;
 
     let Ordering { ranked, order } = ordering(select, group, &measures)?;
@@ -98,7 +104,7 @@ pub(super) fn grouped(
     let mut keys: Vec<usize> = (0..calls.len()).collect();
     if ranked {
         keys = vec![0];
-        let mut args = vec![rows.clone(), field_arg(group)];
+        let mut args = vec![rows.clone(), field_arg(&group.name)];
         if let Some(n) = plan_cut {
             args.push(named("n", Expr::Literal(Literal::Int(n as u64))));
         }
@@ -118,7 +124,7 @@ pub(super) fn grouped(
 /// grouped nor aggregated is the classic SQL error and a real one here; and a distinct count or
 /// a ranking *inside* a grouping is a grouping over a composite key this index never stored.
 fn refuse_what_a_grouping_cannot_hold(
-    group: &Name,
+    group: &Grouping,
     stars: &[&Item],
     columns: &[(&Item, Name)],
     aggregates: &[&Item],
@@ -127,18 +133,10 @@ fn refuse_what_a_grouping_cannot_hold(
         return Err(SqlError::Refused { what: Refused::Shape, at: item.at });
     }
     for (item, name) in columns {
-        if name.column != group.column {
-            // The classic SQL error, and it is a real one here: a column that is neither
-            // grouped nor aggregated has no single value per group.
-            return Err(SqlError::Refused { what: Refused::Shape, at: item.at });
-        }
-        // **A scalar on the grouped column relabels rows without merging them.** The grouping
-        // happened over the stored key, so `date_trunc('month', ts)` beside `GROUP BY ts` would
-        // answer with one row per instant, every one of them printed as the same month - an
-        // answer that looks aggregated and is not. Refused rather than rendered, because a
-        // client cannot see the difference. Group by the rounded value instead, once there is a
-        // plan that can.
-        if item.apply().is_some() {
+        // The classic SQL error - a column that is neither grouped nor aggregated has no single
+        // value per group - and, in the same breath, the entry that names the grouped column but
+        // describes different values of it. See `super::agrees`.
+        if name.column != group.name.column || !super::agrees(item, group) {
             return Err(SqlError::Refused { what: Refused::Shape, at: item.at });
         }
     }
@@ -167,7 +165,7 @@ fn refuse_what_a_grouping_cannot_hold(
 fn measures_of(
     table: &str,
     rows: &Expr,
-    group: &Name,
+    group: &Grouping,
     aggregates: &[&Item],
     calls: &mut Calls,
 ) -> Result<Vec<(Measure, Of)>> {
@@ -187,16 +185,10 @@ fn measures_of(
             Proj::Agg { func, field } => Of::Group {
                 plan: calls.push(
                     table,
-                    call_of(
-                        "GroupBy",
-                        vec![
-                            rows,
-                            field_arg(group),
-                            named(
-                                "aggregate",
-                                as_expr(call_of(func.call(), vec![field_arg(field)])),
-                            ),
-                        ],
+                    group_call(
+                        group,
+                        rows,
+                        Some(as_expr(call_of(func.call(), vec![field_arg(field)]))),
                     ),
                 )?,
                 // A sum over no records is `0` here and an extreme over none is absent, which
@@ -212,13 +204,10 @@ fn measures_of(
             Proj::Avg(field) => Of::Ratio {
                 plan: calls.push(
                     table,
-                    call_of(
-                        "GroupBy",
-                        vec![
-                            rows.clone(),
-                            field_arg(group),
-                            named("aggregate", as_expr(call_of("Sum", vec![field_arg(field)]))),
-                        ],
+                    group_call(
+                        group,
+                        rows.clone(),
+                        Some(as_expr(call_of("Sum", vec![field_arg(field)]))),
                     ),
                 )?,
                 over: count_plan(calls, table, &rows, group)?,
@@ -235,7 +224,12 @@ fn measures_of(
 }
 
 /// The columns, in select-list order, which is the only order the caller asked for.
-fn cells_of(select: &Select, table: &str, measures: &[(Measure, Of)]) -> Vec<Cell> {
+fn cells_of(
+    select: &Select,
+    table: &str,
+    group: &Grouping,
+    measures: &[(Measure, Of)],
+) -> Vec<Cell> {
     let mut next = measures.iter().map(|(_, of)| *of);
     select
         .items
@@ -247,7 +241,15 @@ fn cells_of(select: &Select, table: &str, measures: &[(Measure, Of)]) -> Vec<Cel
                 _ => next.next().expect("one measure per aggregate, in select-list order"),
             },
             units: units_of(table, &i.proj),
-            apply: i.apply().cloned(),
+            // **The plan already rounded, so the expression does not run again.** A bucket
+            // grouping merged its records on the truncated value and the group carries that
+            // value; applying `date_trunc` to it a second time would be a second spelling of
+            // one fact, kept in step by nothing. The column keeps the *name* it was written
+            // under, which comes from the item rather than from here.
+            apply: match (i.leaf(), group.bucket) {
+                (Proj::Column(_), Some(_)) => None,
+                _ => i.apply().cloned(),
+            },
         })
         .collect()
 }
@@ -270,7 +272,7 @@ struct Ordering {
 /// *can* answer is a sort of the merged list at the coordinator, which costs materialising every
 /// group before the cut and is why it is not the default. What is left names a number that is
 /// not there, and is refused.
-fn ordering(select: &Select, group: &Name, measures: &[(Measure, Of)]) -> Result<Ordering> {
+fn ordering(select: &Select, group: &Grouping, measures: &[(Measure, Of)]) -> Result<Ordering> {
     let Some(order) = &select.order_by else {
         return Ok(Ordering { ranked: false, order: None });
     };
@@ -282,7 +284,7 @@ fn ordering(select: &Select, group: &Name, measures: &[(Measure, Of)]) -> Result
         .iter()
         .filter(|i| matches!(i.proj, Proj::Column(_)))
         .map(Item::column)
-        .chain(std::iter::once(group.column.clone()))
+        .chain(std::iter::once(group.name.column.clone()))
         .collect();
     let value_names: Vec<(String, Of)> = select
         .items
@@ -323,7 +325,15 @@ fn ordering(select: &Select, group: &Name, measures: &[(Measure, Of)]) -> Result
     // `WITH TIES` also rules it out, and for a different reason: the rows kept past the limit
     // are the ones the *ordering* cannot separate, so the coordinator has to be told what the
     // ordering was. A `TopN` answers in ranked order and says nothing about why.
+    //
+    // A bucket grouping rules it out too, and this is the load-bearing half: `TopN` ranks the
+    // rows of a keyed field, and a bucket grouping has none - the planner would refuse it by
+    // name. Without this the ordinary `ORDER BY count(*) DESC LIMIT 10` over a month grouping
+    // would be answered with "`TopN` is not allowed on `ts`, which is a date", for a statement
+    // that has nothing wrong with it. The ordering becomes a coordinator sort instead, which is
+    // bounded by `MAX_BUCKETS` and therefore already paid for.
     let single_count = !select.with_ties
+        && group.bucket.is_none()
         && measures.len() <= 1
         && matches!(by, OrderBy::Value { of: Of::Group { .. } })
         && measures.first().is_none_or(|(m, _)| *m == Measure::Count);

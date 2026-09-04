@@ -382,3 +382,51 @@ fn a_pattern_composes_with_the_other_set_operations() {
     let Plan::Count { rows: Rows::Not(inner), .. } = p else { panic!("expected a count") };
     assert!(matches!(*inner, Rows::KeyLike { .. }));
 }
+
+/// **The one grouping over a column with no dictionary**, and the check that decides it is the
+/// mirror image of the one every other grouping makes.
+///
+/// `Distinct` and `GroupBy` insist on a keyed field, because a group is a row of one and a
+/// bit-sliced column has no rows. A bucket grouping insists on the opposite: it needs an
+/// ordering to cut into ranges, and a keyed column has none.
+#[test]
+fn a_bucket_grouping_takes_the_columns_every_other_grouping_refuses() {
+    assert!(planned("GroupByBucket(All(), field=day, unit=\"month\", n=1000)").is_ok());
+    assert!(planned("GroupByBucket(All(), field=seen, unit=\"month\", n=1000)").is_ok());
+    // A keyed column: what `GroupBy` wants and this cannot use.
+    assert!(planned("GroupByBucket(All(), field=country, unit=\"month\", n=1000)").is_err());
+    // A number is ordered, but a month of it is not a thing.
+    assert!(planned("GroupByBucket(All(), field=amount, unit=\"month\", n=1000)").is_err());
+    // And the reverse, which is the claim's other half.
+    assert!(planned("GroupBy(All(), field=day)").is_err());
+}
+
+/// A boundary finer than the column, refused where the column's units are known.
+///
+/// A `DATE` counts whole days, so truncating one to the hour asks about a time of day it never
+/// held. The same sentence guards a `date_trunc` in a select list - one rule, two callers.
+#[test]
+fn a_boundary_below_a_day_means_nothing_to_a_column_counting_days() {
+    assert!(planned("GroupByBucket(All(), field=day, unit=\"day\", n=1000)").is_ok());
+    assert!(planned("GroupByBucket(All(), field=day, unit=\"hour\", n=1000)").is_err());
+    // A `DATETIME` counts seconds, so every boundary says something about one.
+    assert!(planned("GroupByBucket(All(), field=seen, unit=\"hour\", n=1000)").is_ok());
+    assert!(planned("GroupByBucket(All(), field=seen, unit=\"second\", n=1000)").is_ok());
+    // A boundary the calendar does not have at all.
+    assert!(planned("GroupByBucket(All(), field=seen, unit=\"fortnight\", n=1000)").is_err());
+}
+
+/// The aggregate rides along exactly as it does for a keyed grouping, which is what lets the
+/// coordinator fold two nodes' buckets with the code that already folds their groups.
+#[test]
+fn a_bucket_grouping_carries_its_aggregate() {
+    let p = planned(
+        "GroupByBucket(All(), field=seen, unit=\"year\", n=10, aggregate=Sum(field=amount))",
+    )
+    .unwrap();
+    let Plan::GroupByBucket { unit, max_buckets, aggregate, .. } = p else {
+        panic!("expected a bucket grouping")
+    };
+    assert_eq!((unit, max_buckets), (big_civil::Unit::Year, 10));
+    assert!(matches!(*aggregate, Plan::Sum { .. }));
+}

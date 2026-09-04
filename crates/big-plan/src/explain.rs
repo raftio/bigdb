@@ -35,7 +35,7 @@
 //! as a full child instead, which is the whole reason the fold is written as a match that can
 //! fail rather than an assumption.
 
-use crate::plan::{CmpOp, Plan, Rows};
+use crate::plan::{CmpOp, Level, Plan, Rows};
 
 /// The plan, as a tree of lines. No trailing newline.
 ///
@@ -83,8 +83,14 @@ fn head(plan: &Plan) -> String {
         Plan::GroupBy { table, field, aggregate, .. } => {
             format!("GroupBy {table}.{field}{}", folded(aggregate))
         }
-        Plan::GroupByPair { table, left, right, left_max, aggregate, .. } => format!(
-            "GroupByPair {table}.({left}, {right}) left_max={left_max}{}",
+        Plan::GroupByBucket { table, field, unit, max_buckets, aggregate, .. } => format!(
+            "GroupByBucket {table}.{field} by {} n={max_buckets}{}",
+            unit.name(),
+            folded(aggregate)
+        ),
+        Plan::GroupByTuple { table, levels, max_passes, aggregate, .. } => format!(
+            "GroupByTuple {table}.({}) max_passes={max_passes}{}",
+            levels.iter().map(level_name).collect::<Vec<_>>().join(", "),
             folded(aggregate)
         ),
         Plan::Project { table, fields, limit, .. } => {
@@ -107,7 +113,8 @@ fn rows_of(plan: &Plan) -> &Rows {
         | Plan::Distinct { rows, .. }
         | Plan::TopN { rows, .. }
         | Plan::GroupBy { rows, .. }
-        | Plan::GroupByPair { rows, .. }
+        | Plan::GroupByBucket { rows, .. }
+        | Plan::GroupByTuple { rows, .. }
         | Plan::Project { rows, .. } => rows,
     }
 }
@@ -131,7 +138,9 @@ fn folded(aggregate: &Plan) -> String {
 /// The aggregate a grouping carries, when the head line did not fold it.
 fn unfolded_aggregate(plan: &Plan) -> Option<&Plan> {
     let aggregate = match plan {
-        Plan::GroupBy { aggregate, .. } | Plan::GroupByPair { aggregate, .. } => aggregate,
+        Plan::GroupBy { aggregate, .. }
+        | Plan::GroupByBucket { aggregate, .. }
+        | Plan::GroupByTuple { aggregate, .. } => aggregate,
         _ => return None,
     };
     folded(aggregate).is_empty().then_some(aggregate.as_ref())
@@ -228,5 +237,13 @@ fn write_children(out: &mut String, kids: &[Node], prefix: &str) {
                 write_children(out, &below, &inner);
             }
         }
+    }
+}
+
+/// One level of a tuple grouping, as the column and - for a bucket - the boundary it cuts on.
+fn level_name(level: &Level) -> String {
+    match level {
+        Level::Keyed { field } => field.clone(),
+        Level::Bucket { field, unit, .. } => format!("{field} by {}", unit.name()),
     }
 }
