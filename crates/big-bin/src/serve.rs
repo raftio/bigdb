@@ -41,7 +41,11 @@ usage: big serve <file> [addr] [options]
   addr                        defaults to 127.0.0.1:7654
 
   --users <file>              one `username role hash` per line, made by `big passwd`
-                              roles: read, write, admin; file must be mode 600
+                              a role is a name the catalog holds - made with CREATE ROLE,
+                              given privileges with GRANT - and a name it does not hold is
+                              no privileges at all. `superuser` is reserved and holds
+                              everything, which is how a new database gets its first GRANT.
+                              The file must be mode 600
   --tls-cert <file>           PEM certificate chain this server presents
   --tls-key <file>            PEM private key for it; file must be mode 600
                               both need a build with the `tls` feature
@@ -87,20 +91,24 @@ Listing:
 
 Replication:
   GET  /verify   do the copies of every range still hold the same facts
-                 a scan, not a probe; needs a `read` user
+                 a scan, not a probe; needs OPERATE on *.*
   POST /repair   catch up every copy the agreement has marked behind
-                 a scan and a copy; needs an `admin` user
+                 a scan and a copy; needs OPERATE on *.*
 
 Backup:
   POST /admin/backup?name=<f>  an online, compact copy of this node's file
-                 needs --backup-dir and an `admin` user; one at a time
+                 needs --backup-dir and OPERATE on *.*; one at a time
                  a cluster is backed up one node at a time, and the copies
                  are not one snapshot - see docs/clustering.md
 
 Probes and metrics:
   GET /health    liveness, never authenticated
   GET /ready     readiness, never authenticated
-  GET /metrics   Prometheus text; needs a `read` user when --users is configured
+  GET /metrics   Prometheus text; needs OPERATE on *.* when --users is configured
+
+The operational routes above are one server-wide privilege rather than a role that also
+happened to read tables - GRANT OPERATE ON *.* TO <role>. So is everything under
+/admin/cluster. See docs/access-control.md.
 ";
 
 /// `big serve`, with the word already stripped by the dispatcher.

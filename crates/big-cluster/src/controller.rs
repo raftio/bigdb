@@ -300,6 +300,16 @@ impl Controller {
         self.map().held_by(self.this)
     }
 
+    /// The shards this node is the one to read from, **as the agreement has them**.
+    ///
+    /// Not the same question as what the cluster file said at startup, and the difference is the
+    /// point: a node that joined a running cluster, or watched a range split, or took one over in
+    /// a failover, serves something its own file never mentioned. A node may hold several ranges
+    /// now, so this is a list rather than the single span the file could express.
+    pub fn shards_served(&self) -> Vec<big_engine::ShardRange> {
+        self.map().shards_served_by(self.this)
+    }
+
     /// Whether this node may answer as the primary of the ranges it serves right now.
     ///
     /// `true` when nothing it holds could be taken away. Otherwise it is the lease: this node
