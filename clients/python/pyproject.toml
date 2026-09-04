@@ -1,0 +1,90 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "bigdb"
+dynamic = ["version"]
+description = "A Python client for bigdb, written against its HTTP surface."
+readme = "readme.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "Bany" }]
+keywords = ["bigdb", "database", "bitmap", "analytics"]
+
+# Empty, and it stays empty. `contrib/big-message` makes the same claim about its
+# `[dependencies]`, and the reason is the same: an empty manifest is the only form of that
+# claim a build can check. The `no-deps` CI job checks it.
+dependencies = []
+
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Database :: Front-Ends",
+  "Typing :: Typed",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8",
+  "pytest-asyncio>=0.24",
+  "pytest-cov>=5",
+  "ruff>=0.6",
+  "mypy>=1.11",
+]
+
+[project.urls]
+Homepage = "https://github.com/9bany/bigdb"
+Source = "https://github.com/9bany/bigdb/tree/main/clients/python"
+
+[tool.hatch.version]
+path = "bigdb/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["bigdb"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Integration needs a real `big serve`. Excluded by default so `pytest` is a gate anyone can
+# run on a machine with no Rust toolchain; `make e2e` builds the binary and asks for them.
+addopts = "-m 'not integration'"
+markers = [
+  "integration: needs a real `big serve`; skipped when no binary is found",
+]
+asyncio_mode = "auto"
+
+[tool.ruff]
+# 100, matching the repo's rustfmt.toml max_width, so a line that fits one file fits the other.
+line-length = 100
+target-version = "py310"
+# Ruff formats Python inside Markdown fences as of 0.16. The readme's snippets are illustrative
+# and their comment alignment is deliberate, so prose stays prose.
+extend-exclude = ["*.md"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
+ignore = [
+  # `Warning` and `ConnectionError` are PEP 249's names for exceptions and are not ours to
+  # rename; shadowing the builtin inside `errors.py` is the specification, not an oversight.
+  "A003",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"bigdb/errors.py" = ["N818"]
+"tests/*" = ["B011"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+warn_unreachable = true
+files = ["bigdb"]
+
+[[tool.mypy.overrides]]
+module = "tests.*"
+disallow_untyped_defs = false

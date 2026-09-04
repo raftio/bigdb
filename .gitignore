@@ -24,3 +24,20 @@ deploy/single/secrets
 checklist.md
 big-web
 /target-base
+__pycache__
+# The Python client in clients/python. Caches and build output; the wheel is built in CI and
+# published from there, never committed. (`__pycache__` is already above.)
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+clients/python/dist/
+clients/python/.venv/
+clients/python/*.egg-info/
+
+# Go clients. Build output and coverage only - this module vendors nothing, so there is no
+# vendor/ entry, and its absence is part of the zero-dependency claim.
+clients/go/*.test
+clients/go/coverage.out
+clients/go/dist/
