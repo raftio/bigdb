@@ -392,6 +392,24 @@ pub(super) fn cluster_rebalance<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Requ
     }
 }
 
+/// `POST /admin/cluster/schema-leader?to=<node>` - hand the row-key namespace over.
+///
+/// **The one change that corrupts rather than fails**, so it is worth the wait: it copies every
+/// row key of every table and the record ids the old leader has promised but not written, and
+/// only then commits. See `Cluster::move_schema_leader`.
+pub(super) fn cluster_schema_leader<P: PagerMut + Sync>(
+    ctx: &Ctx<'_, P>,
+    req: &Request,
+) -> Response {
+    let Some(to) = req.param("to") else {
+        return Response::failure(400, "bad_request", "this needs ?to=<node>");
+    };
+    match ctx.cluster.move_schema_leader(&to) {
+        Ok(()) => Response::ok(format!("{{\"schema_leader\":{}}}", json::string(&to))),
+        Err(e) => from_cluster(&e),
+    }
+}
+
 /// Every fragment of a table, with the count that stands in for its contents.
 pub(super) fn peer_fragments<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request) -> Response {
     let request = match wire::FragmentsRequest::decode(&req.body) {

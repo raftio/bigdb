@@ -236,6 +236,9 @@ fn request(command: &Command, input: &mut dyn BufRead) -> Result<Request, String
         Command::ClusterRebalance => {
             Request::new("POST", "/admin/cluster/rebalance?force=true".to_string(), String::new())
         }
+        Command::ClusterSchemaLeader { to } => {
+            Request::new("POST", format!("/admin/cluster/schema-leader?to={to}"), String::new())
+        }
         Command::ClusterMove { range, to } => Request::new(
             "POST",
             format!("/admin/cluster/move?range={range}&to={to}"),

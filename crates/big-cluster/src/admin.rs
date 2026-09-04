@@ -454,6 +454,102 @@ impl<P: PagerMut + Sync> Cluster<P> {
         ))
     }
 
+    /// Hands the row-key namespace to another node.
+    ///
+    /// **The one change here that corrupts rather than fails.** Every other verb, done wrong,
+    /// leaves a range unavailable or a report unhappy; this one, done wrong, hands two different
+    /// strings the same row id - and a row id is what every bit in every fragment means. The
+    /// engine refuses a contradicting assignment outright, so what it looks like afterwards is
+    /// a write that will not land, for ever, on a key nobody can see is duplicated.
+    ///
+    /// So the order is the whole design:
+    ///
+    /// 1. **The keys go first**, every table's, and they are not scoped to a range - a row key
+    ///    has to mean the same number in every shard, so the successor needs the whole mapping
+    ///    or it will invent a second id for a string that already has one.
+    /// 2. **The floor goes with them.** A leader hands out record ids from a number held in
+    ///    memory and not yet written anywhere; a successor that started from what is *on disk*
+    ///    would hand out ids the old leader has already given away. This is the part that has
+    ///    no second chance - the ids are gone by the time anybody notices.
+    /// 3. **Then the decision commits**, and only then does the successor answer. Until it
+    ///    does, the old leader is still the one interning, which is what keeps the window from
+    ///    being one in which nobody is.
+    pub fn move_schema_leader(&self, to: &str) -> Result<()> {
+        let target = self.node_named(to)?;
+        let source = self.schema_leader();
+        if source == target {
+            return Err(ClusterError::Refused(format!("`{to}` already leads the schema")));
+        }
+
+        // 1. Every key of every table. The successor's schema has to exist first, or a key
+        // naming a field it has never heard of has nowhere to land.
+        self.match_schema(source, target)?;
+        for table in self.pull_schema(source)?.0 {
+            let keys = self.pull_keys(source, &table.name)?;
+            self.push_keys(target, &table.name, keys)?;
+        }
+
+        // 2. The floor: one past the highest id the old leader has handed out, whether or not
+        // it has landed. Taken *after* the keys, so nothing allocated during the copy is
+        // missed.
+        let floors = self.allocation_floors(source)?;
+        self.seed_floors(target, &floors)?;
+
+        // 3. The decision.
+        self.with_map(|m| {
+            m.schema_leader = target;
+            Ok(())
+        })
+        .map(|_| ())
+    }
+
+    /// One past the highest record id a node has handed out for each table, landed or not.
+    fn allocation_floors(&self, node: usize) -> Result<Vec<(String, RecordId)>> {
+        if node == self.config.this_index() {
+            return Ok(self.floors_here());
+        }
+        let bytes = self.ask(node, path::FLOORS, &[], None)?;
+        self.read(node, || wire::get_floors(&bytes))
+    }
+
+    /// This node's own floors, which only the schema leader has anything in.
+    pub fn floors_here(&self) -> Vec<(String, RecordId)> {
+        let allocated = self.allocated.lock().unwrap_or_else(|e| e.into_inner());
+        let mut out: Vec<(String, RecordId)> = Vec::new();
+        for table in self.schema() {
+            // The greater of what is on disk and what has been promised. A leader that has
+            // never allocated still has a floor - it is just the data's own high-water mark.
+            let landed =
+                self.api.max_record(&table.name).ok().flatten().map_or(0, |m| m.saturating_add(1));
+            let promised = allocated.get(&table.name).copied().unwrap_or(0);
+            out.push((table.name.clone(), landed.max(promised)));
+        }
+        out
+    }
+
+    /// Starts a node's floors at least as high as these.
+    fn seed_floors(&self, node: usize, floors: &[(String, RecordId)]) -> Result<()> {
+        if node == self.config.this_index() {
+            self.raise_floors(floors);
+            return Ok(());
+        }
+        let body = wire::put_floors(floors);
+        self.ask(node, path::FLOORS_PUT, &body, None).map(|_| ())
+    }
+
+    /// Raises this node's floors, never lowering one.
+    ///
+    /// Never lowering is what makes it safe to apply twice, and safe to apply to a node that
+    /// has been allocating on its own: a floor is a promise about ids already handed out, and
+    /// the higher of two promises is the one that keeps both.
+    pub fn raise_floors(&self, floors: &[(String, RecordId)]) {
+        let mut allocated = self.allocated.lock().unwrap_or_else(|e| e.into_inner());
+        for (table, floor) in floors {
+            let entry = allocated.entry(table.clone()).or_insert(0);
+            *entry = (*entry).max(*floor);
+        }
+    }
+
     // ---------------------------------------------------------------------------------------
     // Balancing
     // ---------------------------------------------------------------------------------------

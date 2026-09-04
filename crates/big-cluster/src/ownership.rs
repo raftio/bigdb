@@ -66,6 +66,20 @@ impl<P: PagerMut + Sync> Cluster<P> {
         self.map().stale.iter().filter_map(|n| self.name_of(*n)).collect()
     }
 
+    /// The node that owns the row-key namespace.
+    ///
+    /// **From the agreement, not the file.** It was a name in `cluster.toml` for the life of
+    /// the process, which meant draining the node holding it was draining a role nothing could
+    /// move. It is a field in the map now, and moving it is a decision like any other.
+    pub(super) fn schema_leader(&self) -> usize {
+        self.ranges.read().expect("no panic holds this lock").schema_leader
+    }
+
+    /// Whether this node is the one that assigns row ids.
+    pub(super) fn leads_schema(&self) -> bool {
+        self.schema_leader() == self.config.this_index()
+    }
+
     /// A node's name, or `None` for an index the cluster file never had.
     ///
     /// An option rather than an index, because a node can now join at runtime: a `NodeId` from

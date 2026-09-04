@@ -716,3 +716,25 @@ pub fn get_load(bytes: &[u8]) -> Result<(u64, u64)> {
     finished(&r)?;
     Ok(out)
 }
+
+/// One past the highest record id handed out for each table.
+pub fn put_floors(floors: &[(String, RecordId)]) -> Vec<u8> {
+    let mut out = Vec::new();
+    put_count(&mut out, floors.len());
+    for (table, floor) in floors {
+        put_str(&mut out, table);
+        put_u64(&mut out, *floor);
+    }
+    out
+}
+
+pub fn get_floors(bytes: &[u8]) -> Result<Vec<(String, RecordId)>> {
+    let mut r = Reader::new(bytes);
+    let n = r.count()?;
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        out.push((r.str()?, r.u64()?));
+    }
+    finished(&r)?;
+    Ok(out)
+}

@@ -139,6 +139,10 @@ pub enum Command {
     },
     /// `cluster rebalance` - take one balancing step, if the facts call for one.
     ClusterRebalance,
+    /// `cluster schema-leader <node>` - hand the row-key namespace over.
+    ClusterSchemaLeader {
+        to: String,
+    },
     Health,
     Ready,
     Metrics,
@@ -560,6 +564,10 @@ fn command(positional: &[String], scoped: Vec<(String, String)>) -> Result<Comma
                 .parse()
                 .map_err(|_| format!("`{range}` is not a range id; write `cluster move 2 to c`"))?;
             Command::ClusterMove { range, to: (*node).to_string() }
+        }
+        ["cluster", "schema-leader", node] => {
+            only(&scoped, "cluster schema-leader", &[])?;
+            Command::ClusterSchemaLeader { to: (*node).to_string() }
         }
         ["cluster", "rebalance"] => {
             only(&scoped, "cluster rebalance", &[])?;

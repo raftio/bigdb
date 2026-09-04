@@ -164,6 +164,10 @@ pub mod path {
     pub const EPOCH: &str = "/internal/epoch";
     /// What a node weighs, for the balancer.
     pub const LOAD: &str = "/internal/load";
+    /// One past the highest record id a node has handed out, per table. Read and written when
+    /// the row-key namespace changes hands.
+    pub const FLOORS: &str = "/internal/floors";
+    pub const FLOORS_PUT: &str = "/internal/floors/put";
 }
 
 /// One node, playing whichever of the three roles a given request needs.

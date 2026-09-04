@@ -2008,3 +2008,55 @@ fn the_balancer_does_nothing_until_it_is_switched_on() {
     let leader = leader_of(&[a, b, spare]);
     assert_eq!(ok(leader, "POST", "/admin/cluster/rebalance", ""), r#"{"did":null}"#);
 }
+
+/// **The row-key namespace moves, and nothing is handed the same id twice.**
+///
+/// This is the one change that corrupts rather than fails. A successor that started from what
+/// is on disk would re-issue record ids the old leader had already given away, and would invent
+/// a second row id for a string that already had one - which the engine refuses outright, so
+/// what it looks like afterwards is a write that will never land on a key nobody can see is
+/// duplicated.
+#[test]
+fn the_schema_leader_moves_without_reissuing_anything() {
+    let (a, b, spare) = (free_port(), free_port(), free_port());
+    let file = three(a, b, spare);
+    let _a = start_agreeing(&file, "a", a);
+    let _b = start_agreeing(&file, "b", b);
+    let _spare = start_agreeing(&file, "a-spare", spare);
+    until("an elected leader", || ready(a).contains(r#""leader":""#));
+
+    ok(a, "POST", "/table/tx", "");
+    ok(a, "POST", "/table/tx/field/amount?kind=int&bit_depth=32", "");
+    ok(a, "POST", "/table/tx/field/country?kind=set", "");
+    ok(a, "POST", "/sql", "INSERT INTO tx (amount, country) VALUES (5, 'GB')");
+    ok(a, "POST", "/sql", "INSERT INTO tx (amount, country) VALUES (7, 'FR')");
+    assert_eq!(ok(a, "POST", "/table/tx/query", "Count(All())"), r#"{"count":2}"#);
+
+    let leader = leader_of(&[a, b, spare]);
+    assert!(ok(a, "GET", "/cluster/topology", "").contains(r#""schema_leader":"a""#));
+
+    let body = ok(leader, "POST", "/admin/cluster/schema-leader?to=b", "");
+    assert!(body.contains(r#""schema_leader":"b""#), "{body}");
+    until("every node to know who leads the schema", || {
+        [a, b, spare]
+            .iter()
+            .all(|p| ok(*p, "GET", "/cluster/topology", "").contains(r#""schema_leader":"b""#))
+    });
+
+    // **The keys came across.** A key `b` had never seen would be given a second row id, and
+    // the group below would come back with a name missing.
+    let groups = ok(a, "POST", "/table/tx/query", "GroupBy(All(), field=\"country\")");
+    assert!(groups.contains("GB") && groups.contains("FR"), "{groups}");
+
+    // **And so did the floor.** Ids keep going up rather than starting again over records that
+    // are already there.
+    ok(a, "POST", "/sql", "INSERT INTO tx (amount, country) VALUES (9, 'US')");
+    ok(b, "POST", "/sql", "INSERT INTO tx (amount, country) VALUES (11, 'GB')");
+    assert_eq!(
+        ok(a, "POST", "/table/tx/query", "Count(All())"),
+        r#"{"count":4}"#,
+        "four inserts, four records - nothing overwrote anything"
+    );
+    let after = ok(b, "POST", "/table/tx/query", "GroupBy(All(), field=\"country\")");
+    assert!(after.contains("US"), "a key invented after the handover works too: {after}");
+}

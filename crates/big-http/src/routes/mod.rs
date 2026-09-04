@@ -250,6 +250,10 @@ enum Target<'a> {
     PeerEpoch,
     /// What this node weighs, for the balancer.
     PeerLoad,
+    /// The record ids this node has handed out, read and written when the row-key namespace
+    /// changes hands.
+    PeerFloors,
+    PeerFloorsPut,
     Repair,
     Backup,
     /// What the cluster looks like right now, for an operator or an autoscaler.
@@ -269,6 +273,8 @@ enum Target<'a> {
     ClusterCancel,
     /// Take one balancing step, if the facts call for one.
     ClusterRebalance,
+    /// Hand the row-key namespace to another node.
+    ClusterSchemaLeader,
 }
 
 impl<'a> Target<'a> {
@@ -283,6 +289,8 @@ impl<'a> Target<'a> {
             Self::PeerQuery
                 | Self::PeerEpoch
                 | Self::PeerLoad
+                | Self::PeerFloors
+                | Self::PeerFloorsPut
                 | Self::PeerRecords
                 | Self::PeerDigest
                 | Self::PeerImport
@@ -354,7 +362,8 @@ impl<'a> Target<'a> {
             | Self::ClusterRemove
             | Self::ClusterMove
             | Self::ClusterCancel
-            | Self::ClusterRebalance => Guard::Needs(Privilege::Operate, ObjectRef::Server),
+            | Self::ClusterRebalance
+            | Self::ClusterSchemaLeader => Guard::Needs(Privilege::Operate, ObjectRef::Server),
             Self::Query(t) | Self::Records(t) => Guard::Needs(Privilege::Select, table(t)),
             Self::Import(t) => Guard::Needs(Privilege::Insert, table(t)),
             // Deleting records is not inserting them: a credential that may add facts is not
@@ -392,6 +401,8 @@ impl<'a> Target<'a> {
             | Self::PeerKeysPut
             | Self::PeerEpoch
             | Self::PeerLoad
+            | Self::PeerFloors
+            | Self::PeerFloorsPut
             | Self::PeerRepaired => Guard::Node,
         }
     }
@@ -434,6 +445,8 @@ fn resolve<'a>(method: &str, segments: &[&'a str]) -> Option<Target<'a>> {
         ("POST", ["internal", "schema"]) => Target::PeerSchema,
         ("POST", ["internal", "epoch"]) => Target::PeerEpoch,
         ("POST", ["internal", "load"]) => Target::PeerLoad,
+        ("POST", ["internal", "floors"]) => Target::PeerFloors,
+        ("POST", ["internal", "floors", "put"]) => Target::PeerFloorsPut,
         ("POST", ["repair"]) => Target::Repair,
         ("GET", ["cluster", "topology"]) => Target::ClusterTopology,
         ("POST", ["admin", "cluster", "split"]) => Target::ClusterSplit,
@@ -445,6 +458,7 @@ fn resolve<'a>(method: &str, segments: &[&'a str]) -> Option<Target<'a>> {
         ("POST", ["admin", "cluster", "move"]) => Target::ClusterMove,
         ("POST", ["admin", "cluster", "cancel"]) => Target::ClusterCancel,
         ("POST", ["admin", "cluster", "rebalance"]) => Target::ClusterRebalance,
+        ("POST", ["admin", "cluster", "schema-leader"]) => Target::ClusterSchemaLeader,
         ("POST", ["admin", "backup"]) => Target::Backup,
         _ => return None,
     })
@@ -567,6 +581,14 @@ pub fn dispatch<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request) -> Answered
         Target::PeerKeysPut => peer_keys_put(ctx, req),
         Target::PeerRepaired => peer_repaired(ctx, req),
         Target::PeerEpoch => Response::binary(wire::put_u64_body(ctx.cluster.map().epoch)),
+        Target::PeerFloors => Response::binary(wire::put_floors(&ctx.cluster.floors_here())),
+        Target::PeerFloorsPut => match wire::get_floors(&req.body) {
+            Err(e) => unreadable(&e),
+            Ok(floors) => {
+                ctx.cluster.raise_floors(&floors);
+                Response::binary(wire::put_u64_body(floors.len() as u64))
+            }
+        },
         Target::PeerLoad => {
             let load = ctx.cluster.load();
             Response::binary(wire::put_load(load.pages.unwrap_or(0), load.frontier))
@@ -587,6 +609,7 @@ pub fn dispatch<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request) -> Answered
         Target::ClusterMove => cluster_move(ctx, req),
         Target::ClusterCancel => cluster_cancel(ctx, req),
         Target::ClusterRebalance => cluster_rebalance(ctx, req),
+        Target::ClusterSchemaLeader => cluster_schema_leader(ctx, req),
         Target::Backup => backup(ctx, req),
     };
     Answered { response, who }

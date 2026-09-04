@@ -276,7 +276,7 @@ impl<P: PagerMut + Sync> Cluster<P> {
             let rows = self.intern(table, field, &misses)?;
             if rows.len() != misses.len() {
                 return Err(ClusterError::Mismatch {
-                    node: self.config.leader().name.clone(),
+                    node: self.describe(self.schema_leader()),
                     what: "a different number of row ids than keys",
                 });
             }
@@ -297,10 +297,10 @@ impl<P: PagerMut + Sync> Cluster<P> {
     ///
     /// Answers the first id of the run; the caller takes `count` consecutive ids from it.
     pub(super) fn allocate(&self, table: &str, count: u64) -> Result<RecordId> {
-        if self.config.leads_schema() {
+        if self.leads_schema() {
             return self.allocate_here(table, count);
         }
-        let leader = self.config.leader_index();
+        let leader = self.schema_leader();
         let body = wire::AllocateRequest { table: table.to_string(), count }.encode();
         let bytes = self.ask(leader, path::ALLOCATE, &body, None).map_err(|e| match e {
             ClusterError::Unreachable { node, why, .. } => {
@@ -309,7 +309,7 @@ impl<P: PagerMut + Sync> Cluster<P> {
             other => other,
         })?;
         wire::get_u64_body(&bytes)
-            .map_err(|why| ClusterError::Wire { node: self.config.leader().name.clone(), why })
+            .map_err(|why| ClusterError::Wire { node: self.describe(self.schema_leader()), why })
     }
 
     /// The leader's own half of `Cluster::allocate`.
@@ -375,10 +375,10 @@ impl<P: PagerMut + Sync> Cluster<P> {
     /// Not queued, not assigned locally and reconciled later: two row ids for one string is a
     /// silently wrong answer, and a refusal is not.
     pub(super) fn intern(&self, table: &str, field: &str, keys: &[&str]) -> Result<Vec<RowId>> {
-        if self.config.leads_schema() {
+        if self.leads_schema() {
             return Ok(self.api.intern_keys(table, field, keys)?);
         }
-        let leader = self.config.leader_index();
+        let leader = self.schema_leader();
         let body = wire::InternRequest {
             table: table.to_string(),
             field: field.to_string(),
@@ -394,7 +394,7 @@ impl<P: PagerMut + Sync> Cluster<P> {
             other => other,
         })?;
         wire::get_rows_ids(&bytes)
-            .map_err(|why| ClusterError::Wire { node: self.config.leader().name.clone(), why })
+            .map_err(|why| ClusterError::Wire { node: self.describe(self.schema_leader()), why })
     }
 }
 
