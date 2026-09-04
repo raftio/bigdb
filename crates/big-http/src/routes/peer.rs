@@ -49,7 +49,7 @@ pub(super) fn peer_query<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request) ->
     };
     match ctx.api().execute(&request.plan, &opts) {
         Ok(value) => Response::binary(wire::encode_value(&value)),
-        Err(e) => Response::from_error(&e),
+        Err(e) => crate::status::response_for(&e),
     }
 }
 
@@ -70,7 +70,7 @@ pub(super) fn peer_records<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request) 
             wire::put_records(&mut out, &ids);
             Response::binary(out)
         }
-        Err(e) => Response::from_error(&e),
+        Err(e) => crate::status::response_for(&e),
     }
 }
 
@@ -102,7 +102,7 @@ pub(super) fn peer_import<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request) -
     let facts: Vec<big_embed::Fact<'_>> = request.facts.iter().map(OwnedFact::as_fact).collect();
     match ctx.api().import_with_keys(&request.table, &keys, &facts) {
         Ok(()) => Response::binary(wire::put_u64_body(facts.len() as u64)),
-        Err(e) => Response::from_error(&e),
+        Err(e) => crate::status::response_for(&e),
     }
 }
 
@@ -119,7 +119,7 @@ pub(super) fn peer_delete<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request) -
     }
     match ctx.api().delete(&request.table, &request.records) {
         Ok(n) => Response::binary(wire::put_u64_body(n)),
-        Err(e) => Response::from_error(&e),
+        Err(e) => crate::status::response_for(&e),
     }
 }
 
@@ -141,7 +141,7 @@ pub(super) fn peer_intern<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request) -
             wire::put_rows_ids(&mut out, &rows);
             Response::binary(out)
         }
-        Err(e) => Response::from_error(&e),
+        Err(e) => crate::status::response_for(&e),
     }
 }
 
@@ -181,7 +181,7 @@ pub(super) fn peer_ddl<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request) -> R
     };
     match big_cluster::apply_ddl(ctx.api(), &op) {
         Ok(n) => Response::binary(wire::put_u64_body(n)),
-        Err(e) => Response::from_error(&e),
+        Err(e) => crate::status::response_for(&e),
     }
 }
 
@@ -202,7 +202,7 @@ pub(super) fn peer_digest<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request) -
     };
     match big_cluster::digest::digest_in(ctx.api(), shards) {
         Ok(d) => Response::binary(wire::put_u64_body(d)),
-        Err(e) => Response::from_error(&e),
+        Err(e) => crate::status::response_for(&e),
     }
 }
 
@@ -422,7 +422,7 @@ pub(super) fn peer_fragments<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request
             wire::put_fragment_list(&mut out, &list);
             Response::binary(out)
         }
-        Err(e) => Response::from_error(&e),
+        Err(e) => crate::status::response_for(&e),
     }
 }
 
@@ -436,7 +436,7 @@ pub(super) fn peer_fragment<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request)
             wire::FragmentBody { addr: request.addr, meta: meta.unwrap_or_default(), data }
                 .encode(),
         ),
-        Err(e) => Response::from_error(&e),
+        Err(e) => crate::status::response_for(&e),
     }
 }
 
@@ -451,7 +451,7 @@ pub(super) fn peer_fragment_put<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Requ
     };
     match ctx.api().replace_fragment(&body.addr, body.meta, &body.data) {
         Ok(()) => Response::binary(Vec::new()),
-        Err(e) => Response::from_error(&e),
+        Err(e) => crate::status::response_for(&e),
     }
 }
 
@@ -471,7 +471,7 @@ pub(super) fn peer_keys<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request) -> 
             }
             .encode(),
         ),
-        Err(e) => Response::from_error(&e),
+        Err(e) => crate::status::response_for(&e),
     }
 }
 
@@ -487,7 +487,7 @@ pub(super) fn peer_keys_put<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request)
         .collect();
     match ctx.api().assign_keys(&body.table, &keys) {
         Ok(()) => Response::binary(Vec::new()),
-        Err(e) => Response::from_error(&e),
+        Err(e) => crate::status::response_for(&e),
     }
 }
 

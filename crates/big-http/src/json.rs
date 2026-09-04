@@ -22,36 +22,12 @@ use big_db::RecordId;
 use big_embed::{Datum, Format, GroupAt, GroupKey, ResultSet, TableInfo, TimeUnit};
 use big_exec::{Group, Value};
 
-/// Escapes a string into a JSON string literal, including the quotes.
+/// The JSON primitives, re-exported from [`big_wire`].
 ///
-/// Control characters go out as `\u00XX` rather than raw, because a raw one makes the document
-/// invalid and a row key is user data that can contain anything.
-pub fn string(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
-}
-
-/// An error body: a stable code and a sentence.
-///
-/// The code is what a client matches on and the message is what a person reads. Keeping both
-/// in every error body is the whole reason the codes exist - a body with only prose forces
-/// clients to match on prose.
-pub fn error(code: &str, message: &str) -> String {
-    format!("{{\"error\":{},\"code\":{}}}", string(message), string(code))
-}
+/// They moved out with the parser: escaping a string and shaping an error body are things a
+/// proxy needs and a database is not required for. Everything below them here — rows, result
+/// sets, schemas, topologies — is shaped by the engine's types and stayed.
+pub use big_wire::json::{error, string};
 
 /// Which slice of a record list to return.
 ///

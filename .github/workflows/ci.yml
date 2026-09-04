@@ -75,6 +75,36 @@ jobs:
               exit 1
             fi
           done
+      - name: the proxy links no engine and no password hasher
+        run: |
+          # `big-proxy` forwards a client's Authorization header and never reads it, opens no
+          # file and holds no credential. That is the whole security story of the component, and
+          # `big-wire` was split out of `big-http` so it could be a fact about the dependency
+          # graph rather than a sentence in a readme.
+          #
+          # `-e normal` matters: the tests legitimately use `big-http`, `big-cluster` and
+          # `big-embed` to run real daemons and to hold this crate's copied constants to the
+          # originals. Dev-dependencies never reach the shipped binary.
+          if cargo tree -p big-proxy -e normal \
+               | grep -E 'argon2|blake2|big-engine|big-db|big-sql|big-exec|big-embed|big-cluster'; then
+            echo "big-proxy grew a dependency on the engine or on a password hasher." >&2
+            echo "See crates/big-wire/readme.md for why that must not happen." >&2
+            exit 1
+          fi
+
+  # Real `big serve` processes behind a real `bigproxy`, with a node stopped mid-suite. Out of
+  # the default run for the same reason `e2e-cluster` is: failover is decided by wall-clock
+  # heartbeats, and a timing test in the default suite is one that eventually fails for reasons
+  # nobody changed.
+  e2e-proxy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Quoted, like the job below: a plain scalar ending in a colon is a YAML mapping, and an
+      # unquoted `proxy::` here once made the whole workflow unparseable.
+      - run: "cargo test -p big-e2e -- --ignored proxy::"
 
   # Two real `big serve` processes and a failover decided by wall-clock heartbeats. Out of the job
   # above because a timing test in the default run is a test that eventually fails for reasons

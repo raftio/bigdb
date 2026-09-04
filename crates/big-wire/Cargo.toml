@@ -1,0 +1,21 @@
+[package]
+name = "big-wire"
+description = "HTTP/1.1 framing: one request off a socket, one response back, and the log line between"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "readme.md"
+keywords = ["http", "parser", "server"]
+categories = ["web-programming::http-server"]
+
+# **One, and it brings nothing with it.** This crate is HTTP/1.1 framing and nothing else, so a
+# process that only needs to speak HTTP — `big-proxy` — links it without an engine, a SQL
+# planner or a password hasher. CI asserts that absence rather than trusting the readme.
+[dependencies]
+# For one function: base64-decoding an `Authorization: Basic` header. It lives there because
+# `big-tls` needs the same decoder for PEM, and two copies of a base64 decoder is one too many.
+# With the `tls` feature off — which is how this crate takes it — `big-tls` has no dependencies
+# at all, so this line adds a module and not a tree.
+big-tls.workspace = true

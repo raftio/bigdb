@@ -20,7 +20,7 @@
 //! the unredacted detail - so that the log line can report a failure without parsing the body
 //! back out of the JSON that was just written.
 
-use crate::{json, status};
+use crate::json;
 
 /// A status line, a content type, a body, and whatever extra headers the caller added.
 ///
@@ -91,17 +91,6 @@ impl Response {
         }
     }
 
-    /// An engine error, classified once by [`status::Failure`].
-    pub fn from_error(e: &big_embed::ApiError) -> Self {
-        let f = status::Failure::new(e);
-        let mut out = Self::failure(f.status, f.code, &f.message);
-        if f.is_internal() {
-            out.detail = Some(f.detail);
-        }
-        out
-    }
-
-    /// `400`, code `bad_request`.
     pub fn bad_request(message: &str) -> Self {
         Self::failure(400, "bad_request", message)
     }

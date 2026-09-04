@@ -5,7 +5,7 @@
 #   ./users.sh                  # writes secrets/users, mode 600, and prints the passwords
 #   ./certs.sh                  # writes secrets/peer-ca.pem and one certificate per node
 #   docker compose up -d
-#   curl -u ops:$PASSWORD localhost:7654/ready
+#   curl -u ops:$PASSWORD localhost:7654/ready      # the proxy's own, and the rotation
 #   curl -u ops:$PASSWORD localhost:7654/verify
 #
 # The published port is plaintext on loopback, which is why it is published on 127.0.0.1 and
@@ -13,9 +13,13 @@
 # for - and a deployment reachable from anywhere else needs --tls-cert on the published node
 # too, or a proxy in front of it.
 #
-# Any node answers any request: the one that receives it plans the query and fans it out. Only
-# `a` is published, because publishing three ports would suggest a client has to choose, and it
-# does not.
+# Any node answers any request: the one that receives it plans the query and fans it out — so a
+# client never had to choose. What it did have to do, until there was a proxy, was pick *one*
+# address and keep using it: the clients hold one connection to one host and have no failover.
+# So the published port is `proxy` now. A client still sees one address; it is no longer one
+# machine.
+#
+# `stop a` and the queries keep working. That is the whole difference.
 
 # Everything the three nodes share. Not the volumes: a merge key replaces a list rather than
 # extending it, so a `volumes` here would be silently overridden by each service's own and read
@@ -45,8 +49,9 @@ x-node: &node
 services:
   a:
     <<: *node
-    ports:
-      - "127.0.0.1:7654:7654"
+    # **No `ports:`, and that is the change the proxy makes.** Publishing one node made that
+    # node a single point of failure for machines that were all healthy — the clients hold one
+    # connection to one address and do not fail over. The published port is `proxy` now.
     volumes:
       - a-data:/data
       - ./cluster.toml:/etc/big/cluster.toml:ro
@@ -197,6 +202,52 @@ services:
       # exclusive lock the daemon holds - so `POST /admin/backup` is the online path.
       - --backup-dir
       - /data
+
+  # The front door. One address, three nodes behind it, and a request that lands on a node which
+  # has stopped serving lands somewhere else instead.
+  #
+  # It adds no routing: every node already plans a query and fans it out, so this answers "which
+  # node is alive" and nothing more. What it does add is a route allowlist — `/internal/*` is
+  # unreachable through it, and cannot be made reachable, because it presents no client
+  # certificate either.
+  proxy:
+    build:
+      context: ../..
+      dockerfile: deploy/proxy/Dockerfile
+    restart: unless-stopped
+    # The only published port. Loopback only, for the same reason the node's was: this hop is in
+    # the clear. Add --tls-cert and --tls-key before publishing it wider.
+    ports:
+      - "127.0.0.1:7654:7650"
+    depends_on: [a, b, a-spare]
+    volumes:
+      # The same file the nodes read. This takes `name` and `addr` out of it and ignores the
+      # rest — it does not route by key, so the shard map is none of its business. One file, so
+      # a node that moves moves once.
+      - ./cluster.toml:/etc/bigproxy/cluster.toml:ro
+      # `peer-ca.pem` only, and only to *verify* the nodes' certificates. A certificate signed
+      # by that CA would name a node and would reach /internal/*; there is deliberately no flag
+      # that loads one. Trusting a CA is not being trusted by it.
+      - ./secrets:/etc/bigproxy/secrets:ro
+    command:
+      - 0.0.0.0:7650
+      - --cluster
+      - /etc/bigproxy/cluster.toml
+      - --upstream-ca
+      - /run/bigproxy/peer-ca.pem
+      # Published to 127.0.0.1 above, so the clear-text hop is inside one machine. Drop this and
+      # add --tls-cert before publishing it wider.
+      - --insecure-no-tls
+    healthcheck:
+      # Liveness. A proxy whose upstreams are all down is still a healthy proxy: it is answering,
+      # and `503` is the correct answer. `/ready` is where an orchestrator asks the other
+      # question, and restarting this would not bring a database back.
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:7650/health"]
+      interval: 10s
+      timeout: 2s
+      start_period: 5s
+      retries: 3
+    stop_grace_period: 2s
 
 # One volume per node. **Not one shared between them**: one process holds one file - the pager
 # takes an exclusive lock - and two nodes pointed at one volume is two nodes fighting over a

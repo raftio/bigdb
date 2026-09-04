@@ -16,9 +16,14 @@ members = [
     "crates/big-exec",
     "crates/big-embed",
     "crates/big-tls",
+    "crates/big-wire",
     "crates/big-cluster",
     "crates/big-http",
-    # Everything that ships as an executable: `big` and `bigctl`, and nothing else.
+    # One address in front of many nodes. It ships an executable of its own rather than a third
+    # `[[bin]]` in `big-bin`, because the point of it is that it opens no file and links no
+    # engine, and a shared package would make that unobservable from outside.
+    "crates/big-proxy",
+    # Everything else that ships as an executable: `big` and `bigctl`.
     "crates/big-bin",
     "crates/big-e2e",
     # Not part of the engine: it pulls in rival engines to measure against.
@@ -57,9 +62,11 @@ big-keys = { path = "crates/big-keys", version = "0.1.0" }
 big-page = { path = "crates/big-page", version = "0.1.0" }
 big-pager = { path = "crates/big-pager", version = "0.1.0" }
 big-plan = { path = "crates/big-plan", version = "0.1.0" }
+big-proxy = { path = "crates/big-proxy", version = "0.1.0" }
 big-rbac = { path = "crates/big-rbac", version = "0.1.0" }
 big-sql = { path = "crates/big-sql", version = "0.1.0" }
 big-tls = { path = "crates/big-tls", version = "0.1.0" }
+big-wire = { path = "crates/big-wire", version = "0.1.0" }
 # No version: `publish = false`, so it can only ever be reached by path.
 big-testfile = { path = "crates/big-testfile" }
 big-message = { path = "contrib/big-message" }

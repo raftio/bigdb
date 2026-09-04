@@ -21,6 +21,9 @@ tls = ["big-tls/tls"]
 # No web framework. The surface is a dozen routes and a JSON writer; pulling in an async
 # runtime for that would be a larger commitment than the whole engine has made so far.
 [dependencies]
+# The HTTP/1.1 framing, with no dependencies of its own. Split out so `big-proxy` can speak
+# HTTP without linking an engine; re-exported below so nothing downstream noticed.
+big-wire.workspace = true
 big-embed.workspace = true
 big-civil.workspace = true
 # For the status a refused role maps to. `DbError::Rbac` delegates, so this crate has to be

@@ -28,6 +28,7 @@
 //! filesystem layout is not something a client is owed. The full message goes to the log
 //! against the request id, which is in the response, so an operator can still join the two.
 
+use crate::Response;
 use big_db::DbError;
 use big_embed::ApiError;
 use big_engine::bitmap::field::FieldError;
@@ -281,4 +282,15 @@ fn store(e: &StoreError) -> u16 {
         | StoreError::SnapshotNotFound(_)
         | StoreError::UnallocatedPage(_) => 500,
     }
+}
+
+/// The response an engine error deserves.
+///
+/// This was `Response::from_error`, and it is here because it could not follow `Response` into
+/// `big-wire`: classifying an error means matching on the engine's whole error tree, and a crate
+/// that speaks only HTTP must not know that tree exists. `status.rs` is already the one place
+/// that knows both, so it is the one place this belongs.
+pub fn response_for(e: &ApiError) -> Response {
+    let f = Failure::new(e);
+    Response::failure(f.status, f.code, &f.message)
 }

@@ -37,10 +37,11 @@ const PATIENCE: Duration = Duration::from_secs(20);
 
 /// Which package builds which binary.
 ///
-/// Two, from one package, where there were four from four. `big-bin` is the only crate in the
-/// workspace with a `[[bin]]`, so this table is short by construction now rather than by
-/// upkeep.
-const BINARIES: &[(&str, &str)] = &[("big", "big-bin"), ("bigctl", "big-bin")];
+/// `big-bin` ships the two an operator runs against a database. `big-proxy` ships its own
+/// rather than adding a third `[[bin]]` there, because the point of it is that it links no
+/// engine and opens no file — and a shared package would make that unobservable from outside.
+const BINARIES: &[(&str, &str)] =
+    &[("big", "big-bin"), ("bigctl", "big-bin"), ("bigproxy", "big-proxy")];
 
 /// The directory this test executable was built into, which is where the binaries land.
 ///

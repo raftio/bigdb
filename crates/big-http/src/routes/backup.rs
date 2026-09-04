@@ -86,7 +86,7 @@ pub(super) fn backup<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request) -> Res
     ctx.backup_running.store(false, Ordering::SeqCst);
 
     match outcome {
-        Err(e) => Response::from_error(&e),
+        Err(e) => crate::status::response_for(&e),
         Ok(done) => {
             // The size of what was written, which is the number an operator budgets with and
             // is not derivable from the source's page count: the copy is compact, so it is

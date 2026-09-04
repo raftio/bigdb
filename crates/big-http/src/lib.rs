@@ -44,17 +44,21 @@
 
 pub mod auth;
 pub mod json;
-pub mod log;
 pub mod metrics;
-pub mod request;
-pub mod response;
 pub mod routes;
 pub mod status;
 mod watchdog;
 
+/// Re-exported from [`big_wire`], which is where the HTTP/1.1 framing lives now.
+///
+/// Kept at these paths so `big_http::Request`, `big_http::log` and the rest go on resolving: the
+/// split was for `big-proxy`'s dependency graph, not for anybody's imports. The one thing that
+/// did move is `Response::from_error`, which classifies an engine error and so could not follow
+/// the parser out — it is [`status::response_for`] now.
+pub use big_wire::{log, request, response};
+
 pub use auth::Auth;
-pub use request::Request;
-pub use response::{reason_for, Response};
+pub use big_wire::{reason_for, Request, Response, MAX_BODY, MAX_INTERNAL_BODY};
 
 use big_cluster::Cluster;
 use big_embed::Api;
@@ -67,18 +71,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 use watchdog::Watchdog;
-
-/// Largest request body accepted, so a single client cannot ask the process to allocate
-/// without bound.
-pub const MAX_BODY: usize = 8 << 20;
-
-/// The same, for the `/internal/` routes one node uses to reach another.
-///
-/// Larger because the body is not a stranger's: it is what a coordinator made of a request
-/// that had already passed [`MAX_BODY`], and the binary encoding of a batch of facts runs to
-/// roughly twice the text it was parsed from - a length and a tag per field where the text had
-/// a space. A public body that grew into that headroom is still refused; only a peer's is not.
-pub const MAX_INTERNAL_BODY: usize = 4 * MAX_BODY;
 
 /// Every ceiling the server enforces on itself.
 ///
@@ -609,6 +601,13 @@ fn serve_one<P: PagerMut + Sync>(
     // Who the request turned out to be, filled in once the route has decided. Declared out here
     // so that the log line below can reach it whether or not a handler ever ran.
     let mut who: Option<(&'static str, String)> = None;
+    // When the request was actually in hand. **Not `started`**, which begins before
+    // `Request::read` and therefore runs while a worker sits blocked waiting for a client to
+    // send anything - on a pooled connection that idle wait can be seconds, and reporting it as
+    // time this server spent working produced a "server" figure larger than the client's own
+    // round trip. The log below keeps using `started`, because the whole slot is what an
+    // operator wants to see; the header wants the work.
+    let mut in_hand: Option<Instant> = None;
 
     let (response, method, path, bytes_in, keep) = match Request::read(wire) {
         // Nobody is left to answer. A kept-alive connection ends this way every time, so it is
@@ -616,6 +615,7 @@ fn serve_one<P: PagerMut + Sync>(
         // client.
         Err(request::RequestError::Closed) => return Ok(false),
         Ok(req) => {
+            in_hand = Some(Instant::now());
             let bytes_in = req.body.len();
             let (method, path) = (req.method.clone(), req.path.clone());
             let keep = req.wants_keep_alive();
@@ -654,7 +654,21 @@ fn serve_one<P: PagerMut + Sync>(
         && !wire.is_poisoned()
         && !wire.has_pending_plaintext();
 
-    let response = response.with_header("X-Request-Id", &id);
+    // **How long this server took, measured from the request being in hand to just before the
+    // bytes go out.**
+    //
+    // A client timing a request from the outside cannot separate its own network from this
+    // server's work, and over a tunnel or a long link the network is most of what it measures.
+    // Sending this costs one header and makes the difference between "the query was slow" and
+    // "getting to the query was slow" answerable from the other end.
+    //
+    // Both ends of the measurement matter: it starts at `in_hand` rather than `started` so that
+    // a worker waiting for a client to speak is not counted, and it stops before the write
+    // rather than after so that a slow client reading the answer is not either. `elapsed` below
+    // keeps measuring the whole slot, for the log and the latency histogram, which is the
+    // number an operator wants.
+    let served_us = in_hand.unwrap_or(started).elapsed().as_micros().min(u64::MAX as u128) as u64;
+    let response = response.with_header("X-Request-Id", &id).with_header("X-Served-Us", served_us);
     let encoded = response.encode(keep);
 
     // A cancelled request means the client is already gone, so writing is pointless and
