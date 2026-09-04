@@ -38,6 +38,10 @@ pub(super) fn query<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request, table: 
         timeout: ctx.query_timeout,
         cancel: ctx.cancel.clone(),
         database: req.param("database").map(|d| d.into_owned()),
+        // A client's request names no shards. This node is the coordinator, and it scopes each
+        // leg of its own fan-out - a client that could ask for a shard range would be a client
+        // able to see half a cluster and call it an answer.
+        shards: None,
     };
     match ctx.cluster.query(table, text, &opts) {
         // Refused rather than ignored. `Count(All())&limit=10` is a client that believes it is
@@ -83,6 +87,10 @@ pub(super) fn sql<P: PagerMut + Sync>(
         timeout: ctx.query_timeout,
         cancel: ctx.cancel.clone(),
         database: req.param("database").map(|d| d.into_owned()),
+        // A client's request names no shards. This node is the coordinator, and it scopes each
+        // leg of its own fan-out - a client that could ask for a shard range would be a client
+        // able to see half a cluster and call it an answer.
+        shards: None,
     };
 
     // **Translated once, for both decisions.** What the statement is decides what it costs and

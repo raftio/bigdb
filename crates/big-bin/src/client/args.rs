@@ -107,6 +107,42 @@ pub enum Command {
     },
     Verify,
     Repair,
+    /// `cluster topology` - what the cluster looks like right now.
+    ClusterTopology,
+    /// `cluster split <shard> [to <node>]` - cut a range in two.
+    ClusterSplit {
+        at: u64,
+        to: Option<String>,
+    },
+    /// `cluster merge <range>` - join a range to the one after it.
+    ClusterMerge {
+        range: u64,
+    },
+    /// `cluster add-node <name> <addr>` - a node joins, as a learner.
+    ClusterAddNode {
+        name: String,
+        addr: String,
+    },
+    /// `cluster admit|drain|remove <name>` - the three one-node changes.
+    ClusterMember {
+        verb: &'static str,
+        name: String,
+    },
+    /// `cluster move <range> to <node>` - hand a populated range over.
+    ClusterMove {
+        range: u64,
+        to: String,
+    },
+    /// `cluster cancel <range>` - abandon a move in flight.
+    ClusterCancel {
+        range: u64,
+    },
+    /// `cluster rebalance` - take one balancing step, if the facts call for one.
+    ClusterRebalance,
+    /// `cluster schema-leader <node>` - hand the row-key namespace over.
+    ClusterSchemaLeader {
+        to: String,
+    },
     Health,
     Ready,
     Metrics,
@@ -485,6 +521,72 @@ fn command(positional: &[String], scoped: Vec<(String, String)>) -> Result<Comma
             only(&scoped, "repair", &[])?;
             Command::Repair
         }
+
+        // **Three verbs, and the shape of the cluster is all of them.** An operator types
+        // these; an autoscaler and a Kubernetes controller reach the same routes directly.
+        ["cluster", "topology"] => {
+            only(&scoped, "cluster topology", &[])?;
+            Command::ClusterTopology
+        }
+        ["cluster", "split", at] => {
+            only(&scoped, "cluster split", &[])?;
+            let at = at
+                .parse()
+                .map_err(|_| format!("`{at}` is not a shard number; write `cluster split 900`"))?;
+            Command::ClusterSplit { at, to: None }
+        }
+        ["cluster", "split", at, "to", node] => {
+            only(&scoped, "cluster split", &[])?;
+            let at = at
+                .parse()
+                .map_err(|_| format!("`{at}` is not a shard number; write `cluster split 900`"))?;
+            Command::ClusterSplit { at, to: Some((*node).to_string()) }
+        }
+        ["cluster", "add-node", name, addr] => {
+            only(&scoped, "cluster add-node", &[])?;
+            Command::ClusterAddNode { name: (*name).to_string(), addr: (*addr).to_string() }
+        }
+        ["cluster", "admit", name] => {
+            only(&scoped, "cluster admit", &[])?;
+            Command::ClusterMember { verb: "admit", name: (*name).to_string() }
+        }
+        ["cluster", "drain", name] => {
+            only(&scoped, "cluster drain", &[])?;
+            Command::ClusterMember { verb: "drain", name: (*name).to_string() }
+        }
+        ["cluster", "remove", name] => {
+            only(&scoped, "cluster remove", &[])?;
+            Command::ClusterMember { verb: "remove", name: (*name).to_string() }
+        }
+        ["cluster", "move", range, "to", node] => {
+            only(&scoped, "cluster move", &[])?;
+            let range = range
+                .parse()
+                .map_err(|_| format!("`{range}` is not a range id; write `cluster move 2 to c`"))?;
+            Command::ClusterMove { range, to: (*node).to_string() }
+        }
+        ["cluster", "schema-leader", node] => {
+            only(&scoped, "cluster schema-leader", &[])?;
+            Command::ClusterSchemaLeader { to: (*node).to_string() }
+        }
+        ["cluster", "rebalance"] => {
+            only(&scoped, "cluster rebalance", &[])?;
+            Command::ClusterRebalance
+        }
+        ["cluster", "cancel", range] => {
+            only(&scoped, "cluster cancel", &[])?;
+            let range = range
+                .parse()
+                .map_err(|_| format!("`{range}` is not a range id; write `cluster cancel 2`"))?;
+            Command::ClusterCancel { range }
+        }
+        ["cluster", "merge", range] => {
+            only(&scoped, "cluster merge", &[])?;
+            let range = range
+                .parse()
+                .map_err(|_| format!("`{range}` is not a range id; write `cluster merge 2`"))?;
+            Command::ClusterMerge { range }
+        }
         ["health"] => {
             only(&scoped, "health", &[])?;
             Command::Health
@@ -524,9 +626,9 @@ const LOAD: [&str; 8] = [
 ];
 
 /// Every first word this client answers to, for telling a typo from a misuse.
-const KNOWN: [&str; 15] = [
+const KNOWN: [&str; 16] = [
     "sql", "query", "records", "import", "delete", "schema", "create", "drop", "verify", "repair",
-    "health", "ready", "metrics", "shell", "help",
+    "health", "ready", "metrics", "shell", "help", "cluster",
 ];
 
 fn source(arg: &str) -> Source {

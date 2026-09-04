@@ -43,13 +43,28 @@ use big_embed::{Api, FieldKind, GroupAt, PagerMut, Plan, QueryOptions, Rows, Val
 /// schema in a different order still produce the same digest. Nothing here depends on a table
 /// or field *id*, which is each node's own numbering.
 pub fn digest<P: PagerMut + Sync>(api: &Api<P>) -> big_embed::Result<u64> {
+    digest_in(api, None)
+}
+
+/// The same, over a set of shard ranges rather than everything this node holds.
+///
+/// **Two copies of one range are compared, not two whole nodes.** Once a node can hold several
+/// ranges, two nodes that agree perfectly about the range being checked would still produce
+/// different whole-node digests - and `verify` would report a disagreement that is not one.
+/// A leftover, from a range that has been handed away but not yet deleted, does the same.
+pub fn digest_in<P: PagerMut + Sync>(
+    api: &Api<P>,
+    shards: Option<Vec<big_engine::ShardRange>>,
+) -> big_embed::Result<u64> {
+    let opts = QueryOptions::default().in_shards(shards);
+    let opts = &opts;
     let mut h = Fnv::new();
     let mut tables = api.schema();
     tables.sort_by(|a, b| a.name.cmp(&b.name));
 
     for table in &tables {
         h.str(&table.name);
-        h.u64(count(api, &table.name)?);
+        h.u64(count(api, &table.name, opts)?);
 
         let mut fields = table.fields.clone();
         fields.sort_by(|a, b| a.name.cmp(&b.name));
@@ -67,7 +82,7 @@ pub fn digest<P: PagerMut + Sync>(api: &Api<P>) -> big_embed::Result<u64> {
                             rows: Rows::All,
                             field: field.name.clone(),
                         },
-                        &QueryOptions::default(),
+                        opts,
                     )?;
                     // Sorted by identity rather than by key, because a row id means the same
                     // thing on every node and is cheaper to compare than the string it came
@@ -100,7 +115,7 @@ pub fn digest<P: PagerMut + Sync>(api: &Api<P>) -> big_embed::Result<u64> {
                             rows: Rows::All,
                             field: field.name.clone(),
                         },
-                        &QueryOptions::default(),
+                        opts,
                     )?;
                     match total {
                         Value::Sum(n) => h.u128(n),
@@ -124,7 +139,7 @@ pub fn digest<P: PagerMut + Sync>(api: &Api<P>) -> big_embed::Result<u64> {
                         Plan::Max { table: t, rows: Rows::All, field: f },
                     ];
                     for plan in extremes {
-                        let extreme = api.execute(&plan, &QueryOptions::default())?;
+                        let extreme = api.execute(&plan, opts)?;
                         // The stored value, not the float it decodes to: the encoding is
                         // order-preserving, so the extreme of one is the extreme of the other,
                         // and an integer digests without a rounding question.
@@ -145,7 +160,7 @@ pub fn digest<P: PagerMut + Sync>(api: &Api<P>) -> big_embed::Result<u64> {
                                 table: table.name.clone(),
                                 rows: Rows::Bool { field: field.name.clone(), value },
                             },
-                            &QueryOptions::default(),
+                            opts,
                         )?;
                         h.u64(n.as_count().unwrap_or(0));
                     }
@@ -156,9 +171,13 @@ pub fn digest<P: PagerMut + Sync>(api: &Api<P>) -> big_embed::Result<u64> {
     Ok(h.finish())
 }
 
-fn count<P: PagerMut + Sync>(api: &Api<P>, table: &str) -> big_embed::Result<u64> {
+fn count<P: PagerMut + Sync>(
+    api: &Api<P>,
+    table: &str,
+    opts: &QueryOptions,
+) -> big_embed::Result<u64> {
     let plan = Plan::Count { table: table.to_string(), rows: Rows::All };
-    Ok(api.execute(&plan, &QueryOptions::default())?.as_count().unwrap_or(0))
+    Ok(api.execute(&plan, opts)?.as_count().unwrap_or(0))
 }
 
 /// FNV-1a, 64 bit.

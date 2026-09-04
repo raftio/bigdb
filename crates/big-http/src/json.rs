@@ -17,7 +17,7 @@
 //! The whole output surface is four shapes, so a serialisation library would be a dependency
 //! carried for one file. Escaping is the part worth getting right, and it is one function.
 
-use big_cluster::{RangeVerdict, RepairReport, WriteOutcome};
+use big_cluster::{MoveReport, RangeVerdict, RepairReport, Topology, WriteOutcome};
 use big_db::RecordId;
 use big_embed::{Datum, Format, GroupAt, GroupKey, ResultSet, TableInfo, TimeUnit};
 use big_exec::{Group, Value};
@@ -444,12 +444,84 @@ pub fn repaired(reports: &[RepairReport]) -> String {
         .iter()
         .map(|r| {
             format!(
-                "{{\"node\":{},\"fragments\":{},\"outcome\":{}}}",
+                "{{\"node\":{},\"shards\":{},\"fragments\":{},\"outcome\":{}}}",
                 string(&r.node),
+                string(&r.shards),
                 r.fragments,
                 string(&r.outcome)
             )
         })
         .collect();
     format!("{{\"repaired\":[{}]}}", items.join(","))
+}
+
+/// What the cluster looks like right now.
+///
+/// **The one surface an autoscaler or a Kubernetes controller reads.** Everything a placement
+/// decision needs is here - which ranges exist, who holds each, what is moving - so nothing
+/// outside has to infer the shape from a config file it was not given.
+pub fn topology(t: &Topology) -> String {
+    let ranges: Vec<String> = t
+        .ranges
+        .iter()
+        .map(|r| {
+            let holders: Vec<String> = r.holders.iter().map(|h| string(h)).collect();
+            let moving = match (&r.moving_to, r.moving_state) {
+                (Some(to), Some(state)) => {
+                    format!(",\"moving_to\":{},\"moving_state\":{}", string(to), string(state))
+                }
+                _ => String::new(),
+            };
+            format!(
+                "{{\"id\":{},\"shards\":{},\"primary\":{},\"holders\":[{}]{}}}",
+                r.id,
+                string(&r.shards),
+                string(&r.primary),
+                holders.join(","),
+                moving
+            )
+        })
+        .collect();
+    let members: Vec<String> = t
+        .members
+        .iter()
+        .map(|m| {
+            format!(
+                "{{\"name\":{},\"addr\":{},\"state\":{}}}",
+                string(&m.name),
+                string(&m.addr),
+                string(m.state)
+            )
+        })
+        .collect();
+    let behind: Vec<String> = t.behind.iter().map(|b| string(b)).collect();
+    let leader = match &t.leader {
+        Some(l) => string(l),
+        None => "null".to_string(),
+    };
+    format!(
+        "{{\"epoch\":{},\"leader\":{},\"schema_leader\":{},\"members\":[{}],\"ranges\":[{}],\
+         \"behind\":[{}]}}",
+        t.epoch,
+        leader,
+        string(&t.schema_leader),
+        members.join(","),
+        ranges.join(","),
+        behind.join(",")
+    )
+}
+
+/// What a move managed.
+pub fn moved(r: &MoveReport) -> String {
+    format!(
+        "{{\"range\":{},\"shards\":{},\"from\":{},\"to\":{},\"fragments\":{},\
+         \"dropped\":{},\"outcome\":{}}}",
+        r.range,
+        string(&r.shards),
+        string(&r.from),
+        string(&r.to),
+        r.fragments,
+        r.dropped,
+        string(&r.outcome)
+    )
 }

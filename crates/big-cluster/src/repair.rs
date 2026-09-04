@@ -35,16 +35,26 @@ impl<P: PagerMut + Sync> Cluster<P> {
     /// It is a scan. Run it deliberately, not every fifteen seconds.
     pub fn verify(&self) -> Vec<RangeVerdict> {
         let mut out = Vec::new();
-        for range in 0..self.config.range_count() {
+        for range in 0..self.range_count() {
             let copies = self.copies_of_range(range);
             let primary = copies[0];
+            // **Every copy is asked about the same range**, not about everything it holds. Two
+            // nodes that agree perfectly about this range would otherwise produce different
+            // numbers the moment either of them held a second one, and `verify` would report a
+            // disagreement that is not one.
+            let scope_of = self.scope_of_range(range);
             let digests: Vec<CopyDigest> = std::thread::scope(|scope| {
-                let handles: Vec<_> =
-                    copies.iter().map(|&i| (i, scope.spawn(move || self.digest_of(i)))).collect();
+                let handles: Vec<_> = copies
+                    .iter()
+                    .map(|&i| {
+                        let shards = scope_of.clone();
+                        (i, scope.spawn(move || self.digest_in(i, shards)))
+                    })
+                    .collect();
                 handles
                     .into_iter()
                     .map(|(i, h)| {
-                        let node = self.config.nodes()[i].name.clone();
+                        let node = self.name_of(i).unwrap_or_else(|| self.name_of_agreed(i));
                         match h.join() {
                             Ok(Ok(d)) => CopyDigest { node, digest: Some(d), why: None },
                             Ok(Err(e)) => {
@@ -66,8 +76,8 @@ impl<P: PagerMut + Sync> Cluster<P> {
             let agree = digests.iter().all(|d| d.digest.is_some())
                 && digests.windows(2).all(|w| w[0].digest == w[1].digest);
             out.push(RangeVerdict {
-                shards: self.config.nodes()[primary].shards.to_string(),
-                primary: self.config.nodes()[primary].name.clone(),
+                shards: self.shards_of_range(range).to_string(),
+                primary: self.name_of(primary).unwrap_or_else(|| self.name_of_agreed(primary)),
                 copies: digests,
                 agree,
             });
@@ -75,13 +85,29 @@ impl<P: PagerMut + Sync> Cluster<P> {
         out
     }
 
-    pub(super) fn digest_of(&self, node: usize) -> Result<u64> {
+    /// Whether two copies of one range hold the same facts, right now.
+    ///
+    /// Scoped to the range, so that a node holding a second one - or a leftover it has not yet
+    /// deleted - does not make two copies that agree look as though they do not. Taken after a
+    /// repair as the proof that it worked.
+    pub(super) fn agreed(&self, range: usize, source: usize, target: usize) -> Result<bool> {
+        let shards = self.scope_of_range(range);
+        Ok(self.digest_in(source, shards.clone())? == self.digest_in(target, shards)?)
+    }
+
+    /// One copy's digest over a set of shard ranges. `None` is everything it holds.
+    pub(super) fn digest_in(
+        &self,
+        node: usize,
+        shards: Option<Vec<big_engine::ShardRange>>,
+    ) -> Result<u64> {
         if node == self.config.this_index() {
-            return digest::digest(&self.api).map_err(ClusterError::Local);
+            return digest::digest_in(&self.api, shards).map_err(ClusterError::Local);
         }
-        let bytes = self.ask(node, path::DIGEST, &[], None)?;
+        let body = wire::put_shards_body(shards.as_deref());
+        let bytes = self.ask(node, path::DIGEST, &body, None)?;
         wire::get_u64_body(&bytes)
-            .map_err(|why| ClusterError::Wire { node: self.config.nodes()[node].name.clone(), why })
+            .map_err(|why| ClusterError::Wire { node: self.describe(node), why })
     }
 
     // -----------------------------------------------------------------------------------
@@ -106,51 +132,147 @@ impl<P: PagerMut + Sync> Cluster<P> {
     /// the truth than it was and still marked behind, which is exactly the state it should be
     /// left in.
     pub fn repair(&self) -> Result<Vec<RepairReport>> {
-        let Some(controller) = &self.controller else { return Ok(Vec::new()) };
-        let behind = controller.ownership().stale;
+        if self.controller.is_none() {
+            return Ok(Vec::new());
+        }
+        let map = self.map();
         let mut out = Vec::new();
-        for node in behind {
-            let Some(range) = self.config.range_of_node(node) else { continue };
-            let source = self.serving(range);
-            if source == node {
-                // The copy that is behind is the one serving the range. Nothing here can fix
-                // that: there is no more authoritative copy to take from.
-                out.push(RepairReport {
-                    node: self.config.nodes()[node].name.clone(),
-                    fragments: 0,
-                    outcome: "this copy is the one serving its range".to_string(),
-                });
-                continue;
-            }
-            let report = match self.catch_up(source, node) {
-                Ok(fragments) => {
-                    let cleared = self.clear_stale(node);
-                    RepairReport {
-                        node: self.config.nodes()[node].name.clone(),
-                        fragments,
-                        outcome: if cleared {
-                            "caught up".to_string()
-                        } else {
-                            // The data moved and the mark did not, so the copy is correct and
-                            // still will not be promoted. Saying so is the difference between
-                            // a repair to run again and a repair to worry about.
-                            "caught up, but the agreement did not record it".to_string()
-                        },
-                    }
+        for node in map.stale.iter().copied() {
+            // A behind copy may hold several ranges. Each is repaired from whoever serves it,
+            // which is not necessarily one node: after a move they can differ.
+            for range in map.held_by(node) {
+                let source = self.serving(range);
+                if source == node {
+                    // The copy that is behind is the one serving the range. Nothing here can
+                    // fix that: there is no more authoritative copy to take from.
+                    out.push(RepairReport {
+                        node: self.name_of(node).unwrap_or_default(),
+                        shards: self.shards_of_range(range).to_string(),
+                        fragments: 0,
+                        outcome: "this copy is the one serving its range".to_string(),
+                    });
+                    continue;
                 }
-                Err(e) => RepairReport {
-                    node: self.config.nodes()[node].name.clone(),
-                    fragments: 0,
-                    outcome: e.to_string(),
-                },
-            };
-            out.push(report);
+                out.push(self.repair_one(range, source, node));
+            }
         }
         Ok(out)
     }
 
+    /// One behind copy of one range, brought back into line.
+    fn repair_one(&self, range: usize, source: usize, node: usize) -> RepairReport {
+        match self.catch_up(source, node) {
+            Ok(fragments) => {
+                // **Proved, not assumed.** A fragment is replaced whole, and the copy being
+                // repaired is still taking writes - it is in the range's group, which is
+                // exactly why it can be behind by one batch rather than by a database. So a
+                // write that reached the source after its fragments were listed, and the
+                // target before they were pushed, is a write this pass overwrote. Clearing
+                // the mark on the strength of "the copy ran without erroring" would be
+                // recording that a copy is promotable when it is missing an acknowledged
+                // write, and nothing downstream would ever contradict it.
+                //
+                // Two digests instead. They disagree when a write landed during the pass,
+                // which is a repair to run again - the honest answer, and cheap to act on.
+                // They cannot agree while the copy is missing a fact the source holds.
+                match self.agreed(range, source, node) {
+                    Err(e) => RepairReport {
+                        node: self.name_of(node).unwrap_or_default(),
+                        shards: self.shards_of_range(range).to_string(),
+                        fragments,
+                        outcome: format!("copied, but could not be checked: {e}"),
+                    },
+                    Ok(false) => RepairReport {
+                        node: self.name_of(node).unwrap_or_default(),
+                        shards: self.shards_of_range(range).to_string(),
+                        fragments,
+                        outcome: "copied, but the two still disagree - a write probably \
+                                      landed while this ran. The mark stands; run it again"
+                            .to_string(),
+                    },
+                    Ok(true) => {
+                        let cleared = self.clear_stale(node);
+                        RepairReport {
+                            node: self.name_of(node).unwrap_or_default(),
+                            shards: self.shards_of_range(range).to_string(),
+                            fragments,
+                            outcome: if cleared {
+                                "caught up".to_string()
+                            } else {
+                                // The data moved and the mark did not, so the copy is
+                                // correct and still will not be promoted. Saying so is the
+                                // difference between a repair to run again and a repair to
+                                // worry about.
+                                "caught up, but the agreement did not record it".to_string()
+                            },
+                        }
+                    }
+                }
+            }
+            Err(e) => RepairReport {
+                node: self.name_of(node).unwrap_or_default(),
+                shards: self.shards_of_range(range).to_string(),
+                fragments: 0,
+                outcome: e.to_string(),
+            },
+        }
+    }
+
+    /// Empties every fragment a node holds inside a set of shards.
+    ///
+    /// **What a node does with a range it has handed away.** The records are somebody else's
+    /// now; leaving them costs space, and - once that part of the space is split again - would
+    /// leave a node holding data for shards it was never given.
+    ///
+    /// Emptied rather than deleted, because emptying is what the wire already knows how to do:
+    /// a fragment replaced with nothing frees its pages, which is the same thing a repair does
+    /// to a fragment the truth no longer has.
+    pub(super) fn drop_shards(&self, node: usize, shards: big_engine::ShardRange) -> Result<()> {
+        for table in self.pull_schema(node)?.0 {
+            for (addr, _) in self.pull_fragments(node, &table.name)? {
+                if !shards.contains(addr.shard) {
+                    continue;
+                }
+                self.push_fragment(
+                    node,
+                    &wire::FragmentBody {
+                        // Emptied in whichever units this address stores, so that replacing a
+                        // segment with "no containers" cannot be what frees it.
+                        data: if addr.view.is_none() && addr.view_id == big_db::COLUMN_VIEW {
+                            big_embed::FragmentData::Cells(Vec::new())
+                        } else {
+                            big_embed::FragmentData::Containers(Vec::new())
+                        },
+                        addr,
+                        meta: big_embed::FragmentMeta::default(),
+                    },
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     /// Makes `target` hold what `source` holds. Returns how many fragments had to move.
     pub(super) fn catch_up(&self, source: usize, target: usize) -> Result<usize> {
+        self.catch_up_in(source, target, None)
+    }
+
+    /// The same, over a set of shard ranges rather than everything.
+    ///
+    /// **What a move copies.** A repair catches up a whole node because a replica holds
+    /// precisely its primary's range; a move copies one range and leaves the rest of both nodes
+    /// alone, which is what makes it affordable at all.
+    ///
+    /// The row keys are the exception and they are **not** scoped, because they cannot be: a
+    /// row key has to mean the same number in every shard, so a node taking one range still
+    /// needs the whole mapping. That is a real cost and it is the size of the key store rather
+    /// than the size of the range.
+    pub(super) fn catch_up_in(
+        &self,
+        source: usize,
+        target: usize,
+        shards: Option<big_engine::ShardRange>,
+    ) -> Result<usize> {
         // The schema first, or nothing else can land: a fragment belongs to a field, and a
         // node that was away while the field was created has never heard of it.
         let mut moved = self.match_schema(source, target)?;
@@ -162,8 +284,17 @@ impl<P: PagerMut + Sync> Cluster<P> {
             let keys = self.pull_keys(source, &table.name)?;
             self.push_keys(target, &table.name, keys)?;
 
-            let mine = self.pull_fragments(source, &table.name)?;
-            let theirs = self.pull_fragments(target, &table.name)?;
+            let keep = |addr: &big_db::FragmentAddr| shards.is_none_or(|s| s.contains(addr.shard));
+            let mine: Vec<_> = self
+                .pull_fragments(source, &table.name)?
+                .into_iter()
+                .filter(|(a, _)| keep(a))
+                .collect();
+            let theirs: Vec<_> = self
+                .pull_fragments(target, &table.name)?
+                .into_iter()
+                .filter(|(a, _)| keep(a))
+                .collect();
             for (addr, count) in &mine {
                 let same = theirs.iter().any(|(a, c)| a == addr && c == count);
                 if same {

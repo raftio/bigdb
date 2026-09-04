@@ -62,9 +62,16 @@ pub struct TlsConfig {
 struct ServerInner {
     server: Arc<rustls::ServerConfig>,
     /// The node names a client certificate is allowed to name. A certificate this node's peer CA
-    /// signed that matches none of them is refused: the cluster file is the roster, which is
-    /// where a roster belongs.
-    roster: Vec<String>,
+    /// signed that matches none of them is refused.
+    ///
+    /// **Replaceable while the listener runs.** The cluster file used to be the roster for the
+    /// life of the process, which was exact while membership was a file - and impossible once a
+    /// node can join, because the joining node's certificate names somebody the file has never
+    /// heard of. The agreement is the roster now; the file is only what it starts as.
+    ///
+    /// A lock rather than an `Arc` swap because it is read once per accepted connection, which
+    /// is nowhere near often enough to be worth anything cleverer.
+    roster: std::sync::RwLock<Vec<String>>,
 }
 
 /// Redacted, like `Auth`. Nothing here is a secret that printing would leak - the private key is
@@ -74,7 +81,7 @@ impl core::fmt::Debug for TlsConfig {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         #[cfg(feature = "tls")]
         {
-            write!(f, "TlsConfig({} peers in the roster)", self.inner.roster.len())
+            write!(f, "TlsConfig({} peers in the roster)", self.roster().len())
         }
         #[cfg(not(feature = "tls"))]
         {
@@ -126,7 +133,12 @@ impl TlsConfig {
                 Some(ca) => builder.with_client_cert_verifier(super::tls::peer_verifier(ca)?),
             };
             let server = builder.with_single_cert(chain, key).map_err(super::tls::bad)?;
-            Ok(Self { inner: Arc::new(ServerInner { server: Arc::new(server), roster }) })
+            Ok(Self {
+                inner: Arc::new(ServerInner {
+                    server: Arc::new(server),
+                    roster: std::sync::RwLock::new(roster),
+                }),
+            })
         }
     }
 
@@ -134,10 +146,31 @@ impl TlsConfig {
     pub fn checks_peers(&self) -> bool {
         #[cfg(feature = "tls")]
         {
-            !self.inner.roster.is_empty()
+            !self.roster().is_empty()
         }
         #[cfg(not(feature = "tls"))]
         match self.never {}
+    }
+
+    /// Replaces the names a peer certificate may claim.
+    ///
+    /// **Called when the agreement says the cluster has changed.** Without it a node that
+    /// joined could never connect: its certificate is signed by the right CA and names a node
+    /// this listener has never heard of, which is exactly what the roster refuses.
+    ///
+    /// A node that has *left* is dropped from the roster by the same call, which is what makes
+    /// removing one mean anything - a certificate is not revoked by editing a file nobody
+    /// re-reads.
+    pub fn set_roster(&self, names: Vec<String>) {
+        #[cfg(feature = "tls")]
+        {
+            *self.inner.roster.write().expect("no panic holds this lock") = names;
+        }
+        #[cfg(not(feature = "tls"))]
+        {
+            let _ = names;
+            match self.never {}
+        }
     }
 
     #[cfg(feature = "tls")]
@@ -146,8 +179,8 @@ impl TlsConfig {
     }
 
     #[cfg(feature = "tls")]
-    pub(crate) fn roster(&self) -> &[String] {
-        &self.inner.roster
+    pub(crate) fn roster(&self) -> Vec<String> {
+        self.inner.roster.read().expect("no panic holds this lock").clone()
     }
 }
 

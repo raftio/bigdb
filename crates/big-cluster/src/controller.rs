@@ -38,7 +38,7 @@
 
 use crate::client::{Peers, Repeatable};
 use crate::config::ClusterConfig;
-use crate::raft::{self, Decision, Message, NodeId, Ownership, Raft, Store, Timing};
+use crate::raft::{self, Decision, Member, Message, NodeId, Raft, RangeMap, Store, Timing};
 use crate::{path, wire};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, RwLock};
@@ -72,26 +72,112 @@ pub struct Controller {
     raft: Mutex<Raft>,
     store: Box<dyn Store>,
     leases: Leases,
-    /// Which node serves each range, as last committed. Read on the path of every request, so
-    /// it is a lock held for a pointer's worth of time and never across any I/O.
-    ownership: Arc<RwLock<Ownership>>,
-    /// Every node holding each range, from the config file. Static: a promotion moves the
-    /// answer within a group, never between groups, because no data moves.
-    groups: Vec<Vec<NodeId>>,
-    /// The range this node holds, if it holds one. A node is in exactly one group, which is
-    /// what makes the lease a property of the node rather than of each request.
-    mine: Option<usize>,
-    /// Whether this node's range has a copy at all. A range of one cannot be taken away, so it
-    /// is not fenced: fencing it would stop a node serving because a *different* machine is
-    /// unreachable, which is an outage invented rather than avoided.
-    fenced: bool,
+    /// The map, as last committed. Read on the path of every request, so it is a lock held
+    /// for a pointer's worth of time and never across any I/O.
+    ///
+    /// **Shared with the [`crate::Cluster`] that owns this controller**, so that routing has
+    /// one source rather than two that can drift. Seeded from the cluster file and replaced by
+    /// every committed `Decision::Ranges`.
+    ranges: Arc<RwLock<RangeMap>>,
+    /// Who the cluster is, as last *appended* - the rule Raft states for a configuration
+    /// change, because the majority that commits an entry has to be the one it describes.
+    members: Arc<RwLock<Vec<Member>>>,
+    /// This node's own index, kept because half the questions below are about it.
+    this: NodeId,
+    /// How the other nodes are reached. Held so that a node which joins can be added to it.
+    peers: Arc<dyn Peers>,
+    /// The listener's peer roster, when this node has one.
+    ///
+    /// **Set after construction**, because the listener is built by the layer above and this
+    /// node has to exist before it can be listened for. Shared rather than copied: a
+    /// `TlsConfig` is a handle onto one `Arc`, so writing the roster here is the same roster
+    /// the accept path reads.
+    roster: RwLock<Option<big_tls::TlsConfig>>,
     /// Milliseconds since this process started, at the last moment this node could prove it
     /// was still in touch with a majority. The lease, in one number.
     lease_at: AtomicU64,
     started: Instant,
     inbox: mpsc::Sender<Message>,
-    outbox: Vec<Option<mpsc::SyncSender<Message>>>,
+    /// One sender thread per peer, made on demand.
+    outbox: Outbox,
     stop: Arc<AtomicBool>,
+}
+
+/// The threads that carry the agreement to the other nodes.
+///
+/// **One per peer, made when the peer first appears.** It used to be a fixed vector built from
+/// the cluster file, so a message addressed to a node that joined at runtime went into
+/// `outbox.get(to)`, matched `None`, and was silently dropped - a new node that could never be
+/// reached and no error anywhere saying so.
+struct Outbox {
+    senders: RwLock<Vec<Option<mpsc::SyncSender<Message>>>>,
+    peers: Arc<dyn Peers>,
+    stop: Arc<AtomicBool>,
+    budget: u64,
+    this: NodeId,
+}
+
+impl Outbox {
+    fn new(peers: Arc<dyn Peers>, stop: Arc<AtomicBool>, budget: u64, this: NodeId) -> Self {
+        Self { senders: RwLock::new(Vec::new()), peers, stop, budget, this }
+    }
+
+    /// Makes sure there is a thread for every node below `len`.
+    fn reach(&self, len: usize) {
+        let mut senders = self.senders.write().expect("no panic holds this lock");
+        if senders.len() < len {
+            senders.resize_with(len, || None);
+        }
+        for i in 0..senders.len() {
+            if i == self.this || senders[i].is_some() {
+                continue;
+            }
+            // A short queue, and a heartbeat that cannot be queued is dropped rather than
+            // waited for: this protocol was designed for a network that loses messages, and
+            // blocking the one thread that drives it in order to reach a node that is not
+            // answering is how a live cluster is brought down by a dead node.
+            let (send, recv) = mpsc::sync_channel::<Message>(64);
+            senders[i] = Some(send);
+            let peers = Arc::clone(&self.peers);
+            let stop = Arc::clone(&self.stop);
+            let budget = self.budget;
+            std::thread::Builder::new()
+                .name(format!("big-raft-out-{i}"))
+                .spawn(move || {
+                    while let Ok(m) = recv.recv() {
+                        if stop.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        let body = wire::encode_raft(&m);
+                        let _ = peers.post(
+                            i,
+                            path::RAFT,
+                            &body,
+                            Some(Duration::from_millis(budget)),
+                            // A message that arrives twice decides nothing twice: a term and an
+                            // index say what a message means, so a retry on a connection that
+                            // was closed underneath us is free.
+                            Repeatable::Yes,
+                        );
+                    }
+                })
+                .expect("a thread per peer");
+        }
+    }
+
+    /// How many nodes this outbox can already reach.
+    fn len(&self) -> usize {
+        self.senders.read().expect("no panic holds this lock").len()
+    }
+
+    fn send(&self, to: NodeId, m: Message) {
+        let senders = self.senders.read().expect("no panic holds this lock");
+        if let Some(Some(sender)) = senders.get(to) {
+            // Full means this peer is not keeping up, and a queued heartbeat that is already
+            // stale helps nobody.
+            let _ = sender.try_send(m);
+        }
+    }
 }
 
 impl Controller {
@@ -100,18 +186,42 @@ impl Controller {
     /// `peers` is the same table everything else uses: agreement is traffic like any other,
     /// over the same routes with the same tokens. A trait object so that a test can drive an
     /// election without opening a socket.
+    /// **A state file that cannot be read stops this node**, rather than being ignored. Reading
+    /// it is how a node remembers the vote it already cast, so a node that starts without it
+    /// starts at term 0 with an empty log and is free to vote a second time in a term it has
+    /// already voted in - which is two leaders, the one failure this module exists to prevent.
+    /// A missing file is not that: it is a node that has never voted, and `load` says so with
+    /// `Ok(None)`. Only a file that exists and cannot be decoded lands here.
     pub fn start(
         config: &ClusterConfig,
         peers: Arc<dyn Peers>,
         store: Box<dyn Store>,
         timing: Timing,
         leases: Leases,
-    ) -> Arc<Self> {
+        ranges: Arc<RwLock<RangeMap>>,
+    ) -> std::io::Result<Arc<Self>> {
         let started = Instant::now();
-        let members: Vec<NodeId> = (0..config.nodes().len()).collect();
-        let mut raft = Raft::new(config.this_index(), members, timing, 0);
-        if let Ok(Some((term, voted_for, log))) = store.load() {
-            raft.restore(term, voted_for, log);
+        let this = config.this_index();
+        let mut raft = Raft::new(this, config.seed_members(), timing, 0);
+        if let Some(state) = store.load()? {
+            raft.restore(state);
+        }
+
+        // **The file seeds; the log decides.** Both are replayed from what is on disk rather
+        // than taken from the file alone, or a node that restarted would come back believing
+        // the file's map - which, once a range has moved, describes a cluster that no longer
+        // exists. Members follow every entry because a configuration change applies when it is
+        // appended; ranges follow only committed ones.
+        let mut members = config.seed_members();
+        {
+            let mut map = ranges.write().expect("no panic holds this lock");
+            for (i, entry) in raft.log().iter().enumerate() {
+                match &entry.decision {
+                    Decision::Members(ms) => members = ms.clone(),
+                    Decision::Ranges(m) if i as u64 <= raft.commit_index() => *map = m.clone(),
+                    _ => {}
+                }
+            }
         }
 
         let (tx, rx) = mpsc::channel();
@@ -121,56 +231,18 @@ impl Controller {
         // queued is dropped rather than waited for: this protocol was designed for a network
         // that loses messages, and blocking the one thread that drives it in order to reach a
         // node that is not answering is how a live cluster is brought down by a dead node.
-        let mut outbox = Vec::with_capacity(peers.len());
-        for i in 0..peers.len() {
-            match i == config.this_index() {
-                true => outbox.push(None),
-                false => {
-                    let (send, recv) = mpsc::sync_channel::<Message>(64);
-                    outbox.push(Some(send));
-                    let peers = Arc::clone(&peers);
-                    let stop = Arc::clone(&stop);
-                    let budget = timing.heartbeat;
-                    std::thread::Builder::new()
-                        .name(format!("big-raft-out-{i}"))
-                        .spawn(move || {
-                            while let Ok(m) = recv.recv() {
-                                if stop.load(Ordering::Relaxed) {
-                                    return;
-                                }
-                                let body = wire::encode_raft(&m);
-                                let _ = peers.post(
-                                    i,
-                                    path::RAFT,
-                                    &body,
-                                    Some(Duration::from_millis(budget)),
-                                    // A message that arrives twice decides nothing twice: a
-                                    // term and an index say what a message means, so a retry
-                                    // on a connection that was closed underneath us is free.
-                                    Repeatable::Yes,
-                                );
-                            }
-                        })
-                        .expect("a thread per peer");
-                }
-            }
-        }
-
-        let ownership = Arc::new(RwLock::new(config.initial_ownership()));
-        let mine = config.range_of_node(config.this_index());
-        // A range with no copy is never fenced: nothing could take it away, so a node that
-        // stops hearing from the agreement has lost nothing, and stopping would be an outage
-        // invented rather than avoided.
-        let fenced = mine.is_some_and(|r| config.group(r).len() > 1);
+        let outbox = Outbox::new(Arc::clone(&peers), Arc::clone(&stop), timing.heartbeat, this);
+        outbox.reach(peers.len());
 
         let controller = Arc::new(Self {
             raft: Mutex::new(raft),
             store,
             leases,
-            ownership,
-            groups: (0..config.range_count()).map(|r| config.group(r).to_vec()).collect(),
-            mine,
-            fenced,
+            ranges,
+            members: Arc::new(RwLock::new(members)),
+            this,
+            peers: Arc::clone(&peers),
+            roster: RwLock::new(None),
             lease_at: AtomicU64::new(0),
             started,
             inbox: tx,
@@ -183,29 +255,76 @@ impl Controller {
             .name("big-raft".to_string())
             .spawn(move || driver.run(rx))
             .expect("one driver thread");
-        controller
+        Ok(controller)
     }
 
-    /// Which node serves each range, as last committed.
-    pub fn ownership(&self) -> Ownership {
-        self.ownership.read().expect("no panic holds this lock").clone()
-    }
-
-    /// Whether this node may answer as the primary of its range right now.
+    /// Hands this controller the listener's peer roster to keep current.
     ///
-    /// `true` for a range nothing could take away. For a replicated one it is the lease: this
-    /// node stopped hearing from the agreement, so it has to assume it may already have been
-    /// replaced, and answering would be the two-primaries failure this is all built to avoid.
-    /// The range this node holds, primary or copy.
-    pub fn range(&self) -> Option<usize> {
-        self.mine
+    /// **Without it a node that joins can never connect.** Its certificate is signed by the
+    /// right CA and names a node the listener has never heard of, which is precisely what the
+    /// roster refuses - so the roster has to follow the agreement rather than the file.
+    pub fn follow_roster(&self, tls: big_tls::TlsConfig) {
+        let names = self.member_names();
+        tls.set_roster(names);
+        *self.roster.write().expect("no panic holds this lock") = Some(tls);
     }
 
+    /// The names of every node still in the cluster.
+    fn member_names(&self) -> Vec<String> {
+        self.members().iter().filter(|m| m.reachable()).map(|m| m.name.clone()).collect()
+    }
+
+    /// Whether everything this node has appended has also been agreed.
+    ///
+    /// **What a caller waits for between two changes.** A membership change takes effect when
+    /// it is *appended* - that is the rule Raft states for one - so a caller watching only for
+    /// the new member list stops waiting while the entry is still in flight, and the next
+    /// proposal is refused as busy. Nothing is settled until the log is.
+    pub fn settled(&self) -> bool {
+        let raft = self.raft.lock().expect("no panic holds this lock");
+        raft.commit_index() == raft.last_index()
+    }
+
+    /// The map, as last committed.
+    pub fn map(&self) -> RangeMap {
+        self.ranges.read().expect("no panic holds this lock").clone()
+    }
+
+    /// Who the cluster is, as last appended.
+    pub fn members(&self) -> Vec<Member> {
+        self.members.read().expect("no panic holds this lock").clone()
+    }
+
+    /// Every range this node holds, whether it serves it or only copies it.
+    pub fn ranges_held(&self) -> Vec<usize> {
+        self.map().held_by(self.this)
+    }
+
+    /// Whether this node may answer as the primary of the ranges it serves right now.
+    ///
+    /// `true` when nothing it holds could be taken away. Otherwise it is the lease: this node
+    /// stopped hearing from the agreement, so it has to assume it may already have been
+    /// replaced, and answering would be the two-primaries failure this is all built to avoid.
+    ///
+    /// **Fencing is recomputed rather than fixed at startup.** It used to be a bool decided
+    /// once from the file, which was exact while a node held exactly one range for the life of
+    /// the process. A node can now gain and lose ranges, so whether it has anything worth
+    /// fencing is a question about the map as it stands.
     pub fn may_serve(&self) -> bool {
-        if !self.fenced {
+        if !self.fenced() {
             return true;
         }
         self.since_lease() < self.leases.serve_for.as_millis() as u64
+    }
+
+    /// Whether any range this node holds has a copy that could take it.
+    ///
+    /// A range with no copy is never fenced: nothing could take it away, so a node that stops
+    /// hearing from the agreement has lost nothing, and stopping would be an outage invented
+    /// rather than avoided.
+    fn fenced(&self) -> bool {
+        let map = self.ranges.read().expect("no panic holds this lock");
+        map.ranges.iter().any(|r| r.group.contains(&self.this) && r.group.len() > 1)
     }
 
     fn since_lease(&self) -> u64 {
@@ -272,8 +391,7 @@ impl Controller {
                     }
                 }
 
-                let state =
-                    out.persist.then(|| (raft.term(), raft.voted_for(), raft.log().to_vec()));
+                let state = out.persist.then(|| raft.state());
                 (out, state)
             };
 
@@ -281,8 +399,8 @@ impl Controller {
             // a vote this node can cast again after a restart, which is two leaders in one
             // term. The lock is released first because the disk is slow and the protocol is
             // not; nothing else writes this state, so there is nothing to race with.
-            if let Some((term, voted_for, log)) = persist_state {
-                if let Err(e) = self.store.save(term, voted_for, &log) {
+            if let Some(state) = persist_state {
+                if let Err(e) = self.store.save(&state) {
                     // A node that cannot persist may not participate. Dropping the messages is
                     // what makes that true: it looks exactly like a node that is down, which
                     // is the one failure every other node here already handles.
@@ -291,18 +409,46 @@ impl Controller {
                 }
             }
 
+            // **Before anything is sent to a node that may be new.** The membership the raft
+            // core is working from is derived from its log, so a node that joined is already
+            // being addressed - and a message to a peer with no client and no thread would be
+            // dropped without a word. Cheap: both calls do nothing at all once the tables are
+            // long enough, which is every tick but the few where the cluster changed.
+            let membership =
+                self.raft.lock().expect("no panic holds this lock").membership().to_vec();
+            if membership.len() > self.outbox.len() {
+                let addrs: Vec<(String, String)> =
+                    membership.iter().map(|m| (m.name.clone(), m.addr.clone())).collect();
+                self.peers.extend(&addrs);
+                self.outbox.reach(membership.len());
+            }
+            let changed = *self.members.read().expect("no panic holds this lock") != membership;
+            *self.members.write().expect("no panic holds this lock") = membership;
+            if changed {
+                // A node that joined has to be let through the handshake, and one that left has
+                // to stop being: a certificate is not revoked by editing a file nobody re-reads.
+                if let Some(tls) = self.roster.read().expect("no panic holds this lock").as_ref() {
+                    tls.set_roster(self.member_names());
+                }
+            }
+
             for decision in out.applied {
-                if let Decision::Own(o) = decision {
-                    *self.ownership.write().expect("no panic holds this lock") = o;
+                match decision {
+                    // Applied on commit: routing a read to a node before a majority agreed it
+                    // owns the range would answer from a node nobody has acknowledged.
+                    Decision::Ranges(m) => {
+                        *self.ranges.write().expect("no panic holds this lock") = m
+                    }
+                    // Membership is applied when the entry is *appended*, not here - the raft
+                    // core does it, and the loop above copies the result out every tick. A
+                    // committed one decides nothing new.
+                    Decision::Members(_) => {}
+                    Decision::Noop => {}
                 }
             }
 
             for (to, m) in out.send {
-                if let Some(Some(sender)) = self.outbox.get(to) {
-                    // Full means this peer is not keeping up, and a queued heartbeat that is
-                    // already stale helps nobody.
-                    let _ = sender.try_send(m);
-                }
+                self.outbox.send(to, m);
             }
         }
     }
@@ -331,8 +477,7 @@ impl Controller {
                 || now.saturating_sub(raft.last_heard(node).unwrap_or(0)) < promote_after
         };
 
-        let current = self.ownership();
-        let mut next = current.clone();
+        let mut next = self.map();
         let mut changed = false;
 
         // Marked behind, and never unmarked here: only a repair knows whether a copy has
@@ -341,7 +486,9 @@ impl Controller {
         // Only inside a group that has more than one copy. A range held by one node cannot be
         // given to anybody, so marking its node behind would record a fact nothing acts on and
         // put a name in a report that has no repair to run.
-        for group in self.groups.iter().filter(|g| g.len() > 1) {
+        let held: Vec<Vec<NodeId>> =
+            next.ranges.iter().filter(|r| r.group.len() > 1).map(|r| r.group.clone()).collect();
+        for group in &held {
             for &node in group {
                 if !live(node) && !next.is_stale(node) {
                     next.stale.push(node);
@@ -351,9 +498,8 @@ impl Controller {
         }
         next.stale.sort_unstable();
 
-        for (range, group) in self.groups.iter().enumerate() {
-            let Some(primary) = current.primary.get(range).copied() else { continue };
-            if live(primary) {
+        for i in 0..next.ranges.len() {
+            if live(next.ranges[i].primary) {
                 continue;
             }
             // A copy that is answering *and* has not missed a write. In group order, so two
@@ -361,10 +507,10 @@ impl Controller {
             // twice. When there is no such copy the range stays where it is and stays
             // unavailable, which is the honest answer: promoting a copy that is behind would
             // answer from data somebody else has and this one does not.
-            let Some(&replacement) = group.iter().find(|n| live(**n) && !next.is_stale(**n)) else {
-                continue;
-            };
-            next.primary[range] = replacement;
+            let replacement =
+                next.ranges[i].group.iter().copied().find(|n| live(*n) && !next.is_stale(*n));
+            let Some(replacement) = replacement else { continue };
+            next.ranges[i].primary = replacement;
             changed = true;
         }
 
@@ -376,7 +522,70 @@ impl Controller {
         // is now serving a range it no longer holds. `GET /verify` is how that is found; the
         // mark is what makes somebody look.
 
-        changed.then_some(Decision::Own(next))
+        if !changed {
+            return None;
+        }
+        // A promotion never reshapes the space, so this cannot fail - but the check is here
+        // rather than assumed, because every proposal goes through it and a proposal that
+        // skipped it would be the one that got it wrong.
+        if let Err(e) = next.check() {
+            debug_assert!(false, "a promotion produced an invalid map: {e}");
+            return None;
+        }
+        next.epoch += 1;
+        Some(Decision::Ranges(next))
+    }
+
+    /// Proposes a new map, which every node will adopt once a majority has it.
+    ///
+    /// **Only the leader, and only when everything before it has settled.** A second proposal
+    /// while the first is in flight would be a decision made about a state that has not landed
+    /// - the same rule `promotion` follows, for the same reason.
+    ///
+    /// The map is checked before it is proposed rather than after it commits, because a
+    /// committed map that leaves a gap is a record id nobody answers for and there is nothing
+    /// downstream that would notice.
+    pub fn propose_map(&self, mut next: RangeMap) -> core::result::Result<u64, ProposeError> {
+        next.check().map_err(ProposeError::Invalid)?;
+        let mut raft = self.raft.lock().expect("no panic holds this lock");
+        if !raft.is_leader() {
+            return Err(ProposeError::NotLeader { leader: raft.leader() });
+        }
+        if raft.commit_index() != raft.last_index() {
+            return Err(ProposeError::Busy);
+        }
+        // Bumped here rather than by the caller, so that two callers racing cannot mint one
+        // epoch twice - and a routed request carrying an epoch is only useful if it counts.
+        next.epoch = self.map().epoch + 1;
+        let epoch = next.epoch;
+        match raft.propose(Decision::Ranges(next)) {
+            Some(_) => Ok(epoch),
+            None => Err(ProposeError::NotLeader { leader: raft.leader() }),
+        }
+    }
+
+    /// Proposes a change to who is in the cluster.
+    ///
+    /// **One node at a time.** Adding or removing a single member keeps the old majority and
+    /// the new one overlapping, which is what makes the change safe without joint consensus -
+    /// two at once can split into two disjoint majorities that each elect a leader. The
+    /// "everything before it has committed" rule below is what enforces the one-at-a-time part.
+    pub fn propose_members(&self, next: Vec<Member>) -> core::result::Result<(), ProposeError> {
+        let mut raft = self.raft.lock().expect("no panic holds this lock");
+        if !raft.is_leader() {
+            return Err(ProposeError::NotLeader { leader: raft.leader() });
+        }
+        if raft.commit_index() != raft.last_index() {
+            return Err(ProposeError::Busy);
+        }
+        let before = raft.membership().to_vec();
+        if differences(&before, &next) > 1 {
+            return Err(ProposeError::TooManyAtOnce);
+        }
+        match raft.propose(Decision::Members(next)) {
+            Some(_) => Ok(()),
+            None => Err(ProposeError::NotLeader { leader: raft.leader() }),
+        }
     }
 
     /// Records that a copy has caught up, after a repair has made it true.
@@ -388,12 +597,13 @@ impl Controller {
         if !raft.is_leader() {
             return false;
         }
-        let mut next = self.ownership();
+        let mut next = self.map();
         if !next.is_stale(node) {
             return true;
         }
         next.stale.retain(|n| *n != node);
-        raft.propose(Decision::Own(next)).is_some()
+        next.epoch += 1;
+        raft.propose(Decision::Ranges(next)).is_some()
     }
 }
 
@@ -410,17 +620,70 @@ fn merge(into: &mut raft::Output, from: raft::Output) {
 /// one. A candidate has no lease at all, which is correct - it does not know who leads.
 fn lease_anchor(raft: &Raft, now: u64) -> Option<u64> {
     if raft.is_leader() {
-        let mut heard: Vec<u64> = (0..raft.members())
-            .filter_map(|n| if n == raft.id() { Some(now) } else { raft.last_heard(n) })
+        // **Over the voters, and by their ids.** This used to walk `0..members()` as though the
+        // member set were a dense range - true while membership was a file read once, and
+        // wrong the moment a node can leave and keep its slot. A learner is excluded for the
+        // same reason it does not count towards a majority: it cannot help prove this node is
+        // still the leader.
+        let voters = raft.voters();
+        let mut heard: Vec<u64> = voters
+            .iter()
+            .filter_map(|n| if *n == raft.id() { Some(now) } else { raft.last_heard(*n) })
             .collect();
         heard.sort_unstable_by(|a, b| b.cmp(a));
         // The majority-th most recent. With three nodes that is the second: this node and one
         // other, which is a majority that has answered within that time.
-        return heard.get(raft.members() / 2).copied();
+        return heard.get(voters.len() / 2).copied();
     }
     let leader = raft.leader()?;
     if leader == raft.id() {
         return Some(now);
     }
     raft.last_heard(leader)
+}
+
+/// Why a change to the map was not proposed.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum ProposeError {
+    /// This node is not the one that decides. The leader, when it knows who that is.
+    NotLeader {
+        leader: Option<NodeId>,
+    },
+    /// Something is already in flight. Deciding about a state that has not settled is how two
+    /// changes are made about one map and only one of them survives.
+    Busy,
+    /// More than one member added, removed or changed at once. Two at a time can split the
+    /// cluster into two majorities that do not overlap, and each would elect its own leader.
+    TooManyAtOnce,
+    Invalid(raft::MapError),
+}
+
+impl core::fmt::Display for ProposeError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::NotLeader { leader: Some(n) } => {
+                write!(f, "this node does not decide the map; node {n} leads the agreement")
+            }
+            Self::NotLeader { leader: None } => {
+                write!(f, "this node does not decide the map, and no leader is known yet")
+            }
+            Self::Busy => write!(
+                f,
+                "a change to the map is already in flight; wait for it to commit and try again"
+            ),
+            Self::TooManyAtOnce => write!(
+                f,
+                "a membership change moves one node at a time; two at once can leave two \
+                 majorities that do not overlap, and each would elect its own leader"
+            ),
+            Self::Invalid(e) => write!(f, "the change would leave the map invalid: {e}"),
+        }
+    }
+}
+
+/// How many slots differ between two member lists, counting a longer list as that many more.
+fn differences(before: &[Member], after: &[Member]) -> usize {
+    let common = before.len().min(after.len());
+    let changed = (0..common).filter(|i| before[*i] != after[*i]).count();
+    changed + before.len().abs_diff(after.len())
 }

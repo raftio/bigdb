@@ -167,6 +167,9 @@ pub struct Ctx<'a, P: PagerMut> {
     /// Whether a backup is already walking this node's file. Shared with the server rather
     /// than owned here, because a `Ctx` lives for one request and the flag has to outlive it.
     pub backup_running: &'a AtomicBool,
+    /// When the cluster may reshape itself, and how hard. Off by default: a cluster that
+    /// changes its own shape unasked is a cluster whose shape an operator cannot predict.
+    pub balance: big_cluster::balance::Policy,
 }
 
 /// What a request has to be to reach a route.
@@ -243,8 +246,35 @@ enum Target<'a> {
     PeerKeysPut,
     PeerRepaired,
     PeerSchema,
+    /// Which version of the map this node has applied.
+    PeerEpoch,
+    /// What this node weighs, for the balancer.
+    PeerLoad,
+    /// The record ids this node has handed out, read and written when the row-key namespace
+    /// changes hands.
+    PeerFloors,
+    PeerFloorsPut,
     Repair,
     Backup,
+    /// What the cluster looks like right now, for an operator or an autoscaler.
+    ClusterTopology,
+    /// Cut a range in two, and optionally hand the upper half to another node.
+    ClusterSplit,
+    /// Join a range to the one after it.
+    ClusterMerge,
+    /// Add a node, promote it, start taking one out, or take it out for good.
+    ClusterAddNode,
+    ClusterAdmit,
+    ClusterDrain,
+    ClusterRemove,
+    /// Hand a populated range to another node without stopping reads.
+    ClusterMove,
+    /// Abandon a move that is in flight.
+    ClusterCancel,
+    /// Take one balancing step, if the facts call for one.
+    ClusterRebalance,
+    /// Hand the row-key namespace to another node.
+    ClusterSchemaLeader,
 }
 
 impl<'a> Target<'a> {
@@ -257,6 +287,10 @@ impl<'a> Target<'a> {
         matches!(
             self,
             Self::PeerQuery
+                | Self::PeerEpoch
+                | Self::PeerLoad
+                | Self::PeerFloors
+                | Self::PeerFloorsPut
                 | Self::PeerRecords
                 | Self::PeerDigest
                 | Self::PeerImport
@@ -317,6 +351,19 @@ impl<'a> Target<'a> {
             Self::Metrics | Self::Verify | Self::Repair | Self::Backup => {
                 Guard::Needs(Privilege::Operate, ObjectRef::Server)
             }
+            // Reshaping the cluster is the same privilege as repairing it: about the process
+            // and its peers, not about anybody's rows.
+            Self::ClusterTopology
+            | Self::ClusterSplit
+            | Self::ClusterMerge
+            | Self::ClusterAddNode
+            | Self::ClusterAdmit
+            | Self::ClusterDrain
+            | Self::ClusterRemove
+            | Self::ClusterMove
+            | Self::ClusterCancel
+            | Self::ClusterRebalance
+            | Self::ClusterSchemaLeader => Guard::Needs(Privilege::Operate, ObjectRef::Server),
             Self::Query(t) | Self::Records(t) => Guard::Needs(Privilege::Select, table(t)),
             Self::Import(t) => Guard::Needs(Privilege::Insert, table(t)),
             // Deleting records is not inserting them: a credential that may add facts is not
@@ -352,6 +399,10 @@ impl<'a> Target<'a> {
             | Self::PeerRaft
             | Self::PeerFragmentPut
             | Self::PeerKeysPut
+            | Self::PeerEpoch
+            | Self::PeerLoad
+            | Self::PeerFloors
+            | Self::PeerFloorsPut
             | Self::PeerRepaired => Guard::Node,
         }
     }
@@ -392,7 +443,22 @@ fn resolve<'a>(method: &str, segments: &[&'a str]) -> Option<Target<'a>> {
         ("POST", ["internal", "keys", "put"]) => Target::PeerKeysPut,
         ("POST", ["internal", "repaired"]) => Target::PeerRepaired,
         ("POST", ["internal", "schema"]) => Target::PeerSchema,
+        ("POST", ["internal", "epoch"]) => Target::PeerEpoch,
+        ("POST", ["internal", "load"]) => Target::PeerLoad,
+        ("POST", ["internal", "floors"]) => Target::PeerFloors,
+        ("POST", ["internal", "floors", "put"]) => Target::PeerFloorsPut,
         ("POST", ["repair"]) => Target::Repair,
+        ("GET", ["cluster", "topology"]) => Target::ClusterTopology,
+        ("POST", ["admin", "cluster", "split"]) => Target::ClusterSplit,
+        ("POST", ["admin", "cluster", "merge"]) => Target::ClusterMerge,
+        ("POST", ["admin", "cluster", "node"]) => Target::ClusterAddNode,
+        ("POST", ["admin", "cluster", "admit"]) => Target::ClusterAdmit,
+        ("POST", ["admin", "cluster", "drain"]) => Target::ClusterDrain,
+        ("DELETE", ["admin", "cluster", "node"]) => Target::ClusterRemove,
+        ("POST", ["admin", "cluster", "move"]) => Target::ClusterMove,
+        ("POST", ["admin", "cluster", "cancel"]) => Target::ClusterCancel,
+        ("POST", ["admin", "cluster", "rebalance"]) => Target::ClusterRebalance,
+        ("POST", ["admin", "cluster", "schema-leader"]) => Target::ClusterSchemaLeader,
         ("POST", ["admin", "backup"]) => Target::Backup,
         _ => return None,
     })
@@ -506,7 +572,7 @@ pub fn dispatch<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request) -> Answered
         Target::PeerAllocate => peer_allocate(ctx, req),
         Target::PeerNextRecord => peer_next_record(ctx, req),
         Target::PeerDdl => peer_ddl(ctx, req),
-        Target::PeerDigest => peer_digest(ctx),
+        Target::PeerDigest => peer_digest(ctx, req),
         Target::PeerRaft => peer_raft(ctx, req),
         Target::PeerFragments => peer_fragments(ctx, req),
         Target::PeerFragment => peer_fragment(ctx, req),
@@ -514,12 +580,36 @@ pub fn dispatch<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request) -> Answered
         Target::PeerKeys => peer_keys(ctx, req),
         Target::PeerKeysPut => peer_keys_put(ctx, req),
         Target::PeerRepaired => peer_repaired(ctx, req),
+        Target::PeerEpoch => Response::binary(wire::put_u64_body(ctx.cluster.map().epoch)),
+        Target::PeerFloors => Response::binary(wire::put_floors(&ctx.cluster.floors_here())),
+        Target::PeerFloorsPut => match wire::get_floors(&req.body) {
+            Err(e) => unreadable(&e),
+            Ok(floors) => {
+                ctx.cluster.raise_floors(&floors);
+                Response::binary(wire::put_u64_body(floors.len() as u64))
+            }
+        },
+        Target::PeerLoad => {
+            let load = ctx.cluster.load();
+            Response::binary(wire::put_load(load.pages.unwrap_or(0), load.frontier))
+        }
         Target::PeerSchema => {
             let mut out = Vec::new();
             wire::put_schema(&mut out, &ctx.cluster.schema(), &ctx.cluster.views());
             Response::binary(out)
         }
         Target::Repair => repair(ctx),
+        Target::ClusterTopology => cluster_topology(ctx),
+        Target::ClusterSplit => cluster_split(ctx, req),
+        Target::ClusterMerge => cluster_merge(ctx, req),
+        Target::ClusterAddNode => cluster_add_node(ctx, req),
+        Target::ClusterAdmit => cluster_member(ctx, req, Membership::Admit),
+        Target::ClusterDrain => cluster_member(ctx, req, Membership::Drain),
+        Target::ClusterRemove => cluster_member(ctx, req, Membership::Remove),
+        Target::ClusterMove => cluster_move(ctx, req),
+        Target::ClusterCancel => cluster_cancel(ctx, req),
+        Target::ClusterRebalance => cluster_rebalance(ctx, req),
+        Target::ClusterSchemaLeader => cluster_schema_leader(ctx, req),
         Target::Backup => backup(ctx, req),
     };
     Answered { response, who }

@@ -820,7 +820,7 @@ impl<P: PagerMut + Sync> Cluster<P> {
     fn merge_answers(&self, plan: &Plan, answers: Vec<(usize, Value)>) -> Result<Value> {
         let mut merge = Merge::new(plan);
         for (i, value) in answers {
-            merge.add(&self.config.nodes()[i].name, value)?;
+            merge.add(&self.describe(i), value)?;
         }
         Ok(merge.finish())
     }
@@ -828,26 +828,32 @@ impl<P: PagerMut + Sync> Cluster<P> {
     /// Every primary owner's answer to one plan, exactly as it was asked.
     fn ask_owners(&self, asked: &Plan, opts: &QueryOptions) -> Result<Vec<(usize, Value)>> {
         let asked = asked.clone();
-        let body = wire::QueryRequest {
-            plan: asked.clone(),
-            timeout_ms: opts.timeout.map(|t| t.as_millis().min(u64::MAX as u128) as u64),
-        }
-        .encode();
+        let timeout_ms = opts.timeout.map(|t| t.as_millis().min(u64::MAX as u128) as u64);
 
         // Primaries only. A replica holds the same records, so asking it as well would double
         // every count - and choosing it *instead* would answer from a copy that this node
-        // cannot know is current. Which copy is authoritative is a fact about the config file
-        // rather than about the moment, because there is no protocol here that could make it
-        // one about the moment.
+        // cannot know is current.
+        //
+        // **And each is asked for its own range only.** Once a node can serve two of them, a
+        // body that did not name one would have that node answer with both, twice - so the
+        // scope travels with the plan rather than being inferred from who received it.
         let answers = self.fan_out_over(
-            &self.candidates(0..self.config.range_count()),
+            &self.candidates(0..self.range_count()),
             opts.timeout,
             path::QUERY,
-            &body,
+            |slot| {
+                wire::QueryRequest {
+                    plan: asked.clone(),
+                    timeout_ms,
+                    shards: self.scope_of_range(slot),
+                }
+                .encode()
+            },
             wire::decode_value,
-            || {
+            |slot| {
                 self.guard()?;
-                self.api.execute(&asked, opts).map_err(ClusterError::Local)
+                let opts = opts.clone().in_shards(self.scope_of_range(slot));
+                self.api.execute(&asked, &opts).map_err(ClusterError::Local)
             },
         )?;
         Ok(answers)
@@ -865,21 +871,35 @@ impl<P: PagerMut + Sync> Cluster<P> {
         after: Option<RecordId>,
         limit: usize,
     ) -> Result<Vec<RecordId>> {
-        let body = wire::RecordsRequest {
-            table: table.to_string(),
-            after,
-            limit: limit.min(u64::MAX as usize) as u64,
-        }
-        .encode();
+        // The ranges still in play, and the slot order they were taken in. A slot is an index
+        // into *this* list once a range has been pruned, so the range it stands for has to be
+        // carried rather than assumed - otherwise a pruned scan would scope every remaining
+        // owner to the wrong shards.
+        let live: Vec<usize> =
+            (0..self.range_count()).filter(|r| self.may_hold_after(*r, after)).collect();
+        let asked = self.candidates(live.iter().copied());
 
-        let asked = self
-            .candidates((0..self.config.range_count()).filter(|r| self.may_hold_after(*r, after)));
-
-        let answers =
-            self.fan_out_over(&asked, None, path::RECORDS, &body, wire::get_records, || {
+        let answers = self.fan_out_over(
+            &asked,
+            None,
+            path::RECORDS,
+            |slot| {
+                wire::RecordsRequest {
+                    table: table.to_string(),
+                    after,
+                    limit: limit.min(u64::MAX as usize) as u64,
+                    shards: self.scope_of_range(live[slot]),
+                }
+                .encode()
+            },
+            wire::get_records,
+            |slot| {
                 self.guard()?;
-                self.api.records(table, after, limit).map_err(ClusterError::Local)
-            })?;
+                self.api
+                    .records_in(table, after, limit, self.scope_of_range(live[slot]))
+                    .map_err(ClusterError::Local)
+            },
+        )?;
 
         Ok(merge::merge_records(answers.into_iter().map(|(_, page)| page).collect(), limit))
     }

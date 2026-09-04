@@ -197,9 +197,9 @@ impl<P: PagerMut + Sync> Cluster<P> {
     /// the resolving, all the way down. Reporting one node's is a choice about which of two
     /// equally true numbers to print, and the leader's is the one that was assigned first.
     pub(super) fn ddl(&self, op: &Ddl) -> Result<u64> {
-        let leader = self.config.leader_index();
+        let leader = self.schema_leader();
         let body = op.encode();
-        let answer = if self.config.leads_schema() {
+        let answer = if self.leads_schema() {
             apply_ddl(&self.api, op).map_err(ClusterError::Local)?
         } else {
             let bytes = self.ask(leader, path::DDL, &body, None).map_err(|e| match e {
@@ -209,7 +209,7 @@ impl<P: PagerMut + Sync> Cluster<P> {
                 other => other,
             })?;
             wire::get_u64_body(&bytes).map_err(|why| ClusterError::Wire {
-                node: self.config.leader().name.clone(),
+                node: self.describe(self.schema_leader()),
                 why,
             })?
         };

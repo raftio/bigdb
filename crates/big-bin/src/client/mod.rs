@@ -218,6 +218,48 @@ fn request(command: &Command, input: &mut dyn BufRead) -> Result<Request, String
 
         Command::Verify => Request::new("GET", "/verify".to_string(), String::new()),
         Command::Repair => Request::new("POST", "/repair".to_string(), String::new()),
+        Command::ClusterTopology => {
+            Request::new("GET", "/cluster/topology".to_string(), String::new())
+        }
+        Command::ClusterSplit { at, to } => {
+            let path = match to {
+                Some(node) => format!("/admin/cluster/split?at={at}&to={node}"),
+                None => format!("/admin/cluster/split?at={at}"),
+            };
+            Request::new("POST", path, String::new())
+        }
+        Command::ClusterMerge { range } => {
+            Request::new("POST", format!("/admin/cluster/merge?range={range}"), String::new())
+        }
+        // Forced, because a person typing this has asked for it - the policy decides whether
+        // the cluster balances *itself*, not whether an operator may.
+        Command::ClusterRebalance => {
+            Request::new("POST", "/admin/cluster/rebalance?force=true".to_string(), String::new())
+        }
+        Command::ClusterSchemaLeader { to } => {
+            Request::new("POST", format!("/admin/cluster/schema-leader?to={to}"), String::new())
+        }
+        Command::ClusterMove { range, to } => Request::new(
+            "POST",
+            format!("/admin/cluster/move?range={range}&to={to}"),
+            String::new(),
+        ),
+        Command::ClusterCancel { range } => {
+            Request::new("POST", format!("/admin/cluster/cancel?range={range}"), String::new())
+        }
+        Command::ClusterAddNode { name, addr } => Request::new(
+            "POST",
+            format!("/admin/cluster/node?name={name}&addr={addr}"),
+            String::new(),
+        ),
+        // `remove` is the only one that takes a node away for good, so it is the only one
+        // written as a deletion.
+        Command::ClusterMember { verb: "remove", name } => {
+            Request::new("DELETE", format!("/admin/cluster/node?name={name}"), String::new())
+        }
+        Command::ClusterMember { verb, name } => {
+            Request::new("POST", format!("/admin/cluster/{verb}?name={name}"), String::new())
+        }
         Command::Health => Request::new("GET", "/health".to_string(), String::new()),
         Command::Ready => Request::new("GET", "/ready".to_string(), String::new()),
         Command::Metrics => Request {

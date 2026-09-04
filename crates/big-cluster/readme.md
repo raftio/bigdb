@@ -1,6 +1,6 @@
 # big-cluster
 
-Static shard ownership, the fan-out over it, and the wire it travels on.
+Who owns which shards, the fan-out over it, and the wire it travels on.
 
 Above `big-embed` and below `big-http`, which is the whole reason it is its own crate: the merge
 has to live somewhere that has never heard of a socket handler and somewhere `big-db` has never
@@ -88,8 +88,26 @@ that need no coordination were rejected rather than merely not chosen.
 change that has already been ruled legal. Table and field ids stay each node's own numbering,
 because nothing on the wire depends on two nodes agreeing about them.
 
+## The map is agreed, not configured
+
+`cluster.toml` says what the cluster was when it started. Every committed decision replaces it,
+so ranges split, merge and move, and nodes join and leave, without stopping anybody. Three
+things make that safe, and each is a way it could quietly not be:
+
+- **A routed request says which shards it is for.** A node can hold more than one range, so a
+  fan-out that asked it twice without naming one would have it answer twice over.
+- **A write says what it assumed.** The map can change between a coordinator reading it and the
+  batch arriving; the owner disagrees and the coordinator retries, rather than the batch landing
+  somewhere no read will ever look.
+- **A move commits in one entry**, after the copy is made and checked. There is no committed
+  state in which two nodes could both be asked for one record.
+
 ## What it does not do
 
-No replication, no rebalancing, no cross-node atomicity, no cluster-wide snapshot, no
-membership. Each of those is a decision with a reason, and the reasons are in
+No cross-node atomicity, no cluster-wide snapshot, no quorum reads or writes, no repair in the
+background. And a range that holds records still crosses the wire fragment by fragment - one
+process holds one file, so moving one is a copy. What changed is that it happens while the
+cluster serves, not that it became free.
+
+Each of those is a decision with a reason, and the reasons are in
 [docs/clustering.md](../../docs/clustering.md#what-this-does-not-give-you).

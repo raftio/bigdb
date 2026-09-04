@@ -20,6 +20,7 @@
 use crate::error::{DbError, Result};
 use big_engine::bitmap::field::Granularity;
 use big_engine::bitmap::FragmentKey;
+use big_engine::{ShardId, ShardRange};
 use big_keys::KeyStore;
 use big_pager::{kind, CATALOG_ENTRY_BYTES};
 use std::collections::BTreeMap;
@@ -357,6 +358,18 @@ pub struct Catalog {
     /// data. Counters that only ever go up make that unrepresentable.
     seq: Sequences,
     pub keys: KeyStore,
+    /// The shards this *view* of the catalog admits. `None` is every shard, which is what a
+    /// node with no peers and every write path uses.
+    ///
+    /// **A property of one read transaction, not of the database.** [`crate::DbRead`] takes its
+    /// own clone of the catalog, and scoping that clone is how "answer for these shards and no
+    /// others" reaches every scan at once. Putting it here rather than threading a parameter
+    /// through each enumerator is deliberate: the two methods below are the only ways to reach
+    /// a fragment, so a caller cannot forget the scope - and forgetting it, once one node can
+    /// hold two ranges, is a `Count` that silently returns double.
+    ///
+    /// Never persisted. [`Catalog::encode`] does not write it and a reload does not read one.
+    visible: Option<Vec<ShardRange>>,
 }
 
 #[derive(Clone, Debug)]
@@ -959,6 +972,28 @@ impl Catalog {
         self.fragments.entry(key).or_default()
     }
 
+    /// Restricts this *view* of the catalog to a set of shard ranges.
+    ///
+    /// Called on a read transaction's own clone, never on the database's. An empty slice is a
+    /// view that admits nothing, which is the honest answer for a node asked about a range it
+    /// does not hold - not a reason to fall back to everything.
+    pub fn restrict_to_shards(&mut self, ranges: Vec<ShardRange>) {
+        self.visible = Some(ranges);
+    }
+
+    /// The shards this view admits, or `None` for all of them.
+    pub fn visible_shards(&self) -> Option<&[ShardRange]> {
+        self.visible.as_deref()
+    }
+
+    /// Whether this view admits a shard at all.
+    fn sees(&self, shard: ShardId) -> bool {
+        match &self.visible {
+            None => true,
+            Some(ranges) => ranges.iter().any(|r| r.contains(shard)),
+        }
+    }
+
     /// Every fragment of a table, across every field and every view.
     ///
     /// The reserved existence field is included: it is a fragment like any other and a record
@@ -969,7 +1004,10 @@ impl Catalog {
     ) -> impl Iterator<Item = (&FragmentKey, &FragmentMeta)> {
         let lo = FragmentKey { table, field: 0, view: 0, shard: 0 };
         let hi = FragmentKey { table, field: FieldId::MAX, view: ViewId::MAX, shard: u64::MAX };
-        self.fragments.range(lo..=hi)
+        // A filter rather than a tighter range: the shard is the *last* component of the key,
+        // so a set of shard ranges is not one contiguous span of keys here the way it is in
+        // `fragments_of_field`.
+        self.fragments.range(lo..=hi).filter(|(k, _)| self.sees(k.shard))
     }
 
     pub fn fragments_of_field(
@@ -980,7 +1018,7 @@ impl Catalog {
     ) -> impl Iterator<Item = (&FragmentKey, &FragmentMeta)> {
         let lo = FragmentKey { table, field, view, shard: 0 };
         let hi = FragmentKey { table, field, view, shard: u64::MAX };
-        self.fragments.range(lo..=hi)
+        self.fragments.range(lo..=hi).filter(|(k, _)| self.sees(k.shard))
     }
 
     pub fn encode(&self) -> Vec<Vec<u8>> {

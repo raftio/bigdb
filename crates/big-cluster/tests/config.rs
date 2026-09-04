@@ -457,3 +457,79 @@ replica = "a"
     let unreplicated = text.replace("replica = \"a\"", "shards = \"1..\"").replace("0..", "0..1");
     assert!(ClusterFile::parse(&unreplicated).is_ok(), "{unreplicated}");
 }
+
+// -------------------------------------------------------------------------------------------
+// What names a cluster
+// -------------------------------------------------------------------------------------------
+
+/// **The check that used to make joining impossible.** Two nodes of one cluster now legitimately
+/// hold different files - the agreement decides who is a member - so the shape of the file
+/// cannot be what they recognise each other by. `cluster_id` is what they use instead.
+#[test]
+fn two_nodes_with_different_files_and_one_cluster_id_recognise_each_other() {
+    let three = r#"
+cluster_id    = "orders-eu"
+schema_leader = "a"
+
+[[node]]
+name   = "a"
+addr   = "10.0.0.1:7654"
+shards = "0..64"
+
+[[node]]
+name   = "b"
+addr   = "10.0.0.2:7654"
+shards = "64.."
+
+[[node]]
+name    = "a-spare"
+addr    = "10.0.0.3:7654"
+replica = "a"
+"#;
+    // The file a node joining later is given: it knows itself and one peer, and nothing about
+    // the shape the cluster happens to have today.
+    let joining = r#"
+cluster_id    = "orders-eu"
+schema_leader = "a"
+
+[[node]]
+name   = "a"
+addr   = "10.0.0.1:7654"
+shards = "0.."
+"#;
+
+    let old = ClusterFile::parse(three).unwrap().for_node(Some("a"), "").unwrap();
+    let new = ClusterFile::parse(joining).unwrap().for_node(Some("a"), "").unwrap();
+    assert_eq!(old.fingerprint(), new.fingerprint(), "same cluster, different files");
+}
+
+/// And a node pointed at the wrong cluster is still refused, which is what the check is for.
+#[test]
+fn a_different_cluster_id_is_a_different_cluster() {
+    let one = "cluster_id = \"orders-eu\"\nschema_leader = \"a\"\n\
+               [[node]]\nname = \"a\"\naddr = \"10.0.0.1:7654\"\nshards = \"0..\"\n";
+    let two = "cluster_id = \"orders-us\"\nschema_leader = \"a\"\n\
+               [[node]]\nname = \"a\"\naddr = \"10.0.0.1:7654\"\nshards = \"0..\"\n";
+    let a = ClusterFile::parse(one).unwrap().for_node(Some("a"), "").unwrap();
+    let b = ClusterFile::parse(two).unwrap().for_node(Some("a"), "").unwrap();
+    assert_ne!(a.fingerprint(), b.fingerprint());
+}
+
+/// **Nothing that deploys the old way has to change.** Without an id, the shape of the file is
+/// still what identifies the cluster - exact for the case that has always worked, which is
+/// every node started from one file.
+#[test]
+fn a_file_with_no_cluster_id_is_still_identified_by_its_shape() {
+    let text = "schema_leader = \"a\"\n\
+                [[node]]\nname = \"a\"\naddr = \"10.0.0.1:7654\"\nshards = \"0..64\"\n\
+                [[node]]\nname = \"b\"\naddr = \"10.0.0.2:7654\"\nshards = \"64..\"\n";
+    let moved = "schema_leader = \"a\"\n\
+                 [[node]]\nname = \"a\"\naddr = \"10.0.0.1:7654\"\nshards = \"0..32\"\n\
+                 [[node]]\nname = \"b\"\naddr = \"10.0.0.2:7654\"\nshards = \"32..\"\n";
+    let a = ClusterFile::parse(text).unwrap().for_node(Some("a"), "").unwrap();
+    let b = ClusterFile::parse(text).unwrap().for_node(Some("b"), "").unwrap();
+    let edited = ClusterFile::parse(moved).unwrap().for_node(Some("a"), "").unwrap();
+
+    assert_eq!(a.fingerprint(), b.fingerprint(), "which node this is does not change it");
+    assert_ne!(a.fingerprint(), edited.fingerprint(), "a file somebody edited does");
+}

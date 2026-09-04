@@ -31,24 +31,47 @@
 //! was full - the request holding the last worker would be waiting for a worker to answer it.
 //! The local share of every fan-out is a direct call.
 //!
-//! **What this does not give you**, spelled out because the absences are the design:
+//! **The map is a value the agreement decides, and the file only seeds it.** `cluster.toml`
+//! says what the cluster was when it started; every committed decision replaces it. That is the
+//! same rule ownership always followed - *the config's answer until the agreement has one* -
+//! widened from *who serves a range* to *what the ranges are and who is in the cluster*. So a
+//! range can be split, moved or merged, and a node can join or leave, without stopping anybody.
 //!
-//! - **No replication.** A node's disk is the only copy of its shards.
-//! - **No rebalancing.** Changing a range means stopping a node, copying a file, editing the
-//!   config. One process holds one file - the pager takes an exclusive lock - so a shard does
-//!   not move without a copy.
+//! Three things make that safe, and each is worth naming because each is a way it could
+//! silently not be:
+//!
+//! - **A routed request says which shards it is for.** A node can hold more than one range, so
+//!   a fan-out that asked it twice without naming one would have it answer twice over - a
+//!   `Count` that is quietly double, with nothing downstream to contradict it.
+//! - **A write says what it assumed.** Between a coordinator reading the map and its batch
+//!   arriving, the map can change; without the check the batch lands on yesterday's owner, is
+//!   reported written, and is never read again. The owner disagrees and the coordinator retries.
+//! - **A move copies before it commits, and commits in one entry.** There is no committed state
+//!   in which two nodes could both be asked for one record.
+//!
+//! **What this still does not give you**, spelled out because the absences are the design:
+//!
 //! - **No cross-node atomicity.** A batch spanning two owners is two commits, and a failure in
 //!   the middle is reported as [`ClusterError::Partial`] rather than hidden.
 //! - **No cluster-wide snapshot.** Each owner serves the fan-out from its own read transaction,
 //!   taken when its part of the request arrived, so a distributed read can straddle two
 //!   commits. Fixing that means a cluster-wide transaction id, which means the meta page flip
 //!   stops being the only atomic point, which is a different engine.
-//! - **No membership layer.** A failure detector's answer would have to change a routing
-//!   decision, and with one owner per shard there is nothing to route to. That day arrives
-//!   with replication and not before.
+//! - **No quorum reads or writes.** A read goes to one copy and a write goes to all of them.
+//!   What a quorum would buy is bought instead by letting the write stand and marking the copy
+//!   behind, which costs one entry in a log that is already there.
+//! - **No repair in the background.** `POST /repair` is a thing an operator or cron runs. A
+//!   repair is a scan and a copy, and a system that starts one by itself starts it at the worst
+//!   possible moment.
+//! - **Shards still do not move without a copy.** One process holds one file - the pager takes
+//!   an exclusive lock - so a range that is not empty crosses the wire fragment by fragment.
+//!   What changed is that it can do so while the cluster serves, not that it became free.
 
 #![deny(unsafe_code)]
 
+mod admin;
+pub mod balance;
+pub use admin::{MemberReport, MoveReport, RangeReport, Topology};
 mod ddl;
 // The one item a sibling borrows across the split: `repair` recreates a field exactly as
 // another node has it, and that is a `Ddl` rather than a repair concern.
@@ -118,9 +141,16 @@ use std::time::{Duration, Instant};
 /// adding three. A `4` node reading a `5` message would take that first tag as the top of a row
 /// id - a misread rather than a refusal, which is exactly what a version bump exists to prevent.
 ///
+/// `6` since a routed request says **which shards it is for**. `QueryRequest`, `RecordsRequest`
+/// and `TableRequest` each gained a scope at the end, and `/internal/digest` grew a body that
+/// used to be empty. A node may hold more than one range now, and a `5` node - which answers
+/// every request from everything on its disk - asked twice by a `6` coordinator would return
+/// its data twice, so `Count` would silently double. That is precisely the quiet mistake a
+/// version exists to turn into a refusal.
+///
 /// The retired numbers are **not** reused. A stale peer that somehow got past the handshake
 /// would then misparse rather than fail, which is what `finished` exists to prevent.
-pub const WIRE_VERSION: u32 = 5;
+pub const WIRE_VERSION: u32 = 6;
 
 /// The header carrying [`WIRE_VERSION`].
 pub const WIRE_HEADER: &str = "x-big-wire";
@@ -150,6 +180,14 @@ pub mod path {
     pub const KEYS_PUT: &str = "/internal/keys/put";
     pub const REPAIRED: &str = "/internal/repaired";
     pub const SCHEMA: &str = "/internal/schema";
+    /// Which version of the map a node has applied. Asked before its data is taken away.
+    pub const EPOCH: &str = "/internal/epoch";
+    /// What a node weighs, for the balancer.
+    pub const LOAD: &str = "/internal/load";
+    /// One past the highest record id a node has handed out, per table. Read and written when
+    /// the row-key namespace changes hands.
+    pub const FLOORS: &str = "/internal/floors";
+    pub const FLOORS_PUT: &str = "/internal/floors/put";
 }
 
 /// One node, playing whichever of the three roles a given request needs.
@@ -187,12 +225,25 @@ pub struct Cluster<P: PagerMut> {
     /// running an election to decide who serves it would be machinery deciding a question
     /// with one possible answer.
     controller: Option<Arc<Controller>>,
+    /// **Which node answers for which part of the space.** The one place routing reads.
+    ///
+    /// Seeded from the cluster file and replaced by every committed `Decision::Ranges`, which
+    /// is the same rule ownership always followed - "the config's answer until the agreement
+    /// has one" - widened from *who serves a range* to *what the ranges are*.
+    ///
+    /// Shared with the controller rather than owned by it, because a cluster with no copies
+    /// runs no agreement at all and still has to route. One value, not two that can drift.
+    ranges: Arc<std::sync::RwLock<raft::RangeMap>>,
 }
 
 impl<P: PagerMut + Sync> Cluster<P> {
     /// A database that is not clustered: one node, every shard, nobody to disagree with.
+    ///
+    /// Infallible where [`Cluster::new`] is not, and provably: a cluster of one is not
+    /// replicated, so no agreement is started and no state file is read.
     pub fn solo(api: Api<P>) -> Self {
         Self::new(api, ClusterConfig::solo("127.0.0.1:7654"), None, Box::new(raft::Forgetful))
+            .expect("a cluster of one starts no agreement, so nothing can fail to load")
     }
 
     /// A node in a configured cluster. `tls` is what this node presents to its peers.
@@ -212,7 +263,7 @@ impl<P: PagerMut + Sync> Cluster<P> {
         config: ClusterConfig,
         tls: Option<Arc<big_tls::ClientTls>>,
         store: Box<dyn raft::Store>,
-    ) -> Self {
+    ) -> std::io::Result<Self> {
         Self::with_timing(api, config, tls, store, raft::Timing::default(), Leases::default())
     }
 
@@ -229,7 +280,7 @@ impl<P: PagerMut + Sync> Cluster<P> {
         store: Box<dyn raft::Store>,
         timing: raft::Timing,
         leases: Leases,
-    ) -> Self {
+    ) -> std::io::Result<Self> {
         let peers = Arc::new(client::HttpPeers::new(
             config.nodes().iter().map(|n| n.name.clone()),
             config.nodes().iter().map(|n| n.addr.clone()),
@@ -252,28 +303,39 @@ impl<P: PagerMut + Sync> Cluster<P> {
         store: Box<dyn raft::Store>,
         timing: raft::Timing,
         leases: Leases,
-    ) -> Self {
-        let controller = config
-            .is_replicated()
-            .then(|| Controller::start(&config, Arc::clone(&peers), store, timing, leases));
-        Self {
+    ) -> std::io::Result<Self> {
+        let ranges = Arc::new(std::sync::RwLock::new(config.seed_map()));
+        let controller = match config.is_replicated() {
+            false => None,
+            true => Some(Controller::start(
+                &config,
+                Arc::clone(&peers),
+                store,
+                timing,
+                leases,
+                Arc::clone(&ranges),
+            )?),
+        };
+        Ok(Self {
             config,
             api,
             peers,
             controller,
+            ranges,
             counters: counters::Counters::new(),
             allocated: Default::default(),
-        }
+        })
     }
 
     /// What an operator can see about this node's place in the cluster.
     ///
     /// A snapshot rather than a handle: rendering it must never hold anything a request needs.
     pub fn counters(&self) -> counters::Snapshot {
-        let (term, leader, behind) = match &self.controller {
-            None => (0, false, 0),
-            Some(c) => (c.term(), c.is_leader(), c.ownership().stale.len()),
+        let (term, leader) = match &self.controller {
+            None => (0, false),
+            Some(c) => (c.term(), c.is_leader()),
         };
+        let behind = self.map().stale.len();
         counters::Snapshot {
             nodes: self.config.nodes().len(),
             peers: self.config.nodes().len() - 1,
@@ -294,6 +356,17 @@ impl<P: PagerMut + Sync> Cluster<P> {
         }
     }
 
+    /// Hands the listener's peer roster to the agreement, so that it follows the membership.
+    ///
+    /// Called by whoever built the listener, because this node has to exist before it can be
+    /// listened for. A cluster with no agreement keeps whatever roster it was built with,
+    /// which is right: nothing can change its membership either.
+    pub fn follow_roster(&self, tls: big_tls::TlsConfig) {
+        if let Some(c) = &self.controller {
+            c.follow_roster(tls);
+        }
+    }
+
     /// The agreement, for the routes that carry it and for anything asking who leads.
     pub fn controller(&self) -> Option<&Arc<Controller>> {
         self.controller.as_ref()
@@ -307,6 +380,14 @@ impl<P: PagerMut + Sync> Cluster<P> {
 
     pub fn config(&self) -> &ClusterConfig {
         &self.config
+    }
+
+    /// Which node answers for which part of the space, right now.
+    ///
+    /// A clone rather than a guard: this is read on the path of every request, so the lock is
+    /// held for a pointer's worth of time and never across any I/O.
+    pub fn map(&self) -> raft::RangeMap {
+        self.ranges.read().expect("no panic holds this lock").clone()
     }
 }
 
@@ -325,10 +406,16 @@ pub struct WriteOutcome {
     pub missed: Vec<String>,
 }
 
-/// What a repair managed for one copy.
+/// What a repair managed for one copy of one range.
+///
+/// **One per copy *and* range.** A behind copy can hold several ranges, and each is caught up
+/// from whoever serves that one - which need not be the same node twice. Naming only the copy
+/// would make two entries look identical while describing different work.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct RepairReport {
     pub node: String,
+    /// The range that was repaired, as `0..64`.
+    pub shards: String,
     /// How many fragments had to move. Zero means the copy was already correct and only the
     /// mark was stale, which is the common case after a brief blip.
     pub fragments: usize,

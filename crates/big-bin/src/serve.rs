@@ -281,7 +281,7 @@ fn assemble(
     // two.
     let state = format!("{}.raft", opts.path);
     eprintln!("big: agreement state in {state}");
-    Ok(Cluster::new(api, config, tls, Box::new(big_cluster::raft::FileStore::new(state))))
+    Cluster::new(api, config, tls, Box::new(big_cluster::raft::FileStore::new(state)))
 }
 
 /// The listener's settings: the defaults, with whatever the operator overrode.

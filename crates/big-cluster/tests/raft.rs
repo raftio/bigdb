@@ -24,7 +24,11 @@
 //! never lead the same term, and a committed decision is never taken back.** Everything else
 //! is a way of stressing that.
 
-use big_cluster::raft::{Decision, Message, NodeId, Ownership, Raft, Role, Store, Timing};
+use big_cluster::raft::{
+    Decision, Member, MemberState, Message, NodeId, Raft, Range, RangeMap, Role, State, Store,
+    Timing,
+};
+use big_engine::ShardRange;
 use std::collections::BTreeSet;
 
 /// A cluster in one process, with a clock and a network this test drives.
@@ -51,7 +55,7 @@ impl Sim {
     /// waits seconds for are exercised in microseconds. What it cannot exercise is the *wall*
     /// clock - that is `a_range_fails_over_on_the_clocks_it_ships_with` over real sockets.
     fn with_timing(n: usize, timing: Timing) -> Self {
-        let members: Vec<NodeId> = (0..n).collect();
+        let members = voters(n);
         Self {
             nodes: (0..n).map(|i| Raft::new(i, members.clone(), timing, 0)).collect(),
             queue: Vec::new(),
@@ -135,8 +139,40 @@ impl Sim {
     }
 }
 
+/// `n` nodes, all of them voting, which is what a cluster file describes.
+fn voters(n: usize) -> Vec<Member> {
+    (0..n)
+        .map(|i| Member {
+            name: format!("n{i}"),
+            addr: format!("10.0.0.{i}:7654"),
+            state: MemberState::Voter,
+        })
+        .collect()
+}
+
+/// A map in which node `primary[i]` serves range `i`, each over an arbitrary slice of the
+/// space. What the ranges cover does not matter to the agreement - only that a decision is a
+/// value that survives a round trip and that two of them compare unequal.
 fn owning(primary: &[NodeId]) -> Decision {
-    Decision::Own(Ownership { primary: primary.to_vec(), stale: Vec::new() })
+    Decision::Ranges(map_of(primary, &[]))
+}
+
+fn map_of(primary: &[NodeId], stale: &[NodeId]) -> RangeMap {
+    let ranges = primary
+        .iter()
+        .enumerate()
+        .map(|(i, p)| Range {
+            id: i as u64,
+            shards: ShardRange {
+                start: i as u64 * 64,
+                end: (i + 1 < primary.len()).then(|| (i as u64 + 1) * 64),
+            },
+            group: vec![*p],
+            primary: *p,
+            moving: None,
+        })
+        .collect();
+    RangeMap { epoch: 1, ranges, stale: stale.to_vec(), schema_leader: 0 }
 }
 
 /// A node alone in its config file leads immediately: a majority of one is one.
@@ -307,7 +343,7 @@ fn a_returning_leader_gives_up_what_it_decided_alone() {
 /// candidates in the same term and a simulation is free not to produce one.
 #[test]
 fn a_node_votes_once_per_term() {
-    let members = vec![0, 1, 2];
+    let members = voters(3);
     let mut node = Raft::new(0, members, Timing::default(), 0);
 
     let ask = |candidate: NodeId| Message::RequestVote {
@@ -362,7 +398,7 @@ fn a_stale_log_cannot_win_a_vote() {
 /// A follower whose log disagrees has the disagreement removed, not merged.
 #[test]
 fn a_conflicting_log_is_truncated_and_repaired() {
-    let members = vec![0, 1, 2];
+    let members = voters(3);
     let mut node = Raft::new(1, members, Timing::default(), 0);
 
     // Term 1 appends two entries.
@@ -402,7 +438,7 @@ fn a_conflicting_log_is_truncated_and_repaired() {
 /// An append from a stale term is refused outright, and the stale leader is told the real one.
 #[test]
 fn an_append_from_an_old_term_is_refused() {
-    let members = vec![0, 1, 2];
+    let members = voters(3);
     let mut node = Raft::new(1, members, Timing::default(), 0);
     node.deliver(
         Message::Append {
@@ -483,22 +519,38 @@ fn a_restart_keeps_the_term_the_vote_and_the_log() {
         big_cluster::raft::Entry { term: 0, decision: Decision::Noop },
         big_cluster::raft::Entry { term: 3, decision: Decision::Noop },
         big_cluster::raft::Entry { term: 3, decision: owning(&[2, 0, 1]) },
+        big_cluster::raft::Entry { term: 4, decision: Decision::Ranges(map_of(&[1, 1], &[0, 2])) },
+        // A configuration change is a decision like any other and has to survive the same trip.
         big_cluster::raft::Entry {
             term: 4,
-            decision: Decision::Own(Ownership { primary: vec![1, 1], stale: vec![0, 2] }),
+            decision: Decision::Members(vec![
+                Member {
+                    name: "a".to_string(),
+                    addr: "10.0.0.1:7654".to_string(),
+                    state: MemberState::Voter,
+                },
+                Member {
+                    name: "d".to_string(),
+                    addr: "10.0.0.4:7654".to_string(),
+                    state: MemberState::Learner,
+                },
+            ]),
         },
     ];
-    store.save(4, Some(2), &log).unwrap();
+    let state = State { term: 4, voted_for: Some(2), commit: 3, base: 0, log: log.clone() };
+    store.save(&state).unwrap();
 
-    let (term, voted, back) = store.load().unwrap().expect("just written");
-    assert_eq!(term, 4);
-    assert_eq!(voted, Some(2));
-    assert_eq!(back, log);
+    let back = store.load().unwrap().expect("just written");
+    assert_eq!(back, state);
+
+    // **The commit point is part of the state.** A node that forgot it would replay its whole
+    // log into the state machine on the way up, applying a map no majority ever agreed to.
+    assert_eq!(back.commit, 3);
 
     // A node with no vote is a different state from a node that voted for node zero, and the
     // two must not encode alike.
-    store.save(9, None, &log).unwrap();
-    assert_eq!(store.load().unwrap().unwrap().1, None);
+    store.save(&State { term: 9, voted_for: None, commit: 1, base: 0, log }).unwrap();
+    assert_eq!(store.load().unwrap().unwrap().voted_for, None);
 }
 
 /// A node comes back holding what it held, and does not vote for a log that is behind its own.
@@ -510,11 +562,11 @@ fn a_restarted_node_still_refuses_a_stale_candidate() {
         big_cluster::raft::Entry { term: 0, decision: Decision::Noop },
         big_cluster::raft::Entry { term: 7, decision: owning(&[1, 0]) },
     ];
-    store.save(7, Some(1), &log).unwrap();
+    store.save(&State { term: 7, voted_for: Some(1), commit: 1, base: 0, log }).unwrap();
 
-    let (term, voted, log) = store.load().unwrap().unwrap();
-    let mut node = Raft::new(0, vec![0, 1, 2], Timing::default(), 0);
-    node.restore(term, voted, log);
+    let state = store.load().unwrap().unwrap();
+    let mut node = Raft::new(0, voters(3), Timing::default(), 0);
+    node.restore(state);
     assert_eq!(node.term(), 7);
 
     // A candidate at a higher term with an empty log: newer term, older log. Refused, because
@@ -533,7 +585,13 @@ fn a_damaged_state_file_is_refused() {
     let path = dir.path().join("state.raft");
     let store = big_cluster::raft::FileStore::new(&path);
     store
-        .save(2, Some(0), &[big_cluster::raft::Entry { term: 0, decision: Decision::Noop }])
+        .save(&State {
+            term: 2,
+            voted_for: Some(0),
+            commit: 0,
+            base: 0,
+            log: vec![big_cluster::raft::Entry { term: 0, decision: Decision::Noop }],
+        })
         .unwrap();
 
     let good = std::fs::read(&path).unwrap();
@@ -596,4 +654,251 @@ fn the_shipped_clocks_do_not_re_elect_a_healthy_leader() {
         term,
         "the term moved with nothing wrong: an election was held for no reason"
     );
+}
+
+// -------------------------------------------------------------------------------------------
+// Membership, changed while the cluster runs
+//
+// **The part of Raft most often got wrong**, and the reason it stayed out of this file for so
+// long. Three rules, and every one of them has a way of failing quietly rather than loudly.
+// -------------------------------------------------------------------------------------------
+
+fn learner(name: &str) -> Member {
+    Member {
+        name: name.to_string(),
+        addr: "10.0.0.9:7654".to_string(),
+        state: MemberState::Learner,
+    }
+}
+
+/// **A configuration change takes effect when it is appended, not when it commits.**
+///
+/// The majority that commits an entry has to be the majority the entry describes. A leader that
+/// waited for the commit would be counting a quorum the change is in the middle of abolishing.
+#[test]
+fn a_membership_change_counts_from_the_moment_it_is_appended() {
+    let mut node = Raft::new(0, voters(1), Timing::default(), 0);
+    node.tick(2_000);
+    assert!(node.is_leader(), "alone, so a majority of one");
+    assert_eq!(node.voters(), &[0]);
+
+    // A second voter: the majority is now two, immediately - before anything has committed.
+    let mut next = voters(1);
+    next.push(Member {
+        name: "n1".to_string(),
+        addr: "10.0.0.1:7654".to_string(),
+        state: MemberState::Voter,
+    });
+    node.propose(Decision::Members(next)).expect("the leader proposes");
+    assert_eq!(node.voters(), &[0, 1], "the new member counts at once");
+    assert_eq!(node.members(), 2);
+}
+
+/// **A learner replicates and does not vote.** Counting one towards a majority would raise the
+/// bar for every election while it contributed nothing to one - and a node still filling up is
+/// exactly the node least able to help.
+#[test]
+fn a_learner_is_replicated_to_and_does_not_count_towards_a_majority() {
+    let mut node = Raft::new(0, voters(1), Timing::default(), 0);
+    node.tick(2_000);
+
+    let mut next = voters(1);
+    next.push(learner("joining"));
+    node.propose(Decision::Members(next)).expect("the leader proposes");
+
+    assert_eq!(node.members(), 2, "it is replicated to");
+    assert_eq!(node.voters(), &[0], "and it does not vote");
+    // Still a majority of one, so this node can still commit on its own.
+    assert!(node.is_leader());
+}
+
+/// **A membership that was appended and then truncated away goes back.**
+///
+/// This is the one that fails silently. A leader with a better log can take away an entry this
+/// node already applied; a membership mutated in place would have no way back, and the node
+/// would go on counting a quorum that never existed. Deriving it from the log makes the undo
+/// free - which is the whole reason it is derived.
+#[test]
+fn a_membership_taken_away_by_a_better_log_is_taken_back() {
+    let mut node = Raft::new(1, voters(3), Timing::default(), 0);
+
+    // A leader at term 1 appends a change this node applies on the spot.
+    let mut grown = voters(3);
+    grown.push(learner("joining"));
+    let out = node.deliver(
+        Message::Append {
+            term: 1,
+            leader: 0,
+            prev_index: 0,
+            prev_term: 0,
+            entries: vec![big_cluster::raft::Entry { term: 1, decision: Decision::Members(grown) }],
+            commit: 0,
+        },
+        0,
+    );
+    assert!(matches!(out.send.first(), Some((0, Message::AppendReply { success: true, .. }))));
+    assert_eq!(node.members(), 4, "applied on append, before any commit");
+
+    // A different leader at a higher term overwrites that index with something else.
+    node.deliver(
+        Message::Append {
+            term: 2,
+            leader: 2,
+            prev_index: 0,
+            prev_term: 0,
+            entries: vec![big_cluster::raft::Entry { term: 2, decision: Decision::Noop }],
+            commit: 0,
+        },
+        0,
+    );
+    assert_eq!(node.members(), 3, "the change went away with the entry that carried it");
+    assert_eq!(node.voters(), &[0, 1, 2]);
+}
+
+/// A node that comes back reads its cluster out of its own log, not out of the file it was
+/// first started with - which, once a node has joined or left, describes a cluster that is gone.
+#[test]
+fn a_restarted_node_comes_back_with_the_cluster_as_the_log_left_it() {
+    let mut grown = voters(3);
+    grown.push(learner("joining"));
+    let log = vec![
+        big_cluster::raft::Entry { term: 0, decision: Decision::Noop },
+        big_cluster::raft::Entry { term: 5, decision: Decision::Members(grown) },
+    ];
+
+    // Started from a file that knows three nodes, restored from a log that knows four.
+    let mut node = Raft::new(0, voters(3), Timing::default(), 0);
+    assert_eq!(node.members(), 3);
+    node.restore(State { term: 5, voted_for: Some(0), commit: 1, base: 0, log });
+
+    assert_eq!(node.members(), 4, "the log is what says who is in the cluster");
+    assert_eq!(node.voters(), &[0, 1, 2], "and the fourth is still catching up");
+}
+
+/// A node this cluster has removed can still be running and still campaigning. Granting it a
+/// vote would let a machine nobody has agreed to lead a cluster it has left.
+#[test]
+fn a_candidate_that_is_not_a_member_here_gets_no_vote() {
+    let mut node = Raft::new(0, voters(2), Timing::default(), 0);
+    let out = node
+        .deliver(Message::RequestVote { term: 9, candidate: 5, last_index: 0, last_term: 0 }, 0);
+    assert!(
+        matches!(out.send.first(), Some((5, Message::VoteReply { granted: false, .. }))),
+        "{:?}",
+        out.send
+    );
+}
+
+/// And the other half: a node that does not vote does not campaign either. One that did would
+/// depose a working leader once per election timeout for as long as it was running.
+#[test]
+fn a_node_that_does_not_vote_never_stands_for_election() {
+    let mut members = voters(2);
+    members[0].state = MemberState::Learner;
+    let mut node = Raft::new(0, members, Timing::default(), 0);
+
+    node.tick(100_000);
+    assert!(!node.is_leader());
+    assert_eq!(node.term(), 0, "it never even raised the term");
+}
+
+// -------------------------------------------------------------------------------------------
+// A log that does not grow for ever
+//
+// The log used to be short by construction - one entry per election, one per machine that dies.
+// Once a balancer proposes, that is no longer true, and the whole log is rewritten every time
+// anything is persisted. So it is compacted; and compacting means a follower can fall behind
+// what the leader still holds, which is what the snapshot is for.
+// -------------------------------------------------------------------------------------------
+
+/// **Nothing a follower still needs is dropped.** Compaction is best effort on purpose: a node
+/// that is down holds the base where it is, which costs disk and keeps recovery cheap.
+#[test]
+fn a_leader_keeps_every_entry_a_follower_has_not_stored() {
+    let mut sim = Sim::new(3);
+    sim.run(3_000);
+    let leader = sim.leader();
+
+    for i in 0..8 {
+        sim.nodes[leader].propose(owning(&[i % 3, (i + 1) % 3]));
+        sim.run(200);
+    }
+    // Forced, because the shipped margin deliberately keeps far more than this test writes.
+    sim.nodes[leader].compact(0);
+    assert!(sim.nodes[leader].base() > 0, "a log every node has stored is one worth compacting");
+
+    // One node goes away. From here the base cannot move past what it last stored, however
+    // much the other two decide.
+    let absent = (leader + 1) % 3;
+    sim.down.insert(absent);
+    let held = sim.nodes[leader].base();
+    for i in 0..8 {
+        sim.nodes[leader].propose(owning(&[i % 3, (i + 2) % 3]));
+        sim.run(200);
+    }
+    sim.nodes[leader].compact(0);
+    assert_eq!(
+        sim.nodes[leader].base(),
+        held,
+        "the base did not move past a node that is not storing anything"
+    );
+}
+
+/// **A follower the leader has compacted past is handed the answer itself.**
+///
+/// There is no prefix left to match against, so nothing can be merged: the state is taken as
+/// given, and the follower is caught up in one message rather than never.
+#[test]
+fn a_follower_that_falls_behind_the_base_is_caught_up_by_a_snapshot() {
+    let mut sim = Sim::new(3);
+    sim.run(3_000);
+    let leader = sim.leader();
+    let absent = (leader + 1) % 3;
+
+    // It misses everything, and the two that are left keep deciding - a majority of three is
+    // two, so the log advances without it.
+    sim.down.insert(absent);
+    for i in 0..40 {
+        sim.nodes[leader].propose(owning(&[i % 3, (i + 1) % 3]));
+        sim.run(200);
+    }
+
+    // Its `matched` is stale rather than absent, so the leader is still holding the base for
+    // it. Forcing the compaction is what puts it behind - which is the state this exists for.
+    sim.nodes[leader].compact(0);
+    let base = sim.nodes[leader].base();
+
+    sim.down.remove(&absent);
+    sim.run(4_000);
+
+    assert!(
+        sim.nodes[absent].base() >= base || sim.nodes[absent].last_index() >= base,
+        "it came back to a log it could not extend and was handed the state instead"
+    );
+    // And it agrees about the one thing the agreement decides.
+    let theirs = sim.applied[absent].last().cloned();
+    let mine = sim.applied[leader].last().cloned();
+    assert!(theirs.is_some(), "it applied something");
+    assert_eq!(theirs, mine, "and it is what the leader applied");
+}
+
+/// A restart after a compaction comes back to the compacted log, not to an empty one.
+#[test]
+fn a_compacted_log_survives_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = big_cluster::raft::FileStore::new(dir.path().join("state.raft"));
+    let log = vec![
+        // The sentinel is the state as of the base, not an empty entry.
+        big_cluster::raft::Entry { term: 3, decision: Decision::Ranges(map_of(&[1, 0], &[])) },
+        big_cluster::raft::Entry { term: 4, decision: Decision::Noop },
+    ];
+    let state = State { term: 4, voted_for: Some(1), commit: 41, base: 40, log };
+    store.save(&state).unwrap();
+    assert_eq!(store.load().unwrap().unwrap(), state, "the base is part of what is written down");
+
+    let mut node = Raft::new(0, voters(3), Timing::default(), 0);
+    node.restore(store.load().unwrap().unwrap());
+    assert_eq!(node.base(), 40);
+    assert_eq!(node.last_index(), 41, "indices are log positions, not vector positions");
+    assert_eq!(node.commit_index(), 41);
 }

@@ -132,7 +132,7 @@ impl Wire {
             // same question on every fan-out message.
             let identity = match conn.peer_certificates() {
                 None => Identity::None,
-                Some(chain) => match crate::tls::node_identity(Some(chain), tls.roster()) {
+                Some(chain) => match crate::tls::node_identity(Some(chain), &tls.roster()) {
                     Some(id) => id,
                     // Signed by our peer CA and naming nobody we know. Refused rather than
                     // demoted to an anonymous client: a certificate that got this far was meant

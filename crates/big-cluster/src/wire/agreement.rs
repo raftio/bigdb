@@ -54,19 +54,25 @@ pub fn put_raft(out: &mut Vec<u8>, m: &raft::Message) {
                 put_u64(out, entry.term);
                 match &entry.decision {
                     raft::Decision::Noop => put_u8(out, 0),
-                    raft::Decision::Own(o) => {
+                    raft::Decision::Ranges(m) => {
                         put_u8(out, 1);
-                        put_count(out, o.primary.len());
-                        for p in &o.primary {
-                            put_u64(out, *p as u64);
-                        }
-                        put_count(out, o.stale.len());
-                        for n in &o.stale {
-                            put_u64(out, *n as u64);
-                        }
+                        put_range_map(out, m);
+                    }
+                    raft::Decision::Members(ms) => {
+                        put_u8(out, 2);
+                        put_members(out, ms);
                     }
                 }
             }
+        }
+        raft::Message::Snapshot { term, leader, index, last_term, ranges, members } => {
+            put_u8(out, 4);
+            put_u64(out, *term);
+            put_u64(out, *leader as u64);
+            put_u64(out, *index);
+            put_u64(out, *last_term);
+            put_range_map(out, ranges);
+            put_members(out, members);
         }
         raft::Message::AppendReply { term, from, success, match_index } => {
             put_u8(out, 3);
@@ -101,19 +107,8 @@ pub fn get_raft(bytes: &[u8]) -> Result<raft::Message> {
                 let term = r.u64()?;
                 let decision = match r.u8()? {
                     0 => raft::Decision::Noop,
-                    1 => {
-                        let list = |r: &mut Reader<'_>| -> Result<Vec<raft::NodeId>> {
-                            let count = r.count()?;
-                            let mut out = Vec::with_capacity(count);
-                            for _ in 0..count {
-                                out.push(node(r.u64()?));
-                            }
-                            Ok(out)
-                        };
-                        let primary = list(&mut r)?;
-                        let stale = list(&mut r)?;
-                        raft::Decision::Own(raft::Ownership { primary, stale })
-                    }
+                    1 => raft::Decision::Ranges(get_range_map(&mut r)?),
+                    2 => raft::Decision::Members(get_members(&mut r)?),
                     tag => return Err(WireError::BadTag { what: "decision", tag }),
                 };
                 entries.push(raft::Entry { term, decision });
@@ -126,6 +121,14 @@ pub fn get_raft(bytes: &[u8]) -> Result<raft::Message> {
             success: r.bool()?,
             match_index: r.u64()?,
         },
+        4 => raft::Message::Snapshot {
+            term: r.u64()?,
+            leader: node(r.u64()?),
+            index: r.u64()?,
+            last_term: r.u64()?,
+            ranges: get_range_map(&mut r)?,
+            members: get_members(&mut r)?,
+        },
         tag => return Err(WireError::BadTag { what: "agreement message", tag }),
     };
     finished(&r)?;
@@ -136,4 +139,122 @@ pub fn encode_raft(m: &raft::Message) -> Vec<u8> {
     let mut out = Vec::new();
     put_raft(&mut out, m);
     out
+}
+
+// -----------------------------------------------------------------------------------------
+// The two values the agreement carries
+//
+// Both are small - a map is one line per range, a member list one line per node - and both
+// travel inside an append, so they are encoded here rather than as messages of their own.
+// -----------------------------------------------------------------------------------------
+
+fn put_range_map(out: &mut Vec<u8>, m: &raft::RangeMap) {
+    put_u64(out, m.epoch);
+    put_u64(out, m.schema_leader as u64);
+    put_count(out, m.ranges.len());
+    for r in &m.ranges {
+        put_u64(out, r.id);
+        put_u64(out, r.shards.start);
+        put_opt_u64(out, r.shards.end);
+        put_u64(out, r.primary as u64);
+        put_count(out, r.group.len());
+        for n in &r.group {
+            put_u64(out, *n as u64);
+        }
+        match &r.moving {
+            None => put_u8(out, 0),
+            Some(mv) => {
+                put_u8(
+                    out,
+                    match mv.state {
+                        raft::MoveState::Seeding => 1,
+                        raft::MoveState::Cutover => 2,
+                    },
+                );
+                put_u64(out, mv.target as u64);
+            }
+        }
+    }
+    put_count(out, m.stale.len());
+    for n in &m.stale {
+        put_u64(out, *n as u64);
+    }
+}
+
+fn get_range_map(r: &mut Reader<'_>) -> Result<raft::RangeMap> {
+    let epoch = r.u64()?;
+    let schema_leader = r.u64()? as raft::NodeId;
+    let n = r.count()?;
+    let mut ranges = Vec::with_capacity(n);
+    for _ in 0..n {
+        let id = r.u64()?;
+        let start = r.u64()?;
+        let end = r.opt_u64()?;
+        let primary = r.u64()? as raft::NodeId;
+        let count = r.count()?;
+        let mut group = Vec::with_capacity(count);
+        for _ in 0..count {
+            group.push(r.u64()? as raft::NodeId);
+        }
+        let moving = match r.u8()? {
+            0 => None,
+            1 => Some(raft::Move {
+                target: r.u64()? as raft::NodeId,
+                state: raft::MoveState::Seeding,
+            }),
+            2 => Some(raft::Move {
+                target: r.u64()? as raft::NodeId,
+                state: raft::MoveState::Cutover,
+            }),
+            tag => return Err(WireError::BadTag { what: "move state", tag }),
+        };
+        ranges.push(raft::Range {
+            id,
+            shards: big_engine::ShardRange { start, end },
+            group,
+            primary,
+            moving,
+        });
+    }
+    let count = r.count()?;
+    let mut stale = Vec::with_capacity(count);
+    for _ in 0..count {
+        stale.push(r.u64()? as raft::NodeId);
+    }
+    Ok(raft::RangeMap { epoch, ranges, stale, schema_leader })
+}
+
+fn put_members(out: &mut Vec<u8>, members: &[raft::Member]) {
+    put_count(out, members.len());
+    for m in members {
+        put_str(out, &m.name);
+        put_str(out, &m.addr);
+        put_u8(
+            out,
+            match m.state {
+                raft::MemberState::Learner => 0,
+                raft::MemberState::Voter => 1,
+                raft::MemberState::Draining => 2,
+                raft::MemberState::Gone => 3,
+            },
+        );
+    }
+}
+
+fn get_members(r: &mut Reader<'_>) -> Result<Vec<raft::Member>> {
+    let n = r.count()?;
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        let name = r.str()?;
+        let addr = r.str()?;
+        let state = match r.u8()? {
+            0 => raft::MemberState::Learner,
+            1 => raft::MemberState::Voter,
+            2 => raft::MemberState::Draining,
+            3 => raft::MemberState::Gone,
+            tag => return Err(WireError::BadTag { what: "member state", tag }),
+        };
+        out.push(raft::Member { name, addr, state });
+    }
+    Ok(out)
 }

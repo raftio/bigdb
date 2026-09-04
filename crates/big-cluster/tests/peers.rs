@@ -110,8 +110,8 @@ impl Peers for Fake {
         self.replies.len()
     }
 
-    fn addr(&self, node: usize) -> Option<&str> {
-        self.replies[node].as_ref().map(|_| "fake")
+    fn addr(&self, node: usize) -> Option<String> {
+        self.replies.get(node)?.as_ref().map(|_| "fake".to_string())
     }
 }
 
@@ -129,6 +129,7 @@ fn cluster(peers: Arc<Fake>) -> Cluster<MemPager> {
         raft::Timing::default(),
         Default::default(),
     )
+    .expect("Forgetful loads nothing and so cannot fail")
 }
 
 fn count(c: &Cluster<MemPager>) -> Result<Value, ClusterError> {
@@ -230,4 +231,74 @@ fn a_cluster_of_one_runs_the_same_coordinator_and_asks_nobody() {
     let c = Cluster::solo(api);
 
     assert_eq!(count(&c).unwrap().as_count(), Some(0));
+}
+
+/// A cluster file with a copy, which is what makes the agreement run at all.
+const THREE: &str = r#"
+schema_leader = "a"
+
+[[node]]
+name   = "a"
+addr   = "10.0.0.1:7654"
+shards = "0..64"
+
+[[node]]
+name   = "b"
+addr   = "10.0.0.2:7654"
+shards = "64.."
+
+[[node]]
+name    = "a-spare"
+addr    = "10.0.0.3:7654"
+replica = "a"
+"#;
+
+/// **A state file that cannot be read stops the node**, rather than being ignored.
+///
+/// The old code matched `if let Ok(Some(..)) = store.load()`, so a damaged file was
+/// indistinguishable from a node that had never voted: it started at term 0 with an empty log,
+/// free to vote a second time in a term it had already voted in. `raft.rs` proves the store
+/// refuses those bytes; this proves the controller acts on the refusal.
+#[test]
+fn a_node_whose_vote_is_unreadable_refuses_to_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.raft");
+    std::fs::write(&path, b"not a raft file at all").unwrap();
+
+    let api = Api::in_memory().unwrap();
+    let config: ClusterConfig = ClusterFile::parse(THREE).unwrap().for_node(Some("a"), "").unwrap();
+    let peers = Fake::new(vec![None, Some(Reply::Unreachable), Some(Reply::Unreachable)]);
+
+    let e = Cluster::with_peers(
+        api,
+        config,
+        peers,
+        Box::new(raft::FileStore::new(&path)),
+        raft::Timing::default(),
+        Default::default(),
+    )
+    .map(|_| ())
+    .expect_err("a damaged state file is not a node that has never voted");
+    assert_eq!(e.kind(), std::io::ErrorKind::InvalidData, "{e}");
+}
+
+/// The other half of the same rule: **a file that is simply not there is a fresh node**, and a
+/// fresh node starts. Without this the fix above would be a cluster that cannot be deployed.
+#[test]
+fn a_node_that_has_never_voted_starts() {
+    let dir = tempfile::tempdir().unwrap();
+    let api = Api::in_memory().unwrap();
+    let config: ClusterConfig = ClusterFile::parse(THREE).unwrap().for_node(Some("a"), "").unwrap();
+    let peers = Fake::new(vec![None, Some(Reply::Unreachable), Some(Reply::Unreachable)]);
+
+    let c = Cluster::with_peers(
+        api,
+        config,
+        peers,
+        Box::new(raft::FileStore::new(dir.path().join("absent.raft"))),
+        raft::Timing::default(),
+        Default::default(),
+    )
+    .expect("a node with no state file has never voted, which is a node that may start");
+    c.stop();
 }

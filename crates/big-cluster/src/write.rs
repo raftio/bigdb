@@ -22,6 +22,12 @@
 
 use super::*;
 
+/// How long a coordinator waits for a map it is behind on before trying a routed write again.
+///
+/// One heartbeat and a little, because that is how long a committed decision takes to reach a
+/// node that did not propose it.
+const STALE_ROUTE_PAUSE_MS: u64 = 500;
+
 impl<P: PagerMut + Sync> Cluster<P> {
     /// Writes a batch, splitting it by the owner of each record.
     ///
@@ -69,13 +75,44 @@ impl<P: PagerMut + Sync> Cluster<P> {
             self.api.import(table, &borrowed)?;
             return Ok(WriteOutcome { count: facts.len() as u64, missed: Vec::new() });
         }
+        self.retrying_stale_routes(|| self.import_once(table, facts))
+    }
 
+    /// Runs a routed write, and runs it once more if the map moved underneath it.
+    ///
+    /// **A retry rather than a failure, and exactly one.** A map changes when an operator
+    /// splits a range or the balancer moves one, and a coordinator learns about it by
+    /// replication like everybody else - so the window in which it routes by yesterday's map is
+    /// about one heartbeat wide. Waiting it out here turns a client-visible failure into a
+    /// pause, and *one* retry keeps a genuinely wrong route from becoming an endless loop: if
+    /// the second attempt is still stale, the map is moving faster than a batch can land and
+    /// the client is told so.
+    ///
+    /// Safe to run twice because a fact is idempotent: writing the same value to the same
+    /// record is the state it was already in. A batch that half landed and then retried does
+    /// not double anything.
+    fn retrying_stale_routes(
+        &self,
+        mut attempt: impl FnMut() -> Result<WriteOutcome>,
+    ) -> Result<WriteOutcome> {
+        match attempt() {
+            Err(e) if e.is_stale_route() => {
+                // Long enough for a heartbeat to have carried the decision here, and short
+                // enough that a client is waiting rather than timing out.
+                std::thread::sleep(Duration::from_millis(STALE_ROUTE_PAUSE_MS));
+                attempt()
+            }
+            other => other,
+        }
+    }
+
+    fn import_once(&self, table: &str, facts: &[OwnedFact]) -> Result<WriteOutcome> {
         let assignments = self.resolve_keys(table, facts)?;
         // Grouped by *range*, not by node. Which node serves a range can move; which range a
         // record belongs to cannot, because it is a shift of the record id.
         let mut by_range: BTreeMap<usize, Vec<&OwnedFact>> = BTreeMap::new();
         for fact in facts {
-            let range = self.config.range_of(big_engine::shard_of(fact.record));
+            let range = self.range_of(big_engine::shard_of(fact.record));
             by_range.entry(range).or_default().push(fact);
         }
 
@@ -92,7 +129,7 @@ impl<P: PagerMut + Sync> Cluster<P> {
             let copies = self.copies_of_range(range);
             let primary = copies[0];
             for copy in copies {
-                match self.write_share(copy, table, &keys, &share) {
+                match self.write_share(copy, table, &keys, &share, self.routed_for(range)) {
                     Ok(()) => report.landed(self.describe(copy)),
                     Err(e) => match report.refused(self.describe(copy), e, copy == primary) {
                         Verdict::Stop => return Err(report.into_error("the batch")),
@@ -105,6 +142,17 @@ impl<P: PagerMut + Sync> Cluster<P> {
         report.finish("the batch", facts.len() as u64)
     }
 
+    /// What a routed write claims about who owns the records in it.
+    ///
+    /// Sent so the owner can disagree. A coordinator holding a map one decision old would
+    /// otherwise write to whoever used to own those records, and the batch would land on a node
+    /// no read will ever ask - a loss nothing reports. The owner compares and refuses; the
+    /// coordinator learns the new map and sends it again.
+    pub(super) fn routed_for(&self, range: usize) -> Option<wire::Routed> {
+        let map = self.ranges.read().expect("no panic holds this lock");
+        map.ranges.get(range).map(|r| wire::Routed { epoch: map.epoch, shards: vec![r.shards] })
+    }
+
     /// One node's share of a batch, whether that node is this one or another.
     pub(super) fn write_share(
         &self,
@@ -112,9 +160,11 @@ impl<P: PagerMut + Sync> Cluster<P> {
         table: &str,
         keys: &[Assignment],
         share: &[&OwnedFact],
+        routed: Option<wire::Routed>,
     ) -> Result<()> {
         if node == self.config.this_index() {
             self.guard()?;
+            self.check_route(routed.as_ref())?;
             let borrowed: Vec<KeyAssignment<'_>> = keys
                 .iter()
                 .map(|a| KeyAssignment { field: &a.field, key: &a.key, row: a.row })
@@ -130,6 +180,7 @@ impl<P: PagerMut + Sync> Cluster<P> {
             table: table.to_string(),
             keys: keys.to_vec(),
             facts: share.iter().map(|f| (*f).clone()).collect(),
+            routed,
         }
         .encode();
         self.ask(node, path::IMPORT, &body, None).map(|_| ())
@@ -141,9 +192,13 @@ impl<P: PagerMut + Sync> Cluster<P> {
     /// matters less here only because a repeated delete is already safe: deleting a record that
     /// was never written is a request that was already satisfied.
     pub fn delete(&self, table: &str, records: &[RecordId]) -> Result<WriteOutcome> {
+        self.retrying_stale_routes(|| self.delete_once(table, records))
+    }
+
+    fn delete_once(&self, table: &str, records: &[RecordId]) -> Result<WriteOutcome> {
         let mut by_range: BTreeMap<usize, Vec<RecordId>> = BTreeMap::new();
         for record in records {
-            let range = self.config.range_of(big_engine::shard_of(*record));
+            let range = self.range_of(big_engine::shard_of(*record));
             by_range.entry(range).or_default().push(*record);
         }
 
@@ -157,14 +212,15 @@ impl<P: PagerMut + Sync> Cluster<P> {
                     self.guard()
                         .and_then(|()| self.api.delete(table, &share).map_err(ClusterError::Local))
                 } else {
-                    let body =
-                        wire::DeleteRequest { table: table.to_string(), records: share.clone() }
-                            .encode();
+                    let body = wire::DeleteRequest {
+                        table: table.to_string(),
+                        records: share.clone(),
+                        routed: self.routed_for(range),
+                    }
+                    .encode();
                     self.ask(copy, path::DELETE, &body, None).and_then(|bytes| {
-                        wire::get_u64_body(&bytes).map_err(|why| ClusterError::Wire {
-                            node: self.config.nodes()[copy].name.clone(),
-                            why,
-                        })
+                        wire::get_u64_body(&bytes)
+                            .map_err(|why| ClusterError::Wire { node: self.describe(copy), why })
                     })
                 };
                 match outcome {
@@ -220,7 +276,7 @@ impl<P: PagerMut + Sync> Cluster<P> {
             let rows = self.intern(table, field, &misses)?;
             if rows.len() != misses.len() {
                 return Err(ClusterError::Mismatch {
-                    node: self.config.leader().name.clone(),
+                    node: self.describe(self.schema_leader()),
                     what: "a different number of row ids than keys",
                 });
             }
@@ -241,10 +297,10 @@ impl<P: PagerMut + Sync> Cluster<P> {
     ///
     /// Answers the first id of the run; the caller takes `count` consecutive ids from it.
     pub(super) fn allocate(&self, table: &str, count: u64) -> Result<RecordId> {
-        if self.config.leads_schema() {
+        if self.leads_schema() {
             return self.allocate_here(table, count);
         }
-        let leader = self.config.leader_index();
+        let leader = self.schema_leader();
         let body = wire::AllocateRequest { table: table.to_string(), count }.encode();
         let bytes = self.ask(leader, path::ALLOCATE, &body, None).map_err(|e| match e {
             ClusterError::Unreachable { node, why, .. } => {
@@ -253,7 +309,7 @@ impl<P: PagerMut + Sync> Cluster<P> {
             other => other,
         })?;
         wire::get_u64_body(&bytes)
-            .map_err(|why| ClusterError::Wire { node: self.config.leader().name.clone(), why })
+            .map_err(|why| ClusterError::Wire { node: self.describe(self.schema_leader()), why })
     }
 
     /// The leader's own half of `Cluster::allocate`.
@@ -280,19 +336,36 @@ impl<P: PagerMut + Sync> Cluster<P> {
     /// One shard's work per node - see `big_embed::Api::max_record` - and one round trip per
     /// statement that allocates, rather than per row. Zero for a table nobody has written to.
     pub(super) fn next_record(&self, table: &str) -> Result<RecordId> {
-        let body = wire::TableRequest { table: table.to_string() }.encode();
-        let asked = self.candidates(0..self.config.range_count());
-        let answers =
-            self.fan_out_over(&asked, None, path::NEXT_RECORD, &body, wire::get_u64_body, || {
+        let asked = self.candidates(0..self.range_count());
+        let answers = self.fan_out_over(
+            &asked,
+            None,
+            path::NEXT_RECORD,
+            |slot| {
+                wire::TableRequest { table: table.to_string(), shards: self.scope_of_range(slot) }
+                    .encode()
+            },
+            wire::get_u64_body,
+            |slot| {
                 self.guard()?;
-                self.local_next_record(table)
-            })?;
+                self.local_next_record(table, self.scope_of_range(slot))
+            },
+        )?;
         Ok(answers.into_iter().map(|(_, next)| next).max().unwrap_or(0))
     }
 
     /// This node's share of that answer, which the peer route answers with.
-    pub fn local_next_record(&self, table: &str) -> Result<RecordId> {
-        let max = self.api.max_record(table).map_err(ClusterError::Local)?;
+    ///
+    /// Scoped, and that is load bearing. A node that has handed a range away still holds those
+    /// fragments until it deletes them, and a `max` over them would push the allocator past the
+    /// end of the range this node still owns - handing out record ids that belong to somebody
+    /// else. What it answers for is what it was asked for.
+    pub fn local_next_record(
+        &self,
+        table: &str,
+        shards: Option<Vec<big_engine::ShardRange>>,
+    ) -> Result<RecordId> {
+        let max = self.api.max_record_in(table, shards).map_err(ClusterError::Local)?;
         Ok(max.map_or(0, |m| m.saturating_add(1)))
     }
 
@@ -302,10 +375,10 @@ impl<P: PagerMut + Sync> Cluster<P> {
     /// Not queued, not assigned locally and reconciled later: two row ids for one string is a
     /// silently wrong answer, and a refusal is not.
     pub(super) fn intern(&self, table: &str, field: &str, keys: &[&str]) -> Result<Vec<RowId>> {
-        if self.config.leads_schema() {
+        if self.leads_schema() {
             return Ok(self.api.intern_keys(table, field, keys)?);
         }
-        let leader = self.config.leader_index();
+        let leader = self.schema_leader();
         let body = wire::InternRequest {
             table: table.to_string(),
             field: field.to_string(),
@@ -321,7 +394,7 @@ impl<P: PagerMut + Sync> Cluster<P> {
             other => other,
         })?;
         wire::get_rows_ids(&bytes)
-            .map_err(|why| ClusterError::Wire { node: self.config.leader().name.clone(), why })
+            .map_err(|why| ClusterError::Wire { node: self.describe(self.schema_leader()), why })
     }
 }
 

@@ -295,6 +295,7 @@ fn the_wall_clock_budget_is_spent_once_across_every_plan_of_a_statement() {
         // meaning the same thing.
         timeout: Some(std::time::Duration::ZERO),
         cancel: None,
+        shards: None,
     };
     let e = api
         .sql("SELECT count(*), sum(amount), min(amount), max(amount) FROM tx", &opts)
@@ -307,6 +308,7 @@ fn the_wall_clock_budget_is_spent_once_across_every_plan_of_a_statement() {
         limits: None,
         timeout: Some(std::time::Duration::from_secs(30)),
         cancel: None,
+        shards: None,
     };
     let (values, _) =
         api.sql("SELECT count(*), sum(amount), min(amount), max(amount) FROM tx", &opts).unwrap();

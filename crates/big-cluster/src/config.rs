@@ -12,13 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Who owns which shards, read from a file at startup and never changed after it.
+//! What the cluster was when it started, read from a file once.
 //!
-//! `owner(shard)` is a range lookup and nothing else. There is no membership protocol here
-//! and no consensus, so a file that disagrees with itself is a fact the operator has to fix -
-//! which is why every disagreement below is a startup failure naming the shards involved,
-//! rather than a rule that resolves it. Two nodes each believing they own shard 64 would each
-//! answer half a query, and neither would notice.
+//! **A seed, not the truth.** The agreement decides who owns which shards and who is in the
+//! cluster - see [`crate::raft::RangeMap`] - and every committed decision replaces what is
+//! here. What this file still does is get the first one off the ground, and say which node
+//! this process is.
+//!
+//! A file that disagrees with itself is a fact the operator has to fix, so every disagreement
+//! below is a startup failure naming the shards involved rather than a rule that resolves one.
+//! Two nodes each believing they own shard 64 would each answer half a query, and neither would
+//! notice - and that check has to happen before there is an agreement to appeal to.
 //!
 //! **The parser is not a TOML implementation.** It reads the subset this file is written in:
 //! `[[node]]` tables, double-quoted string values, `#` comments. An unknown key is refused
@@ -26,37 +30,21 @@
 //! range the operator did not write - `shard = "0..64"` for `shards` is a typo that costs a
 //! silent misconfiguration everywhere else and a startup error here.
 
-use big_engine::{RecordId, ShardId, SHARD_WIDTH};
+use big_engine::{RecordId, ShardId};
 
-/// A half-open range of shard ids, with an open end for "the rest of the space".
+/// A half-open range of shard ids. **Defined in [`big_engine`]**, because a range is also what
+/// a read can be scoped to and the storage layer cannot ask a crate above it what one is.
 ///
-/// The open end is not a convenience. Ownership has to be *total* - every record id a client
-/// can choose has to belong to somebody - and the space is `0..=u64::MAX`, which no half-open
-/// range with a written end can reach. `"64.."` is how the last node says it takes what is
-/// left, and a file whose ranges stop short is refused.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct ShardRange {
-    /// First shard owned.
-    pub start: ShardId,
-    /// One past the last shard owned; `None` runs to the end of the space.
-    pub end: Option<ShardId>,
+/// What lives here is only the part the storage layer has no use for: reading one out of a
+/// cluster file.
+pub use big_engine::ShardRange;
+
+/// Parsing a range as an operator writes it, which is a cluster-file concern and nothing else's.
+trait ParseRange: Sized {
+    fn parse(text: &str) -> Option<Self>;
 }
 
-impl ShardRange {
-    pub fn contains(&self, shard: ShardId) -> bool {
-        shard >= self.start && self.end.is_none_or(|e| shard < e)
-    }
-
-    /// Whether a record id falls in this range, which is the same question one shift earlier.
-    pub fn holds(&self, record: RecordId) -> bool {
-        self.contains(big_engine::shard_of(record))
-    }
-
-    /// The lowest record id this range can hold. What a paging cursor is clamped to.
-    pub fn first_record(&self) -> RecordId {
-        self.start.saturating_mul(SHARD_WIDTH)
-    }
-
+impl ParseRange for ShardRange {
     fn parse(text: &str) -> Option<Self> {
         let (lo, hi) = text.split_once("..")?;
         let start = lo.trim().parse().ok()?;
@@ -68,15 +56,6 @@ impl ShardRange {
             return None;
         }
         Some(Self { start, end })
-    }
-}
-
-impl core::fmt::Display for ShardRange {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self.end {
-            Some(e) => write!(f, "{}..{e}", self.start),
-            None => write!(f, "{}..", self.start),
-        }
     }
 }
 
@@ -197,7 +176,7 @@ impl core::fmt::Display for ConfigError {
             Self::UnknownKey { line, key } => write!(
                 f,
                 "line {line}: unknown key `{key}`; a cluster file has name, addr and shards \
-                 inside [[node]], and schema_leader and peer_ca_file outside it"
+                 inside [[node]], and schema_leader, peer_ca_file and cluster_id outside it"
             ),
             Self::BadRange { line, text } => write!(
                 f,
@@ -293,6 +272,9 @@ pub struct ClusterFile {
     primary_count: usize,
     leader: usize,
     peer_ca_file: Option<String>,
+    /// `cluster_id = "..."`, when the operator named the cluster. See
+    /// [`ClusterConfig::fingerprint`].
+    cluster_id: Option<String>,
 }
 
 /// One `[[node]]` block, before it is known whether the file as a whole makes sense.
@@ -345,10 +327,15 @@ impl ClusterFile {
 
         let mut leader_name = None;
         let mut peer_ca_file = None;
+        let mut cluster_id = None;
         for (key, value, line) in top {
             match key.as_str() {
                 "schema_leader" => leader_name = Some(value),
                 "peer_ca_file" => peer_ca_file = Some(value),
+                // What names this cluster, so that a node which joined at runtime - and whose
+                // own file therefore describes a different set of nodes - can still be
+                // recognised as one of us. See `ClusterConfig::fingerprint`.
+                "cluster_id" => cluster_id = Some(value),
                 _ => return Err(ConfigError::UnknownKey { line, key }),
             }
         }
@@ -392,13 +379,14 @@ impl ClusterFile {
             parsed.push(Draft { name, addr, shards, replica });
         }
 
-        Self::validated(parsed, leader_name, peer_ca_file)
+        Self::validated(parsed, leader_name, peer_ca_file, cluster_id)
     }
 
     fn validated(
         drafts: Vec<Draft>,
         leader_name: Option<String>,
         peer_ca_file: Option<String>,
+        cluster_id: Option<String>,
     ) -> Result<Self, ConfigError> {
         if drafts.is_empty() {
             return Err(ConfigError::NoNodes);
@@ -508,7 +496,7 @@ impl ClusterFile {
             return Err(ConfigError::LeaderIsReplica { name: leader_name });
         }
 
-        Ok(Self { nodes, primary_count, leader, peer_ca_file })
+        Ok(Self { nodes, primary_count, leader, peer_ca_file, cluster_id })
     }
 
     /// Says which of these nodes is doing the reading.
@@ -548,6 +536,7 @@ impl ClusterFile {
             leader: self.leader,
             this,
             peer_ca_file: self.peer_ca_file,
+            cluster_id: self.cluster_id,
         })
     }
 
@@ -587,6 +576,12 @@ pub struct ClusterConfig {
     leader: usize,
     this: usize,
     peer_ca_file: Option<String>,
+    /// What names this cluster, when the operator has named it.
+    ///
+    /// **What lets a node join.** Two nodes of one cluster now legitimately hold different
+    /// files - the agreement decides membership - so the shape of the file cannot be what they
+    /// check each other against. `cluster_id = "..."` is what a joining node is given instead.
+    cluster_id: Option<String>,
 }
 
 impl ClusterConfig {
@@ -609,21 +604,39 @@ impl ClusterConfig {
             leader: 0,
             this: 0,
             peer_ca_file: None,
+            cluster_id: None,
         }
     }
 
-    /// A number every node holding the same cluster file computes alike.
+    /// A number every node of the same cluster computes alike.
     ///
-    /// **This closes the one failure ownership-by-configuration could not see.** Two nodes given
-    /// files that disagree - a range moved, a replica added, a different leader - used to be
-    /// undetectable until somebody noticed a query answering half of itself. They cannot meet
-    /// without exchanging this, and a mismatch is refused rather than served.
+    /// **What it is for has narrowed, because the file has.** It used to close the one failure
+    /// ownership-by-configuration could not see: two nodes given files that disagreed - a range
+    /// moved, a replica added - were undetectable until a query answered half of itself. The
+    /// agreement decides both of those now, so two nodes of one cluster *legitimately* hold
+    /// different files: a node that joined at runtime was never in anybody else's.
     ///
-    /// Covers what every node has to agree on and nothing else: the names, the addresses, the
-    /// ranges, which node copies which, and who leads the schema. Not which node *this* is, and
-    /// not where its token file lives - those are local, and folding them in would make every
-    /// node disagree with every other by construction.
+    /// What is left is "these two belong to the same cluster", and that is what `cluster_id`
+    /// says. Without one it falls back to the shape of the file, which is exact for the case
+    /// that has always worked - every node started from one file - and is why nothing that
+    /// deploys that way has to change.
+    ///
+    /// **A node that joins must be given the id**, or it cannot be admitted: its own file
+    /// describes a different set of nodes and would hash differently.
     pub fn fingerprint(&self) -> u64 {
+        if let Some(id) = &self.cluster_id {
+            let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+            for b in id.as_bytes() {
+                h ^= *b as u64;
+                h = h.wrapping_mul(0x100_0000_01b3);
+            }
+            return h;
+        }
+        self.shape_fingerprint()
+    }
+
+    /// The old fingerprint: the shape of the file itself.
+    fn shape_fingerprint(&self) -> u64 {
         // FNV-1a. What it is up against is a file somebody edited on one machine and not
         // another, not a file somebody forged: a node that could forge this could equally
         // forge the answer to any query.
@@ -712,11 +725,40 @@ impl ClusterConfig {
         &self.groups[range]
     }
 
-    /// Who serves each range before anything has been agreed: what the file says.
-    pub fn initial_ownership(&self) -> crate::raft::Ownership {
+    /// The map the cluster starts from: what the file says.
+    ///
+    /// **The file is a seed, not the truth.** It is what the map is before the agreement has
+    /// decided anything, and every committed `Decision::Ranges` replaces it. That is the same
+    /// rule ownership always followed - "the config's answer until the agreement has one" -
+    /// widened from *who serves a range* to *what the ranges are*.
+    ///
+    /// Range ids are positions in the file here, and only here. After the first split they are
+    /// minted from [`crate::raft::RangeMap::next_id`] and mean nothing positional.
+    pub fn seed_map(&self) -> crate::raft::RangeMap {
+        let ranges = (0..self.primary_count)
+            .map(|r| crate::raft::Range {
+                id: r as crate::raft::RangeId,
+                shards: self.nodes[r].shards,
+                group: self.groups[r].clone(),
+                primary: r,
+                moving: None,
+            })
+            .collect();
         // Nothing is behind before anything has happened, which is exactly what the file
         // asserts by naming a primary for every range.
-        crate::raft::Ownership { primary: (0..self.primary_count).collect(), stale: Vec::new() }
+        crate::raft::RangeMap { epoch: 0, ranges, stale: Vec::new(), schema_leader: self.leader }
+    }
+
+    /// The members the cluster starts from, in the file's order.
+    pub fn seed_members(&self) -> Vec<crate::raft::Member> {
+        self.nodes
+            .iter()
+            .map(|n| crate::raft::Member {
+                name: n.name.clone(),
+                addr: n.addr.clone(),
+                state: crate::raft::MemberState::Voter,
+            })
+            .collect()
     }
 
     /// The nodes a read goes to, one per range, in range order.

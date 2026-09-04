@@ -41,6 +41,11 @@ pub(super) fn peer_query<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request) ->
         // it has rather than about the request that arrived.
         timeout: request.timeout_ms.map(Duration::from_millis).or(ctx.query_timeout),
         cancel: ctx.cancel.clone(),
+        // **What this node answers for is what it was asked for**, not what is on its disk. A
+        // node can hold more than one range, and one that has just handed a range away still
+        // holds those fragments until it deletes them. `None` from a peer that predates the
+        // scope would mean everything, which is why the coordinator always sends one.
+        shards: request.shards,
     };
     match ctx.api().execute(&request.plan, &opts) {
         Ok(value) => Response::binary(wire::encode_value(&value)),
@@ -59,7 +64,7 @@ pub(super) fn peer_records<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request) 
     // The coordinator asked for a page and will cut the merge to size itself; a limit that
     // does not fit this machine's `usize` is therefore harmless to clamp.
     let limit = request.limit.try_into().unwrap_or(usize::MAX);
-    match ctx.api().records(&request.table, request.after, limit) {
+    match ctx.api().records_in(&request.table, request.after, limit, request.shards) {
         Ok(ids) => {
             let mut out = Vec::new();
             wire::put_records(&mut out, &ids);
@@ -88,6 +93,12 @@ pub(super) fn peer_import<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request) -
         .iter()
         .map(|a| big_embed::KeyAssignment { field: &a.field, key: &a.key, row: a.row })
         .collect();
+    // **Before anything lands.** The coordinator says which shards it believed this node owns;
+    // a batch routed by a map that has since changed belongs somewhere else, and writing it
+    // here would be a write no read ever finds.
+    if let Err(e) = ctx.cluster.check_route(request.routed.as_ref()) {
+        return super::from_cluster(&e);
+    }
     let facts: Vec<big_embed::Fact<'_>> = request.facts.iter().map(OwnedFact::as_fact).collect();
     match ctx.api().import_with_keys(&request.table, &keys, &facts) {
         Ok(()) => Response::binary(wire::put_u64_body(facts.len() as u64)),
@@ -103,6 +114,9 @@ pub(super) fn peer_delete<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request) -
         Ok(r) => r,
         Err(e) => return unreadable(&e),
     };
+    if let Err(e) = ctx.cluster.check_route(request.routed.as_ref()) {
+        return super::from_cluster(&e);
+    }
     match ctx.api().delete(&request.table, &request.records) {
         Ok(n) => Response::binary(wire::put_u64_body(n)),
         Err(e) => Response::from_error(&e),
@@ -153,7 +167,7 @@ pub(super) fn peer_next_record<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Reque
         Ok(r) => r,
         Err(e) => return unreadable(&e),
     };
-    match ctx.cluster.local_next_record(&request.table) {
+    match ctx.cluster.local_next_record(&request.table, request.shards) {
         Ok(next) => Response::binary(wire::put_u64_body(next)),
         Err(e) => super::from_cluster(&e),
     }
@@ -176,8 +190,17 @@ pub(super) fn peer_ddl<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request) -> R
 ///
 /// A scan, and deliberately not on any probe's path: nothing calls this except `GET /verify`,
 /// which an operator runs on purpose.
-pub(super) fn peer_digest<P: PagerMut + Sync>(ctx: &Ctx<'_, P>) -> Response {
-    match big_cluster::digest::digest(ctx.api()) {
+pub(super) fn peer_digest<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request) -> Response {
+    // An empty body is a digest of everything, which is what `GET /verify` asked for before a
+    // node could hold two ranges. A body names the range being compared.
+    let shards = match req.body.is_empty() {
+        true => None,
+        false => match wire::get_shards_body(&req.body) {
+            Ok(s) => s,
+            Err(e) => return unreadable(&e),
+        },
+    };
+    match big_cluster::digest::digest_in(ctx.api(), shards) {
         Ok(d) => Response::binary(wire::put_u64_body(d)),
         Err(e) => Response::from_error(&e),
     }
@@ -217,6 +240,172 @@ pub(super) fn peer_raft<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request) -> 
 pub(super) fn repair<P: PagerMut + Sync>(ctx: &Ctx<'_, P>) -> Response {
     match ctx.cluster.repair() {
         Ok(reports) => Response::ok(json::repaired(&reports)),
+        Err(e) => from_cluster(&e),
+    }
+}
+
+// -------------------------------------------------------------------------------------------
+// Reshaping the cluster
+//
+// Three verbs, and all four ways of asking for one - an operator at a terminal, a node joining
+// itself, an autoscaler reading a metric, a controller reacting to a pod - come through them.
+// Nothing here decides *when*; that belongs to whoever is asking.
+// -------------------------------------------------------------------------------------------
+
+/// What the cluster looks like right now.
+pub(super) fn cluster_topology<P: PagerMut + Sync>(ctx: &Ctx<'_, P>) -> Response {
+    Response::ok(json::topology(&ctx.cluster.topology()))
+}
+
+/// `POST /admin/cluster/split?at=<shard>&to=<node>`
+///
+/// **The scale-out that moves no bytes.** Cutting the open tail above everything written so far
+/// and handing the upper half to an empty node costs one entry in the agreement and not one
+/// byte on the wire. `to` is optional: without it the range is merely divided, which is what an
+/// operator does before moving half of it somewhere.
+pub(super) fn cluster_split<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request) -> Response {
+    let Some(at) = req.param("at").and_then(|v| v.parse::<u64>().ok()) else {
+        return Response::failure(
+            400,
+            "bad_request",
+            "split needs ?at=<shard>, the first shard of the new upper range",
+        );
+    };
+    let to = req.param("to").map(|v| v.into_owned());
+    match ctx.cluster.split_range(at, to.as_deref()) {
+        Ok(id) => Response::ok(format!("{{\"range\":{id}}}")),
+        Err(e) => from_cluster(&e),
+    }
+}
+
+/// `POST /admin/cluster/merge?range=<id>` - joins a range to the one after it.
+pub(super) fn cluster_merge<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request) -> Response {
+    let Some(id) = req.param("range").and_then(|v| v.parse::<u64>().ok()) else {
+        return Response::failure(
+            400,
+            "bad_request",
+            "merge needs ?range=<id>, the lower of the two ranges to join",
+        );
+    };
+    match ctx.cluster.merge_range(id) {
+        Ok(()) => Response::ok(format!("{{\"range\":{id}}}")),
+        Err(e) => from_cluster(&e),
+    }
+}
+
+/// `POST /admin/cluster/node?name=<name>&addr=<host:port>` - a node joins, as a learner.
+///
+/// **A learner, not a voter.** A node that has just arrived holds no range and has not caught
+/// up on the log; counting it towards a majority would raise the bar for every election while
+/// it contributed nothing to one. `admit` is the step that makes it a full member.
+pub(super) fn cluster_add_node<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request) -> Response {
+    let (Some(name), Some(addr)) = (req.param("name"), req.param("addr")) else {
+        return Response::failure(
+            400,
+            "bad_request",
+            "adding a node needs ?name=<name>&addr=<host:port>",
+        );
+    };
+    match ctx.cluster.add_node(&name, &addr) {
+        Ok(()) => Response::ok(format!("{{\"node\":{}}}", json::string(&name))),
+        Err(e) => from_cluster(&e),
+    }
+}
+
+/// Which of the three one-node changes a request is.
+pub(super) enum Membership {
+    Admit,
+    Drain,
+    Remove,
+}
+
+/// `POST /admin/cluster/{admit,drain}` and `DELETE /admin/cluster/node`, all `?name=<node>`.
+pub(super) fn cluster_member<P: PagerMut + Sync>(
+    ctx: &Ctx<'_, P>,
+    req: &Request,
+    what: Membership,
+) -> Response {
+    let Some(name) = req.param("name") else {
+        return Response::failure(400, "bad_request", "this needs ?name=<node>");
+    };
+    let done = match what {
+        Membership::Admit => ctx.cluster.admit(&name),
+        Membership::Drain => ctx.cluster.drain_node(&name),
+        Membership::Remove => ctx.cluster.remove_node(&name),
+    };
+    match done {
+        Ok(()) => Response::ok(format!("{{\"node\":{}}}", json::string(&name))),
+        Err(e) => from_cluster(&e),
+    }
+}
+
+/// `POST /admin/cluster/move?range=<id>&to=<node>` - hand a populated range over.
+///
+/// **A scan and a copy, run deliberately**, like `POST /repair`: it holds this request for as
+/// long as the range takes to copy. Reads of the range never stop; writes to it are refused,
+/// retryably, only for the last pass.
+pub(super) fn cluster_move<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request) -> Response {
+    let (Some(range), Some(to)) = (req.param("range"), req.param("to")) else {
+        return Response::failure(400, "bad_request", "a move needs ?range=<id>&to=<node>");
+    };
+    let Ok(range) = range.parse::<u64>() else {
+        return Response::failure(400, "bad_request", "?range= takes a range id");
+    };
+    match ctx.cluster.move_range(range, &to) {
+        Ok(report) => Response::ok(json::moved(&report)),
+        Err(e) => from_cluster(&e),
+    }
+}
+
+/// `POST /admin/cluster/cancel?range=<id>` - abandon a move.
+///
+/// Nothing is ever read from the target of a move that has not completed, so this loses only
+/// the copying already done.
+pub(super) fn cluster_cancel<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request) -> Response {
+    let Some(range) = req.param("range").and_then(|v| v.parse::<u64>().ok()) else {
+        return Response::failure(400, "bad_request", "cancelling needs ?range=<id>");
+    };
+    match ctx.cluster.cancel_move(range) {
+        Ok(()) => Response::ok(format!("{{\"range\":{range}}}")),
+        Err(e) => from_cluster(&e),
+    }
+}
+
+/// `POST /admin/cluster/rebalance` - take one balancing step, if the facts call for one.
+///
+/// **One step per call.** A cluster that needs three moves takes three calls, each against
+/// facts gathered afresh - because `each move is a moment where a query can fail`, and a plan
+/// made before the first move is a plan about a cluster that no longer exists.
+///
+/// This is what an autoscaler or a Kubernetes controller calls on a timer. `?force=true` runs
+/// the step even when the policy is switched off, which is what makes it usable as an
+/// operator's command on a cluster that does not balance itself.
+pub(super) fn cluster_rebalance<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request) -> Response {
+    let mut policy = ctx.balance;
+    if req.param("force").is_some_and(|v| v == "true") {
+        policy.enabled = true;
+    }
+    match ctx.cluster.rebalance(&policy) {
+        Ok(None) => Response::ok("{\"did\":null}".to_string()),
+        Ok(Some(what)) => Response::ok(format!("{{\"did\":{}}}", json::string(&what))),
+        Err(e) => from_cluster(&e),
+    }
+}
+
+/// `POST /admin/cluster/schema-leader?to=<node>` - hand the row-key namespace over.
+///
+/// **The one change that corrupts rather than fails**, so it is worth the wait: it copies every
+/// row key of every table and the record ids the old leader has promised but not written, and
+/// only then commits. See `Cluster::move_schema_leader`.
+pub(super) fn cluster_schema_leader<P: PagerMut + Sync>(
+    ctx: &Ctx<'_, P>,
+    req: &Request,
+) -> Response {
+    let Some(to) = req.param("to") else {
+        return Response::failure(400, "bad_request", "this needs ?to=<node>");
+    };
+    match ctx.cluster.move_schema_leader(&to) {
+        Ok(()) => Response::ok(format!("{{\"schema_leader\":{}}}", json::string(&to))),
         Err(e) => from_cluster(&e),
     }
 }
