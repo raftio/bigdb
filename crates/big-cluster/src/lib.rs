@@ -31,21 +31,41 @@
 //! was full - the request holding the last worker would be waiting for a worker to answer it.
 //! The local share of every fan-out is a direct call.
 //!
-//! **What this does not give you**, spelled out because the absences are the design:
+//! **The map is a value the agreement decides, and the file only seeds it.** `cluster.toml`
+//! says what the cluster was when it started; every committed decision replaces it. That is the
+//! same rule ownership always followed - *the config's answer until the agreement has one* -
+//! widened from *who serves a range* to *what the ranges are and who is in the cluster*. So a
+//! range can be split, moved or merged, and a node can join or leave, without stopping anybody.
 //!
-//! - **No replication.** A node's disk is the only copy of its shards.
-//! - **No rebalancing.** Changing a range means stopping a node, copying a file, editing the
-//!   config. One process holds one file - the pager takes an exclusive lock - so a shard does
-//!   not move without a copy.
+//! Three things make that safe, and each is worth naming because each is a way it could
+//! silently not be:
+//!
+//! - **A routed request says which shards it is for.** A node can hold more than one range, so
+//!   a fan-out that asked it twice without naming one would have it answer twice over - a
+//!   `Count` that is quietly double, with nothing downstream to contradict it.
+//! - **A write says what it assumed.** Between a coordinator reading the map and its batch
+//!   arriving, the map can change; without the check the batch lands on yesterday's owner, is
+//!   reported written, and is never read again. The owner disagrees and the coordinator retries.
+//! - **A move copies before it commits, and commits in one entry.** There is no committed state
+//!   in which two nodes could both be asked for one record.
+//!
+//! **What this still does not give you**, spelled out because the absences are the design:
+//!
 //! - **No cross-node atomicity.** A batch spanning two owners is two commits, and a failure in
 //!   the middle is reported as [`ClusterError::Partial`] rather than hidden.
 //! - **No cluster-wide snapshot.** Each owner serves the fan-out from its own read transaction,
 //!   taken when its part of the request arrived, so a distributed read can straddle two
 //!   commits. Fixing that means a cluster-wide transaction id, which means the meta page flip
 //!   stops being the only atomic point, which is a different engine.
-//! - **No membership layer.** A failure detector's answer would have to change a routing
-//!   decision, and with one owner per shard there is nothing to route to. That day arrives
-//!   with replication and not before.
+//! - **No quorum reads or writes.** A read goes to one copy and a write goes to all of them.
+//!   What a quorum would buy is bought instead by letting the write stand and marking the copy
+//!   behind, which costs one entry in a log that is already there.
+//! - **No repair in the background.** `POST /repair` is a thing an operator or cron runs. A
+//!   repair is a scan and a copy, and a system that starts one by itself starts it at the worst
+//!   possible moment.
+//! - **Shards still do not move without a copy.** One process holds one file - the pager takes
+//!   an exclusive lock - so a range that is not empty crosses the wire fragment by fragment.
+//!   What changed is that it can do so while the cluster serves, not that it became free.
 
 #![deny(unsafe_code)]
 

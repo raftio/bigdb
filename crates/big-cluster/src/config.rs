@@ -12,13 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Who owns which shards, read from a file at startup and never changed after it.
+//! What the cluster was when it started, read from a file once.
 //!
-//! `owner(shard)` is a range lookup and nothing else. There is no membership protocol here
-//! and no consensus, so a file that disagrees with itself is a fact the operator has to fix -
-//! which is why every disagreement below is a startup failure naming the shards involved,
-//! rather than a rule that resolves it. Two nodes each believing they own shard 64 would each
-//! answer half a query, and neither would notice.
+//! **A seed, not the truth.** The agreement decides who owns which shards and who is in the
+//! cluster - see [`crate::raft::RangeMap`] - and every committed decision replaces what is
+//! here. What this file still does is get the first one off the ground, and say which node
+//! this process is.
+//!
+//! A file that disagrees with itself is a fact the operator has to fix, so every disagreement
+//! below is a startup failure naming the shards involved rather than a rule that resolves one.
+//! Two nodes each believing they own shard 64 would each answer half a query, and neither would
+//! notice - and that check has to happen before there is an agreement to appeal to.
 //!
 //! **The parser is not a TOML implementation.** It reads the subset this file is written in:
 //! `[[node]]` tables, double-quoted string values, `#` comments. An unknown key is refused

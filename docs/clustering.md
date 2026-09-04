@@ -9,9 +9,13 @@ Where this sits in CAP, and why, is [The choice, and what it costs](#the-choice-
 The short version: **CP**, and the availability that usually costs you is bought back by failing
 over in about a second rather than by answering from data nobody can vouch for.
 
-What is *not* built is stated as plainly as ever: no rebalancing, no cross-node atomicity, no
-cluster-wide snapshot, no gossip. Those are decisions, not a backlog —
-[What this does not give you](#what-this-does-not-give-you) says why for each.
+The map is a value the agreement decides and the file only seeds, so ranges split, merge and
+move, and nodes join and leave, while the cluster serves —
+[Changing the shape while it runs](#changing-the-shape-while-it-runs).
+
+What is *not* built is stated as plainly as ever: no cross-node atomicity, no cluster-wide
+snapshot, no quorum, no gossip, no repair in the background. Those are decisions, not a
+backlog — [What this does not give you](#what-this-does-not-give-you) says why for each.
 
 Everything below is a decision, not a survey of options. Where an option was rejected, the
 reason is stated, because the reason is the part that stays true when the option comes back.
@@ -138,11 +142,15 @@ replica = "a"
 ```
 
 A node has either `shards` or `replica`, never both and never neither. Ranges must be
-**disjoint and total**. A gap or an overlap is a startup failure naming the
-shards involved, not something resolved by a rule. There is no protocol here that could change
-ownership safely — no membership, no consensus, no leases — so a config that disagrees with
-itself is a fact the operator has to fix, and pretending otherwise would mean two nodes each
-believing they own shard 64 and each answering half a query.
+**disjoint and total**. A gap or an overlap is a startup failure naming the shards involved, not
+something resolved by a rule: this check has to pass before there is an agreement to appeal to,
+and a file that disagrees with itself is a fact the operator has to fix. Pretending otherwise
+would mean two nodes each believing they own shard 64 and each answering half a query.
+
+The same rule holds for every change made afterwards — see
+[`RangeMap::check`](../crates/big-cluster/src/raft.rs) — but it moved from being read once to
+being tested on **every proposal**, because a map that leaves a gap while the cluster runs is a
+record id nobody answers for, with nothing afterwards to notice.
 
 Note `"64.."` on the last node, and note that `"64..128"` there would be **refused**. Total
 means the whole space: a record id above shard 128 is one a client can choose, and a range map
@@ -424,8 +432,7 @@ would be told and would be wrong.
 
 ## The failure detector is the heartbeat, and nothing else
 
-There is no gossip here and no membership protocol, and the reason is that the agreement
-already answers the question. A protocol that has to say "I am here" every four hundred
+There is no gossip here, and the reason is that the agreement already answers the question. A protocol that has to say "I am here" every four hundred
 milliseconds in order to keep leading knows exactly which nodes have stopped saying it, so the
 failure detector costs nothing and has no state of its own: it is
 [`Raft::last_heard`](../crates/big-cluster/src/raft.rs), a timestamp per node, updated by
@@ -484,17 +491,12 @@ The most important section on this page.
   starts one by itself is a system that starts one at the worst possible moment. Backup is still
   per node and [`Db::copy_to`](../crates/big-db/src/db.rs#L69) is still the whole story: an
   online walk under a read transaction, producing an ordinary database file.
-- **No membership changes at run time.** Adding or removing a node is editing the file and
-  restarting, on every node. See [What consensus is still not used
-  for](#what-consensus-is-still-not-used-for).
 - **No quorum reads or writes.** A read goes to one copy and a write goes to all of them. What
   a quorum would buy - a write surviving the loss of a minority - is bought instead by letting
   the write stand and marking the copy behind, which costs one entry in a log that is already
   there.
-- **No rebalancing.** Changing a range means stopping a node, copying a file, and editing the
-  config. There is no online shard movement, and building one means answering what a query does
-  while a shard is in flight — a question worth asking only once replication has answered the
-  easier ones.
+- **No automatic replication.** The balancer moves ranges and splits them; it does not decide
+  that a range needs a second copy. `replica = "a"` is still how a copy comes to exist.
 - **No cross-node atomicity**, as above — and not for want of a protocol. Two-phase commit
   needs a transaction held open across a network round trip, and this engine will not do that
   for two reasons it already had: `big-embed` exists so that a read or write transaction never
@@ -649,15 +651,80 @@ Three things travel, in this order, and the order is the point:
    leaves the copy closer to the truth than it was and still marked behind, which is exactly
    the state it should be left in.
 
+## Changing the shape while it runs
+
+`cluster.toml` says what the cluster **was when it started**. Every committed decision replaces
+it — which is the same rule ownership always followed, *the config's answer until the agreement
+has one*, widened from **who serves a range** to **what the ranges are and who is in the
+cluster**. So the file is a seed, not the truth, and two nodes of one cluster legitimately hold
+different files. `cluster_id = "..."` is what they recognise each other by; without one, the
+shape of the file still is, which is exact for the case that has always worked.
+
+### Splitting, which moves no bytes
+
+Cutting the open tail above everything written leaves an upper half that is empty by
+construction, so handing it to another node costs one entry in the agreement and nothing on the
+wire. For a workload whose record ids grow — every `INSERT` that does not name one — that is
+the whole of scaling out.
+
+It is not the whole story, because **the client picks the record id**: a workload writing
+explicit ids through `POST /import` scatters them, and a tail split rebalances nothing. So the
+balancer *measures* rather than assumes, and handing over a half that holds records is refused
+naming the record that stopped it.
+
+### Moving a range, which does
+
+Three steps, each one committed decision:
+
+1. **Seeding.** The target is announced and filled, out of the write path entirely — not in the
+   group, nothing reading from it. Abandoning costs only the copying already done.
+2. **Cutover.** Writes to *this range* are refused, retryably, while the difference that
+   accumulated during the seed is copied. This is the only window in which anything is denied,
+   and it is one range wide.
+3. **Handover.** Group, primary and the end of the move land in one entry.
+
+**What does a query do while a shard is in flight?** Nothing different. The source serves the
+range right up to the instant the handover commits, which is the same atomic act as a failover.
+
+**Why the target is kept out of the write path.** Putting it in the group and letting the
+existing write path dual-write would make the final pass short. It would also lose writes:
+`replace_fragment` discards the old tree before writing, so a seed copy landing after a live
+write silently drops it — and the two then have equal counts and different contents, which is
+exactly what the cardinality comparison a repair depends on cannot tell apart.
+
+**Committing is not applying.** Two ordering bugs found while building this were the same shape:
+the source went on accepting writes because it had not yet *applied* the cutover, and dropping
+its copy before it had applied the handover made it answer zero for records it still believed it
+served. Both wait for the source now.
+
+### Joining and leaving
+
+A node joins as a **learner**: it replicates the log, holds no range, and does not vote — so
+nothing reads from it while it catches up and it does not raise the bar for an election it could
+not help decide. `admit` makes it a full member.
+
+**Draining is not removal.** A draining node still votes and still coordinates, which is what
+keeps the single address a client is holding from going dark halfway through a scale-in; what
+changes is that the balancer takes its ranges away and gives it no new ones. Removing a node
+that still holds a range is refused.
+
+### Deciding when
+
+The balancer is a **pure function** of the map, the membership and one number per node, so two
+leaders elected in sequence reach the same decision from the same facts. One action per call:
+*each move is a moment where a query can fail.* It is **off unless an operator turns it on**,
+and the same three verbs are what a `bigctl` command, a joining node, and a Kubernetes
+controller all reach for.
+
 ## What consensus is still not used for
 
-The agreement decides one value. It is deliberately not extended to:
+The agreement decides the map and the membership. It is deliberately not extended to:
 
 - **The write path.** Facts are not replicated by consensus; they are sent to every copy and
   reconciled by a repair. A quorum write would put an election's worth of machinery in front of
   every batch to buy a guarantee that write-to-all plus a mark already gives.
 - **Cluster-wide read snapshots.** See below: that is a different engine, not a bigger protocol.
-- **Membership.** The set of nodes is the config file, and changing it is a restart. Online
-  membership change is the part of Raft most often got wrong, it is needed only for a cluster
-  that grows without a maintenance window, and a range cannot move between groups anyway
-  without the file copy that rebalancing would need.
+- **The row keys.** They are the schema leader's, and moving that role is a sequence rather
+  than a vote — the keys and the record ids already handed out travel first, and only then does
+  the decision commit. Two row ids for one string is a wrong answer nothing downstream can
+  notice, so this is the one change here that corrupts rather than fails.
