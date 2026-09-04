@@ -18,17 +18,40 @@ mkdir -p secrets
 chmod 700 secrets
 cd secrets
 
-if [ -f peer-ca.pem ]; then
-    echo "peer-ca.pem already exists; delete secrets/ first if you mean to rotate" >&2
-    exit 1
-fi
+# **With a name, this issues one more certificate and leaves everything else alone.** A node that
+# joins a running cluster needs one, and the alternative - re-running the whole script - would
+# rotate the CA and lock out the three nodes that are already talking. Called with no arguments it
+# is the bootstrap it always was, and refuses to run twice for the same reason.
+#
+#   ./certs.sh          the CA and a certificate for each of the nodes above
+#   ./certs.sh d        one more, signed by the CA that is already here
+if [ "$#" -gt 0 ]; then
+    [ -f peer-ca.key ] || {
+        echo "no peer-ca.key here; the CA that signs a new certificate has to be the one the" >&2
+        echo "cluster already trusts. Run ./certs.sh with no arguments to bootstrap one." >&2
+        exit 1
+    }
+    nodes="$*"
+    for node in $nodes; do
+        [ -e "$node.pem" ] && {
+            echo "$node.pem already exists; delete it first if you mean to reissue it" >&2
+            exit 1
+        }
+    done
+else
+    if [ -f peer-ca.pem ]; then
+        echo "peer-ca.pem already exists; delete secrets/ first if you mean to rotate," >&2
+        echo "or name a node - \`./certs.sh d\` - to issue one more against this CA" >&2
+        exit 1
+    fi
 
-# The CA. Kept here so a node can be added later; in anything larger than a demo it belongs
-# somewhere the nodes cannot reach.
-openssl req -x509 -newkey ed25519 -nodes -days "$days" \
-    -keyout peer-ca.key -out peer-ca.pem \
-    -subj '/CN=big peer ca' 2>/dev/null
-chmod 600 peer-ca.key
+    # The CA. Kept here so a node can be added later; in anything larger than a demo it belongs
+    # somewhere the nodes cannot reach.
+    openssl req -x509 -newkey ed25519 -nodes -days "$days" \
+        -keyout peer-ca.key -out peer-ca.pem \
+        -subj '/CN=big peer ca' 2>/dev/null
+    chmod 600 peer-ca.key
+fi
 
 for node in $nodes; do
     # `subjectAltName` is what is actually checked - a CN is not, by anything current - and it
@@ -49,5 +72,9 @@ EXT
 done
 
 rm -f peer-ca.srl
-echo "wrote secrets/peer-ca.pem and a certificate for each of: $nodes"
+echo "wrote a certificate for each of: $nodes"
 echo "keys are mode 600; certificates are public and are not"
+echo
+echo "Each node is started with this pair twice over: --peer-cert/--peer-key is what it presents"
+echo "when it dials another node, and --tls-cert/--tls-key is what its own listener presents when"
+echo "it is dialled. One listener serves peers and people both, so it is one certificate."

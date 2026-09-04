@@ -7,6 +7,23 @@
 # The addresses are the compose service names. Inside the network each node listens on
 # 0.0.0.0:7654 and reaches the others by name, which is why each one is started with --node:
 # the address it binds is not the address the others use to find it.
+#
+# **This file is a seed, not the truth.** It says what the cluster was when it started; every
+# committed decision after that replaces it - a range that split, a range that moved, a node that
+# joined or was removed. So a node that has been running does not have its file rewritten to
+# match, and two nodes of one cluster legitimately hold different ones. See
+# docs/clustering.md, "Changing the shape while it runs", and `deploy/readme.md` for the
+# commands that make those decisions.
+
+# **What names this cluster**, and the reason it is here rather than left out: a node that joins
+# at runtime is given a file describing a different set of nodes - itself and whoever it was told
+# about - so the shape of the file can no longer be what two nodes recognise each other by. With
+# a `cluster_id` they check this instead, and a node admitted next year matches one started
+# today. Without one the shape is still used, which is exact for a cluster that never grows.
+#
+# Any string, the same on every node. Change it and the nodes stop recognising each other, so it
+# is written once and left alone.
+cluster_id      = "big-demo"
 
 schema_leader   = "a"
 # **Who signs a node certificate**, staged from the mount by the entrypoint - see

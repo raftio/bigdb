@@ -36,8 +36,10 @@ pub(super) fn health() -> Response {
 /// **It does not check the peers.** A node that is ready is one that can serve its own shards;
 /// whether another node is up changes nothing this one can do about it, and a readiness probe
 /// that fails because a *different* machine is down takes a healthy node out of rotation for
-/// somebody else's outage. The shards this node holds are reported so that a probe can see
-/// which part of the space this process is answering for.
+/// somebody else's outage. The shards this node serves are reported so that a probe can see
+/// which part of the space this process is answering for - **serves**, so a copy that has not
+/// been promoted reports none, which is the truthful answer to "what would a request to this
+/// node be answered from" and the one that agrees with `serving` beside it.
 pub(super) fn ready<P: PagerMut + Sync>(ctx: &Ctx<'_, P>) -> Response {
     let m = ctx.api().metrics();
     let tables = ctx.cluster.schema().len();
@@ -73,12 +75,24 @@ pub(super) fn ready<P: PagerMut + Sync>(ctx: &Ctx<'_, P>) -> Response {
             )
         }
     };
+    // **The agreement, not the file.** `config()` is the seed this node started from, and
+    // reporting it answers "what was true at startup" to a probe that asked what is true now: a
+    // node that joined a running cluster serves a range its own file never mentioned, and so does
+    // one that has taken a range over or watched one split. A node may hold more than one range
+    // now, so several are joined rather than one being picked - and a node holding none, which is
+    // what a learner is, says so with an empty string.
+    let shards = match ctx.cluster.controller() {
+        Some(c) => c.shards_served().iter().map(ToString::to_string).collect::<Vec<_>>().join(","),
+        // No controller means no agreement to disagree with the file: a node with no replicated
+        // range owns what it was configured to own, for as long as it runs.
+        None => node.shards.to_string(),
+    };
     Response::ok(format!(
         "{{\"status\":\"ready\",\"tables\":{tables},\"txn_id\":{},\"pages\":{},\
          \"node\":{},\"shards\":{}{build}{agreement}}}",
         m.txn_id,
         m.page_count,
         json::string(&node.name),
-        json::string(&node.shards.to_string())
+        json::string(&shards)
     ))
 }

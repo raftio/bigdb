@@ -24,6 +24,20 @@ x-node: &node
   build:
     context: ../..
   restart: unless-stopped
+  # **The image's own health check speaks HTTP, and this port does not.** It is written for the
+  # single-node deployment, where the port is in the clear; here the same request is answered
+  # `400` and every container goes `unhealthy` while the cluster is perfectly well. Same probe,
+  # one scheme over.
+  #
+  # `-k` is deliberate: the certificate names the node - `DNS:a` - and this request is to
+  # `127.0.0.1` from inside that node's own container. What is being asked is "can this process
+  # answer", not "is this the right process", and it never leaves the container to ask it.
+  healthcheck:
+    test: ["CMD", "curl", "-fsSk", "https://127.0.0.1:7654/health"]
+    interval: 10s
+    timeout: 2s
+    start_period: 5s
+    retries: 3
   # Nothing to flush and nothing to replay: the meta page flip is the only atomic point, so a
   # process killed outright leaves a file that is either before it or after it.
   stop_grace_period: 2s
@@ -65,6 +79,26 @@ services:
       # ceiling is a daemon one expensive query can hold a worker on for as long as it likes.
       - --query-timeout
       - "30"
+      # **The same certificate again, and this is the pair that makes the cluster work.**
+      # `--peer-cert` is the identity this node presents when it *dials* another; `--tls-cert` is
+      # what its own listener presents when it is dialled. A node given only the first speaks TLS
+      # outward into a plaintext port and every peer handshake fails - `received corrupt message
+      # of type InvalidContentType`, an election that never settles, `serving: false`. One
+      # listener serves peers and people both, so there is one certificate for both, and
+      # `certs.sh` issues it with `serverAuth` and `clientAuth` for exactly this reason.
+      #
+      # It also means the published port is HTTPS: `bigctl --addr https://... --ca-file` rather
+      # than a bare host:port. Client certificates are optional on this listener, so a person
+      # with no certificate still connects and still authenticates with a password.
+      - --tls-cert
+      - /run/big/peer.pem
+      - --tls-key
+      - /run/big/peer.key
+      # Per node, because a backup is per node: each holds its own range, and a copy of one node
+      # is a copy of one range. `big backup` cannot do this while the daemon runs - it wants the
+      # exclusive lock the daemon holds - so `POST /admin/backup` is the online path.
+      - --backup-dir
+      - /data
 
   b:
     <<: *node
@@ -94,6 +128,26 @@ services:
       # ceiling is a daemon one expensive query can hold a worker on for as long as it likes.
       - --query-timeout
       - "30"
+      # **The same certificate again, and this is the pair that makes the cluster work.**
+      # `--peer-cert` is the identity this node presents when it *dials* another; `--tls-cert` is
+      # what its own listener presents when it is dialled. A node given only the first speaks TLS
+      # outward into a plaintext port and every peer handshake fails - `received corrupt message
+      # of type InvalidContentType`, an election that never settles, `serving: false`. One
+      # listener serves peers and people both, so there is one certificate for both, and
+      # `certs.sh` issues it with `serverAuth` and `clientAuth` for exactly this reason.
+      #
+      # It also means the published port is HTTPS: `bigctl --addr https://... --ca-file` rather
+      # than a bare host:port. Client certificates are optional on this listener, so a person
+      # with no certificate still connects and still authenticates with a password.
+      - --tls-cert
+      - /run/big/peer.pem
+      - --tls-key
+      - /run/big/peer.key
+      # Per node, because a backup is per node: each holds its own range, and a copy of one node
+      # is a copy of one range. `big backup` cannot do this while the daemon runs - it wants the
+      # exclusive lock the daemon holds - so `POST /admin/backup` is the online path.
+      - --backup-dir
+      - /data
 
   a-spare:
     <<: *node
@@ -123,6 +177,26 @@ services:
       # ceiling is a daemon one expensive query can hold a worker on for as long as it likes.
       - --query-timeout
       - "30"
+      # **The same certificate again, and this is the pair that makes the cluster work.**
+      # `--peer-cert` is the identity this node presents when it *dials* another; `--tls-cert` is
+      # what its own listener presents when it is dialled. A node given only the first speaks TLS
+      # outward into a plaintext port and every peer handshake fails - `received corrupt message
+      # of type InvalidContentType`, an election that never settles, `serving: false`. One
+      # listener serves peers and people both, so there is one certificate for both, and
+      # `certs.sh` issues it with `serverAuth` and `clientAuth` for exactly this reason.
+      #
+      # It also means the published port is HTTPS: `bigctl --addr https://... --ca-file` rather
+      # than a bare host:port. Client certificates are optional on this listener, so a person
+      # with no certificate still connects and still authenticates with a password.
+      - --tls-cert
+      - /run/big/peer.pem
+      - --tls-key
+      - /run/big/peer.key
+      # Per node, because a backup is per node: each holds its own range, and a copy of one node
+      # is a copy of one range. `big backup` cannot do this while the daemon runs - it wants the
+      # exclusive lock the daemon holds - so `POST /admin/backup` is the online path.
+      - --backup-dir
+      - /data
 
 # One volume per node. **Not one shared between them**: one process holds one file - the pager
 # takes an exclusive lock - and two nodes pointed at one volume is two nodes fighting over a

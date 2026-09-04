@@ -326,6 +326,8 @@ impl Answer {
             ["agree", "ranges"] => verify(&value),
             // `POST /repair`.
             ["repaired"] => repaired(&value),
+            // `GET /cluster/topology`.
+            ["epoch", "leader", "schema_leader", "members", "ranges", "behind"] => topology(&value),
             // Everything else the server writes is a flat object of scalars: a count, a sum, a
             // value, an id, a probe. Rendered as one row of its own keys, which is the reading
             // that needs no per-route knowledge and cannot be wrong about a shape it has not
@@ -504,6 +506,93 @@ fn repaired(v: &Value) -> Result<Answer, String> {
         columns: ["node", "fragments", "outcome"].map(str::to_string).to_vec(),
         rows,
         notes: Vec::new(),
+    })
+}
+
+/// `GET /cluster/topology`: one row per node, saying what that node holds.
+///
+/// **Two lists in one answer**, which is why this shape reached `flat` and was refused: `members`
+/// says who is in the cluster and `ranges` says who serves what, and neither is the whole answer
+/// on its own. A node is the thing both are about, so a node is the row - which also makes a
+/// learner holding nothing a row with two empty cells rather than an absence somebody has to
+/// notice.
+///
+/// The scalars - leader, schema leader, epoch - are notes rather than a column repeated on every
+/// row, and a cluster with no leader says so in words. That last case is the one worth reading
+/// aloud: it is what a peer handshake that keeps failing looks like from the outside.
+fn topology(v: &Value) -> Result<Answer, String> {
+    let (Some(Value::Arr(members)), Some(Value::Arr(ranges))) = (v.get("members"), v.get("ranges"))
+    else {
+        return Err("`members` and `ranges` must both be arrays".to_string());
+    };
+    let behind: Vec<String> = match v.get("behind") {
+        Some(Value::Arr(items)) => items.iter().filter_map(Value::cell).collect(),
+        _ => Vec::new(),
+    };
+
+    let mut rows = Vec::new();
+    for m in members {
+        let name = m.get("name").and_then(Value::cell).unwrap_or_default();
+        // Primary and copy are separate columns rather than one with a marker in it: which
+        // ranges a node *answers* for is a different question from which it merely holds, and an
+        // operator reading this after a failover is asking the first one.
+        let (mut primary, mut copies) = (Vec::new(), Vec::new());
+        for r in ranges {
+            let shards = r.get("shards").and_then(Value::cell).unwrap_or_default();
+            let holds = matches!(r.get("holders"), Some(Value::Arr(h))
+                if h.iter().filter_map(Value::cell).any(|holder| holder == name));
+            if r.get("primary").and_then(Value::cell).is_some_and(|p| p == name) {
+                primary.push(shards);
+            } else if holds {
+                copies.push(shards);
+            }
+        }
+        rows.push(vec![
+            name.clone(),
+            m.get("addr").and_then(Value::cell).unwrap_or_default(),
+            m.get("state").and_then(Value::cell).unwrap_or_default(),
+            primary.join(" "),
+            copies.join(" "),
+            if behind.contains(&name) { "yes".to_string() } else { String::new() },
+        ]);
+    }
+
+    let mut notes = Vec::new();
+    // `null` is a cell, and the cell it is is the empty string - so the check is emptiness
+    // rather than absence.
+    match v.get("leader").and_then(Value::cell) {
+        Some(leader) if !leader.is_empty() => notes.push(format!(
+            "leader `{leader}`, schema leader `{}`, epoch {}",
+            v.get("schema_leader").and_then(Value::cell).unwrap_or_default(),
+            v.get("epoch").and_then(Value::cell).unwrap_or_default(),
+        )),
+        _ => notes.push(
+            "no leader: the nodes have not agreed on one. A cluster that stays this way is \
+             usually one whose peers cannot reach each other - check that every node was given \
+             --tls-cert as well as --peer-cert, and that each names a node in the cluster file"
+                .to_string(),
+        ),
+    }
+    for r in ranges {
+        if let Some(to) = r.get("moving_to").and_then(Value::cell) {
+            notes.push(format!(
+                "range {} ({}) is moving to `{to}`: {}",
+                r.get("id").and_then(Value::cell).unwrap_or_default(),
+                r.get("shards").and_then(Value::cell).unwrap_or_default(),
+                r.get("moving_state").and_then(Value::cell).unwrap_or_default(),
+            ));
+        }
+    }
+    if !behind.is_empty() {
+        notes.push(format!("behind, and not promotable until repaired: {}", behind.join(", ")));
+    }
+
+    Ok(Answer {
+        columns: ["node", "addr", "state", "primary", "copy", "behind"]
+            .map(str::to_string)
+            .to_vec(),
+        rows,
+        notes,
     })
 }
 
