@@ -35,7 +35,7 @@ impl<P: PagerMut + Sync> Cluster<P> {
     /// It is a scan. Run it deliberately, not every fifteen seconds.
     pub fn verify(&self) -> Vec<RangeVerdict> {
         let mut out = Vec::new();
-        for range in 0..self.config.range_count() {
+        for range in 0..self.range_count() {
             let copies = self.copies_of_range(range);
             let primary = copies[0];
             // **Every copy is asked about the same range**, not about everything it holds. Two
@@ -132,76 +132,90 @@ impl<P: PagerMut + Sync> Cluster<P> {
     /// the truth than it was and still marked behind, which is exactly the state it should be
     /// left in.
     pub fn repair(&self) -> Result<Vec<RepairReport>> {
-        let Some(controller) = &self.controller else { return Ok(Vec::new()) };
-        let behind = controller.ownership().stale;
+        if self.controller.is_none() {
+            return Ok(Vec::new());
+        }
+        let map = self.map();
         let mut out = Vec::new();
-        for node in behind {
-            let Some(range) = self.config.range_of_node(node) else { continue };
-            let source = self.serving(range);
-            if source == node {
-                // The copy that is behind is the one serving the range. Nothing here can fix
-                // that: there is no more authoritative copy to take from.
-                out.push(RepairReport {
-                    node: self.config.nodes()[node].name.clone(),
-                    fragments: 0,
-                    outcome: "this copy is the one serving its range".to_string(),
-                });
-                continue;
+        for node in map.stale.iter().copied() {
+            // A behind copy may hold several ranges. Each is repaired from whoever serves it,
+            // which is not necessarily one node: after a move they can differ.
+            for range in map.held_by(node) {
+                let source = self.serving(range);
+                if source == node {
+                    // The copy that is behind is the one serving the range. Nothing here can
+                    // fix that: there is no more authoritative copy to take from.
+                    out.push(RepairReport {
+                        node: self.name_of(node).unwrap_or_default(),
+                        shards: self.shards_of_range(range).to_string(),
+                        fragments: 0,
+                        outcome: "this copy is the one serving its range".to_string(),
+                    });
+                    continue;
+                }
+                out.push(self.repair_one(range, source, node));
             }
-            let report = match self.catch_up(source, node) {
-                Ok(fragments) => {
-                    // **Proved, not assumed.** A fragment is replaced whole, and the copy being
-                    // repaired is still taking writes - it is in the range's group, which is
-                    // exactly why it can be behind by one batch rather than by a database. So a
-                    // write that reached the source after its fragments were listed, and the
-                    // target before they were pushed, is a write this pass overwrote. Clearing
-                    // the mark on the strength of "the copy ran without erroring" would be
-                    // recording that a copy is promotable when it is missing an acknowledged
-                    // write, and nothing downstream would ever contradict it.
-                    //
-                    // Two digests instead. They disagree when a write landed during the pass,
-                    // which is a repair to run again - the honest answer, and cheap to act on.
-                    // They cannot agree while the copy is missing a fact the source holds.
-                    match self.agreed(range, source, node) {
-                        Err(e) => RepairReport {
-                            node: self.config.nodes()[node].name.clone(),
-                            fragments,
-                            outcome: format!("copied, but could not be checked: {e}"),
-                        },
-                        Ok(false) => RepairReport {
-                            node: self.config.nodes()[node].name.clone(),
-                            fragments,
-                            outcome: "copied, but the two still disagree - a write probably \
+        }
+        Ok(out)
+    }
+
+    /// One behind copy of one range, brought back into line.
+    fn repair_one(&self, range: usize, source: usize, node: usize) -> RepairReport {
+        match self.catch_up(source, node) {
+            Ok(fragments) => {
+                // **Proved, not assumed.** A fragment is replaced whole, and the copy being
+                // repaired is still taking writes - it is in the range's group, which is
+                // exactly why it can be behind by one batch rather than by a database. So a
+                // write that reached the source after its fragments were listed, and the
+                // target before they were pushed, is a write this pass overwrote. Clearing
+                // the mark on the strength of "the copy ran without erroring" would be
+                // recording that a copy is promotable when it is missing an acknowledged
+                // write, and nothing downstream would ever contradict it.
+                //
+                // Two digests instead. They disagree when a write landed during the pass,
+                // which is a repair to run again - the honest answer, and cheap to act on.
+                // They cannot agree while the copy is missing a fact the source holds.
+                match self.agreed(range, source, node) {
+                    Err(e) => RepairReport {
+                        node: self.name_of(node).unwrap_or_default(),
+                        shards: self.shards_of_range(range).to_string(),
+                        fragments,
+                        outcome: format!("copied, but could not be checked: {e}"),
+                    },
+                    Ok(false) => RepairReport {
+                        node: self.name_of(node).unwrap_or_default(),
+                        shards: self.shards_of_range(range).to_string(),
+                        fragments,
+                        outcome: "copied, but the two still disagree - a write probably \
                                       landed while this ran. The mark stands; run it again"
-                                .to_string(),
-                        },
-                        Ok(true) => {
-                            let cleared = self.clear_stale(node);
-                            RepairReport {
-                                node: self.config.nodes()[node].name.clone(),
-                                fragments,
-                                outcome: if cleared {
-                                    "caught up".to_string()
-                                } else {
-                                    // The data moved and the mark did not, so the copy is
-                                    // correct and still will not be promoted. Saying so is the
-                                    // difference between a repair to run again and a repair to
-                                    // worry about.
-                                    "caught up, but the agreement did not record it".to_string()
-                                },
-                            }
+                            .to_string(),
+                    },
+                    Ok(true) => {
+                        let cleared = self.clear_stale(node);
+                        RepairReport {
+                            node: self.name_of(node).unwrap_or_default(),
+                            shards: self.shards_of_range(range).to_string(),
+                            fragments,
+                            outcome: if cleared {
+                                "caught up".to_string()
+                            } else {
+                                // The data moved and the mark did not, so the copy is
+                                // correct and still will not be promoted. Saying so is the
+                                // difference between a repair to run again and a repair to
+                                // worry about.
+                                "caught up, but the agreement did not record it".to_string()
+                            },
                         }
                     }
                 }
-                Err(e) => RepairReport {
-                    node: self.config.nodes()[node].name.clone(),
-                    fragments: 0,
-                    outcome: e.to_string(),
-                },
-            };
-            out.push(report);
+            }
+            Err(e) => RepairReport {
+                node: self.name_of(node).unwrap_or_default(),
+                shards: self.shards_of_range(range).to_string(),
+                fragments: 0,
+                outcome: e.to_string(),
+            },
         }
-        Ok(out)
     }
 
     /// Makes `target` hold what `source` holds. Returns how many fragments had to move.

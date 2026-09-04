@@ -22,16 +22,27 @@
 use super::*;
 
 impl<P: PagerMut + Sync> Cluster<P> {
+    /// How many ranges the space is divided into right now.
+    ///
+    /// **From the map, not the file.** The file only ever seeded it, and after a split or a
+    /// merge the two do not agree.
+    pub(super) fn range_count(&self) -> usize {
+        self.ranges.read().expect("no panic holds this lock").len()
+    }
+
+    /// Which range a shard falls in.
+    pub(super) fn range_of(&self, shard: big_engine::ShardId) -> usize {
+        self.ranges.read().expect("no panic holds this lock").range_of(shard)
+    }
+
     /// Who serves a range right now.
     ///
-    /// The config's answer until the agreement has one, and the agreement's after that. The
-    /// two are the same until a machine dies, which is the point: failing over changes who
-    /// answers and changes nothing else.
+    /// The config's answer until the agreement has one, and the agreement's after that - the
+    /// map is seeded from the file and replaced by every committed decision. The two are the
+    /// same until a machine dies or a range moves.
     pub(super) fn serving(&self, range: usize) -> usize {
-        match &self.controller {
-            Some(c) => c.ownership().primary.get(range).copied().unwrap_or(range),
-            None => range,
-        }
+        let map = self.ranges.read().expect("no panic holds this lock");
+        map.ranges.get(range).map_or(range, |r| r.primary)
     }
 
     /// Every node holding a range, the one currently serving it first.
@@ -40,9 +51,10 @@ impl<P: PagerMut + Sync> Cluster<P> {
     /// follows the agreement rather than the file: after a promotion the new primary is
     /// written first, because it is the one reads now go to.
     pub(super) fn copies_of_range(&self, range: usize) -> Vec<usize> {
-        let serving = self.serving(range);
-        let mut out = vec![serving];
-        out.extend(self.config.group(range).iter().copied().filter(|n| *n != serving));
+        let map = self.ranges.read().expect("no panic holds this lock");
+        let Some(r) = map.ranges.get(range) else { return vec![range] };
+        let mut out = vec![r.primary];
+        out.extend(r.group.iter().copied().filter(|n| *n != r.primary));
         out
     }
 
@@ -51,8 +63,15 @@ impl<P: PagerMut + Sync> Cluster<P> {
     /// Empty on the path everybody hopes for. A name here is a copy that a write could not
     /// reach, which is a copy the agreement will not promote until a repair has been run.
     pub fn behind(&self) -> Vec<String> {
-        let Some(c) = &self.controller else { return Vec::new() };
-        c.ownership().stale.iter().map(|n| self.config.nodes()[*n].name.clone()).collect()
+        self.map().stale.iter().filter_map(|n| self.name_of(*n)).collect()
+    }
+
+    /// A node's name, or `None` for an index the cluster file never had.
+    ///
+    /// An option rather than an index, because a node can now join at runtime: a `NodeId` from
+    /// the map may name a machine the file this process read has never heard of.
+    pub(super) fn name_of(&self, node: usize) -> Option<String> {
+        self.config.nodes().get(node).map(|n| n.name.clone())
     }
 
     /// Whether this node may answer for the range it holds.
@@ -84,7 +103,8 @@ impl<P: PagerMut + Sync> Cluster<P> {
     /// stays true when ownership moves, because a promotion moves who answers and not what
     /// the range is.
     pub(super) fn shards_of_range(&self, range: usize) -> big_engine::ShardRange {
-        self.config.nodes()[range].shards
+        let map = self.ranges.read().expect("no panic holds this lock");
+        map.ranges.get(range).map_or(big_engine::ShardRange::ALL, |r| r.shards)
     }
 
     /// What one slot of a fan-out asks its owner to answer for.

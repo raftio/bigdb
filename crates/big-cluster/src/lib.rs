@@ -194,6 +194,15 @@ pub struct Cluster<P: PagerMut> {
     /// running an election to decide who serves it would be machinery deciding a question
     /// with one possible answer.
     controller: Option<Arc<Controller>>,
+    /// **Which node answers for which part of the space.** The one place routing reads.
+    ///
+    /// Seeded from the cluster file and replaced by every committed `Decision::Ranges`, which
+    /// is the same rule ownership always followed - "the config's answer until the agreement
+    /// has one" - widened from *who serves a range* to *what the ranges are*.
+    ///
+    /// Shared with the controller rather than owned by it, because a cluster with no copies
+    /// runs no agreement at all and still has to route. One value, not two that can drift.
+    ranges: Arc<std::sync::RwLock<raft::RangeMap>>,
 }
 
 impl<P: PagerMut + Sync> Cluster<P> {
@@ -264,15 +273,24 @@ impl<P: PagerMut + Sync> Cluster<P> {
         timing: raft::Timing,
         leases: Leases,
     ) -> std::io::Result<Self> {
+        let ranges = Arc::new(std::sync::RwLock::new(config.seed_map()));
         let controller = match config.is_replicated() {
             false => None,
-            true => Some(Controller::start(&config, Arc::clone(&peers), store, timing, leases)?),
+            true => Some(Controller::start(
+                &config,
+                Arc::clone(&peers),
+                store,
+                timing,
+                leases,
+                Arc::clone(&ranges),
+            )?),
         };
         Ok(Self {
             config,
             api,
             peers,
             controller,
+            ranges,
             counters: counters::Counters::new(),
             allocated: Default::default(),
         })
@@ -282,10 +300,11 @@ impl<P: PagerMut + Sync> Cluster<P> {
     ///
     /// A snapshot rather than a handle: rendering it must never hold anything a request needs.
     pub fn counters(&self) -> counters::Snapshot {
-        let (term, leader, behind) = match &self.controller {
-            None => (0, false, 0),
-            Some(c) => (c.term(), c.is_leader(), c.ownership().stale.len()),
+        let (term, leader) = match &self.controller {
+            None => (0, false),
+            Some(c) => (c.term(), c.is_leader()),
         };
+        let behind = self.map().stale.len();
         counters::Snapshot {
             nodes: self.config.nodes().len(),
             peers: self.config.nodes().len() - 1,
@@ -320,6 +339,14 @@ impl<P: PagerMut + Sync> Cluster<P> {
     pub fn config(&self) -> &ClusterConfig {
         &self.config
     }
+
+    /// Which node answers for which part of the space, right now.
+    ///
+    /// A clone rather than a guard: this is read on the path of every request, so the lock is
+    /// held for a pointer's worth of time and never across any I/O.
+    pub fn map(&self) -> raft::RangeMap {
+        self.ranges.read().expect("no panic holds this lock").clone()
+    }
 }
 
 /// What a write actually managed to do.
@@ -337,10 +364,16 @@ pub struct WriteOutcome {
     pub missed: Vec<String>,
 }
 
-/// What a repair managed for one copy.
+/// What a repair managed for one copy of one range.
+///
+/// **One per copy *and* range.** A behind copy can hold several ranges, and each is caught up
+/// from whoever serves that one - which need not be the same node twice. Naming only the copy
+/// would make two entries look identical while describing different work.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct RepairReport {
     pub node: String,
+    /// The range that was repaired, as `0..64`.
+    pub shards: String,
     /// How many fragments had to move. Zero means the copy was already correct and only the
     /// mark was stale, which is the common case after a brief blip.
     pub fragments: usize,

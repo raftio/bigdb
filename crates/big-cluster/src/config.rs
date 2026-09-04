@@ -687,11 +687,40 @@ impl ClusterConfig {
         &self.groups[range]
     }
 
-    /// Who serves each range before anything has been agreed: what the file says.
-    pub fn initial_ownership(&self) -> crate::raft::Ownership {
+    /// The map the cluster starts from: what the file says.
+    ///
+    /// **The file is a seed, not the truth.** It is what the map is before the agreement has
+    /// decided anything, and every committed `Decision::Ranges` replaces it. That is the same
+    /// rule ownership always followed - "the config's answer until the agreement has one" -
+    /// widened from *who serves a range* to *what the ranges are*.
+    ///
+    /// Range ids are positions in the file here, and only here. After the first split they are
+    /// minted from [`crate::raft::RangeMap::next_id`] and mean nothing positional.
+    pub fn seed_map(&self) -> crate::raft::RangeMap {
+        let ranges = (0..self.primary_count)
+            .map(|r| crate::raft::Range {
+                id: r as crate::raft::RangeId,
+                shards: self.nodes[r].shards,
+                group: self.groups[r].clone(),
+                primary: r,
+                moving: None,
+            })
+            .collect();
         // Nothing is behind before anything has happened, which is exactly what the file
         // asserts by naming a primary for every range.
-        crate::raft::Ownership { primary: (0..self.primary_count).collect(), stale: Vec::new() }
+        crate::raft::RangeMap { epoch: 0, ranges, stale: Vec::new(), schema_leader: self.leader }
+    }
+
+    /// The members the cluster starts from, in the file's order.
+    pub fn seed_members(&self) -> Vec<crate::raft::Member> {
+        self.nodes
+            .iter()
+            .map(|n| crate::raft::Member {
+                name: n.name.clone(),
+                addr: n.addr.clone(),
+                state: crate::raft::MemberState::Voter,
+            })
+            .collect()
     }
 
     /// The nodes a read goes to, one per range, in range order.

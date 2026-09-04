@@ -1366,7 +1366,7 @@ fn a_node_that_restarts_keeps_what_it_agreed() {
 
     // The file was read rather than started fresh: the state on disk says so.
     let written = std::fs::read(dir.path().join("c.raft")).unwrap();
-    assert!(written.starts_with(b"BIGRAFT1"), "the agreement wrote no state for `c`");
+    assert!(written.starts_with(b"BIGRAFT2"), "the agreement wrote no state for `c`");
 
     // Reads never stopped: the copy serving the range was never the one taken away.
     assert_eq!(ok(ports[0], "POST", "/table/tx/query", "Count(All())"), r#"{"count":1}"#);

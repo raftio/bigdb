@@ -75,7 +75,7 @@ impl<P: PagerMut + Sync> Cluster<P> {
         // record belongs to cannot, because it is a shift of the record id.
         let mut by_range: BTreeMap<usize, Vec<&OwnedFact>> = BTreeMap::new();
         for fact in facts {
-            let range = self.config.range_of(big_engine::shard_of(fact.record));
+            let range = self.range_of(big_engine::shard_of(fact.record));
             by_range.entry(range).or_default().push(fact);
         }
 
@@ -143,7 +143,7 @@ impl<P: PagerMut + Sync> Cluster<P> {
     pub fn delete(&self, table: &str, records: &[RecordId]) -> Result<WriteOutcome> {
         let mut by_range: BTreeMap<usize, Vec<RecordId>> = BTreeMap::new();
         for record in records {
-            let range = self.config.range_of(big_engine::shard_of(*record));
+            let range = self.range_of(big_engine::shard_of(*record));
             by_range.entry(range).or_default().push(*record);
         }
 
@@ -280,7 +280,7 @@ impl<P: PagerMut + Sync> Cluster<P> {
     /// One shard's work per node - see `big_embed::Api::max_record` - and one round trip per
     /// statement that allocates, rather than per row. Zero for a table nobody has written to.
     pub(super) fn next_record(&self, table: &str) -> Result<RecordId> {
-        let asked = self.candidates(0..self.config.range_count());
+        let asked = self.candidates(0..self.range_count());
         let answers = self.fan_out_over(
             &asked,
             None,

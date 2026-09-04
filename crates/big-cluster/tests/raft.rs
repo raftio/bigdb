@@ -24,7 +24,11 @@
 //! never lead the same term, and a committed decision is never taken back.** Everything else
 //! is a way of stressing that.
 
-use big_cluster::raft::{Decision, Message, NodeId, Ownership, Raft, Role, Store, Timing};
+use big_cluster::raft::{
+    Decision, Member, MemberState, Message, NodeId, Raft, Range, RangeMap, Role, State, Store,
+    Timing,
+};
+use big_engine::ShardRange;
 use std::collections::BTreeSet;
 
 /// A cluster in one process, with a clock and a network this test drives.
@@ -135,8 +139,29 @@ impl Sim {
     }
 }
 
+/// A map in which node `primary[i]` serves range `i`, each over an arbitrary slice of the
+/// space. What the ranges cover does not matter to the agreement - only that a decision is a
+/// value that survives a round trip and that two of them compare unequal.
 fn owning(primary: &[NodeId]) -> Decision {
-    Decision::Own(Ownership { primary: primary.to_vec(), stale: Vec::new() })
+    Decision::Ranges(map_of(primary, &[]))
+}
+
+fn map_of(primary: &[NodeId], stale: &[NodeId]) -> RangeMap {
+    let ranges = primary
+        .iter()
+        .enumerate()
+        .map(|(i, p)| Range {
+            id: i as u64,
+            shards: ShardRange {
+                start: i as u64 * 64,
+                end: (i + 1 < primary.len()).then(|| (i as u64 + 1) * 64),
+            },
+            group: vec![*p],
+            primary: *p,
+            moving: None,
+        })
+        .collect();
+    RangeMap { epoch: 1, ranges, stale: stale.to_vec(), schema_leader: 0 }
 }
 
 /// A node alone in its config file leads immediately: a majority of one is one.
@@ -483,22 +508,38 @@ fn a_restart_keeps_the_term_the_vote_and_the_log() {
         big_cluster::raft::Entry { term: 0, decision: Decision::Noop },
         big_cluster::raft::Entry { term: 3, decision: Decision::Noop },
         big_cluster::raft::Entry { term: 3, decision: owning(&[2, 0, 1]) },
+        big_cluster::raft::Entry { term: 4, decision: Decision::Ranges(map_of(&[1, 1], &[0, 2])) },
+        // A configuration change is a decision like any other and has to survive the same trip.
         big_cluster::raft::Entry {
             term: 4,
-            decision: Decision::Own(Ownership { primary: vec![1, 1], stale: vec![0, 2] }),
+            decision: Decision::Members(vec![
+                Member {
+                    name: "a".to_string(),
+                    addr: "10.0.0.1:7654".to_string(),
+                    state: MemberState::Voter,
+                },
+                Member {
+                    name: "d".to_string(),
+                    addr: "10.0.0.4:7654".to_string(),
+                    state: MemberState::Learner,
+                },
+            ]),
         },
     ];
-    store.save(4, Some(2), &log).unwrap();
+    let state = State { term: 4, voted_for: Some(2), commit: 3, log: log.clone() };
+    store.save(&state).unwrap();
 
-    let (term, voted, back) = store.load().unwrap().expect("just written");
-    assert_eq!(term, 4);
-    assert_eq!(voted, Some(2));
-    assert_eq!(back, log);
+    let back = store.load().unwrap().expect("just written");
+    assert_eq!(back, state);
+
+    // **The commit point is part of the state.** A node that forgot it would replay its whole
+    // log into the state machine on the way up, applying a map no majority ever agreed to.
+    assert_eq!(back.commit, 3);
 
     // A node with no vote is a different state from a node that voted for node zero, and the
     // two must not encode alike.
-    store.save(9, None, &log).unwrap();
-    assert_eq!(store.load().unwrap().unwrap().1, None);
+    store.save(&State { term: 9, voted_for: None, commit: 1, log }).unwrap();
+    assert_eq!(store.load().unwrap().unwrap().voted_for, None);
 }
 
 /// A node comes back holding what it held, and does not vote for a log that is behind its own.
@@ -510,11 +551,11 @@ fn a_restarted_node_still_refuses_a_stale_candidate() {
         big_cluster::raft::Entry { term: 0, decision: Decision::Noop },
         big_cluster::raft::Entry { term: 7, decision: owning(&[1, 0]) },
     ];
-    store.save(7, Some(1), &log).unwrap();
+    store.save(&State { term: 7, voted_for: Some(1), commit: 1, log }).unwrap();
 
-    let (term, voted, log) = store.load().unwrap().unwrap();
+    let state = store.load().unwrap().unwrap();
     let mut node = Raft::new(0, vec![0, 1, 2], Timing::default(), 0);
-    node.restore(term, voted, log);
+    node.restore(state);
     assert_eq!(node.term(), 7);
 
     // A candidate at a higher term with an empty log: newer term, older log. Refused, because
@@ -533,7 +574,12 @@ fn a_damaged_state_file_is_refused() {
     let path = dir.path().join("state.raft");
     let store = big_cluster::raft::FileStore::new(&path);
     store
-        .save(2, Some(0), &[big_cluster::raft::Entry { term: 0, decision: Decision::Noop }])
+        .save(&State {
+            term: 2,
+            voted_for: Some(0),
+            commit: 0,
+            log: vec![big_cluster::raft::Entry { term: 0, decision: Decision::Noop }],
+        })
         .unwrap();
 
     let good = std::fs::read(&path).unwrap();

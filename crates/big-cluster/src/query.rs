@@ -838,7 +838,7 @@ impl<P: PagerMut + Sync> Cluster<P> {
         // body that did not name one would have that node answer with both, twice - so the
         // scope travels with the plan rather than being inferred from who received it.
         let answers = self.fan_out_over(
-            &self.candidates(0..self.config.range_count()),
+            &self.candidates(0..self.range_count()),
             opts.timeout,
             path::QUERY,
             |slot| {
@@ -876,7 +876,7 @@ impl<P: PagerMut + Sync> Cluster<P> {
         // carried rather than assumed - otherwise a pruned scan would scope every remaining
         // owner to the wrong shards.
         let live: Vec<usize> =
-            (0..self.config.range_count()).filter(|r| self.may_hold_after(*r, after)).collect();
+            (0..self.range_count()).filter(|r| self.may_hold_after(*r, after)).collect();
         let asked = self.candidates(live.iter().copied());
 
         let answers = self.fan_out_over(

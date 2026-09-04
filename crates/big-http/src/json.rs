@@ -444,8 +444,9 @@ pub fn repaired(reports: &[RepairReport]) -> String {
         .iter()
         .map(|r| {
             format!(
-                "{{\"node\":{},\"fragments\":{},\"outcome\":{}}}",
+                "{{\"node\":{},\"shards\":{},\"fragments\":{},\"outcome\":{}}}",
                 string(&r.node),
+                string(&r.shards),
                 r.fragments,
                 string(&r.outcome)
             )

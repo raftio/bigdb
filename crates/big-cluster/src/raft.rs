@@ -46,24 +46,69 @@
 //!   overwrites, and the no-op appended on election is what makes the first commit of a term
 //!   reachable at all.
 
+use big_engine::{ShardId, ShardRange};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// A node's index in the cluster file. Stable for the life of a process, which is the only
 /// life this protocol has: membership changes are a restart, like every other config change.
 pub type NodeId = usize;
+/// A range's own name, minted once and never reused. See [`Range::id`].
+pub type RangeId = u64;
 pub type Term = u64;
 /// One past the last index of the log. Index 0 is the sentinel that is always agreed.
 pub type Index = u64;
 
-/// Which node currently serves each range, and which copies are known to be behind.
+/// One contiguous span of the shard space, and who answers for it.
 ///
-/// Indexed by the range's position in the cluster file, so the *ranges* stay static and only
-/// the answer to "who serves this one" moves. That is the whole difference between this and
-/// rebalancing: no data moves, because every node in a range's group already holds it.
+/// **The range has an identity of its own.** It used to be its primary's index in the cluster
+/// file, which made "which range" and "which node" the same number - so a range could never
+/// move to a node that did not already have one, and a node could never hold two. Splitting
+/// them is what the rest of this is built on.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Range {
+    /// Stable for the life of the range. A split retires nothing and mints one new id, so an
+    /// id never means two different spans.
+    pub id: RangeId,
+    /// The shards this range covers, half-open, with an open end on the last one.
+    pub shards: ShardRange,
+    /// Every node holding this range. The primary is one of them.
+    pub group: Vec<NodeId>,
+    /// The node a read of this range goes to.
+    pub primary: NodeId,
+    /// A move in flight, if there is one. `None` on every path that is not rebalancing.
+    pub moving: Option<Move>,
+}
+
+/// A range on its way from one node to another.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Move {
+    pub target: NodeId,
+    pub state: MoveState,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MoveState {
+    /// The target is filling up, out of the write path entirely. Reads and writes are
+    /// untouched, and abandoning it costs nothing.
+    Seeding,
+    /// Writes to this range are refused - retryably - while the last difference is copied.
+    /// The only window in a move where anything is denied, and it is one range wide.
+    Cutover,
+}
+
+/// Which node answers for which part of the space, and which copies are behind.
+///
+/// **The one value the agreement decides about data.** It used to be a vector of primaries
+/// indexed by position in the cluster file; it is now the map itself, because a map that only
+/// says *who* and never *what* cannot describe a range that moved.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
-pub struct Ownership {
-    /// The node a read of each range goes to.
-    pub primary: Vec<NodeId>,
+pub struct RangeMap {
+    /// Bumped on every committed change. What a routed request carries so that an owner can
+    /// refuse a request naming a range it no longer holds.
+    pub epoch: u64,
+    /// Disjoint and total, in ascending order of `shards.start`. Both are invariants, checked
+    /// before any change is proposed - see [`RangeMap::check`].
+    pub ranges: Vec<Range>,
     /// Copies that were unreachable at some point since they were last repaired, and may
     /// therefore have missed a write.
     ///
@@ -76,11 +121,204 @@ pub struct Ownership {
     /// still marked, because the alternative is deciding whether a write happened during a
     /// window nobody was watching. A repair clears it.
     pub stale: Vec<NodeId>,
+    /// The node that owns the row-key namespace. In the map rather than the file because
+    /// draining the node holding it has to be able to move it.
+    pub schema_leader: NodeId,
 }
 
-impl Ownership {
+/// Why a proposed map was refused.
+///
+/// Every variant is a way the space would stop being covered exactly once. They are checked
+/// before a change is proposed rather than after it is committed, because a committed map that
+/// leaves a gap is a record id nobody answers for.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum MapError {
+    Empty,
+    NotStartingAtZero { start: ShardId },
+    Unordered { at: usize },
+    Overlap { from: ShardId, to: ShardId },
+    Gap { from: ShardId, to: ShardId },
+    NotTotal { from: ShardId },
+    EmptyGroup { id: RangeId },
+    PrimaryNotInGroup { id: RangeId, primary: NodeId },
+    DuplicateId { id: RangeId },
+}
+
+impl core::fmt::Display for MapError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Empty => write!(f, "a map with no ranges answers for no record id at all"),
+            Self::NotStartingAtZero { start } => {
+                write!(f, "the first range starts at {start}; shards 0..{start} have no owner")
+            }
+            Self::Unordered { at } => write!(f, "range {at} starts before the one before it"),
+            Self::Overlap { from, to } => write!(
+                f,
+                "shards {from}..{to} have two owners; each would answer half of every query"
+            ),
+            Self::Gap { from, to } => write!(f, "shards {from}..{to} have no owner"),
+            Self::NotTotal { from } => write!(
+                f,
+                "shards {from}.. have no owner; the last range must be open so that every \
+                 record id a client can choose belongs to somebody"
+            ),
+            Self::EmptyGroup { id } => write!(f, "range {id} is held by nobody"),
+            Self::PrimaryNotInGroup { id, primary } => {
+                write!(f, "range {id} is served by node {primary}, which does not hold it")
+            }
+            Self::DuplicateId { id } => write!(f, "two ranges are both called {id}"),
+        }
+    }
+}
+
+impl RangeMap {
+    /// Whether this map covers the shard space exactly once, and every range is held.
+    ///
+    /// **Checked on every proposal rather than only at startup.** A file was read once and
+    /// could be refused; a map changes while the cluster runs, and a change that leaves a gap
+    /// is a record id that no node answers for and nothing to notice it afterwards.
+    pub fn check(&self) -> core::result::Result<(), MapError> {
+        let Some(first) = self.ranges.first() else { return Err(MapError::Empty) };
+        if first.shards.start != 0 {
+            return Err(MapError::NotStartingAtZero { start: first.shards.start });
+        }
+
+        let mut seen = BTreeSet::new();
+        for r in &self.ranges {
+            if !seen.insert(r.id) {
+                return Err(MapError::DuplicateId { id: r.id });
+            }
+            if r.group.is_empty() {
+                return Err(MapError::EmptyGroup { id: r.id });
+            }
+            if !r.group.contains(&r.primary) {
+                return Err(MapError::PrimaryNotInGroup { id: r.id, primary: r.primary });
+            }
+        }
+
+        for (i, pair) in self.ranges.windows(2).enumerate() {
+            let (a, b) = (&pair[0], &pair[1]);
+            if b.shards.start < a.shards.start {
+                return Err(MapError::Unordered { at: i + 1 });
+            }
+            // Only the last range may be open, or everything after it is unreachable.
+            let Some(end) = a.shards.end else {
+                return Err(MapError::Overlap {
+                    from: b.shards.start,
+                    to: b.shards.end.unwrap_or(ShardId::MAX),
+                });
+            };
+            match b.shards.start.cmp(&end) {
+                core::cmp::Ordering::Equal => {}
+                core::cmp::Ordering::Less => {
+                    return Err(MapError::Overlap {
+                        from: b.shards.start,
+                        to: end.min(b.shards.end.unwrap_or(ShardId::MAX)),
+                    })
+                }
+                core::cmp::Ordering::Greater => {
+                    return Err(MapError::Gap { from: end, to: b.shards.start })
+                }
+            }
+        }
+
+        let last = self.ranges.last().expect("checked non-empty above");
+        match last.shards.end {
+            None => Ok(()),
+            Some(end) => Err(MapError::NotTotal { from: end }),
+        }
+    }
+
+    /// Which range a shard falls in.
+    ///
+    /// Total by construction: [`RangeMap::check`] refused any map that left a shard uncovered,
+    /// so this returns an index rather than an option.
+    pub fn range_of(&self, shard: ShardId) -> usize {
+        // The last range that begins at or below `shard` is the one containing it.
+        self.ranges.partition_point(|r| r.shards.start <= shard).saturating_sub(1)
+    }
+
+    pub fn len(&self) -> usize {
+        self.ranges.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ranges.is_empty()
+    }
+
     pub fn is_stale(&self, node: NodeId) -> bool {
         self.stale.contains(&node)
+    }
+
+    /// The position of a range by id, for a change that names one.
+    pub fn position(&self, id: RangeId) -> Option<usize> {
+        self.ranges.iter().position(|r| r.id == id)
+    }
+
+    /// Every range this node holds, whether it serves it or only copies it.
+    pub fn held_by(&self, node: NodeId) -> Vec<usize> {
+        (0..self.ranges.len()).filter(|i| self.ranges[*i].group.contains(&node)).collect()
+    }
+
+    /// Every range this node is the one to read from.
+    pub fn served_by(&self, node: NodeId) -> Vec<usize> {
+        (0..self.ranges.len()).filter(|i| self.ranges[*i].primary == node).collect()
+    }
+
+    /// The shards this node serves, which is what scopes its own share of a fan-out.
+    pub fn shards_served_by(&self, node: NodeId) -> Vec<ShardRange> {
+        self.ranges.iter().filter(|r| r.primary == node).map(|r| r.shards).collect()
+    }
+
+    /// One past the highest id in use, which is where the next range's id comes from.
+    pub fn next_id(&self) -> RangeId {
+        self.ranges.iter().map(|r| r.id).max().map_or(0, |m| m + 1)
+    }
+}
+
+/// One node, as the agreement understands it.
+///
+/// **A slot is never reused.** A node that leaves keeps its index at [`MemberState::Gone`],
+/// so a `NodeId` means one machine for the life of the cluster and every vector indexed by one
+/// stays valid. Reusing a slot would hand a new machine the reputation of the old one -
+/// including a behind-mark it never earned.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Member {
+    pub name: String,
+    pub addr: String,
+    pub state: MemberState,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MemberState {
+    /// Receiving the log but not voting, and holding no range yet. A node catching up must not
+    /// count towards a majority: it would raise the bar for every election while contributing
+    /// nothing to one.
+    Learner,
+    /// A full member: votes, counts towards a majority, may hold ranges.
+    Voter,
+    /// On its way out. Still votes and still coordinates - which is what keeps the one address
+    /// a client holds from going dark mid-drain - but the balancer moves its ranges away and
+    /// gives it no new ones.
+    Draining,
+    /// Left. Keeps its slot so that no `NodeId` ever means two machines.
+    Gone,
+}
+
+impl Member {
+    /// Whether this node counts towards a majority.
+    pub fn votes(&self) -> bool {
+        matches!(self.state, MemberState::Voter | MemberState::Draining)
+    }
+
+    /// Whether the agreement still sends to it at all.
+    pub fn reachable(&self) -> bool {
+        !matches!(self.state, MemberState::Gone)
+    }
+
+    /// Whether the balancer may place a range here.
+    pub fn takes_ranges(&self) -> bool {
+        matches!(self.state, MemberState::Voter)
     }
 }
 
@@ -90,8 +328,18 @@ pub enum Decision {
     /// Decides nothing. Appended by a new leader so that it has an entry of its own term to
     /// commit, which is what makes everything before it committable.
     Noop,
-    /// From now on, these nodes serve these ranges.
-    Own(Ownership),
+    /// From now on, the space is divided like this and these nodes answer for it.
+    ///
+    /// **Applied when it commits.** Routing a read to a node before a majority agreed it owns
+    /// the range would be answering from a node nobody has acknowledged.
+    Ranges(RangeMap),
+    /// From now on, these nodes are the cluster.
+    ///
+    /// **Applied when it is appended, not when it commits** - the rule Raft states for a
+    /// configuration change, because the majority that commits the entry has to be the one the
+    /// entry describes. That is why it is a separate variant from [`Decision::Ranges`] rather
+    /// than a field beside it: the two need opposite rules.
+    Members(Vec<Member>),
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -254,11 +502,30 @@ impl Raft {
 
     /// Restores what was on disk. The three fields that may not be lost, and nothing else:
     /// everything volatile is rebuilt by the first heartbeat.
-    pub fn restore(&mut self, term: Term, voted_for: Option<NodeId>, log: Vec<Entry>) {
-        self.term = term;
-        self.voted_for = voted_for;
-        if !log.is_empty() {
-            self.log = log;
+    /// Restores what was on disk, and the commit point with it.
+    ///
+    /// **The commit point matters.** The state machine is rebuilt by replaying the log, and a
+    /// node that came up believing nothing was committed would replay entries no majority ever
+    /// agreed to - which, for a map of who owns what, is routing a read to a node nobody has
+    /// acknowledged.
+    pub fn restore(&mut self, state: State) {
+        self.term = state.term;
+        self.voted_for = state.voted_for;
+        if !state.log.is_empty() {
+            self.log = state.log;
+        }
+        // Clamped: a commit index past the log is a file that disagrees with itself, and
+        // trusting it would index past the end.
+        self.commit = state.commit.min(self.last_index());
+    }
+
+    /// Everything this node needs written down, as one value.
+    pub fn state(&self) -> State {
+        State {
+            term: self.term,
+            voted_for: self.voted_for,
+            commit: self.commit,
+            log: self.log.clone(),
         }
     }
 
@@ -654,12 +921,23 @@ impl Raft {
 /// The whole log is rewritten on every save, and that is affordable because of what the log
 /// holds: one entry per election and one per machine that has died. It is not the write path
 /// and it never will be.
-/// Term, vote and log: the three things a restart may not lose.
-pub type State = (Term, Option<NodeId>, Vec<Entry>);
+/// What a restart may not lose.
+///
+/// Term and vote because forgetting either is two leaders in one term. The log because it is
+/// the decisions themselves. And the commit index because the state machine is rebuilt by
+/// replaying the log, and replaying past the commit point would apply a decision no majority
+/// ever agreed to.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct State {
+    pub term: Term,
+    pub voted_for: Option<NodeId>,
+    pub commit: Index,
+    pub log: Vec<Entry>,
+}
 
 pub trait Store: Send + Sync {
     fn load(&self) -> std::io::Result<Option<State>>;
-    fn save(&self, term: Term, voted_for: Option<NodeId>, log: &[Entry]) -> std::io::Result<()>;
+    fn save(&self, state: &State) -> std::io::Result<()>;
 }
 
 /// Keeps nothing.
@@ -673,7 +951,7 @@ impl Store for Forgetful {
         Ok(None)
     }
 
-    fn save(&self, _: Term, _: Option<NodeId>, _: &[Entry]) -> std::io::Result<()> {
+    fn save(&self, _: &State) -> std::io::Result<()> {
         Ok(())
     }
 }
@@ -694,7 +972,9 @@ impl FileStore {
     }
 }
 
-const MAGIC: &[u8; 8] = b"BIGRAFT1";
+/// Bumped with the shape of the file. A `BIGRAFT1` file has a different header and different
+/// decision tags, and reading one as this format would take a count for a term.
+const MAGIC: &[u8; 8] = b"BIGRAFT2";
 
 impl Store for FileStore {
     fn load(&self) -> std::io::Result<Option<State>> {
@@ -711,9 +991,9 @@ impl Store for FileStore {
         })
     }
 
-    fn save(&self, term: Term, voted_for: Option<NodeId>, log: &[Entry]) -> std::io::Result<()> {
+    fn save(&self, state: &State) -> std::io::Result<()> {
         let tmp = self.path.with_extension("tmp");
-        let bytes = encode_state(term, voted_for, log);
+        let bytes = encode_state(state);
         {
             use std::io::Write;
             let mut f = std::fs::File::create(&tmp)?;
@@ -736,82 +1016,201 @@ fn put_u64(out: &mut Vec<u8>, v: u64) {
     out.extend_from_slice(&v.to_le_bytes());
 }
 
-fn encode_state(term: Term, voted_for: Option<NodeId>, log: &[Entry]) -> Vec<u8> {
+/// A cursor over a byte slice that never panics and never over-allocates.
+struct Bytes<'a> {
+    b: &'a [u8],
+    at: usize,
+}
+
+impl<'a> Bytes<'a> {
+    fn u64(&mut self) -> core::result::Result<u64, &'static str> {
+        let end = self.at.checked_add(8).ok_or("truncated")?;
+        let slice = self.b.get(self.at..end).ok_or("truncated")?;
+        self.at = end;
+        Ok(u64::from_le_bytes(slice.try_into().expect("eight bytes")))
+    }
+
+    fn byte(&mut self) -> core::result::Result<u8, &'static str> {
+        let v = *self.b.get(self.at).ok_or("truncated")?;
+        self.at += 1;
+        Ok(v)
+    }
+
+    fn opt_u64(&mut self) -> core::result::Result<Option<u64>, &'static str> {
+        let v = self.u64()?;
+        Ok((v != u64::MAX).then_some(v))
+    }
+
+    /// A count, refused when the file is too short to hold that many of anything.
+    ///
+    /// The allocation guard: a count is eight bytes of somebody else's file, and every item
+    /// costs at least one byte, so a count larger than what is left cannot be honest.
+    fn count(&mut self) -> core::result::Result<usize, &'static str> {
+        let n = self.u64()? as usize;
+        if n > self.b.len() - self.at.min(self.b.len()) {
+            return Err("a count larger than the bytes that are left");
+        }
+        Ok(n)
+    }
+
+    fn list<T>(
+        &mut self,
+        mut f: impl FnMut(&mut Self) -> core::result::Result<T, &'static str>,
+    ) -> core::result::Result<Vec<T>, &'static str> {
+        let n = self.count()?;
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            out.push(f(self)?);
+        }
+        Ok(out)
+    }
+
+    fn str(&mut self) -> core::result::Result<String, &'static str> {
+        let n = self.count()?;
+        let end = self.at.checked_add(n).ok_or("truncated")?;
+        let slice = self.b.get(self.at..end).ok_or("truncated")?;
+        self.at = end;
+        core::str::from_utf8(slice).map(str::to_string).map_err(|_| "a name that is not utf-8")
+    }
+}
+
+fn put_str(out: &mut Vec<u8>, s: &str) {
+    put_u64(out, s.len() as u64);
+    out.extend_from_slice(s.as_bytes());
+}
+
+fn put_opt_u64(out: &mut Vec<u8>, v: Option<u64>) {
+    put_u64(out, v.unwrap_or(u64::MAX));
+}
+
+fn put_range_map(out: &mut Vec<u8>, m: &RangeMap) {
+    put_u64(out, m.epoch);
+    put_u64(out, m.schema_leader as u64);
+    put_u64(out, m.ranges.len() as u64);
+    for r in &m.ranges {
+        put_u64(out, r.id);
+        put_u64(out, r.shards.start);
+        put_opt_u64(out, r.shards.end);
+        put_u64(out, r.primary as u64);
+        put_u64(out, r.group.len() as u64);
+        for n in &r.group {
+            put_u64(out, *n as u64);
+        }
+        match &r.moving {
+            None => out.push(0),
+            Some(mv) => {
+                out.push(match mv.state {
+                    MoveState::Seeding => 1,
+                    MoveState::Cutover => 2,
+                });
+                put_u64(out, mv.target as u64);
+            }
+        }
+    }
+    put_u64(out, m.stale.len() as u64);
+    for n in &m.stale {
+        put_u64(out, *n as u64);
+    }
+}
+
+fn get_range_map(b: &mut Bytes<'_>) -> core::result::Result<RangeMap, &'static str> {
+    let epoch = b.u64()?;
+    let schema_leader = b.u64()? as NodeId;
+    let ranges = b.list(|b| {
+        let id = b.u64()?;
+        let start = b.u64()?;
+        let end = b.opt_u64()?;
+        let primary = b.u64()? as NodeId;
+        let group = b.list(|b| Ok(b.u64()? as NodeId))?;
+        let moving = match b.byte()? {
+            0 => None,
+            1 => Some(Move { target: b.u64()? as NodeId, state: MoveState::Seeding }),
+            2 => Some(Move { target: b.u64()? as NodeId, state: MoveState::Cutover }),
+            _ => return Err("unknown move state"),
+        };
+        Ok(Range { id, shards: ShardRange { start, end }, group, primary, moving })
+    })?;
+    let stale = b.list(|b| Ok(b.u64()? as NodeId))?;
+    Ok(RangeMap { epoch, ranges, stale, schema_leader })
+}
+
+fn put_members(out: &mut Vec<u8>, members: &[Member]) {
+    put_u64(out, members.len() as u64);
+    for m in members {
+        put_str(out, &m.name);
+        put_str(out, &m.addr);
+        out.push(match m.state {
+            MemberState::Learner => 0,
+            MemberState::Voter => 1,
+            MemberState::Draining => 2,
+            MemberState::Gone => 3,
+        });
+    }
+}
+
+fn get_members(b: &mut Bytes<'_>) -> core::result::Result<Vec<Member>, &'static str> {
+    b.list(|b| {
+        let name = b.str()?;
+        let addr = b.str()?;
+        let state = match b.byte()? {
+            0 => MemberState::Learner,
+            1 => MemberState::Voter,
+            2 => MemberState::Draining,
+            3 => MemberState::Gone,
+            _ => return Err("unknown member state"),
+        };
+        Ok(Member { name, addr, state })
+    })
+}
+
+fn encode_state(state: &State) -> Vec<u8> {
     let mut out = MAGIC.to_vec();
-    put_u64(&mut out, term);
-    put_u64(&mut out, voted_for.map_or(u64::MAX, |v| v as u64));
-    put_u64(&mut out, log.len() as u64);
-    for entry in log {
+    put_u64(&mut out, state.term);
+    put_u64(&mut out, state.voted_for.map_or(u64::MAX, |v| v as u64));
+    // **Persisted, though Raft does not require it.** Nothing is unsafe about recomputing it -
+    // a leader re-commits what it must - but a node that forgot it would replay the whole log
+    // into its state machine on the way up, applying entries that were never committed. For a
+    // map of who owns what, that is routing a read to a node no majority ever acknowledged.
+    put_u64(&mut out, state.commit);
+    put_u64(&mut out, state.log.len() as u64);
+    for entry in &state.log {
         put_u64(&mut out, entry.term);
         match &entry.decision {
             Decision::Noop => out.push(0),
-            Decision::Own(o) => {
+            Decision::Ranges(m) => {
                 out.push(1);
-                put_u64(&mut out, o.primary.len() as u64);
-                for p in &o.primary {
-                    put_u64(&mut out, *p as u64);
-                }
-                put_u64(&mut out, o.stale.len() as u64);
-                for n in &o.stale {
-                    put_u64(&mut out, *n as u64);
-                }
+                put_range_map(&mut out, m);
+            }
+            Decision::Members(ms) => {
+                out.push(2);
+                put_members(&mut out, ms);
             }
         }
     }
     out
 }
 
-fn decode_state(bytes: &[u8]) -> Result<(Term, Option<NodeId>, Vec<Entry>), &'static str> {
-    let mut at = 8usize;
-    let u64_at = |at: &mut usize| -> Result<u64, &'static str> {
-        let end = at.checked_add(8).ok_or("truncated")?;
-        let slice = bytes.get(*at..end).ok_or("truncated")?;
-        *at = end;
-        Ok(u64::from_le_bytes(slice.try_into().expect("eight bytes")))
-    };
-
+fn decode_state(bytes: &[u8]) -> core::result::Result<State, &'static str> {
     if bytes.get(..8) != Some(MAGIC) {
         return Err("not a raft state file");
     }
-    let term = u64_at(&mut at)?;
-    let voted = u64_at(&mut at)?;
+    let mut b = Bytes { b: bytes, at: 8 };
+    let term = b.u64()?;
+    let voted = b.u64()?;
     let voted_for = (voted != u64::MAX).then_some(voted as NodeId);
-    let n = u64_at(&mut at)? as usize;
-    // A count is four bytes of somebody else's file; every entry costs at least nine, so a
-    // count the file cannot hold is a count that is not going to be allocated.
-    if n > bytes.len() {
-        return Err("truncated");
-    }
-
-    let mut log = Vec::with_capacity(n);
-    for _ in 0..n {
-        let term = u64_at(&mut at)?;
-        let tag = *bytes.get(at).ok_or("truncated")?;
-        at += 1;
-        let decision = match tag {
+    let commit = b.u64()?;
+    let log = b.list(|b| {
+        let term = b.u64()?;
+        let decision = match b.byte()? {
             0 => Decision::Noop,
-            1 => {
-                let list = |at: &mut usize| -> Result<Vec<NodeId>, &'static str> {
-                    let count = u64_at(at)? as usize;
-                    if count > bytes.len() {
-                        return Err("truncated");
-                    }
-                    let mut out = Vec::with_capacity(count);
-                    for _ in 0..count {
-                        out.push(u64_at(at)? as NodeId);
-                    }
-                    Ok(out)
-                };
-                let primary = list(&mut at)?;
-                let stale = list(&mut at)?;
-                Decision::Own(Ownership { primary, stale })
-            }
+            1 => Decision::Ranges(get_range_map(b)?),
+            2 => Decision::Members(get_members(b)?),
             _ => return Err("unknown decision"),
         };
-        log.push(Entry { term, decision });
-    }
-    if at != bytes.len() {
+        Ok(Entry { term, decision })
+    })?;
+    if b.at != bytes.len() {
         return Err("bytes after the end");
     }
-    Ok((term, voted_for, log))
+    Ok(State { term, voted_for, commit, log })
 }
