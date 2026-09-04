@@ -1,5 +1,5 @@
-# Three nodes, one of them a copy. See cluster.toml for the shape and docs/clustering.md for
-# why it is that shape.
+# Two nodes, a range each. See cluster.toml for the shape and docs/clustering.md for why it is
+# that shape.
 #
 #   cd deploy/cluster
 #   ./users.sh                  # writes secrets/users, mode 600, and prints the passwords
@@ -19,9 +19,13 @@
 # So the published port is `proxy` now. A client still sees one address; it is no longer one
 # machine.
 #
-# `stop a` and the queries keep working. That is the whole difference.
+# **Nothing here is replicated, and that is a choice with a price.** Each range lives on exactly
+# one node, so `stop b` leaves `64..` unanswerable until it comes back: the proxy picks a node
+# that is up, it cannot pick data that is not there. Failing over needs a copy of a range, and a
+# copy needs a third node to settle the vote - see docs/clustering.md, "Replication, and failing
+# over", and deploy/readme.md, "What a joining node needs first", for what adds one.
 
-# Everything the three nodes share. Not the volumes: a merge key replaces a list rather than
+# Everything the two nodes share. Not the volumes: a merge key replaces a list rather than
 # extending it, so a `volumes` here would be silently overridden by each service's own and read
 # as though it applied.
 x-node: &node
@@ -73,7 +77,7 @@ services:
       # Staged from the mount by the entrypoint, which reads it as root and writes a private
       # copy: a bind mount carries the host's ownership, which the image cannot predict.
       - /run/big/users
-      # What this node presents to the other two. The CA that checks it is named in cluster.toml,
+      # What this node presents to the other node. The CA that checks it is named in cluster.toml,
       # because that half is the same everywhere; these two are this node's alone.
       - --peer-cert
       - /run/big/peer.pem
@@ -122,7 +126,7 @@ services:
       # Staged from the mount by the entrypoint, which reads it as root and writes a private
       # copy: a bind mount carries the host's ownership, which the image cannot predict.
       - /run/big/users
-      # What this node presents to the other two. The CA that checks it is named in cluster.toml,
+      # What this node presents to the other node. The CA that checks it is named in cluster.toml,
       # because that half is the same everywhere; these two are this node's alone.
       - --peer-cert
       - /run/big/peer.pem
@@ -154,56 +158,7 @@ services:
       - --backup-dir
       - /data
 
-  a-spare:
-    <<: *node
-    volumes:
-      - spare-data:/data
-      - ./cluster.toml:/etc/big/cluster.toml:ro
-      - ./secrets:/etc/big/secrets:ro
-    command:
-      - /data/big.db
-      - 0.0.0.0:7654
-      - --cluster
-      - /etc/big/cluster.toml
-      - --node
-      - a-spare
-      - --users
-      # Staged from the mount by the entrypoint, which reads it as root and writes a private
-      # copy: a bind mount carries the host's ownership, which the image cannot predict.
-      - /run/big/users
-      # What this node presents to the other two. The CA that checks it is named in cluster.toml,
-      # because that half is the same everywhere; these two are this node's alone.
-      - --peer-cert
-      - /run/big/peer.pem
-      - --peer-key
-      - /run/big/peer.key
-      # **Set it on a new deployment.** There is no default, on purpose - a query that used to
-      # finish must not start failing because the server was upgraded - but a daemon with no
-      # ceiling is a daemon one expensive query can hold a worker on for as long as it likes.
-      - --query-timeout
-      - "30"
-      # **The same certificate again, and this is the pair that makes the cluster work.**
-      # `--peer-cert` is the identity this node presents when it *dials* another; `--tls-cert` is
-      # what its own listener presents when it is dialled. A node given only the first speaks TLS
-      # outward into a plaintext port and every peer handshake fails - `received corrupt message
-      # of type InvalidContentType`, an election that never settles, `serving: false`. One
-      # listener serves peers and people both, so there is one certificate for both, and
-      # `certs.sh` issues it with `serverAuth` and `clientAuth` for exactly this reason.
-      #
-      # It also means the published port is HTTPS: `bigctl --addr https://... --ca-file` rather
-      # than a bare host:port. Client certificates are optional on this listener, so a person
-      # with no certificate still connects and still authenticates with a password.
-      - --tls-cert
-      - /run/big/peer.pem
-      - --tls-key
-      - /run/big/peer.key
-      # Per node, because a backup is per node: each holds its own range, and a copy of one node
-      # is a copy of one range. `big backup` cannot do this while the daemon runs - it wants the
-      # exclusive lock the daemon holds - so `POST /admin/backup` is the online path.
-      - --backup-dir
-      - /data
-
-  # The front door. One address, three nodes behind it, and a request that lands on a node which
+  # The front door. One address, two nodes behind it, and a request that lands on a node which
   # has stopped serving lands somewhere else instead.
   #
   # It adds no routing: every node already plans a query and fans it out, so this answers "which
@@ -219,7 +174,7 @@ services:
     # the clear. Add --tls-cert and --tls-key before publishing it wider.
     ports:
       - "127.0.0.1:7654:7650"
-    depends_on: [a, b, a-spare]
+    depends_on: [a, b]
     volumes:
       # The same file the nodes read. This takes `name` and `addr` out of it and ignores the
       # rest — it does not route by key, so the shard map is none of its business. One file, so
@@ -255,4 +210,3 @@ services:
 volumes:
   a-data:
   b-data:
-  spare-data:

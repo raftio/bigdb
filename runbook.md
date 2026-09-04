@@ -751,7 +751,7 @@ in the group already holds it.
 ### Containers
 
 Two compose files, in [deploy/](deploy/): [`single/`](deploy/single/) for one node and
-[`cluster/`](deploy/cluster/) for three. Same binary, same code path - `big serve` without
+[`cluster/`](deploy/cluster/) for two. Same binary, same code path - `big serve` without
 `--cluster` builds itself a cluster of one - so what differs is a config file and how many
 containers there are.
 

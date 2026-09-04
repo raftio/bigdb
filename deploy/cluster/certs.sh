@@ -11,7 +11,7 @@
 set -eu
 cd "$(dirname "$0")"
 
-nodes="a b a-spare"
+nodes="a b"
 days=${DAYS:-365}
 
 mkdir -p secrets
@@ -20,7 +20,7 @@ cd secrets
 
 # **With a name, this issues one more certificate and leaves everything else alone.** A node that
 # joins a running cluster needs one, and the alternative - re-running the whole script - would
-# rotate the CA and lock out the three nodes that are already talking. Called with no arguments it
+# rotate the CA and lock out the nodes that are already talking. Called with no arguments it
 # is the bootstrap it always was, and refuses to run twice for the same reason.
 #
 #   ./certs.sh          the CA and a certificate for each of the nodes above

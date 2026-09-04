@@ -255,12 +255,24 @@ cd deploy/cluster
 ./users.sh ; ./certs.sh
 docker compose up -d
 curl -u ops:$PASSWORD localhost:7654/ready
+```
+
+**That deployment holds no copy of either range, so it cannot show the thing this page is
+about.** `docker compose stop a` takes `a` out of rotation and `in_rotation` drops, exactly as
+it should - but shards `0..64` are then held by nobody, and a query reaching them fails at `b`
+rather than at the front door. The proxy removed one single point of failure; an unreplicated
+range is the other one, and it is not a proxy's to remove.
+
+The demonstration that matters needs a range with a copy. Add a third node as `replica = "a"` -
+`deploy/readme.md`, "What a joining node needs first" - and then:
+
+```
 docker compose stop a
 curl -u ops:$PASSWORD localhost:7654/ready   # in_rotation drops, queries keep working
 ```
 
-That last pair is the only demonstration that matters: stop the machine a client was reaching,
-and the client keeps working.
+Stop the machine a client was reaching, and the client keeps working. That is the pair worth
+running, and it takes both halves: a copy of the range, and one address in front of both.
 
 ## What is deliberately absent
 

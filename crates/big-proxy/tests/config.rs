@@ -39,7 +39,7 @@ fn both_readers_agree_on_the_shipped_cluster_file() {
     let proxy_pairs: Vec<(String, String)> = proxy.into_iter().map(|n| (n.name, n.addr)).collect();
 
     assert_eq!(daemon_pairs, proxy_pairs, "the readers disagree about who is in the cluster");
-    assert_eq!(daemon_pairs.len(), 3, "the shipped example is three nodes");
+    assert_eq!(daemon_pairs.len(), 2, "the shipped example is two nodes, a range each");
 }
 
 /// The divergence, pinned.

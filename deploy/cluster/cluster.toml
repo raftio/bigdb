@@ -1,8 +1,9 @@
-# Three nodes: two ranges and a copy of one of them.
+# Two nodes: a range each, and no copy of either.
 #
-# Three is the minimum once anything has a copy, and `big serve` refuses fewer: failing over is a
-# decision a majority has to agree on, and a majority of two is two. `b` counts towards that
-# majority even though it holds a different range.
+# Nothing here is replicated, so nothing fails over - a node that stops takes its range with it
+# until it comes back. A copy would need a third node and not a second: failing over is a
+# decision a majority has to agree on, and a majority of two is two, so two machines can never
+# use a copy they hold. See docs/clustering.md, "Replication, and failing over".
 #
 # The addresses are the compose service names. Inside the network each node listens on
 # 0.0.0.0:7654 and reaches the others by name, which is why each one is started with --node:
@@ -44,10 +45,3 @@ shards = "0..64"
 name   = "b"
 addr   = "b:7654"
 shards = "64.."
-
-# A copy of everything `a` holds. No range of its own: it takes `a`'s. If the node serving that
-# range stops answering, the agreement gives the range to this one.
-[[node]]
-name    = "a-spare"
-addr    = "a-spare:7654"
-replica = "a"

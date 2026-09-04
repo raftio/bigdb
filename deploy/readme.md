@@ -6,10 +6,10 @@ single-node database ends up with a cluster's configuration and none of its guar
 | | What it is | When |
 |---|---|---|
 | [`single/`](single/) | One node, every shard, no peers | Anything that fits on one machine |
-| [`cluster/`](cluster/) | Two ranges and a copy of one | More data than one machine holds, or a range that has to survive losing one |
+| [`cluster/`](cluster/) | Two ranges, one node each | More data than one machine holds |
 
 **They are the same binary and the same code path.** `big serve` without `--cluster` builds itself a
-cluster of one and runs every request through the same coordinator a three-machine deployment
+cluster of one and runs every request through the same coordinator a multi-machine deployment
 does; a second path for the un-clustered case would be the path nobody tests. What the two
 directories differ in is a config file and how many containers there are.
 
@@ -27,7 +27,7 @@ curl -u ops:change-me-please localhost:7654/ready
 names a role the catalog does not have is a credential that authenticates and may do nothing,
 which is what `--role admin` writes on a fresh database.
 
-## Three nodes
+## Two nodes
 
 ```sh
 cd cluster
@@ -59,12 +59,16 @@ machine. The address is the node's *name* because that is what its certificate s
 on the terminal, which is what you want at one; a script wants `BIG_CREDENTIALS=<file>` or
 `--credentials-file <file>`, one `user:password` line at mode 600, because a password given as an
 argument is visible in `ps`. `serving: true` with a
-`leader` is the line that says the three of them found each other; `serving: false` with
+`leader` is the line that says the two of them found each other; `serving: false` with
 `leader: null` and a term that keeps climbing is the shape of a peer handshake that is failing.
 
-Only `a` is published. Any node answers any request - the one that receives it plans the query
-and fans it out - so publishing three ports would suggest a client has to choose, and it does
-not.
+Only the proxy is published. Any node answers any request - the one that receives it plans the
+query and fans it out - so publishing a port per node would suggest a client has to choose, and
+it does not.
+
+Neither range has a copy, so neither fails over: stop `a` and shards `0..64` are unanswerable
+until it is back. That is the smallest shape that runs, not the one to run in production - "What
+a joining node needs first" below adds the third node that makes a copy usable.
 
 ## Five things worth knowing before you run either
 
@@ -157,7 +161,6 @@ ctl cluster topology
 # node     addr          state  primary   copy    behind
 # a        a:7654        voter  0..64
 # b        b:7654        voter  64..900
-# a-spare  a-spare:7654  voter            0..64
 # d        d:7654        voter  900..
 # bigctl: leader `a`, schema leader `a`, epoch 1
 
@@ -191,7 +194,7 @@ not help decide. `admit` is the step that makes it count.
 Three things, and the second is the one that is not obvious.
 
 **A certificate from the CA the cluster already trusts.** Re-running `./certs.sh` would mint a new
-CA and lock out the three nodes that are talking, so it takes a name instead and signs one more
+CA and lock out the nodes that are talking, so it takes a name instead and signs one more
 against the CA that is there:
 
 ```sh
@@ -212,7 +215,7 @@ cluster_id    = "big-demo"     # the same string, or the cluster does not recogn
 schema_leader = "a"
 peer_ca_file  = "/run/big/peer-ca.pem"
 
-# ... a, b and a-spare exactly as they appear in cluster.toml ...
+# ... a and b exactly as they appear in cluster.toml ...
 
 [[node]]
 name    = "d"
@@ -266,7 +269,7 @@ is a command-line decision rather than a request one because a request that chos
 could write anywhere the process can.
 
 In a cluster this is **per node**: each holds its own range, and a copy of one node is a copy of
-one range - and the copies are not one snapshot. Only `a` is published, so the other two are
+one range - and the copies are not one snapshot. Only the proxy is published, so the nodes are
 reached from inside, over their own TLS:
 
 ```sh
