@@ -537,7 +537,7 @@ fn a_restart_keeps_the_term_the_vote_and_the_log() {
             ]),
         },
     ];
-    let state = State { term: 4, voted_for: Some(2), commit: 3, log: log.clone() };
+    let state = State { term: 4, voted_for: Some(2), commit: 3, base: 0, log: log.clone() };
     store.save(&state).unwrap();
 
     let back = store.load().unwrap().expect("just written");
@@ -549,7 +549,7 @@ fn a_restart_keeps_the_term_the_vote_and_the_log() {
 
     // A node with no vote is a different state from a node that voted for node zero, and the
     // two must not encode alike.
-    store.save(&State { term: 9, voted_for: None, commit: 1, log }).unwrap();
+    store.save(&State { term: 9, voted_for: None, commit: 1, base: 0, log }).unwrap();
     assert_eq!(store.load().unwrap().unwrap().voted_for, None);
 }
 
@@ -562,7 +562,7 @@ fn a_restarted_node_still_refuses_a_stale_candidate() {
         big_cluster::raft::Entry { term: 0, decision: Decision::Noop },
         big_cluster::raft::Entry { term: 7, decision: owning(&[1, 0]) },
     ];
-    store.save(&State { term: 7, voted_for: Some(1), commit: 1, log }).unwrap();
+    store.save(&State { term: 7, voted_for: Some(1), commit: 1, base: 0, log }).unwrap();
 
     let state = store.load().unwrap().unwrap();
     let mut node = Raft::new(0, voters(3), Timing::default(), 0);
@@ -589,6 +589,7 @@ fn a_damaged_state_file_is_refused() {
             term: 2,
             voted_for: Some(0),
             commit: 0,
+            base: 0,
             log: vec![big_cluster::raft::Entry { term: 0, decision: Decision::Noop }],
         })
         .unwrap();
@@ -768,7 +769,7 @@ fn a_restarted_node_comes_back_with_the_cluster_as_the_log_left_it() {
     // Started from a file that knows three nodes, restored from a log that knows four.
     let mut node = Raft::new(0, voters(3), Timing::default(), 0);
     assert_eq!(node.members(), 3);
-    node.restore(State { term: 5, voted_for: Some(0), commit: 1, log });
+    node.restore(State { term: 5, voted_for: Some(0), commit: 1, base: 0, log });
 
     assert_eq!(node.members(), 4, "the log is what says who is in the cluster");
     assert_eq!(node.voters(), &[0, 1, 2], "and the fourth is still catching up");
@@ -799,4 +800,105 @@ fn a_node_that_does_not_vote_never_stands_for_election() {
     node.tick(100_000);
     assert!(!node.is_leader());
     assert_eq!(node.term(), 0, "it never even raised the term");
+}
+
+// -------------------------------------------------------------------------------------------
+// A log that does not grow for ever
+//
+// The log used to be short by construction - one entry per election, one per machine that dies.
+// Once a balancer proposes, that is no longer true, and the whole log is rewritten every time
+// anything is persisted. So it is compacted; and compacting means a follower can fall behind
+// what the leader still holds, which is what the snapshot is for.
+// -------------------------------------------------------------------------------------------
+
+/// **Nothing a follower still needs is dropped.** Compaction is best effort on purpose: a node
+/// that is down holds the base where it is, which costs disk and keeps recovery cheap.
+#[test]
+fn a_leader_keeps_every_entry_a_follower_has_not_stored() {
+    let mut sim = Sim::new(3);
+    sim.run(3_000);
+    let leader = sim.leader();
+
+    for i in 0..8 {
+        sim.nodes[leader].propose(owning(&[i % 3, (i + 1) % 3]));
+        sim.run(200);
+    }
+    // Forced, because the shipped margin deliberately keeps far more than this test writes.
+    sim.nodes[leader].compact(0);
+    assert!(sim.nodes[leader].base() > 0, "a log every node has stored is one worth compacting");
+
+    // One node goes away. From here the base cannot move past what it last stored, however
+    // much the other two decide.
+    let absent = (leader + 1) % 3;
+    sim.down.insert(absent);
+    let held = sim.nodes[leader].base();
+    for i in 0..8 {
+        sim.nodes[leader].propose(owning(&[i % 3, (i + 2) % 3]));
+        sim.run(200);
+    }
+    sim.nodes[leader].compact(0);
+    assert_eq!(
+        sim.nodes[leader].base(),
+        held,
+        "the base did not move past a node that is not storing anything"
+    );
+}
+
+/// **A follower the leader has compacted past is handed the answer itself.**
+///
+/// There is no prefix left to match against, so nothing can be merged: the state is taken as
+/// given, and the follower is caught up in one message rather than never.
+#[test]
+fn a_follower_that_falls_behind_the_base_is_caught_up_by_a_snapshot() {
+    let mut sim = Sim::new(3);
+    sim.run(3_000);
+    let leader = sim.leader();
+    let absent = (leader + 1) % 3;
+
+    // It misses everything, and the two that are left keep deciding - a majority of three is
+    // two, so the log advances without it.
+    sim.down.insert(absent);
+    for i in 0..40 {
+        sim.nodes[leader].propose(owning(&[i % 3, (i + 1) % 3]));
+        sim.run(200);
+    }
+
+    // Its `matched` is stale rather than absent, so the leader is still holding the base for
+    // it. Forcing the compaction is what puts it behind - which is the state this exists for.
+    sim.nodes[leader].compact(0);
+    let base = sim.nodes[leader].base();
+
+    sim.down.remove(&absent);
+    sim.run(4_000);
+
+    assert!(
+        sim.nodes[absent].base() >= base || sim.nodes[absent].last_index() >= base,
+        "it came back to a log it could not extend and was handed the state instead"
+    );
+    // And it agrees about the one thing the agreement decides.
+    let theirs = sim.applied[absent].last().cloned();
+    let mine = sim.applied[leader].last().cloned();
+    assert!(theirs.is_some(), "it applied something");
+    assert_eq!(theirs, mine, "and it is what the leader applied");
+}
+
+/// A restart after a compaction comes back to the compacted log, not to an empty one.
+#[test]
+fn a_compacted_log_survives_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = big_cluster::raft::FileStore::new(dir.path().join("state.raft"));
+    let log = vec![
+        // The sentinel is the state as of the base, not an empty entry.
+        big_cluster::raft::Entry { term: 3, decision: Decision::Ranges(map_of(&[1, 0], &[])) },
+        big_cluster::raft::Entry { term: 4, decision: Decision::Noop },
+    ];
+    let state = State { term: 4, voted_for: Some(1), commit: 41, base: 40, log };
+    store.save(&state).unwrap();
+    assert_eq!(store.load().unwrap().unwrap(), state, "the base is part of what is written down");
+
+    let mut node = Raft::new(0, voters(3), Timing::default(), 0);
+    node.restore(store.load().unwrap().unwrap());
+    assert_eq!(node.base(), 40);
+    assert_eq!(node.last_index(), 41, "indices are log positions, not vector positions");
+    assert_eq!(node.commit_index(), 41);
 }

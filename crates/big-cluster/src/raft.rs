@@ -650,6 +650,21 @@ pub enum Message {
         success: bool,
         match_index: Index,
     },
+    /// The state machine as of one index, for a follower that has fallen behind what the
+    /// leader still holds.
+    ///
+    /// **Only reachable after a compaction.** A leader keeps every entry a live follower still
+    /// needs, so this is for one that was away long enough to be dropped past - and for that
+    /// one there is nothing to send but the answer itself.
+    Snapshot {
+        term: Term,
+        leader: NodeId,
+        /// The index and term this state is as of. It becomes the follower's base.
+        index: Index,
+        last_term: Term,
+        ranges: RangeMap,
+        members: Vec<Member>,
+    },
 }
 
 /// How long this node waits before doing anything about silence.
@@ -731,8 +746,17 @@ pub struct Raft {
     // --- persistent: none of this may be lost in a restart ---
     term: Term,
     voted_for: Option<NodeId>,
-    /// One-based. `log[0]` is the sentinel every node agrees on without being told.
+    /// The suffix of the log this node still holds.
+    ///
+    /// `log[0]` is the entry at [`Raft::base`] - the sentinel every node agrees on without
+    /// being told, until a compaction replaces it with the last entry that was dropped.
+    /// Everything before it has been folded into the state machine and thrown away.
     log: Vec<Entry>,
+    /// The index of `log[0]`. Zero until something has been compacted away.
+    ///
+    /// **Log positions are not vector positions.** Every index below is a position in the
+    /// *log*, and reaching the vector means subtracting this.
+    base: Index,
 
     // --- volatile ---
     role: Role,
@@ -767,6 +791,7 @@ impl Raft {
             term: 0,
             voted_for: None,
             log: vec![Entry { term: 0, decision: Decision::Noop }],
+            base: 0,
             role: Role::Follower,
             leader: None,
             commit: 0,
@@ -802,7 +827,11 @@ impl Raft {
         self.refresh_members();
         // Clamped: a commit index past the log is a file that disagrees with itself, and
         // trusting it would index past the end.
-        self.commit = state.commit.min(self.last_index());
+        self.base = state.base;
+        self.commit = state.commit.clamp(self.base, self.last_index());
+        // Everything at or below the base is already folded into `log[0]`, so replaying starts
+        // there. One short, so that the sentinel itself is handed to the caller.
+        self.applied = self.base.saturating_sub(1);
     }
 
     /// Everything this node needs written down, as one value.
@@ -811,6 +840,7 @@ impl Raft {
             term: self.term,
             voted_for: self.voted_for,
             commit: self.commit,
+            base: self.base,
             log: self.log.clone(),
         }
     }
@@ -843,6 +873,66 @@ impl Raft {
     /// Every node this one sends to: everybody but itself that has not left.
     fn peers(&self) -> Vec<NodeId> {
         (0..self.members.len()).filter(|n| *n != self.id && self.members[*n].reachable()).collect()
+    }
+
+    /// How many committed entries a leader keeps beyond what every follower has stored.
+    ///
+    /// The point of a margin at all: a follower a heartbeat or two behind is served from the
+    /// log, which is cheap, rather than from a snapshot, which is the whole map.
+    pub const KEEP_ENTRIES: u64 = 64;
+
+    /// Throws away the prefix of the log every voter has already stored.
+    ///
+    /// **The log is short and cold, but it is not bounded.** One entry per election, one per
+    /// machine that dies - and, once a balancer is proposing, one per decision it makes. Every
+    /// entry carries a whole map, and the whole log is rewritten on every persist, so an
+    /// unbounded log makes each persist slower until heartbeats are late and elections start
+    /// happening for no reason.
+    ///
+    /// **Never past what a follower still needs.** Compaction is best effort on purpose: a
+    /// follower that is down holds the base where it is, which costs some disk and keeps
+    /// recovery cheap. A follower that has fallen behind anyway is sent a snapshot.
+    ///
+    /// `keep` entries are left beyond the safe point so that the common case - a follower a
+    /// heartbeat or two behind - is still served from the log rather than from a snapshot.
+    pub fn compact(&mut self, keep: u64) {
+        if self.role != Role::Leader {
+            return;
+        }
+        let safe = self
+            .voters
+            .iter()
+            .map(|n| self.matched.get(n).copied().unwrap_or(0))
+            .min()
+            .unwrap_or(0)
+            .min(self.applied);
+        let target = safe.saturating_sub(keep);
+        if target <= self.base {
+            return;
+        }
+        let drop = (target - self.base) as usize;
+        self.log.drain(..drop);
+        self.base = target;
+    }
+
+    /// The state machine as this node has applied it, for a snapshot.
+    ///
+    /// Replayed from the log rather than held alongside it, because the log is the only thing
+    /// that is written down - and a second copy is a second thing to get out of step.
+    fn applied_state(&self) -> (RangeMap, Vec<Member>) {
+        let mut ranges = RangeMap::default();
+        let mut members = self.seed.clone();
+        for (at, entry) in self.log.iter().enumerate() {
+            if self.base + at as Index > self.applied {
+                break;
+            }
+            match &entry.decision {
+                Decision::Ranges(m) => ranges = m.clone(),
+                Decision::Members(ms) => members = ms.clone(),
+                Decision::Noop => {}
+            }
+        }
+        (ranges, members)
     }
 
     /// Recomputes the membership from the log.
@@ -900,15 +990,34 @@ impl Raft {
     }
 
     pub fn last_index(&self) -> Index {
-        self.log.len() as Index - 1
+        self.base + self.log.len() as Index - 1
     }
 
     fn last_term(&self) -> Term {
         self.log.last().map_or(0, |e| e.term)
     }
 
+    /// The index of the oldest entry this node still holds.
+    pub fn base(&self) -> Index {
+        self.base
+    }
+
+    /// The term of an entry, or `None` when it is off either end of what is held.
+    ///
+    /// `None` below the base is not "no such entry" - it is "compacted away", and the only
+    /// caller that can reach it is a leader deciding what to send a follower that has fallen
+    /// behind the base. That caller sends a snapshot instead.
     fn term_at(&self, index: Index) -> Option<Term> {
-        self.log.get(index as usize).map(|e| e.term)
+        let at = index.checked_sub(self.base)?;
+        self.log.get(at as usize).map(|e| e.term)
+    }
+
+    /// The entries from `from` onward, empty when `from` is past the end.
+    fn entries_from(&self, from: Index) -> Vec<Entry> {
+        match from.checked_sub(self.base) {
+            None => Vec::new(),
+            Some(at) => self.log.get(at as usize..).map(<[Entry]>::to_vec).unwrap_or_default(),
+        }
     }
 
     /// **Of the voters, not of everybody replicated to.** A learner catching up must not raise
@@ -954,6 +1063,11 @@ impl Raft {
             Role::Leader => {
                 if now >= self.heartbeat_at {
                     self.heartbeat_at = now + self.timing.heartbeat;
+                    // **Bounded, or every persist gets slower.** The whole log is rewritten
+                    // each time anything is written down and every entry carries a whole map,
+                    // so a log that only ever grows eventually makes a heartbeat late - and a
+                    // late heartbeat is an election nobody needed.
+                    self.compact(Self::KEEP_ENTRIES);
                     for peer in self.peers() {
                         if peer != self.id {
                             self.send_append(peer, &mut out);
@@ -1072,8 +1186,25 @@ impl Raft {
     fn send_append(&mut self, peer: NodeId, out: &mut Output) {
         let next = self.next.get(&peer).copied().unwrap_or(self.last_index() + 1);
         let prev_index = next.saturating_sub(1);
+        // **Behind what this leader still holds.** There is no prefix left to match against, so
+        // the only thing that can help is the answer itself.
+        if prev_index < self.base {
+            let (ranges, members) = self.applied_state();
+            out.to(
+                peer,
+                Message::Snapshot {
+                    term: self.term,
+                    leader: self.id,
+                    index: self.applied,
+                    last_term: self.term_at(self.applied).unwrap_or(self.term),
+                    ranges,
+                    members,
+                },
+            );
+            return;
+        }
         let prev_term = self.term_at(prev_index).unwrap_or(0);
-        let entries = self.log.get(next as usize..).map(<[Entry]>::to_vec).unwrap_or_default();
+        let entries = self.entries_from(next);
         out.to(
             peer,
             Message::Append {
@@ -1104,6 +1235,49 @@ impl Raft {
                     self.reset_election(now);
                 }
                 out.to(candidate, Message::VoteReply { term: self.term, from: self.id, granted });
+            }
+
+            // **A state machine handed over whole**, for a follower the leader has compacted
+            // past. There is no prefix to match against, so nothing is merged: the log becomes
+            // one sentinel at the snapshot's index and the state is taken as given.
+            Message::Snapshot { term, leader, index, last_term, ranges, members } => {
+                self.heard.insert(leader, now);
+                self.observe(term, &mut out);
+                if term < self.term || index <= self.base {
+                    // Older than this node's own base is a snapshot it has already passed.
+                    out.to(
+                        leader,
+                        Message::AppendReply {
+                            term: self.term,
+                            from: self.id,
+                            success: false,
+                            match_index: self.last_index(),
+                        },
+                    );
+                    return out;
+                }
+                self.role = Role::Follower;
+                self.leader = Some(leader);
+                self.reset_election(now);
+                self.log = vec![Entry { term: last_term, decision: Decision::Ranges(ranges) }];
+                self.base = index;
+                self.commit = index;
+                // Applied one short of the base, so that the sentinel itself is handed to the
+                // caller - that entry *is* the state, and nothing else carries it.
+                self.applied = index.saturating_sub(1);
+                self.seed = members;
+                self.refresh_members();
+                self.apply(&mut out);
+                out.persist = true;
+                out.to(
+                    leader,
+                    Message::AppendReply {
+                        term: self.term,
+                        from: self.id,
+                        success: true,
+                        match_index: self.last_index(),
+                    },
+                );
             }
 
             Message::VoteReply { term, from, granted } => {
@@ -1167,10 +1341,11 @@ impl Raft {
                             // leader with a better log can take away an entry this node already
                             // applied, and a membership mutated in place would have no way
                             // back - so it is recomputed from the log below instead.
-                            membership_moved |= self.log[index as usize..]
+                            let at = (index - self.base) as usize;
+                            membership_moved |= self.log[at..]
                                 .iter()
                                 .any(|e| matches!(e.decision, Decision::Members(_)));
-                            self.log.truncate(index as usize);
+                            self.log.truncate(at);
                             self.log.push(entry);
                             out.persist = true;
                             membership_moved |= carries_members;
@@ -1256,8 +1431,10 @@ impl Raft {
     fn apply(&mut self, out: &mut Output) {
         while self.applied < self.commit {
             self.applied += 1;
-            if let Some(entry) = self.log.get(self.applied as usize) {
-                out.applied.push(entry.decision.clone());
+            if let Some(at) = self.applied.checked_sub(self.base) {
+                if let Some(entry) = self.log.get(at as usize) {
+                    out.applied.push(entry.decision.clone());
+                }
             }
         }
     }
@@ -1304,6 +1481,8 @@ pub struct State {
     pub term: Term,
     pub voted_for: Option<NodeId>,
     pub commit: Index,
+    /// The index of `log[0]`. Zero until something has been compacted away.
+    pub base: Index,
     pub log: Vec<Entry>,
 }
 
@@ -1544,6 +1723,7 @@ fn encode_state(state: &State) -> Vec<u8> {
     // into its state machine on the way up, applying entries that were never committed. For a
     // map of who owns what, that is routing a read to a node no majority ever acknowledged.
     put_u64(&mut out, state.commit);
+    put_u64(&mut out, state.base);
     put_u64(&mut out, state.log.len() as u64);
     for entry in &state.log {
         put_u64(&mut out, entry.term);
@@ -1571,6 +1751,7 @@ fn decode_state(bytes: &[u8]) -> core::result::Result<State, &'static str> {
     let voted = b.u64()?;
     let voted_for = (voted != u64::MAX).then_some(voted as NodeId);
     let commit = b.u64()?;
+    let base = b.u64()?;
     let log = b.list(|b| {
         let term = b.u64()?;
         let decision = match b.byte()? {
@@ -1584,7 +1765,7 @@ fn decode_state(bytes: &[u8]) -> core::result::Result<State, &'static str> {
     if b.at != bytes.len() {
         return Err("bytes after the end");
     }
-    Ok(State { term, voted_for, commit, log })
+    Ok(State { term, voted_for, commit, base, log })
 }
 
 /// The members whose agreement counts, by index.

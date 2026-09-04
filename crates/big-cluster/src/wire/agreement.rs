@@ -65,6 +65,15 @@ pub fn put_raft(out: &mut Vec<u8>, m: &raft::Message) {
                 }
             }
         }
+        raft::Message::Snapshot { term, leader, index, last_term, ranges, members } => {
+            put_u8(out, 4);
+            put_u64(out, *term);
+            put_u64(out, *leader as u64);
+            put_u64(out, *index);
+            put_u64(out, *last_term);
+            put_range_map(out, ranges);
+            put_members(out, members);
+        }
         raft::Message::AppendReply { term, from, success, match_index } => {
             put_u8(out, 3);
             put_u64(out, *term);
@@ -111,6 +120,14 @@ pub fn get_raft(bytes: &[u8]) -> Result<raft::Message> {
             from: node(r.u64()?),
             success: r.bool()?,
             match_index: r.u64()?,
+        },
+        4 => raft::Message::Snapshot {
+            term: r.u64()?,
+            leader: node(r.u64()?),
+            index: r.u64()?,
+            last_term: r.u64()?,
+            ranges: get_range_map(&mut r)?,
+            members: get_members(&mut r)?,
         },
         tag => return Err(WireError::BadTag { what: "agreement message", tag }),
     };
