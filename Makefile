@@ -62,6 +62,8 @@ help:
 	@echo '  make e2e          both binaries, run as processes'
 	@echo '  make e2e-cluster  two real daemons and a failover; slow, run deliberately'
 	@echo '  make rewrite      regenerate the SQL test corpora, then read the diff'
+	@echo '  make py-check     the Python client in clients/python: lint and tests'
+	@echo '  make go-check     the Go client in clients/go: lint, tests, zero-dependency'
 	@echo
 	@echo 'Variables: PROFILE=debug|release ADDR=host:port DATA=path LOG=level FLAGS="--durability none"'
 
@@ -236,5 +238,36 @@ check: lint test docs
 # question a refactor needs answered - which lines were covered before, and are they still - and
 # `--summary-only` keeps that a number per crate rather than a report to browse.
 COV ?= --summary-only
+# The Go client. Deliberately not part of `check`: that target is Rust-only, and adding a Go
+# toolchain requirement to it would break `make check` on a machine without one.
+go-lint:
+	$(MAKE) -C clients/go lint
+
+go-test:
+	$(MAKE) -C clients/go test
+
+go-e2e: build
+	$(MAKE) -C clients/go e2e
+
+go-check:
+	$(MAKE) -C clients/go check
+
 cov:
 	$(CARGO) llvm-cov $(WORKSPACE) $(COV)
+
+# ---------------------------------------------------------------------------------------------
+# The Python client. Its own targets rather than lines in `check`, because `check` is `lint test
+# docs` and is Rust-only: adding a Python toolchain to the command every contributor runs would
+# break it on a machine with no `pip`. See clients/python/Makefile for what each one does.
+py-lint:
+	$(MAKE) -C clients/python lint
+
+py-test:
+	$(MAKE) -C clients/python test
+
+py-e2e:
+	$(MAKE) -C clients/python e2e PROFILE=$(PROFILE)
+
+py-check: py-lint py-test
+
+.PHONY: py-lint py-test py-e2e py-check go-lint go-test go-e2e go-check

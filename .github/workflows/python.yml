@@ -1,0 +1,116 @@
+# The Python client in clients/python.
+#
+# Its own file rather than jobs in ci.yml: every job there shares `RUSTFLAGS: -D warnings` and
+# the Rust cache, and none of that applies here. The one job that does need a binary builds it
+# itself.
+
+name: python
+
+on:
+  push:
+    branches: [main]
+    paths: ["clients/python/**", ".github/workflows/python.yml"]
+  pull_request:
+    paths: ["clients/python/**", ".github/workflows/python.yml", "crates/big-http/**"]
+
+defaults:
+  run:
+    working-directory: clients/python
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e '.[dev]'
+      # fmt, then lint, then types - cheapest failure first, and a formatting failure is one
+      # command to fix rather than something to read past.
+      - run: ruff format --check .
+      - run: ruff check .
+      - run: mypy bigdb
+
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: pip install -e '.[dev]'
+      - run: pytest --cov=bigdb --cov-report=term-missing --cov-fail-under=80
+
+  # The tests that need a real `big serve`. The fixture deliberately does not build one - a
+  # pytest run that started a cold cargo build would take minutes and would fail outright
+  # without a toolchain - so this job builds it and points BIGDB_BIN at it.
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release -p big-bin --bin big
+        working-directory: .
+      - run: pip install -e '.[dev]'
+      - run: pytest -m integration
+        env:
+          BIGDB_BIN: ${{ github.workspace }}/target/release/big
+
+  # The zero-dependency claim, checked rather than asserted - the counterpart of ci.yml's
+  # `deps` job, whose comment is the argument: an empty manifest is what makes the claim
+  # checkable rather than aspirational.
+  no-deps:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install build
+      - name: the wheel declares no runtime dependency
+        run: |
+          python -m build --wheel --outdir dist .
+          python - <<'PY'
+          import pathlib, zipfile, sys
+          wheel = next(pathlib.Path("dist").glob("*.whl"))
+          with zipfile.ZipFile(wheel) as z:
+              name = next(n for n in z.namelist() if n.endswith(".dist-info/METADATA"))
+              lines = z.read(name).decode().splitlines()
+          requires = [l for l in lines if l.startswith("Requires-Dist:") and "extra ==" not in l]
+          if requires:
+              sys.exit("the wheel declares runtime dependencies:\n" + "\n".join(requires))
+          print("no runtime dependencies")
+          PY
+      # The manifest check above would miss an import that pip never hears about. This one
+      # would not: it imports the package and looks at what actually arrived.
+      - name: importing it pulls in nothing but the standard library
+        run: |
+          pip install -e .
+          python - <<'PY'
+          import sys, sysconfig, pathlib
+          before = set(sys.modules)
+          import bigdb, bigdb.aio, bigdb.dbapi, bigdb.transport.sync, bigdb.transport.aio
+          stdlib = pathlib.Path(sysconfig.get_paths()["stdlib"]).resolve()
+          package = pathlib.Path(bigdb.__file__).parent.resolve()
+          foreign = []
+          for name in set(sys.modules) - before:
+              module = sys.modules[name]
+              path = getattr(module, "__file__", None)
+              if path is None:
+                  continue  # built-in or namespace package
+              path = pathlib.Path(path).resolve()
+              if not (path.is_relative_to(stdlib) or path.is_relative_to(package)):
+                  foreign.append(f"{name} from {path}")
+          if foreign:
+              sys.exit("importing bigdb pulled in non-stdlib modules:\n" + "\n".join(foreign))
+          print("stdlib only")
+          PY
