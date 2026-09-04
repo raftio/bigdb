@@ -1944,3 +1944,67 @@ fn a_cancelled_move_leaves_the_range_where_it_was() {
     let after = ok(a, "GET", "/cluster/topology", "");
     assert!(after.contains(r#""shards":"64..","primary":"b""#), "{after}");
 }
+
+/// **The balancer, over real nodes.** It decides from what the nodes actually weigh, and one
+/// call does one thing - so a cluster that needs several steps takes several calls, each
+/// against facts gathered afresh.
+#[test]
+fn rebalancing_takes_a_range_off_a_draining_node_and_then_stops() {
+    let (a, b, spare) = (free_port(), free_port(), free_port());
+    let file = three(a, b, spare);
+    let _a = start_agreeing(&file, "a", a);
+    let _b = start_agreeing(&file, "b", b);
+    let _spare = start_agreeing(&file, "a-spare", spare);
+    until("an elected leader", || ready(a).contains(r#""leader":""#));
+
+    ok(a, "POST", "/table/tx", "");
+    ok(a, "POST", "/table/tx/field/amount?kind=int&bit_depth=32", "");
+    ok(a, "POST", "/table/tx/import", &format!("amount {} 5\n", 70 * (1 << 20)));
+
+    let leader = leader_of(&[a, b, spare]);
+    // Nothing to do while every node is where it should be.
+    assert_eq!(
+        ok(leader, "POST", "/admin/cluster/rebalance?force=true", ""),
+        r#"{"did":null}"#,
+        "a cluster nobody has asked to change is left alone"
+    );
+
+    // An operator asks for `b` to go. That outranks anything the balancer noticed by itself.
+    ok(leader, "POST", "/admin/cluster/drain?name=b", "");
+    let did = ok(leader, "POST", "/admin/cluster/rebalance?force=true", "");
+    assert!(did.contains("moved shards 64.."), "{did}");
+
+    until("the range to land somewhere else", || {
+        !ok(a, "GET", "/cluster/topology", "").contains(r#""shards":"64..","primary":"b""#)
+    });
+    // The records came with it.
+    assert_eq!(ok(a, "POST", "/table/tx/query", "Count(All())"), r#"{"count":1}"#);
+
+    // **And it stops.** `b` holds nothing now, so there is nothing left to take off it - and a
+    // draining node is never a destination, so nothing is sent back.
+    let again = ok(leader, "POST", "/admin/cluster/rebalance?force=true", "");
+    assert_eq!(again, r#"{"did":null}"#);
+
+    // Which is exactly the state in which it can be removed for good.
+    let (status, said) = send(leader, "DELETE", "/admin/cluster/node?name=b", "");
+    assert_eq!(status, 200, "{said}");
+}
+
+/// Off unless asked. A cluster that reshapes itself unasked is one whose shape an operator
+/// cannot predict, so the policy ships disabled and `?force=true` is what an operator uses.
+#[test]
+fn the_balancer_does_nothing_until_it_is_switched_on() {
+    let (a, b, spare) = (free_port(), free_port(), free_port());
+    let file = three(a, b, spare);
+    let _a = start_agreeing(&file, "a", a);
+    let _b = start_agreeing(&file, "b", b);
+    let _spare = start_agreeing(&file, "a-spare", spare);
+    until("an elected leader", || ready(a).contains(r#""leader":""#));
+
+    ok(a, "POST", "/table/tx", "");
+    ok(a, "POST", "/table/tx/field/amount?kind=int&bit_depth=32", "");
+    ok(a, "POST", "/table/tx/import", &format!("amount {} 5\n", 70 * (1 << 20)));
+
+    let leader = leader_of(&[a, b, spare]);
+    assert_eq!(ok(leader, "POST", "/admin/cluster/rebalance", ""), r#"{"did":null}"#);
+}

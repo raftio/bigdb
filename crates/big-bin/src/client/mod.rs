@@ -231,6 +231,11 @@ fn request(command: &Command, input: &mut dyn BufRead) -> Result<Request, String
         Command::ClusterMerge { range } => {
             Request::new("POST", format!("/admin/cluster/merge?range={range}"), String::new())
         }
+        // Forced, because a person typing this has asked for it - the policy decides whether
+        // the cluster balances *itself*, not whether an operator may.
+        Command::ClusterRebalance => {
+            Request::new("POST", "/admin/cluster/rebalance?force=true".to_string(), String::new())
+        }
         Command::ClusterMove { range, to } => Request::new(
             "POST",
             format!("/admin/cluster/move?range={range}&to={to}"),

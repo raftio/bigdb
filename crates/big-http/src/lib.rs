@@ -118,6 +118,8 @@ pub struct ServerConfig {
     /// The certificate this listener presents, and the CA a peer's client certificate must chain
     /// to. `None` serves in the clear, which `big serve` permits only on a loopback bind.
     ///
+    /// When the cluster may reshape itself, and how hard. Off by default.
+    pub balance: big_cluster::balance::Policy,
     /// An ordinary `Option` with no `#[cfg]` on it: `TlsConfig` is uninhabited in a build with
     /// the feature off, so this is provably `None` there and every construction site in the tree
     /// - tests included - compiles either way without knowing which build it is in.
@@ -150,6 +152,7 @@ impl Default for ServerConfig {
             // In the clear. Same reasoning as `auth`, and the same safety net: a loopback-only
             // server is the default, and `big serve` refuses to bind anywhere else without one.
             tls: None,
+            balance: big_cluster::balance::Policy::default(),
             // Off. A daemon that backed itself up somewhere by default would be a daemon
             // filling a disk nobody chose.
             backup_dir: None,
@@ -761,6 +764,7 @@ fn answer<P: PagerMut + Sync>(state: &State<P>, req: &Request, wire: &Wire) -> r
         cancel: None,
         backup_dir: state.config.backup_dir.as_deref(),
         backup_running: &state.backing_up,
+        balance: state.config.balance,
     };
 
     // Only a query gets a watchdog. Everything else is bounded by the body the client already

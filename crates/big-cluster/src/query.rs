@@ -820,7 +820,7 @@ impl<P: PagerMut + Sync> Cluster<P> {
     fn merge_answers(&self, plan: &Plan, answers: Vec<(usize, Value)>) -> Result<Value> {
         let mut merge = Merge::new(plan);
         for (i, value) in answers {
-            merge.add(&self.config.nodes()[i].name, value)?;
+            merge.add(&self.describe(i), value)?;
         }
         Ok(merge.finish())
     }

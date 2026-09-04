@@ -701,3 +701,18 @@ pub fn get_routed(r: &mut Reader<'_>) -> Result<Option<Routed>> {
     let shards = get_shards(r)?.unwrap_or_default();
     Ok(Some(Routed { epoch, shards }))
 }
+
+/// What a node weighs: pages on disk, and one past the highest record id it holds.
+pub fn put_load(pages: u64, frontier: u64) -> Vec<u8> {
+    let mut out = Vec::new();
+    put_u64(&mut out, pages);
+    put_u64(&mut out, frontier);
+    out
+}
+
+pub fn get_load(bytes: &[u8]) -> Result<(u64, u64)> {
+    let mut r = Reader::new(bytes);
+    let out = (r.u64()?, r.u64()?);
+    finished(&r)?;
+    Ok(out)
+}

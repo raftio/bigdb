@@ -167,6 +167,9 @@ pub struct Ctx<'a, P: PagerMut> {
     /// Whether a backup is already walking this node's file. Shared with the server rather
     /// than owned here, because a `Ctx` lives for one request and the flag has to outlive it.
     pub backup_running: &'a AtomicBool,
+    /// When the cluster may reshape itself, and how hard. Off by default: a cluster that
+    /// changes its own shape unasked is a cluster whose shape an operator cannot predict.
+    pub balance: big_cluster::balance::Policy,
 }
 
 /// What a request has to be to reach a route.
@@ -245,6 +248,8 @@ enum Target<'a> {
     PeerSchema,
     /// Which version of the map this node has applied.
     PeerEpoch,
+    /// What this node weighs, for the balancer.
+    PeerLoad,
     Repair,
     Backup,
     /// What the cluster looks like right now, for an operator or an autoscaler.
@@ -262,6 +267,8 @@ enum Target<'a> {
     ClusterMove,
     /// Abandon a move that is in flight.
     ClusterCancel,
+    /// Take one balancing step, if the facts call for one.
+    ClusterRebalance,
 }
 
 impl<'a> Target<'a> {
@@ -275,6 +282,7 @@ impl<'a> Target<'a> {
             self,
             Self::PeerQuery
                 | Self::PeerEpoch
+                | Self::PeerLoad
                 | Self::PeerRecords
                 | Self::PeerDigest
                 | Self::PeerImport
@@ -345,7 +353,8 @@ impl<'a> Target<'a> {
             | Self::ClusterDrain
             | Self::ClusterRemove
             | Self::ClusterMove
-            | Self::ClusterCancel => Guard::Needs(Privilege::Operate, ObjectRef::Server),
+            | Self::ClusterCancel
+            | Self::ClusterRebalance => Guard::Needs(Privilege::Operate, ObjectRef::Server),
             Self::Query(t) | Self::Records(t) => Guard::Needs(Privilege::Select, table(t)),
             Self::Import(t) => Guard::Needs(Privilege::Insert, table(t)),
             // Deleting records is not inserting them: a credential that may add facts is not
@@ -382,6 +391,7 @@ impl<'a> Target<'a> {
             | Self::PeerFragmentPut
             | Self::PeerKeysPut
             | Self::PeerEpoch
+            | Self::PeerLoad
             | Self::PeerRepaired => Guard::Node,
         }
     }
@@ -423,6 +433,7 @@ fn resolve<'a>(method: &str, segments: &[&'a str]) -> Option<Target<'a>> {
         ("POST", ["internal", "repaired"]) => Target::PeerRepaired,
         ("POST", ["internal", "schema"]) => Target::PeerSchema,
         ("POST", ["internal", "epoch"]) => Target::PeerEpoch,
+        ("POST", ["internal", "load"]) => Target::PeerLoad,
         ("POST", ["repair"]) => Target::Repair,
         ("GET", ["cluster", "topology"]) => Target::ClusterTopology,
         ("POST", ["admin", "cluster", "split"]) => Target::ClusterSplit,
@@ -433,6 +444,7 @@ fn resolve<'a>(method: &str, segments: &[&'a str]) -> Option<Target<'a>> {
         ("DELETE", ["admin", "cluster", "node"]) => Target::ClusterRemove,
         ("POST", ["admin", "cluster", "move"]) => Target::ClusterMove,
         ("POST", ["admin", "cluster", "cancel"]) => Target::ClusterCancel,
+        ("POST", ["admin", "cluster", "rebalance"]) => Target::ClusterRebalance,
         ("POST", ["admin", "backup"]) => Target::Backup,
         _ => return None,
     })
@@ -555,6 +567,10 @@ pub fn dispatch<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request) -> Answered
         Target::PeerKeysPut => peer_keys_put(ctx, req),
         Target::PeerRepaired => peer_repaired(ctx, req),
         Target::PeerEpoch => Response::binary(wire::put_u64_body(ctx.cluster.map().epoch)),
+        Target::PeerLoad => {
+            let load = ctx.cluster.load();
+            Response::binary(wire::put_load(load.pages.unwrap_or(0), load.frontier))
+        }
         Target::PeerSchema => {
             let mut out = Vec::new();
             wire::put_schema(&mut out, &ctx.cluster.schema(), &ctx.cluster.views());
@@ -570,6 +586,7 @@ pub fn dispatch<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request) -> Answered
         Target::ClusterRemove => cluster_member(ctx, req, Membership::Remove),
         Target::ClusterMove => cluster_move(ctx, req),
         Target::ClusterCancel => cluster_cancel(ctx, req),
+        Target::ClusterRebalance => cluster_rebalance(ctx, req),
         Target::Backup => backup(ctx, req),
     };
     Answered { response, who }

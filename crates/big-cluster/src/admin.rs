@@ -445,6 +445,76 @@ impl<P: PagerMut + Sync> Cluster<P> {
         ))
     }
 
+    // ---------------------------------------------------------------------------------------
+    // Balancing
+    // ---------------------------------------------------------------------------------------
+
+    /// What this node weighs, which is what the balancer decides from.
+    ///
+    /// Pages rather than records: pages are what a disk fills with, and the pager counts them
+    /// already so asking costs nothing. The frontier is one past the highest record id this
+    /// node holds, which is where a tail split is cut above.
+    pub fn load(&self) -> crate::balance::NodeLoad {
+        let pages = self.api.metrics().page_count;
+        let frontier = self
+            .schema()
+            .iter()
+            .filter_map(|t| self.api.max_record(&t.name).ok().flatten())
+            .max()
+            .map_or(0, |m| m.saturating_add(1));
+        crate::balance::NodeLoad { pages: Some(pages), frontier }
+    }
+
+    /// What every node weighs, in member order.
+    ///
+    /// A node that does not answer is `None` rather than zero, and the difference matters: an
+    /// empty node and an unreachable one call for opposite actions.
+    fn loads(&self) -> Vec<crate::balance::NodeLoad> {
+        let members = self.members();
+        (0..members.len())
+            .map(|i| {
+                if !members[i].reachable() {
+                    return crate::balance::NodeLoad::default();
+                }
+                if i == self.config.this_index() {
+                    return self.load();
+                }
+                match self.ask(i, path::LOAD, &[], None) {
+                    Err(_) => crate::balance::NodeLoad::default(),
+                    Ok(bytes) => match wire::get_load(&bytes) {
+                        Err(_) => crate::balance::NodeLoad::default(),
+                        Ok((pages, frontier)) => {
+                            crate::balance::NodeLoad { pages: Some(pages), frontier }
+                        }
+                    },
+                }
+            })
+            .collect()
+    }
+
+    /// Takes one balancing step, if the facts call for one.
+    ///
+    /// **One step, and the caller comes back.** `controller.rs` states the principle: *each
+    /// move is a moment where a query can fail*. So this never chains two changes, and a
+    /// cluster that needs three moves takes three calls - each one against facts gathered
+    /// afresh, rather than against a plan made before the first move happened.
+    pub fn rebalance(&self, policy: &crate::balance::Policy) -> Result<Option<String>> {
+        let (map, members, loads) = (self.map(), self.members(), self.loads());
+        let Some(action) = crate::balance::plan(&map, &members, &loads, policy) else {
+            return Ok(None);
+        };
+        match action {
+            crate::balance::Action::SplitTail { at, to } => {
+                self.split_range(at, Some(&to))?;
+                Ok(Some(format!("split the tail at {at} and gave it to `{to}`")))
+            }
+            crate::balance::Action::Move { range, to } => {
+                let report = self.move_range(range, &to)?;
+                Ok(Some(format!("moved shards {} to `{to}`", report.shards)))
+            }
+        }
+    }
+
     /// What the cluster looks like right now: every range, who holds it, and what is moving.
     ///
     /// **The one thing an autoscaler or an operator outside bigdb reads.** It is a report, not

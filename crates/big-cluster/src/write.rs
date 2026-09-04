@@ -219,10 +219,8 @@ impl<P: PagerMut + Sync> Cluster<P> {
                     }
                     .encode();
                     self.ask(copy, path::DELETE, &body, None).and_then(|bytes| {
-                        wire::get_u64_body(&bytes).map_err(|why| ClusterError::Wire {
-                            node: self.config.nodes()[copy].name.clone(),
-                            why,
-                        })
+                        wire::get_u64_body(&bytes)
+                            .map_err(|why| ClusterError::Wire { node: self.describe(copy), why })
                     })
                 };
                 match outcome {

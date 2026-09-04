@@ -371,6 +371,27 @@ pub(super) fn cluster_cancel<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request
     }
 }
 
+/// `POST /admin/cluster/rebalance` - take one balancing step, if the facts call for one.
+///
+/// **One step per call.** A cluster that needs three moves takes three calls, each against
+/// facts gathered afresh - because `each move is a moment where a query can fail`, and a plan
+/// made before the first move is a plan about a cluster that no longer exists.
+///
+/// This is what an autoscaler or a Kubernetes controller calls on a timer. `?force=true` runs
+/// the step even when the policy is switched off, which is what makes it usable as an
+/// operator's command on a cluster that does not balance itself.
+pub(super) fn cluster_rebalance<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request) -> Response {
+    let mut policy = ctx.balance;
+    if req.param("force").is_some_and(|v| v == "true") {
+        policy.enabled = true;
+    }
+    match ctx.cluster.rebalance(&policy) {
+        Ok(None) => Response::ok("{\"did\":null}".to_string()),
+        Ok(Some(what)) => Response::ok(format!("{{\"did\":{}}}", json::string(&what))),
+        Err(e) => from_cluster(&e),
+    }
+}
+
 /// Every fragment of a table, with the count that stands in for its contents.
 pub(super) fn peer_fragments<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request) -> Response {
     let request = match wire::FragmentsRequest::decode(&req.body) {

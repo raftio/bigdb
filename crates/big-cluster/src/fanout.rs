@@ -27,8 +27,7 @@ impl<P: PagerMut + Sync> Cluster<P> {
         node: usize,
         decode: impl FnOnce() -> wire::Result<T>,
     ) -> Result<T> {
-        decode()
-            .map_err(|why| ClusterError::Wire { node: self.config.nodes()[node].name.clone(), why })
+        decode().map_err(|why| ClusterError::Wire { node: self.describe(node), why })
     }
 
     // -----------------------------------------------------------------------------------
@@ -92,7 +91,7 @@ impl<P: PagerMut + Sync> Cluster<P> {
                                     let left = budget.map(|b| b.saturating_sub(started.elapsed()));
                                     self.ask(node, path, &body, left).and_then(|bytes| {
                                         decode(&bytes).map_err(|why| ClusterError::Wire {
-                                            node: self.config.nodes()[node].name.clone(),
+                                            node: self.describe(node),
                                             why,
                                         })
                                     })
@@ -153,20 +152,24 @@ impl<P: PagerMut + Sync> Cluster<P> {
         body: &[u8],
         budget: Option<Duration>,
     ) -> Result<Vec<u8>> {
-        let node = &self.config.nodes()[i];
+        // **A lookup rather than an index.** A node that joined while this one was running is
+        // in the agreement and not in the cluster file this process read, so indexing the file
+        // by a `NodeId` from the map is a panic on the request path.
+        let name = self.name_of(i).unwrap_or_else(|| self.name_of_agreed(i));
+        let shards = self.config.nodes().get(i).map(|n| n.shards.to_string()).unwrap_or_default();
         self.counters.sent();
         match self.peers.post(i, path, body, budget, repeatable(path)) {
             Ok(r) if r.is_ok() => Ok(r.body),
             Ok(r) => Err(self.counters.refused(ClusterError::Peer {
-                node: node.name.clone(),
+                node: name,
                 status: r.status,
                 code: r.code().unwrap_or_else(|| "unknown".to_string()),
                 message: r.message().unwrap_or_else(|| "no message".to_string()),
             })),
             Err(ClientError::Timeout) => Err(self.counters.unreachable(ClusterError::Timeout)),
             Err(e) => Err(self.counters.unreachable(ClusterError::Unreachable {
-                node: node.name.clone(),
-                shards: node.shards.to_string(),
+                node: name,
+                shards,
                 why: e.to_string(),
             })),
         }

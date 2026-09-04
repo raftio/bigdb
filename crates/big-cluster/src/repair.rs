@@ -54,7 +54,7 @@ impl<P: PagerMut + Sync> Cluster<P> {
                 handles
                     .into_iter()
                     .map(|(i, h)| {
-                        let node = self.config.nodes()[i].name.clone();
+                        let node = self.name_of(i).unwrap_or_else(|| self.name_of_agreed(i));
                         match h.join() {
                             Ok(Ok(d)) => CopyDigest { node, digest: Some(d), why: None },
                             Ok(Err(e)) => {
@@ -76,8 +76,8 @@ impl<P: PagerMut + Sync> Cluster<P> {
             let agree = digests.iter().all(|d| d.digest.is_some())
                 && digests.windows(2).all(|w| w[0].digest == w[1].digest);
             out.push(RangeVerdict {
-                shards: self.config.nodes()[primary].shards.to_string(),
-                primary: self.config.nodes()[primary].name.clone(),
+                shards: self.shards_of_range(range).to_string(),
+                primary: self.name_of(primary).unwrap_or_else(|| self.name_of_agreed(primary)),
                 copies: digests,
                 agree,
             });
@@ -107,7 +107,7 @@ impl<P: PagerMut + Sync> Cluster<P> {
         let body = wire::put_shards_body(shards.as_deref());
         let bytes = self.ask(node, path::DIGEST, &body, None)?;
         wire::get_u64_body(&bytes)
-            .map_err(|why| ClusterError::Wire { node: self.config.nodes()[node].name.clone(), why })
+            .map_err(|why| ClusterError::Wire { node: self.describe(node), why })
     }
 
     // -----------------------------------------------------------------------------------

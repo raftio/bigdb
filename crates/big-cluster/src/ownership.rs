@@ -71,7 +71,13 @@ impl<P: PagerMut + Sync> Cluster<P> {
     /// An option rather than an index, because a node can now join at runtime: a `NodeId` from
     /// the map may name a machine the file this process read has never heard of.
     pub(super) fn name_of(&self, node: usize) -> Option<String> {
-        self.config.nodes().get(node).map(|n| n.name.clone())
+        if let Some(n) = self.config.nodes().get(node) {
+            return Some(n.name.clone());
+        }
+        // A node that joined while this one was running is in the agreement and not in the
+        // file, so the agreement is what can name it.
+        let c = self.controller.as_ref()?;
+        c.members().get(node).map(|m| m.name.clone())
     }
 
     /// Whether this node may answer for the range it holds.
@@ -188,8 +194,21 @@ impl<P: PagerMut + Sync> Cluster<P> {
     /// An open end covers everything, including another open end.
     /// `name (shards)`, which is what every report about a node says.
     pub(super) fn describe(&self, i: usize) -> String {
-        let node = &self.config.nodes()[i];
-        format!("{} ({})", node.name, node.shards)
+        match self.config.nodes().get(i) {
+            Some(node) => format!("{} ({})", node.name, node.shards),
+            // A node that joined at runtime is not in the file this process read. Naming it
+            // from the agreement is the honest answer; a panic here would be a report about
+            // the cluster taking the cluster down.
+            None => self.name_of_agreed(i),
+        }
+    }
+
+    /// A node's name from the agreement, for a report about a node the file never had.
+    pub(super) fn name_of_agreed(&self, i: usize) -> String {
+        match &self.controller {
+            Some(c) => c.members().get(i).map_or_else(|| format!("node {i}"), |m| m.name.clone()),
+            None => format!("node {i}"),
+        }
     }
 }
 
