@@ -366,3 +366,79 @@ fn an_unknown_engine_is_refused_rather_than_defaulted() {
     assert_eq!(status, 400, "{body}");
     assert!(body.contains("bad_parameter"), "{body}");
 }
+
+/// A table outside the default database, reached the two ways a client can spell it.
+///
+/// `/import` used to be reachable by neither. It looks its table up in the schema snapshot to
+/// learn how each field reads a value, and that lookup compared the whole path segment against
+/// `TableInfo::name` - which is the bare name - so `sales.orders` matched nothing. `?database=`
+/// fared no better: it reached the RBAC guard and was then dropped, so the write resolved
+/// `orders` in the default database and found nothing there either.
+///
+/// The other three table routes took the qualified path already, because the read and write
+/// paths parse one (`TableRef::parse`); only the parameter was ignored. Both spellings now mean
+/// the same thing on all four, which is what the route table has always said `?database=` does.
+#[test]
+fn a_table_in_another_database_is_reachable_by_path_and_by_parameter() {
+    // Nine, counted: `spawn` serves exactly this many and then stops, so a test that sends one
+    // too many fails on the request rather than by hanging.
+    let addr = spawn(9);
+
+    assert_eq!(send(addr, "POST", "/database/sales", "").0, 200);
+    assert_eq!(send(addr, "POST", "/table/sales.orders", "").0, 200);
+    assert_eq!(send(addr, "POST", "/table/sales.orders/field/amount?kind=int", "").0, 200);
+
+    // Qualified in the path.
+    let (status, body) = send(addr, "POST", "/table/sales.orders/import", "amount 1 100\n");
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body, r#"{"imported":1}"#);
+
+    // The same table, named by parameter instead.
+    let (status, body) =
+        send(addr, "POST", "/table/orders/import?database=sales", "amount 2 900\n");
+    assert_eq!(status, 200, "{body}");
+
+    // Both writes landed in the one table, so it holds two records either way it is asked.
+    let (_, body) = send(addr, "POST", "/table/sales.orders/query", "Count(All())");
+    assert_eq!(body, r#"{"count":2}"#);
+    let (_, body) = send(addr, "POST", "/table/orders/query?database=sales", "Count(All())");
+    assert_eq!(body, r#"{"count":2}"#);
+
+    let (_, body) = send(addr, "GET", "/table/orders/records?database=sales", "");
+    assert_eq!(body, r#"{"records":[1,2],"next":null}"#);
+
+    let (status, body) = send(addr, "POST", "/table/orders/delete?database=sales", "1\n");
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body, r#"{"deleted":1}"#);
+}
+
+/// A bare name still means the default database, even when another database has that table.
+///
+/// The half of the change that could go wrong quietly: folding `?database=` into the name must
+/// not make an unqualified request start resolving somewhere else.
+#[test]
+fn an_unqualified_name_still_means_the_default_database() {
+    let addr = spawn(10);
+
+    assert_eq!(send(addr, "POST", "/database/sales", "").0, 200);
+    for table in ["orders", "sales.orders"] {
+        assert_eq!(send(addr, "POST", &format!("/table/{table}"), "").0, 200);
+        assert_eq!(send(addr, "POST", &format!("/table/{table}/field/amount?kind=int"), "").0, 200);
+    }
+
+    // One record into each, by the two spellings.
+    assert_eq!(send(addr, "POST", "/table/orders/import", "amount 1 1\n").0, 200);
+    assert_eq!(send(addr, "POST", "/table/sales.orders/import", "amount 1 1\namount 2 2\n").0, 200);
+
+    // They are two tables, and neither write reached the other.
+    let (_, body) = send(addr, "POST", "/table/orders/query", "Count(All())");
+    assert_eq!(body, r#"{"count":1}"#, "the default database's table");
+    let (_, body) = send(addr, "POST", "/table/sales.orders/query", "Count(All())");
+    assert_eq!(body, r#"{"count":2}"#, "the one in `sales`");
+
+    // And a path that qualifies wins over a parameter that disagrees, being the more specific
+    // of the two rather than an error nobody could act on.
+    let (_, body) =
+        send(addr, "POST", "/table/sales.orders/query?database=nosuchdb", "Count(All())");
+    assert_eq!(body, r#"{"count":2}"#);
+}
