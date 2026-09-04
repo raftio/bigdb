@@ -344,6 +344,74 @@ later. This is the same shape as every other refusal in the engine — see the
 more here than anywhere, because the alternative is two row ids for one string, which is exactly
 the failure per-node ranges were rejected for.
 
+**A node that has just started has heard from nobody, and says so.** The lease is "when did I
+last prove I was in touch with the agreement", and a fresh process has never proved it — so a
+node holding a replicated range refuses reads and writes for its range, and a node named as the
+schema leader refuses to assign row ids, until the first heartbeat reaches it. On the shipped
+clocks that is one election. It is not politeness: a node that restarted may have been replaced
+while it was away, and serving on the strength of a clock that also starts at zero is exactly
+the two-primaries failure the lease exists to prevent. A cluster with no replicas is unaffected
+— nothing there can be taken away, so nothing is fenced.
+
+**And the leader checks that it still is one.** Being named by the map is not the same as
+being allowed to act on it, and a request to intern or allocate is refused, `503`, in three
+cases. `not_schema_leader`: the map names somebody else — a coordinator holding a map one
+decision old sent this to whoever led *then*, and the answer names who leads now. The request
+carries who the sender *thinks* leads, so a sender that is behind is told rather than served.
+`not_schema_leader` again: this node was told to stand down by a move that has not landed yet.
+And `schema_lease_lost`: this node has lost touch with the agreement and cannot know it has not
+been replaced — the same lease a replicated range serves under, and here there is no unfenced
+case, because the namespace can always be given to somebody else. What these cost is one thing:
+a write with a new key waits. What they prevent is two nodes interning at once, which no write
+could wait out.
+
+**Moving the namespace has a step in the middle where nobody holds it.** `bigctl cluster
+schema-leader --to <node>` copies every row key, then tells the old leader to stop, then reads
+its allocation floor — final now, rather than racing — then commits. Between "stop" and the
+commit, a write with a new key is refused; that gap is allowed. The gap it replaces, in which
+the old leader went on interning for coordinators that had not yet heard, is not.
+
+**And with `--elect-schema-leader`, the agreement moves it on its own.** Off by default, and
+the default is the honest one: a dead schema leader means no *new* row key until it is back,
+which is an outage an operator can wait out, and the alternative has a cost that is worth
+stating before it is switched on.
+
+It waits far longer than a range does — fifteen seconds against `promote_after`'s four and a
+half — because moving the namespace copies every row key of every table, and a flap would be
+the most expensive one available. The successor is chosen the way a range's replacement is: a
+voter that is answering and not marked behind, in a fixed order, so two leaders elected in
+sequence choose the same node. The decision sets `schema_ready` false, and until the successor
+holds every key the survivors have, **nobody interns** — a write with a new key is refused
+`schema_handover`, `503`. That gap is the same shape as the manual move's, and it is allowed
+for the same reason.
+
+**What it costs, stated rather than hidden.** The successor's mapping is rebuilt from the
+copies every *owner* took when it was told what a key meant — the dead leader is not there to
+ask. A key it interned for a write that then failed exists nowhere else, so the successor will
+hand that row id to a different string. Inside the surviving cluster that is harmless: nobody
+holds the old meaning. It matters only if the deposed node comes back, and there it fails
+loudly rather than quietly — `KeyStore::assign` refuses the contradiction, so `POST /repair`
+reports it instead of overwriting. That is why the deposed node is marked behind whether or not
+it held a copy of anything: **a node the agreement has taken the namespace from must be
+repaired before it is trusted again.** Closing this properly means replicating a key assignment
+before `intern` returns, which is a replicated catalog and a different design.
+
+If two *surviving* nodes disagree about what a row id means, the handover stops rather than
+picking a side: `schema_ready` stays false, `big_cluster_schema_handover_blocked` goes to 1,
+and nothing assigns row ids until somebody looks. A cluster that refuses new keys is
+recoverable; a cluster with two meanings for one row id is not.
+
+**Record ids are reserved through the agreement before they are handed out.** The leader
+allocates from a number in its memory, and a successor that started from what is on disk would
+re-issue ids the old leader had promised to writes that had not landed — the one failure with no
+second chance. So the map carries a ceiling per table, the leader commits a block of 65 536 ids
+before it hands out anything under it, and a leader with no floor of its own — just elected, or
+just restarted — starts at the ceiling. What a dead leader promised is below it by construction.
+What it costs is one entry in the agreement per block, and a gap of unused ids when a leader is
+replaced mid-block; record ids are sixty-four bits wide and shard-mapped, so a gap costs nothing.
+This is still not consensus over the write path: the ids themselves travel as they always did,
+and the agreement records only how far the leader may go.
+
 ## The routes a node uses to reach another
 
 Thirteen, all `POST`, all under `/internal/`, all with a binary body and a binary answer. They are

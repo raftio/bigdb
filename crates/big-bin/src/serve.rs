@@ -31,6 +31,7 @@ use big_embed::Api;
 use big_http::{log, Auth, Server, ServerConfig};
 use big_tls::TlsConfig;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 const DEFAULT_ADDR: &str = "127.0.0.1:7654";
@@ -67,6 +68,28 @@ usage: big serve <file> [addr] [options]
   --queue <n>                 connections allowed to wait; past this, 503
   --read-timeout <seconds>    how long a client may take to send a request
   --query-timeout <seconds>   wall-clock budget for one query; 0 means none
+  --reclaim                   give trailing free pages back to the filesystem while serving.
+                              Copy-on-write leaves holes and the freelist reuses them, so a
+                              file that has churned is mostly free space it never hands back;
+                              without this only an offline `big compact` shrinks it. Acts once
+                              a quarter of the file is reclaimable, needs a moment with no
+                              query in flight, and takes the write lock for one truncation.
+                              Watch big_pages_reclaimed_total and big_reclaim_blocked_total
+  --elect-schema-leader       let the agreement give the row-key namespace to another node
+                              when the one holding it has been silent for fifteen seconds.
+                              Without it, `bigctl cluster schema-leader` is the only way it
+                              moves, and a dead leader means no *new* row key can be assigned
+                              until it is back. With it, a failover copies every row key of
+                              every table to the successor - and can burn row ids the dead
+                              leader assigned to writes that never landed, so the deposed node
+                              must be repaired before it is trusted again. See
+                              docs/clustering.md. Needs --cluster
+  --balance                   let the cluster reshape itself: a node that is draining has its
+                              ranges moved away, a node with nothing is given the tail, and a
+                              node much fuller than another gives a range up. One step at a
+                              time, decided by the agreement's leader. Off unless passed - a
+                              cluster that reshapes itself unasked is one whose shape an
+                              operator cannot predict. Needs --cluster to mean anything
   --max-row-keys <n>          refuse to invent more than n row keys; 0 means no limit
                               every row key is resident in memory in both directions, so
                               this is the ceiling on the one allocation that grows with
@@ -157,7 +180,43 @@ pub fn main(args: &[String]) -> std::io::Result<()> {
     refuse_an_open_port(&server, bound, &opts);
     announce(&server, bound, &opts);
 
-    server.serve()
+    // **Stopped by a signal, not killed by one.** `SIGTERM` is what every supervisor sends
+    // first - `docker stop`, a pod being evicted, `systemctl stop` - and the default disposition
+    // ends the process mid-request: the workers die with sockets open, and the agreement learns
+    // this node has gone only when its heartbeats stop. Standing down instead finishes what is
+    // in flight, takes nothing more, and leaves the agreement before the port closes.
+    //
+    // Two things this does *not* promise, said here rather than found out. The agreement is
+    // stopped before the workers drain, so a request that arrives during the drain for a range
+    // this node was serving gets `503 not_serving` - correct, because a node standing down must
+    // not answer for a range it may already have lost, but not the same as "every request
+    // completes". And a move this node was driving as the agreement's leader is not finished
+    // for it: the range stays marked moving until an operator cancels or another leader
+    // finishes it. A signal narrows that window; it does not close it.
+    server.serve_while(stand_down_on_signal())
+}
+
+/// Installs the handlers that ask the server to stand down, and hands back the flag they clear.
+///
+/// **One of the two `unsafe` blocks in this crate** - the other is `tty::Echo` - and the whole
+/// of it is two `libc::signal` calls. The handler does exactly one thing: a relaxed store into a
+/// static `AtomicBool`, which is on the short list of what a signal handler may do. Nothing is
+/// allocated, locked, or printed from it; the accept loop notices the flag on its next poll.
+#[allow(unsafe_code)]
+fn stand_down_on_signal() -> &'static AtomicBool {
+    static RUNNING: AtomicBool = AtomicBool::new(true);
+    extern "C" fn stand_down(_: libc::c_int) {
+        RUNNING.store(false, Ordering::Relaxed);
+    }
+    // SAFETY: `stand_down` is an `extern "C"` function with the signature `signal` expects, it
+    // touches only a `static AtomicBool` through an atomic store (async-signal-safe), and the
+    // static lives for the whole program, so the handler can never run against freed memory.
+    // `signal` itself has no memory-safety preconditions beyond a valid handler pointer.
+    unsafe {
+        libc::signal(libc::SIGTERM, stand_down as *const () as libc::sighandler_t);
+        libc::signal(libc::SIGINT, stand_down as *const () as libc::sighandler_t);
+    }
+    &RUNNING
 }
 
 /// The certificate this listener presents, or the decision to serve in the clear.
@@ -289,7 +348,20 @@ fn assemble(
     // two.
     let state = format!("{}.raft", opts.path);
     eprintln!("big: agreement state in {state}");
-    Cluster::new(api, config, tls, Box::new(big_cluster::raft::FileStore::new(state)))
+    let leases = big_cluster::controller::Leases {
+        move_schema_after: opts
+            .elect_schema_leader
+            .then_some(big_cluster::controller::Leases::SCHEMA_FAILOVER),
+        ..big_cluster::controller::Leases::default()
+    };
+    Cluster::with_timing(
+        api,
+        config,
+        tls,
+        Box::new(big_cluster::raft::FileStore::new(state)),
+        big_cluster::raft::Timing::default(),
+        leases,
+    )
 }
 
 /// The listener's settings: the defaults, with whatever the operator overrode.
@@ -303,6 +375,11 @@ fn serving(auth: Auth, tls: Option<TlsConfig>, opts: &Options) -> ServerConfig {
         workers: opts.workers.unwrap_or(base.workers),
         queue_depth: opts.queue.unwrap_or(base.queue_depth),
         read_timeout: opts.read_timeout.unwrap_or(base.read_timeout),
+        // Only the switch. The thresholds stay at what the policy ships with until somebody
+        // has a reason to move them; three knobs would triple what has to be tested for a
+        // setting nobody has yet needed to change.
+        balance: big_cluster::balance::Policy { enabled: opts.balance, ..base.balance },
+        reclaim: opts.reclaim,
         ..base
     }
 }
@@ -376,6 +453,39 @@ fn announce(server: &Server<big_embed::MmapPager>, bound: std::net::SocketAddr, 
         Some(d) => eprintln!("big: POST /admin/backup writes into {d}"),
         None => eprintln!("big: no --backup-dir; POST /admin/backup is not configured"),
     }
+    // Printed on every start, both ways: whether a cluster was allowed to reshape itself is
+    // the first thing an operator asks after a range has moved, and a line that only appears
+    // when the flag was passed is one they have to remember the absence of.
+    match (opts.balance, opts.cluster.is_some()) {
+        (true, true) => eprintln!("big: balancer on; the agreement's leader reshapes the cluster"),
+        // Not refused: the flag is harmless alone, and a deployment that sets it everywhere
+        // and adds --cluster later should not have to change twice. But a switch that does
+        // nothing has to say so, or somebody will wait for it.
+        (true, false) => eprintln!("big: --balance without --cluster: nothing to balance"),
+        (false, _) => eprintln!("big: balancer off; POST /admin/cluster/rebalance is one step"),
+    }
+    // Both ways again, and this one is about the file rather than the cluster: an operator
+    // asking why a database is not shrinking should be able to read the answer out of a log.
+    if opts.reclaim {
+        eprintln!("big: reclaiming trailing free pages while serving, once a quarter is free");
+    } else {
+        eprintln!("big: no --reclaim; the file gives space back only to an offline `big compact`");
+    }
+    // Printed both ways for the reason the balancer is, and with the consequence spelled out:
+    // an automatic handover can burn row ids the dead leader promised to writes that never
+    // landed, which is not something to find out from a doc after the fact.
+    match (opts.elect_schema_leader, opts.cluster.is_some()) {
+        (true, true) => eprintln!(
+            "big: the agreement may move the row-key namespace after 15s of silence; a \
+             deposed leader must be repaired before it is trusted again"
+        ),
+        (true, false) => {
+            eprintln!("big: --elect-schema-leader without --cluster: nothing to elect")
+        }
+        (false, _) => eprintln!(
+            "big: row-key namespace stays put; bigctl cluster schema-leader is the only mover"
+        ),
+    }
     if !server.config().auth.is_enabled() {
         eprintln!("big: no authentication; this port must not be reachable from anywhere else");
     }
@@ -405,6 +515,12 @@ struct Options {
     queue: Option<usize>,
     read_timeout: Option<Duration>,
     query_timeout: Option<Duration>,
+    /// Whether the agreement's leader may reshape the cluster on its own.
+    balance: bool,
+    /// Whether the agreement may give the row-key namespace to another node on its own.
+    elect_schema_leader: bool,
+    /// Whether this node may hand trailing free pages back to the filesystem while serving.
+    reclaim: bool,
     durability: Option<big_db::Durability>,
     cluster: Option<String>,
     node: Option<String>,
@@ -432,6 +548,9 @@ impl Default for Options {
             queue: None,
             read_timeout: None,
             query_timeout: None,
+            balance: false,
+            elect_schema_leader: false,
+            reclaim: false,
             durability: None,
             cluster: None,
             node: None,
@@ -511,6 +630,18 @@ impl Options {
                     // every query and be a confusing way to spell it.
                     out.query_timeout = (secs > 0).then(|| Duration::from_secs(secs));
                     i += 2;
+                }
+                "--balance" => {
+                    out.balance = true;
+                    i += 1;
+                }
+                "--elect-schema-leader" => {
+                    out.elect_schema_leader = true;
+                    i += 1;
+                }
+                "--reclaim" => {
+                    out.reclaim = true;
+                    i += 1;
                 }
                 "--durability" => {
                     let v = value()?;

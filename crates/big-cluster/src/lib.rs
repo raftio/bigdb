@@ -71,7 +71,7 @@
 
 mod admin;
 pub mod balance;
-pub use admin::{MemberReport, MoveReport, RangeReport, Topology};
+pub use admin::{Balanced, MemberReport, MoveReport, RangeReport, Topology};
 mod ddl;
 // The one item a sibling borrows across the split: `repair` recreates a field exactly as
 // another node has it, and that is a `Ddl` rather than a repair concern.
@@ -148,9 +148,15 @@ use std::time::{Duration, Instant};
 /// its data twice, so `Count` would silently double. That is precisely the quiet mistake a
 /// version exists to turn into a refusal.
 ///
+/// `7` since a request to the schema leader says **who it thinks leads**. `InternRequest` and
+/// `AllocateRequest` each gained an assumption at the end, and `/internal/schema/step-down`
+/// was added. A `6` leader asked by a `7` coordinator would refuse the trailing bytes as
+/// unreadable rather than intern for a coordinator it may no longer lead - the right failure,
+/// and the version makes it a handshake failure instead of a per-request one.
+///
 /// The retired numbers are **not** reused. A stale peer that somehow got past the handshake
 /// would then misparse rather than fail, which is what `finished` exists to prevent.
-pub const WIRE_VERSION: u32 = 6;
+pub const WIRE_VERSION: u32 = 7;
 
 /// The header carrying [`WIRE_VERSION`].
 pub const WIRE_HEADER: &str = "x-big-wire";
@@ -188,6 +194,12 @@ pub mod path {
     /// the row-key namespace changes hands.
     pub const FLOORS: &str = "/internal/floors";
     pub const FLOORS_PUT: &str = "/internal/floors/put";
+    /// Stop interning: the namespace is being handed over. Asked of the source before its
+    /// floor is read, so that the floor is final rather than racing.
+    pub const SCHEMA_STEP_DOWN: &str = "/internal/schema/step-down";
+    /// Raise the agreement's ceiling on record ids for a table. Asked of the agreement's
+    /// leader by a schema leader that is not it.
+    pub const RESERVE: &str = "/internal/reserve";
 }
 
 /// One node, playing whichever of the three roles a given request needs.
@@ -219,6 +231,19 @@ pub struct Cluster<P: PagerMut> {
     /// Not persisted, and does not need to be. A leader that restarts re-derives the first term
     /// from the data itself, and the floor only ever has to outlive the writes it is ahead of.
     allocated: std::sync::Mutex<std::collections::BTreeMap<String, RecordId>>,
+    /// One past the map epoch at which this node was last told to stop leading the schema.
+    /// Zero for never.
+    ///
+    /// A move of the namespace happens in steps, and between "stop" and the decision landing
+    /// this node still leads by the map and must not act like it - a source that went on
+    /// interning while its floor was being read would be the second interner the whole move
+    /// exists to prevent. Compared against the map's epoch, so leadership that comes back at
+    /// a later epoch is leadership again.
+    stood_down_at: std::sync::atomic::AtomicU64,
+    /// Whether the last attempt to hand the namespace to an elected successor found two
+    /// survivors disagreeing about what a row id means. Nobody interns while this is set;
+    /// `/metrics` is how somebody finds out.
+    handover_blocked: std::sync::atomic::AtomicBool,
     /// The agreement, when there is anything to agree about.
     ///
     /// `None` when no range has a copy: a range of one cannot fail over to anything, so
@@ -324,6 +349,8 @@ impl<P: PagerMut + Sync> Cluster<P> {
             ranges,
             counters: counters::Counters::new(),
             allocated: Default::default(),
+            stood_down_at: Default::default(),
+            handover_blocked: Default::default(),
         })
     }
 
@@ -335,7 +362,9 @@ impl<P: PagerMut + Sync> Cluster<P> {
             None => (0, false),
             Some(c) => (c.term(), c.is_leader()),
         };
-        let behind = self.map().stale.len();
+        let map = self.map();
+        let behind = map.stale.len();
+        let moving = map.ranges.iter().filter(|r| r.moving.is_some()).count();
         counters::Snapshot {
             nodes: self.config.nodes().len(),
             peers: self.config.nodes().len() - 1,
@@ -344,6 +373,9 @@ impl<P: PagerMut + Sync> Cluster<P> {
             term,
             leader,
             behind,
+            moving,
+            schema_ready: map.schema_ready,
+            handover_blocked: self.handover_blocked.load(std::sync::atomic::Ordering::Relaxed),
             counts: self.counters.read(),
         }
     }

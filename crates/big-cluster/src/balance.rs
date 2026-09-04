@@ -43,6 +43,13 @@ pub struct NodeLoad {
     /// One past the highest record id the node holds, over every table. What a tail split is
     /// cut above.
     pub frontier: u64,
+    /// Whether the node holds the agreement's log to within a margin of its end.
+    ///
+    /// What decides whether a learner may become a member. A node still replaying what it
+    /// missed would raise the bar for every election while being able to help decide none -
+    /// the exact reason a learner is not a voter to begin with. Only the leader knows this,
+    /// which is fine: only the leader proposes.
+    pub caught_up: bool,
 }
 
 /// When the balancer is allowed to act, and how hard.
@@ -68,6 +75,12 @@ impl Default for Policy {
 /// The one thing to do next.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Action {
+    /// Make a learner that has caught up a full member, so that it votes and may hold a range.
+    ///
+    /// **A change to who the cluster is, not to who holds what** - and the only one the
+    /// balancer makes. It has to come first: until the node is a member, nothing below can see
+    /// it as a node with nothing to give it the tail.
+    Admit { node: String },
     /// Cut the tail above everything written and give the empty half to a node with nothing.
     ///
     /// **The scale-out that moves no bytes**, and the reason it is preferred: it costs one
@@ -81,10 +94,12 @@ pub enum Action {
 ///
 /// The order is the policy, and the first that applies wins:
 ///
-/// 1. **A node that is draining** gives up a range. An operator asked for this, so it outranks
+/// 1. **A learner that is answering and has caught up** is admitted. It joined to take work,
+///    and nothing below can give it any until it counts.
+/// 2. **A node that is draining** gives up a range. An operator asked for this, so it outranks
 ///    anything the balancer noticed by itself.
-/// 2. **A node with nothing** is given the tail, cut above everything written. No bytes move.
-/// 3. **A spread that is too wide** moves one range from the fullest node to the emptiest.
+/// 3. **A node with nothing** is given the tail, cut above everything written. No bytes move.
+/// 4. **A spread that is too wide** moves one range from the fullest node to the emptiest.
 ///
 /// `None` whenever anything is already in flight: a second decision made about a map that has
 /// not settled is a decision about a state that is already gone.
@@ -104,6 +119,18 @@ pub fn plan(
     }
 
     let name = |n: usize| members.get(n).map(|m: &Member| m.name.clone());
+
+    // 1. Somebody joined, and is ready to count. Answering `/internal/load` is what proves it
+    // is up for data and not only for the log; caught up is what proves counting it will not
+    // stall the next election.
+    for (i, m) in members.iter().enumerate() {
+        if !matches!(m.state, crate::raft::MemberState::Learner) {
+            continue;
+        }
+        if load.get(i).is_some_and(|l| l.pages.is_some() && l.caught_up) {
+            return Some(Action::Admit { node: name(i)? });
+        }
+    }
     // A node that did not answer is not a candidate in either direction: it may be full, it may
     // be empty, and sending work to a machine that is not there is the worse guess.
     let live = |n: usize| {
@@ -112,7 +139,7 @@ pub fn plan(
     };
     let pages = |n: usize| load.get(n).and_then(|l| l.pages).unwrap_or(0);
 
-    // 1. Somebody asked for this.
+    // 2. Somebody asked for this.
     for (i, m) in members.iter().enumerate() {
         if !matches!(m.state, crate::raft::MemberState::Draining) {
             continue;
@@ -124,7 +151,7 @@ pub fn plan(
         return Some(Action::Move { range: map.ranges[range].id, to: name(to)? });
     }
 
-    // 2. A node that holds nothing. Give it the part of the space nothing has been written to
+    // 3. A node that holds nothing. Give it the part of the space nothing has been written to
     // yet, which is the only thing that can change hands without a copy.
     if let Some(empty) = (0..members.len()).find(|n| live(*n) && map.held_by(*n).is_empty()) {
         // Above every record any node holds, so the half handed over is empty by construction.
@@ -138,7 +165,7 @@ pub fn plan(
         }
     }
 
-    // 3. A spread that has grown too wide.
+    // 4. A spread that has grown too wide.
     let fullest = (0..members.len()).filter(|n| live(*n)).max_by_key(|n| pages(*n))?;
     let emptiest = (0..members.len()).filter(|n| live(*n)).min_by_key(|n| pages(*n))?;
     if fullest == emptiest {

@@ -179,6 +179,12 @@ fn put_range_map(out: &mut Vec<u8>, m: &raft::RangeMap) {
     for n in &m.stale {
         put_u64(out, *n as u64);
     }
+    put_count(out, m.reserved.len());
+    for (table, upto) in &m.reserved {
+        put_str(out, table);
+        put_u64(out, *upto);
+    }
+    put_bool(out, m.schema_ready);
 }
 
 fn get_range_map(r: &mut Reader<'_>) -> Result<raft::RangeMap> {
@@ -221,7 +227,13 @@ fn get_range_map(r: &mut Reader<'_>) -> Result<raft::RangeMap> {
     for _ in 0..count {
         stale.push(r.u64()? as raft::NodeId);
     }
-    Ok(raft::RangeMap { epoch, ranges, stale, schema_leader })
+    let count = r.count()?;
+    let mut reserved = Vec::with_capacity(count);
+    for _ in 0..count {
+        reserved.push((r.str()?, r.u64()?));
+    }
+    let schema_ready = r.bool()?;
+    Ok(raft::RangeMap { epoch, ranges, stale, schema_leader, reserved, schema_ready })
 }
 
 fn put_members(out: &mut Vec<u8>, members: &[raft::Member]) {

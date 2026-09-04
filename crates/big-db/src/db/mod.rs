@@ -74,6 +74,11 @@ impl<P: PagerMut> Db<P> {
         Ok(self.store.set_durability(next)?)
     }
 
+    /// Gives trailing free pages back to the filesystem. See [`Store::truncate_tail`].
+    pub fn reclaim(&self) -> Result<u64> {
+        Ok(self.store.truncate_tail()?)
+    }
+
     pub fn store(&self) -> &Store<P> {
         &self.store
     }

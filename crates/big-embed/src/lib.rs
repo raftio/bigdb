@@ -1416,6 +1416,26 @@ impl<P: PagerMut + Sync> Api<P> {
         self.db.store().metrics()
     }
 
+    /// Gives trailing free pages back to the filesystem, and answers with how many.
+    ///
+    /// **The only thing in the tree that makes a served database smaller.** Copy-on-write
+    /// leaves holes and the freelist reuses them, so a file that has churned is mostly free
+    /// space that is never handed back; `big compact` gives it back and wants the exclusive
+    /// lock, which means stopping the daemon. This does it in place, while serving.
+    ///
+    /// **Only pages flush against the end of the file**, because moving a page anywhere else
+    /// means rewriting whoever points at it. What makes the tail empty out on its own is that
+    /// the freelist hands out its lowest page first: ordinary writes fill the holes near the
+    /// front, and the end of the file drains.
+    ///
+    /// [`ApiError`] `ReadersActive` when a read transaction is open anywhere in this process -
+    /// shrinking the file turns the region past the new end back into unbacked mapping, and a
+    /// borrow into it would be a `SIGBUS`. It is an ordinary outcome rather than a failure:
+    /// try again when the node is between requests.
+    pub fn reclaim(&self) -> Result<u64> {
+        Ok(self.db.reclaim()?)
+    }
+
     /// What the row-key dictionary costs this process. See [`Db::key_stats`].
     pub fn key_stats(&self) -> KeyStats {
         self.db.key_stats()

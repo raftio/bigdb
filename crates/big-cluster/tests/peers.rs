@@ -24,6 +24,7 @@
 //! a real clock. Those stay in `big-http/tests/cluster.rs`, over real ports, where they belong.
 
 use big_cluster::client::{ClientError, PeerResponse, Peers, Repeatable};
+use big_cluster::raft::Store as _;
 use big_cluster::{
     raft, wire, Cluster, ClusterConfig, ClusterError, ClusterFile, FactValue, OwnedFact,
 };
@@ -280,6 +281,46 @@ fn a_node_whose_vote_is_unreadable_refuses_to_start() {
     .map(|_| ())
     .expect_err("a damaged state file is not a node that has never voted");
     assert_eq!(e.kind(), std::io::ErrorKind::InvalidData, "{e}");
+}
+
+/// **A restart replays only what was committed, counted from the base.**
+///
+/// The replay compared a position in the vector holding the log's suffix against the commit
+/// index, which is a log position. Once anything had been compacted away, an entry past the
+/// commit point looked committed, and a map no majority ever agreed to became this node's map.
+#[test]
+fn a_restart_applies_nothing_past_the_commit_point_once_the_log_has_a_base() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.raft");
+    let config: ClusterConfig = ClusterFile::parse(THREE).unwrap().for_node(Some("a"), "").unwrap();
+    let at = |epoch: u64| {
+        let mut m = config.seed_map();
+        m.epoch = epoch;
+        raft::Decision::Ranges(m)
+    };
+    let log = vec![
+        // Index 40, the sentinel; 41, committed; 42, still in flight.
+        raft::Entry { term: 3, decision: at(2) },
+        raft::Entry { term: 4, decision: at(3) },
+        raft::Entry { term: 4, decision: at(4) },
+    ];
+    raft::FileStore::new(&path)
+        .save(&raft::State { term: 4, voted_for: Some(0), commit: 41, base: 40, log, seed: vec![] })
+        .unwrap();
+
+    let api = Api::in_memory().unwrap();
+    let peers = Fake::new(vec![None, Some(Reply::Unreachable), Some(Reply::Unreachable)]);
+    let c = Cluster::with_peers(
+        api,
+        config,
+        peers,
+        Box::new(raft::FileStore::new(&path)),
+        raft::Timing::default(),
+        Default::default(),
+    )
+    .unwrap();
+    assert_eq!(c.map().epoch, 3, "the committed map, not the one still in flight");
+    c.stop();
 }
 
 /// The other half of the same rule: **a file that is simply not there is a fresh node**, and a

@@ -47,6 +47,7 @@ pub mod json;
 pub mod metrics;
 pub mod routes;
 pub mod status;
+mod steward;
 mod watchdog;
 
 /// Re-exported from [`big_wire`], which is where the HTTP/1.1 framing lives now.
@@ -112,6 +113,13 @@ pub struct ServerConfig {
     ///
     /// When the cluster may reshape itself, and how hard. Off by default.
     pub balance: big_cluster::balance::Policy,
+    /// Whether this node may give trailing free pages back to the filesystem while it serves.
+    ///
+    /// Off by default, like everything else that acts without being asked. What it changes is
+    /// that a file which has churned can get smaller without stopping the daemon; what it
+    /// costs is the write lock for the length of one truncation, and only once a quarter of
+    /// the file is reclaimable.
+    pub reclaim: bool,
     /// An ordinary `Option` with no `#[cfg]` on it: `TlsConfig` is uninhabited in a build with
     /// the feature off, so this is provably `None` there and every construction site in the tree
     /// - tests included - compiles either way without knowing which build it is in.
@@ -145,6 +153,7 @@ impl Default for ServerConfig {
             // server is the default, and `big serve` refuses to bind anywhere else without one.
             tls: None,
             balance: big_cluster::balance::Policy::default(),
+            reclaim: false,
             // Off. A daemon that backed itself up somewhere by default would be a daemon
             // filling a disk nobody chose.
             backup_dir: None,
@@ -316,6 +325,18 @@ impl<P: PagerMut + Sync + Send + 'static> Server<P> {
             })
         };
 
+        // The node's own slow work - balancing, and whatever else is switched on - on a thread
+        // that is neither the agreement's nor a worker's. See `steward.rs` for why it can be
+        // neither. Stopped the way the workers are: `stopping` is set on every way out of this
+        // loop, and it is joined after them.
+        let steward = {
+            let state = Arc::clone(&self.state);
+            std::thread::Builder::new()
+                .name("big-steward".to_string())
+                .spawn(move || steward::run(&state))
+                .expect("one steward thread")
+        };
+
         let mut workers = Vec::with_capacity(self.state.config.workers);
         for _ in 0..self.state.config.workers {
             let rx = Arc::clone(&rx);
@@ -397,12 +418,17 @@ impl<P: PagerMut + Sync + Send + 'static> Server<P> {
                 // peer it has given up waiting for.
                 Err(e) if transient(&e) => continue,
                 Err(e) => {
+                    // A listener that has failed is a server that is stopping, whatever the
+                    // caller asked for; the steward has to hear that too, or it outlives the
+                    // port it was serving.
+                    self.state.stopping.store(true, Ordering::Relaxed);
                     drop(tx);
                     drop(shed_tx);
                     for w in workers {
                         let _ = w.join();
                     }
                     let _ = shedder.join();
+                    let _ = steward.join();
                     return Err(e);
                 }
             }
@@ -414,6 +440,7 @@ impl<P: PagerMut + Sync + Send + 'static> Server<P> {
             let _ = w.join();
         }
         let _ = shedder.join();
+        let _ = steward.join();
         Ok(())
     }
 

@@ -56,6 +56,16 @@ pub struct Leases {
     /// stopped before the new one starts, and the only thing making that true is this
     /// inequality plus clocks that run at similar rates.
     pub promote_after: Duration,
+    /// The leader gives the row-key namespace to another node after this long without hearing
+    /// from the one that holds it. `None` leaves that to an operator.
+    ///
+    /// **Much longer than `promote_after`, and off by default.** Moving the namespace copies
+    /// every row key of every table to the successor, which is the most expensive thing the
+    /// agreement can decide to do - so it waits until ranges have already failed over and the
+    /// map has settled, and it does not happen at all unless somebody turned it on. The same
+    /// lease the schema leader serves under (`serve_for`) is what makes this safe: by the time
+    /// the agreement moves the namespace, the old holder has long since stopped acting on it.
+    pub move_schema_after: Option<Duration>,
 }
 
 impl Default for Leases {
@@ -63,9 +73,24 @@ impl Default for Leases {
         Self {
             serve_for: Duration::from_millis(1_500),
             promote_after: Duration::from_millis(4_500),
+            move_schema_after: None,
         }
     }
 }
+
+impl Leases {
+    /// How long the agreement waits before moving the namespace, when it is allowed to.
+    ///
+    /// Three and a third times `promote_after`: strictly longer is the property that matters,
+    /// and this much longer is the margin for a range failover to have landed first.
+    pub const SCHEMA_FAILOVER: Duration = Duration::from_secs(15);
+}
+
+/// The lease of a node that has not yet heard from the agreement at all.
+///
+/// A sentinel rather than a zero because the clock it is compared against also starts at zero:
+/// a fresh node would otherwise read its own silence as having just been in touch.
+const NEVER: u64 = u64::MAX;
 
 /// One node's half of the agreement, and the thread that drives it.
 pub struct Controller {
@@ -95,6 +120,11 @@ pub struct Controller {
     roster: RwLock<Option<big_tls::TlsConfig>>,
     /// Milliseconds since this process started, at the last moment this node could prove it
     /// was still in touch with a majority. The lease, in one number.
+    ///
+    /// [`NEVER`] until it has proved that once. **Not zero**: this clock starts at zero too, so
+    /// zero reads as "heard from the agreement just now" on a node that has heard from nobody
+    /// at all - which is exactly a node that has restarted and may already have been replaced
+    /// while it was away.
     lease_at: AtomicU64,
     started: Instant,
     inbox: mpsc::Sender<Message>,
@@ -211,14 +241,17 @@ impl Controller {
         // than taken from the file alone, or a node that restarted would come back believing
         // the file's map - which, once a range has moved, describes a cluster that no longer
         // exists. Members follow every entry because a configuration change applies when it is
-        // appended; ranges follow only committed ones.
+        // appended; ranges follow only committed ones - and "committed" is a log position, so
+        // the vector's position is offset by the base, or a compacted log would apply a map no
+        // majority had agreed to yet.
         let mut members = config.seed_members();
         {
             let mut map = ranges.write().expect("no panic holds this lock");
             for (i, entry) in raft.log().iter().enumerate() {
+                let index = raft.base() + i as u64;
                 match &entry.decision {
                     Decision::Members(ms) => members = ms.clone(),
-                    Decision::Ranges(m) if i as u64 <= raft.commit_index() => *map = m.clone(),
+                    Decision::Ranges(m) if index <= raft.commit_index() => *map = m.clone(),
                     _ => {}
                 }
             }
@@ -243,7 +276,7 @@ impl Controller {
             this,
             peers: Arc::clone(&peers),
             roster: RwLock::new(None),
-            lease_at: AtomicU64::new(0),
+            lease_at: AtomicU64::new(NEVER),
             started,
             inbox: tx,
             outbox,
@@ -281,8 +314,19 @@ impl Controller {
     /// the new member list stops waiting while the entry is still in flight, and the next
     /// proposal is refused as busy. Nothing is settled until the log is.
     pub fn settled(&self) -> bool {
+        self.raft.lock().expect("no panic holds this lock").settled()
+    }
+
+    /// Whether `node` holds the log to within the margin a leader keeps before compacting.
+    ///
+    /// **What lets a learner become a member.** A node further behind than that would be sent
+    /// a snapshot rather than entries, and counting it towards a majority while it replays one
+    /// would raise the bar for an election it could not help decide. Only a leader tracks what
+    /// its followers hold, so on any other node this is `false` - which is right, because only
+    /// a leader proposes the change this answer gates.
+    pub fn caught_up(&self, node: NodeId) -> bool {
         let raft = self.raft.lock().expect("no panic holds this lock");
-        raft.commit_index() == raft.last_index()
+        raft.matched(node).is_some_and(|m| m + Raft::KEEP_ENTRIES >= raft.last_index())
     }
 
     /// The map, as last committed.
@@ -337,8 +381,23 @@ impl Controller {
         map.ranges.iter().any(|r| r.group.contains(&self.this) && r.group.len() > 1)
     }
 
+    /// Whether this node may act as the schema leader the map names it as.
+    ///
+    /// **Always fenced.** A range with no copy is never fenced because nothing could take it;
+    /// the schema leader can always be replaced, so it acts only while it has heard from the
+    /// agreement recently enough to know it has not been. The same lease as a range, and the
+    /// same margin against `promote_after` is what makes replacing it safe.
+    pub fn may_lead_schema(&self) -> bool {
+        self.since_lease() < self.leases.serve_for.as_millis() as u64
+    }
+
     fn since_lease(&self) -> u64 {
-        self.now().saturating_sub(self.lease_at.load(Ordering::Relaxed))
+        match self.lease_at.load(Ordering::Relaxed) {
+            // Never in touch is not "in touch a long time ago"; it is further than any lease
+            // reaches, which is what a node that has just started has to assume about itself.
+            NEVER => NEVER,
+            at => self.now().saturating_sub(at),
+        }
     }
 
     /// A message from a peer, on its way to the one thread that decides.
@@ -475,10 +534,24 @@ impl Controller {
     /// already committed - a second proposal while the first is in flight would be a decision
     /// made about a state that has not settled.
     fn promotion(&self, raft: &Raft, now: u64) -> Option<Decision> {
-        if raft.commit_index() != raft.log().len() as u64 - 1 {
+        Self::promotion_for(&self.leases, raft, &self.map(), now).map(Decision::Ranges)
+    }
+
+    /// The rule itself, with nothing of this node's around it.
+    ///
+    /// Public so that it can be run against a simulated agreement - a `Raft` a test has driven
+    /// to a chosen state - without a thread, a socket or a store. The controller only decides
+    /// *when* to ask; what is asked is entirely here.
+    pub fn promotion_for(
+        leases: &Leases,
+        raft: &Raft,
+        current: &RangeMap,
+        now: u64,
+    ) -> Option<RangeMap> {
+        if !raft.settled() {
             return None;
         }
-        let promote_after = self.leases.promote_after.as_millis() as u64;
+        let promote_after = leases.promote_after.as_millis() as u64;
         // A node nobody has heard from *yet* is not a node that has gone: at startup nothing
         // has been heard from anybody, and marking every peer behind before the first
         // heartbeat would mean a cluster that has to be repaired the moment it starts.
@@ -487,7 +560,7 @@ impl Controller {
                 || now.saturating_sub(raft.last_heard(node).unwrap_or(0)) < promote_after
         };
 
-        let mut next = self.map();
+        let mut next = current.clone();
         let mut changed = false;
 
         // Marked behind, and never unmarked here: only a repair knows whether a copy has
@@ -532,18 +605,57 @@ impl Controller {
         // is now serving a range it no longer holds. `GET /verify` is how that is found; the
         // mark is what makes somebody look.
 
+        // **The schema leader, last and slowest.** Silence long enough that the ranges above
+        // have already failed over and the map has settled: moving the namespace copies every
+        // row key of every table, and moving it on a blip would be the most expensive flap
+        // there is. Off unless a lease says how long, which is the operator's switch.
+        //
+        // The successor is chosen the way a range's is - in a fixed order, so two leaders
+        // elected in sequence choose the same node - from the voters that are answering and
+        // not marked behind. Not required to hold a range: after a rebalance a voter may hold
+        // none, and the namespace has nothing to do with ranges. What it is *not* given is
+        // the keys: this decides, and the handover that follows it - run by the agreement's
+        // leader from every survivor - is what makes the successor ready. Until then nobody
+        // interns, which is allowed; two nodes interning is not.
+        //
+        // The deposed node is marked behind whether or not it holds a copy of anything. It
+        // may hold row ids it interned for writes that never landed, which the survivors have
+        // never seen and the successor will hand out again - so it must be repaired, which
+        // will refuse the contradiction loudly, before it is trusted with anything.
+        if let Some(after) = leases.move_schema_after {
+            let after = after.as_millis() as u64;
+            let heard = |node: NodeId| {
+                node == raft.id() || now.saturating_sub(raft.last_heard(node).unwrap_or(0)) < after
+            };
+            let deposed = next.schema_leader;
+            if !heard(deposed) {
+                let members = raft.membership();
+                let successor = (0..members.len())
+                    .find(|&n| members[n].takes_ranges() && live(n) && !next.is_stale(n));
+                if let Some(successor) = successor {
+                    next.schema_leader = successor;
+                    next.schema_ready = false;
+                    if !next.is_stale(deposed) {
+                        next.stale.push(deposed);
+                        next.stale.sort_unstable();
+                    }
+                    changed = true;
+                }
+            }
+        }
+
         if !changed {
             return None;
         }
         // A promotion never reshapes the space, so this cannot fail - but the check is here
         // rather than assumed, because every proposal goes through it and a proposal that
         // skipped it would be the one that got it wrong.
-        if let Err(e) = next.check() {
+        if let Err(e) = next.check_with(raft.membership()) {
             debug_assert!(false, "a promotion produced an invalid map: {e}");
             return None;
         }
         next.epoch += 1;
-        Some(Decision::Ranges(next))
+        Some(next)
     }
 
     /// Proposes a new map, which every node will adopt once a majority has it.
@@ -556,8 +668,10 @@ impl Controller {
     /// committed map that leaves a gap is a record id nobody answers for and there is nothing
     /// downstream that would notice.
     pub fn propose_map(&self, mut next: RangeMap) -> core::result::Result<u64, ProposeError> {
-        next.check().map_err(ProposeError::Invalid)?;
         let mut raft = self.raft.lock().expect("no panic holds this lock");
+        // Against the membership as well as the space: a map naming a schema leader that has
+        // left, or one still catching up, would commit and then nobody would intern.
+        next.check_with(raft.membership()).map_err(ProposeError::Invalid)?;
         if !raft.is_leader() {
             return Err(ProposeError::NotLeader { leader: raft.leader() });
         }

@@ -275,10 +275,15 @@ impl<P: PagerMut + Sync> Cluster<P> {
     fn abandon(&self, id: RangeId, why: ClusterError) -> ClusterError {
         match self.with_map(|m| m.cancel_move(id).map_err(|e| e.to_string())) {
             Ok(_) => why,
-            Err(e) => ClusterError::Refused(format!(
-                "{why} - and the move could not be called off either ({e}), so range {id} is \
-                 still marked as moving. `cluster cancel {id}` clears it"
-            )),
+            Err(e) => {
+                // Counted as well as said: an operator reads the sentence, a background loop
+                // drops it, and the range it names silences every balancing step from here on.
+                self.counters.move_cancel_failed();
+                ClusterError::Refused(format!(
+                    "{why} - and the move could not be called off either ({e}), so range {id} \
+                     is still marked as moving. `cluster cancel {id}` clears it"
+                ))
+            }
         }
     }
 
@@ -345,8 +350,10 @@ impl<P: PagerMut + Sync> Cluster<P> {
     ///
     /// **A learner, not a voter.** A node that has just arrived holds no range and has not
     /// caught up on the log; counting it towards a majority would raise the bar for every
-    /// election while it contributed nothing to one. The balancer promotes it once it has
-    /// something to serve - or an operator does, with `admit`.
+    /// election while it contributed nothing to one. With the balancer on, the agreement's
+    /// leader admits it once it answers for data and holds the log to within the compaction
+    /// margin; otherwise an operator does, with `admit`. Either way it is given nothing to
+    /// serve until it counts.
     pub fn add_node(&self, name: &str, addr: &str) -> Result<()> {
         let mut next = self.members();
         if let Some(existing) = next.iter_mut().find(|m| m.name == name) {
@@ -467,13 +474,16 @@ impl<P: PagerMut + Sync> Cluster<P> {
     /// 1. **The keys go first**, every table's, and they are not scoped to a range - a row key
     ///    has to mean the same number in every shard, so the successor needs the whole mapping
     ///    or it will invent a second id for a string that already has one.
-    /// 2. **The floor goes with them.** A leader hands out record ids from a number held in
-    ///    memory and not yet written anywhere; a successor that started from what is *on disk*
-    ///    would hand out ids the old leader has already given away. This is the part that has
-    ///    no second chance - the ids are gone by the time anybody notices.
-    /// 3. **Then the decision commits**, and only then does the successor answer. Until it
-    ///    does, the old leader is still the one interning, which is what keeps the window from
-    ///    being one in which nobody is.
+    /// 2. **The old leader stops.** It is told the epoch the move read and refuses to intern or
+    ///    allocate until the map is past it. The window that opens here is one in which nobody
+    ///    interns, and a write with a new key waits; the window it closes is one in which two
+    ///    nodes do, which no write could ever wait out.
+    /// 3. **The floor goes next.** A leader hands out record ids from a number held in memory
+    ///    and not yet written anywhere; a successor that started from what is *on disk* would
+    ///    hand out ids the old leader has already given away. This is the part that has no
+    ///    second chance - the ids are gone by the time anybody notices - and it is read only
+    ///    once nothing can still be raising it.
+    /// 4. **Then the decision commits**, and only then does the successor answer.
     pub fn move_schema_leader(&self, to: &str) -> Result<()> {
         let target = self.node_named(to)?;
         let source = self.schema_leader();
@@ -489,18 +499,103 @@ impl<P: PagerMut + Sync> Cluster<P> {
             self.push_keys(target, &table.name, keys)?;
         }
 
-        // 2. The floor: one past the highest id the old leader has handed out, whether or not
-        // it has landed. Taken *after* the keys, so nothing allocated during the copy is
-        // missed.
+        // 2. The old leader stops. From here until the decision lands nobody interns, which
+        // is the gap this move is allowed to have; the one it is not allowed to have is two
+        // nodes interning at once, and a source still answering while its floor is read - or
+        // after, to a coordinator holding the map from before the move - is exactly that. A
+        // source that cannot be told stops the move: refused, not raced.
+        let epoch = self.map().epoch;
+        self.step_down(source, epoch)?;
+
+        // 3. The floor: one past the highest id the old leader has handed out, whether or not
+        // it has landed. Taken *after* the keys and *after* the source stopped, so it is a
+        // number nothing is still adding to.
         let floors = self.allocation_floors(source)?;
         self.seed_floors(target, &floors)?;
 
-        // 3. The decision.
+        // 4. The decision. Ready at once: the keys and the floor went across above, by hand,
+        // which is the whole of what a successor has to take over.
         self.with_map(|m| {
             m.schema_leader = target;
+            m.schema_ready = true;
             Ok(())
         })
         .map(|_| ())
+    }
+
+    /// Finishes a handover the agreement decided: gives the successor every row key the
+    /// survivors hold, then marks it ready.
+    ///
+    /// **Run by the agreement's leader, from every node it can reach.** The old leader is not
+    /// among them - that is why there is a handover - so the mapping is rebuilt from the
+    /// copies every owner took when it was told what a key meant. A key the old leader
+    /// interned for a write that never landed anywhere is the one thing this cannot recover;
+    /// the successor will hand that row id to a different string, and the deposed node, if
+    /// it ever comes back, will refuse the contradiction when it is repaired. That is the
+    /// residual risk of an automatic failover, and it is stated in `docs/clustering.md`
+    /// rather than hidden.
+    ///
+    /// **A contradiction among the survivors stops it.** Two live nodes disagreeing about
+    /// what a row id means is a cluster that has already diverged; marking the successor
+    /// ready would let it pick one side and write on it. Nothing interns until somebody
+    /// looks, and `big_cluster_schema_handover_blocked` is what makes them.
+    pub fn finish_schema_handover(&self) -> Result<Option<String>> {
+        let map = self.map();
+        if map.schema_ready {
+            return Ok(None);
+        }
+        let successor = map.schema_leader;
+        let this = self.config.this_index();
+        let outcome = self.hand_over_to(successor, this);
+        self.handover_blocked.store(
+            matches!(&outcome, Err(e) if !e.is_unreachable()),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        outcome?;
+        self.with_map(|m| {
+            if m.schema_leader != successor {
+                return Err("the namespace moved again while it was being handed over".into());
+            }
+            m.schema_ready = true;
+            Ok(())
+        })?;
+        Ok(Some(self.name_of_agreed(successor)))
+    }
+
+    /// Every row key every reachable member holds, pushed to `successor`.
+    fn hand_over_to(&self, successor: usize, this: usize) -> Result<()> {
+        // The successor's schema has to exist first, or a key naming a field it has never
+        // heard of has nowhere to land. Every node carries the same schema - DDL fans out -
+        // so this node's is as good as any.
+        self.match_schema(this, successor)?;
+        let tables = self.pull_schema(this)?.0;
+        for (i, member) in self.members().iter().enumerate() {
+            if !member.reachable() || i == successor {
+                continue;
+            }
+            for table in &tables {
+                let keys = match self.pull_keys(i, &table.name) {
+                    Ok(keys) => keys,
+                    // A survivor that is not answering right now contributes nothing, and
+                    // that is not a contradiction: the next pass will ask it again.
+                    Err(e) if e.is_unreachable() => continue,
+                    Err(e) => return Err(e),
+                };
+                if !keys.is_empty() {
+                    self.push_keys(successor, &table.name, keys)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Tells a node to stop leading the schema until the map has moved past `epoch`.
+    fn step_down(&self, node: usize, epoch: u64) -> Result<()> {
+        if node == self.config.this_index() {
+            self.stand_down_schema(epoch);
+            return Ok(());
+        }
+        self.ask(node, path::SCHEMA_STEP_DOWN, &wire::put_u64_body(epoch), None).map(|_| ())
     }
 
     /// One past the highest record id a node has handed out for each table, landed or not.
@@ -515,16 +610,72 @@ impl<P: PagerMut + Sync> Cluster<P> {
     /// This node's own floors, which only the schema leader has anything in.
     pub fn floors_here(&self) -> Vec<(String, RecordId)> {
         let allocated = self.allocated.lock().unwrap_or_else(|e| e.into_inner());
+        let map = self.map();
         let mut out: Vec<(String, RecordId)> = Vec::new();
         for table in self.schema() {
-            // The greater of what is on disk and what has been promised. A leader that has
-            // never allocated still has a floor - it is just the data's own high-water mark.
+            // The greatest of what is on disk, what has been promised, and what the agreement
+            // has been told may be promised. A leader that has never allocated still has a
+            // floor - it is just the data's own high-water mark.
             let landed =
                 self.api.max_record(&table.name).ok().flatten().map_or(0, |m| m.saturating_add(1));
             let promised = allocated.get(&table.name).copied().unwrap_or(0);
-            out.push((table.name.clone(), landed.max(promised)));
+            let reserved = map.reserved_for(&table.name);
+            out.push((table.name.clone(), landed.max(promised).max(reserved)));
         }
         out
+    }
+
+    /// Raises the agreement's ceiling on the record ids `table` may be handed, to `upto`.
+    ///
+    /// **Through the agreement's leader, whoever that is.** The schema leader and the
+    /// agreement's leader are two roles that usually sit on two nodes, and only the second can
+    /// propose - so this is one hop when they differ, amortised over a block of ids. Waits
+    /// until this node has applied the result: a ceiling that has been proposed and not landed
+    /// is one a successor could still start below.
+    ///
+    /// A cluster with no agreement has nothing to commit to and nothing to be succeeded by;
+    /// its floor in memory is all there is, and all there needs to be.
+    pub(super) fn reserve_ids(&self, table: &str, upto: RecordId) -> Result<()> {
+        let Some(controller) = &self.controller else { return Ok(()) };
+        if controller.is_leader() {
+            return self.reserve_here(table, upto).map(|_| ());
+        }
+        let Some(leader) = controller.leader() else {
+            return Err(ClusterError::Refused(
+                "no node leads the agreement right now, so no record ids can be reserved; \
+                 try again once an election has finished"
+                    .to_string(),
+            ));
+        };
+        let body = wire::put_floors(&[(table.to_string(), upto)]);
+        self.ask(leader, path::RESERVE, &body, None)?;
+        self.await_reserved(table, upto)
+    }
+
+    /// The agreement leader's half of [`Cluster::reserve_ids`]: commits the ceiling.
+    ///
+    /// Public because the peer route calls it. Answers the epoch it landed at.
+    pub fn reserve_here(&self, table: &str, upto: RecordId) -> Result<u64> {
+        self.with_map(|m| {
+            m.reserve(table, upto);
+            Ok(())
+        })
+    }
+
+    /// Waits until this node's own map carries a ceiling of at least `upto` for `table`.
+    fn await_reserved(&self, table: &str, upto: RecordId) -> Result<()> {
+        let deadline = Instant::now() + PROPOSAL_TIMEOUT;
+        while Instant::now() < deadline {
+            if self.map().reserved_for(table) >= upto {
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        Err(ClusterError::Refused(format!(
+            "the agreement's leader took the reservation but it has not reached this node \
+             after {}s; nothing was handed out",
+            PROPOSAL_TIMEOUT.as_secs()
+        )))
     }
 
     /// Starts a node's floors at least as high as these.
@@ -567,7 +718,8 @@ impl<P: PagerMut + Sync> Cluster<P> {
             .filter_map(|t| self.api.max_record(&t.name).ok().flatten())
             .max()
             .map_or(0, |m| m.saturating_add(1));
-        crate::balance::NodeLoad { pages: Some(pages), frontier }
+        // This node holds its own log, whatever else is true of it.
+        crate::balance::NodeLoad { pages: Some(pages), frontier, caught_up: true }
     }
 
     /// What every node weighs, in member order.
@@ -584,13 +736,21 @@ impl<P: PagerMut + Sync> Cluster<P> {
                 if i == self.config.this_index() {
                     return self.load();
                 }
-                match self.ask(i, path::LOAD, &[], None) {
-                    Err(_) => crate::balance::NodeLoad::default(),
-                    Ok(bytes) => match wire::get_load(&bytes) {
-                        Err(_) => crate::balance::NodeLoad::default(),
-                        Ok((pages, frontier)) => {
-                            crate::balance::NodeLoad { pages: Some(pages), frontier }
-                        }
+                // **A node that does not answer is `None`, not zero** - and it is counted,
+                // because to the balancer it is a node that can neither give nor take, and a
+                // transient timeout and a dead machine would otherwise be the same silence.
+                match self
+                    .ask(i, path::LOAD, &[], None)
+                    .and_then(|b| self.read(i, || wire::get_load(&b)))
+                {
+                    Err(_) => {
+                        self.counters.load_unanswered();
+                        crate::balance::NodeLoad::default()
+                    }
+                    Ok((pages, frontier)) => crate::balance::NodeLoad {
+                        pages: Some(pages),
+                        frontier,
+                        caught_up: self.controller.as_ref().is_some_and(|c| c.caught_up(i)),
                     },
                 }
             })
@@ -603,21 +763,37 @@ impl<P: PagerMut + Sync> Cluster<P> {
     /// move is a moment where a query can fail*. So this never chains two changes, and a
     /// cluster that needs three moves takes three calls - each one against facts gathered
     /// afresh, rather than against a plan made before the first move happened.
-    pub fn rebalance(&self, policy: &crate::balance::Policy) -> Result<Option<String>> {
+    pub fn rebalance(&self, policy: &crate::balance::Policy) -> Result<Option<Balanced>> {
         let (map, members, loads) = (self.map(), self.members(), self.loads());
         let Some(action) = crate::balance::plan(&map, &members, &loads, policy) else {
             return Ok(None);
         };
-        match action {
+        let done = match action {
+            crate::balance::Action::Admit { node } => {
+                self.admit(&node).map(|_| Balanced::Admitted { node })
+            }
             crate::balance::Action::SplitTail { at, to } => {
-                self.split_range(at, Some(&to))?;
-                Ok(Some(format!("split the tail at {at} and gave it to `{to}`")))
+                self.split_range(at, Some(&to)).map(|_| Balanced::SplitTail { at, to })
             }
             crate::balance::Action::Move { range, to } => {
-                let report = self.move_range(range, &to)?;
-                Ok(Some(format!("moved shards {} to `{to}`", report.shards)))
+                self.move_range(range, &to).map(Balanced::Moved)
             }
+        };
+        // Counted here rather than by the caller, so the operator's one step and the steward's
+        // many are one number - and so that a move whose source could not let go is a number
+        // at all, which as a field on a report handed to a loop it was not.
+        match &done {
+            Ok(Balanced::Admitted { .. }) => self.counters.balance_admit(),
+            Ok(Balanced::SplitTail { .. }) => self.counters.balance_split(),
+            Ok(Balanced::Moved(report)) => {
+                self.counters.balance_move();
+                if !report.dropped {
+                    self.counters.balance_drop_failed();
+                }
+            }
+            Err(_) => self.counters.balance_error(),
         }
+        done.map(Some)
     }
 
     /// What the cluster looks like right now: every range, who holds it, and what is moving.
@@ -629,7 +805,7 @@ impl<P: PagerMut + Sync> Cluster<P> {
         Topology {
             epoch: map.epoch,
             leader: self.controller.as_ref().and_then(|c| c.leader()).and_then(|n| self.name_of(n)),
-            schema_leader: self.name_of(map.schema_leader).unwrap_or_default(),
+            schema_leader: self.name_of_agreed(map.schema_leader),
             members: self
                 .members()
                 .iter()
@@ -678,6 +854,33 @@ pub struct MoveReport {
     /// reads: it costs space and answers nothing wrongly.
     pub dropped: bool,
     pub outcome: String,
+}
+
+/// What one balancing step did.
+///
+/// A value rather than a sentence, so that the caller who wants the sentence gets the same one
+/// it always got and the caller who wants to count gets something to count. The move carries
+/// its whole report: `dropped` in particular is a fact a background loop must not lose.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Balanced {
+    /// A learner that had caught up was made a full member.
+    Admitted { node: String },
+    /// The tail was cut above everything written and the empty half given to a node with
+    /// nothing. No bytes moved.
+    SplitTail { at: big_engine::ShardId, to: String },
+    /// A populated range was handed to another node.
+    Moved(MoveReport),
+}
+
+impl Balanced {
+    /// The sentence `POST /admin/cluster/rebalance` has always answered with.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Admitted { node } => format!("admitted `{node}` as a full member"),
+            Self::SplitTail { at, to } => format!("split the tail at {at} and gave it to `{to}`"),
+            Self::Moved(r) => format!("moved shards {} to `{}`", r.shards, r.to),
+        }
+    }
 }
 
 /// The cluster's shape, as a report.

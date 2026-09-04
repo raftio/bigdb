@@ -124,6 +124,23 @@ pub struct RangeMap {
     /// The node that owns the row-key namespace. In the map rather than the file because
     /// draining the node holding it has to be able to move it.
     pub schema_leader: NodeId,
+    /// One past the highest record id the schema leader has been given leave to hand out, per
+    /// table. Sorted by table, so that two leaders building the same map build the same bytes.
+    ///
+    /// **The durable half of the allocation floor.** A leader hands out ids from a number in
+    /// its memory; a successor that started from what is on disk would hand out ids the old
+    /// leader had already promised to a write that had not landed - the one failure with no
+    /// second chance. So a leader commits a ceiling here before it hands out anything under
+    /// it, in blocks, and a successor starts at the ceiling. What a dead leader promised is
+    /// below it by construction.
+    pub reserved: Vec<(String, u64)>,
+    /// Whether the schema leader has finished taking the namespace over.
+    ///
+    /// `false` from the moment leadership moves until the successor has reconciled every row
+    /// key it could reach. While it is false nobody interns - not the old leader, which has
+    /// been deposed, and not the new one, which does not yet hold the mapping. A write with a
+    /// new key waits, which is allowed; two nodes interning at once is not.
+    pub schema_ready: bool,
 }
 
 /// Why a proposed map was refused.
@@ -134,15 +151,44 @@ pub struct RangeMap {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum MapError {
     Empty,
-    NotStartingAtZero { start: ShardId },
-    Unordered { at: usize },
-    Overlap { from: ShardId, to: ShardId },
-    Gap { from: ShardId, to: ShardId },
-    NotTotal { from: ShardId },
-    EmptyGroup { id: RangeId },
-    PrimaryNotInGroup { id: RangeId, primary: NodeId },
-    DuplicateId { id: RangeId },
-    NoSuchRange { id: RangeId },
+    NotStartingAtZero {
+        start: ShardId,
+    },
+    Unordered {
+        at: usize,
+    },
+    Overlap {
+        from: ShardId,
+        to: ShardId,
+    },
+    Gap {
+        from: ShardId,
+        to: ShardId,
+    },
+    NotTotal {
+        from: ShardId,
+    },
+    EmptyGroup {
+        id: RangeId,
+    },
+    PrimaryNotInGroup {
+        id: RangeId,
+        primary: NodeId,
+    },
+    DuplicateId {
+        id: RangeId,
+    },
+    NoSuchRange {
+        id: RangeId,
+    },
+    /// The schema leader names a node the cluster does not have, or one that has left.
+    SchemaLeaderNotAMember {
+        node: NodeId,
+    },
+    /// The schema leader names a node still catching up on the log.
+    SchemaLeaderIsALearner {
+        node: NodeId,
+    },
 }
 
 impl core::fmt::Display for MapError {
@@ -169,11 +215,58 @@ impl core::fmt::Display for MapError {
             }
             Self::DuplicateId { id } => write!(f, "two ranges are both called {id}"),
             Self::NoSuchRange { id } => write!(f, "there is no range {id}"),
+            Self::SchemaLeaderNotAMember { node } => write!(
+                f,
+                "the schema leader is node {node}, which is not in the cluster; nobody would \
+                 assign row ids"
+            ),
+            Self::SchemaLeaderIsALearner { node } => write!(
+                f,
+                "the schema leader is node {node}, which is still catching up on the log and \
+                 cannot be trusted with the row-key namespace yet"
+            ),
         }
     }
 }
 
 impl RangeMap {
+    /// One past the highest record id the schema leader may hand out for `table` without
+    /// asking the agreement first. Zero for a table nothing has been reserved for.
+    pub fn reserved_for(&self, table: &str) -> u64 {
+        self.reserved.iter().find(|(t, _)| t == table).map_or(0, |(_, upto)| *upto)
+    }
+
+    /// Raises the reservation for `table` to `upto`, never lowering it.
+    ///
+    /// Never lowering is what makes it safe to apply twice, and what makes a block that was
+    /// reserved and never used harmless: a reservation is a promise about ids that *may* have
+    /// been handed out, and the higher of two promises keeps both.
+    pub fn reserve(&mut self, table: &str, upto: u64) {
+        match self.reserved.binary_search_by(|(t, _)| t.as_str().cmp(table)) {
+            Ok(i) => self.reserved[i].1 = self.reserved[i].1.max(upto),
+            Err(i) => self.reserved.insert(i, (table.to_string(), upto)),
+        }
+    }
+
+    /// [`RangeMap::check`], and then whether the schema leader is a node that can hold the
+    /// namespace: a member that has not left, and not a learner.
+    ///
+    /// A second entry point because the map alone cannot tell: `schema_leader` is an index
+    /// into a membership the map does not carry. Every proposal goes through this one;
+    /// `check` is what a map can say about itself.
+    pub fn check_with(&self, members: &[Member]) -> core::result::Result<(), MapError> {
+        self.check()?;
+        let node = self.schema_leader;
+        match members.get(node) {
+            Some(m) if !m.reachable() => Err(MapError::SchemaLeaderNotAMember { node }),
+            Some(m) if matches!(m.state, MemberState::Learner) => {
+                Err(MapError::SchemaLeaderIsALearner { node })
+            }
+            Some(_) => Ok(()),
+            None => Err(MapError::SchemaLeaderNotAMember { node }),
+        }
+    }
+
     /// Whether this map covers the shard space exactly once, and every range is held.
     ///
     /// **Checked on every proposal rather than only at startup.** A file was read once and
@@ -821,6 +914,11 @@ impl Raft {
         if !state.log.is_empty() {
             self.log = state.log;
         }
+        // The seed a snapshot handed over outranks the file's: empty is a file from before it
+        // was written down, and those nodes fell back to the file, which this still does.
+        if !state.seed.is_empty() {
+            self.seed = state.seed;
+        }
         // **Before the commit index is used**, because who is in the cluster is a property of
         // the log this node came back holding - not of the file it was first started with,
         // which may describe a cluster that no longer exists.
@@ -842,6 +940,7 @@ impl Raft {
             commit: self.commit,
             base: self.base,
             log: self.log.clone(),
+            seed: self.seed.clone(),
         }
     }
 
@@ -907,6 +1006,23 @@ impl Raft {
             .unwrap_or(0)
             .min(self.applied);
         let target = safe.saturating_sub(keep);
+        // **Never past the newest map or the newest membership.** The state machine is rebuilt
+        // by replaying the log, so the entry that last decided each has to stay in it. A
+        // follower handed a snapshot folds the state into `log[0]`; this is the leader's
+        // equivalent, and it costs at most two entries, for ever. Without it a leader that had
+        // compacted past its last decision came back from a restart with the file's map and
+        // the file's members - a cluster that, once anything had moved or joined, was gone.
+        let anchor = |want: fn(&Decision) -> bool| {
+            self.log.iter().rposition(|e| want(&e.decision)).map(|at| self.base + at as Index)
+        };
+        let keep_from = [
+            anchor(|d| matches!(d, Decision::Ranges(_))),
+            anchor(|d| matches!(d, Decision::Members(_))),
+        ]
+        .into_iter()
+        .flatten()
+        .min();
+        let target = keep_from.map_or(target, |k| target.min(k));
         if target <= self.base {
             return;
         }
@@ -989,8 +1105,24 @@ impl Raft {
         self.heard.get(&node).copied()
     }
 
+    /// The highest index this node knows `node` has stored. **Leader's knowledge**: a follower
+    /// tracks nobody, so this is `None` everywhere but on the node that sends the appends.
+    pub fn matched(&self, node: NodeId) -> Option<Index> {
+        self.matched.get(&node).copied()
+    }
+
     pub fn last_index(&self) -> Index {
         self.base + self.log.len() as Index - 1
+    }
+
+    /// Whether everything this node holds has been committed - the log has settled.
+    ///
+    /// Both sides are log positions. `commit` is one already; the last index is
+    /// `base + len - 1`, and the base is the part that was forgotten once, in a guard that
+    /// compared `commit` with the vector's length and refused every promotion after the first
+    /// compaction.
+    pub fn settled(&self) -> bool {
+        self.commit == self.last_index()
     }
 
     fn last_term(&self) -> Term {
@@ -1484,6 +1616,14 @@ pub struct State {
     /// The index of `log[0]`. Zero until something has been compacted away.
     pub base: Index,
     pub log: Vec<Entry>,
+    /// The cluster this node was started with, before the log said otherwise.
+    ///
+    /// Written down because a snapshot replaces it: a follower handed the state by its leader
+    /// takes the members that came with it as its seed, and a restart that forgot them would
+    /// fall back to the file - which, once anybody has joined or left, describes a cluster that
+    /// no longer exists. Empty in a file written before this was recorded, and empty means "the
+    /// file's", which is exactly what those nodes did.
+    pub seed: Vec<Member>,
 }
 
 pub trait Store: Send + Sync {
@@ -1525,7 +1665,12 @@ impl FileStore {
 
 /// Bumped with the shape of the file. A `BIGRAFT1` file has a different header and different
 /// decision tags, and reading one as this format would take a count for a term.
-const MAGIC: &[u8; 8] = b"BIGRAFT2";
+///
+/// `BIGRAFT3` appends the seed membership after the log. A `BIGRAFT2` file is the same bytes
+/// without it, and is still read: a node upgraded in place has a file from before the seed was
+/// recorded, and refusing it would be refusing the vote it already cast.
+const MAGIC: &[u8; 8] = b"BIGRAFT3";
+const PREVIOUS: &[u8; 8] = b"BIGRAFT2";
 
 impl Store for FileStore {
     fn load(&self) -> std::io::Result<Option<State>> {
@@ -1662,9 +1807,20 @@ fn put_range_map(out: &mut Vec<u8>, m: &RangeMap) {
     for n in &m.stale {
         put_u64(out, *n as u64);
     }
+    put_u64(out, m.reserved.len() as u64);
+    for (table, upto) in &m.reserved {
+        put_str(out, table);
+        put_u64(out, *upto);
+    }
+    out.push(m.schema_ready as u8);
 }
 
-fn get_range_map(b: &mut Bytes<'_>) -> core::result::Result<RangeMap, &'static str> {
+/// `reservations` is whether the bytes carry the two fields `BIGRAFT3` added after `stale`. A
+/// `BIGRAFT2` map has neither: nothing was reserved, and its leader was ready.
+fn get_range_map(
+    b: &mut Bytes<'_>,
+    reservations: bool,
+) -> core::result::Result<RangeMap, &'static str> {
     let epoch = b.u64()?;
     let schema_leader = b.u64()? as NodeId;
     let ranges = b.list(|b| {
@@ -1682,7 +1838,12 @@ fn get_range_map(b: &mut Bytes<'_>) -> core::result::Result<RangeMap, &'static s
         Ok(Range { id, shards: ShardRange { start, end }, group, primary, moving })
     })?;
     let stale = b.list(|b| Ok(b.u64()? as NodeId))?;
-    Ok(RangeMap { epoch, ranges, stale, schema_leader })
+    let (reserved, schema_ready) = if reservations {
+        (b.list(|b| Ok((b.str()?, b.u64()?)))?, b.byte()? != 0)
+    } else {
+        (Vec::new(), true)
+    };
+    Ok(RangeMap { epoch, ranges, stale, schema_leader, reserved, schema_ready })
 }
 
 fn put_members(out: &mut Vec<u8>, members: &[Member]) {
@@ -1739,13 +1900,16 @@ fn encode_state(state: &State) -> Vec<u8> {
             }
         }
     }
+    put_members(&mut out, &state.seed);
     out
 }
 
 fn decode_state(bytes: &[u8]) -> core::result::Result<State, &'static str> {
-    if bytes.get(..8) != Some(MAGIC) {
-        return Err("not a raft state file");
-    }
+    let carries_seed = match bytes.get(..8) {
+        Some(m) if m == MAGIC => true,
+        Some(m) if m == PREVIOUS => false,
+        _ => return Err("not a raft state file"),
+    };
     let mut b = Bytes { b: bytes, at: 8 };
     let term = b.u64()?;
     let voted = b.u64()?;
@@ -1756,16 +1920,17 @@ fn decode_state(bytes: &[u8]) -> core::result::Result<State, &'static str> {
         let term = b.u64()?;
         let decision = match b.byte()? {
             0 => Decision::Noop,
-            1 => Decision::Ranges(get_range_map(b)?),
+            1 => Decision::Ranges(get_range_map(b, carries_seed)?),
             2 => Decision::Members(get_members(b)?),
             _ => return Err("unknown decision"),
         };
         Ok(Entry { term, decision })
     })?;
+    let seed = if carries_seed { get_members(&mut b)? } else { Vec::new() };
     if b.at != bytes.len() {
         return Err("bytes after the end");
     }
-    Ok(State { term, voted_for, commit, base, log })
+    Ok(State { term, voted_for, commit, base, log, seed })
 }
 
 /// The members whose agreement counts, by index.

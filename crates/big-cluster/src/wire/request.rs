@@ -183,12 +183,45 @@ impl RecordsRequest {
     }
 }
 
+/// What a request to the schema leader assumed about who leads, so that the receiver can
+/// disagree with it.
+///
+/// The routed envelope's shape, for the one role that is not a range. A coordinator holding a
+/// map one decision old sends its keys to whoever led *then*; a receiver that no longer leads
+/// answers with who does rather than interning anyway, which is the two-interners failure that
+/// hands one string two row ids and nothing downstream can see.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Led {
+    /// The map epoch the sender read the leader from.
+    pub epoch: u64,
+    /// Who the sender believes leads the schema.
+    pub leader: usize,
+}
+
+pub fn put_led(out: &mut Vec<u8>, led: Option<&Led>) {
+    put_bool(out, led.is_some());
+    let Some(led) = led else { return };
+    put_u64(out, led.epoch);
+    put_u64(out, led.leader as u64);
+}
+
+pub fn get_led(r: &mut Reader<'_>) -> Result<Option<Led>> {
+    if !r.bool()? {
+        return Ok(None);
+    }
+    let epoch = r.u64()?;
+    let leader = r.u64()? as usize;
+    Ok(Some(Led { epoch, leader }))
+}
+
 /// `POST /internal/intern`: what do these keys mean. Only the schema leader answers.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct InternRequest {
     pub table: String,
     pub field: String,
     pub keys: Vec<String>,
+    /// Who the sender thinks leads. `None` from a caller that made no assumption.
+    pub led: Option<Led>,
 }
 
 impl InternRequest {
@@ -200,6 +233,7 @@ impl InternRequest {
         for k in &self.keys {
             put_str(&mut out, k);
         }
+        put_led(&mut out, self.led.as_ref());
         out
     }
 
@@ -212,8 +246,9 @@ impl InternRequest {
         for _ in 0..n {
             keys.push(r.str()?);
         }
+        let led = get_led(&mut r)?;
         finished(&r)?;
-        Ok(Self { table, field, keys })
+        Ok(Self { table, field, keys, led })
     }
 }
 
@@ -227,6 +262,8 @@ pub struct AllocateRequest {
     pub table: String,
     /// How many consecutive ids the caller needs. A whole statement asks once.
     pub count: u64,
+    /// Who the sender thinks leads. `None` from a caller that made no assumption.
+    pub led: Option<Led>,
 }
 
 impl AllocateRequest {
@@ -234,6 +271,7 @@ impl AllocateRequest {
         let mut out = Vec::new();
         put_str(&mut out, &self.table);
         put_u64(&mut out, self.count);
+        put_led(&mut out, self.led.as_ref());
         out
     }
 
@@ -241,8 +279,9 @@ impl AllocateRequest {
         let mut r = Reader::new(bytes);
         let table = r.str()?;
         let count = r.u64()?;
+        let led = get_led(&mut r)?;
         finished(&r)?;
-        Ok(Self { table, count })
+        Ok(Self { table, count, led })
     }
 }
 

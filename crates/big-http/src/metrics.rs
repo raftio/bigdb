@@ -62,6 +62,11 @@ pub struct ServerMetrics {
     /// clients that got a connection reset instead of a `503`, which is a different support
     /// call from the one a `503` produces.
     connections_shed_unspoken: AtomicU64,
+    /// Pages the steward has given back to the filesystem, and the passes on which it could
+    /// not because a query was in flight. The pair is the whole story: a node whose file never
+    /// shrinks and whose blocked count climbs is a node that is never idle for long enough.
+    pages_reclaimed: AtomicU64,
+    reclaim_blocked: AtomicU64,
     /// Handshakes that never completed: a wrong CA, an expired certificate, a client that hung
     /// up, or plaintext sent to a TLS port.
     tls_handshakes_failed: AtomicU64,
@@ -90,6 +95,17 @@ impl ServerMetrics {
     /// limiting throughput, rather than the engine.
     pub fn connection_rejected(&self) {
         self.connections_rejected.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Trailing free pages handed back to the filesystem.
+    pub fn pages_reclaimed(&self, pages: u64) {
+        self.pages_reclaimed.fetch_add(pages, Ordering::Relaxed);
+    }
+
+    /// A pass that found something to give back and could not, because a read transaction was
+    /// open. An ordinary outcome on a busy node, and only worth looking at as a rate.
+    pub fn reclaim_blocked(&self) {
+        self.reclaim_blocked.fetch_add(1, Ordering::Relaxed);
     }
 
     /// A connection closed without being told it was being shed, because the thread that says so
@@ -165,6 +181,21 @@ impl ServerMetrics {
             "big_http_connections_shed_unspoken_total",
             "Connections closed without a 503, because the thread that answers one was busy.",
             g(&self.connections_shed_unspoken),
+        );
+        counter(
+            &mut out,
+            "big_pages_reclaimed_total",
+            "Trailing free pages given back to the filesystem while serving. Zero on a node \
+             started without --reclaim, where only an offline `big compact` shrinks the file.",
+            g(&self.pages_reclaimed),
+        );
+        counter(
+            &mut out,
+            "big_reclaim_blocked_total",
+            "Passes that found pages to give back and could not, because a query was in \
+             flight. Climbing while big_pages_reclaimed_total stays flat is a node that is \
+             never idle long enough to shrink.",
+            g(&self.reclaim_blocked),
         );
         counter(
             &mut out,
@@ -447,7 +478,7 @@ pub fn render_keys(out: &mut String, k: &big_embed::KeyStats) {
 /// **`big_cluster_copies_behind` is the number to alert on.** It is redundancy this cluster has
 /// lost and will not get back until somebody runs `POST /repair`; everything else here recovers
 /// on its own.
-pub fn render_cluster(out: &mut String, c: &big_cluster::counters::Snapshot) {
+pub fn render_cluster(out: &mut String, c: &big_cluster::counters::Snapshot, balancing: bool) {
     gauge(
         out,
         "big_cluster_nodes",
@@ -459,6 +490,81 @@ pub fn render_cluster(out: &mut String, c: &big_cluster::counters::Snapshot) {
         "big_cluster_copies_behind",
         "Copies the agreement has marked behind. Redundancy lost until a repair is run.",
         c.behind as u64,
+    );
+    // **The second number to alert on.** A move takes seconds; a range that has been moving
+    // for minutes is one the balancer will plan nothing around, cluster-wide, until an
+    // operator runs `POST /admin/cluster/cancel`. Nothing else here says so.
+    gauge(
+        out,
+        "big_cluster_ranges_moving",
+        "Ranges with a move in flight. Nonzero for longer than a move takes means the balancer \
+         is silenced until the move is cancelled or finished.",
+        c.moving as u64,
+    );
+    gauge(
+        out,
+        "big_cluster_schema_ready",
+        "1 when the schema leader holds the row-key namespace. 0 is a handover in progress, \
+         during which no new row key can be assigned.",
+        c.schema_ready as u64,
+    );
+    gauge(
+        out,
+        "big_cluster_schema_handover_blocked",
+        "1 when handing the namespace to an elected successor found two surviving nodes \
+         disagreeing about a row id. Nobody assigns row ids until an operator looks.",
+        c.handover_blocked as u64,
+    );
+    gauge(
+        out,
+        "big_cluster_balancer_enabled",
+        "1 when this node was started with --balance and may reshape the cluster by itself.",
+        balancing as u64,
+    );
+    counter(
+        out,
+        "big_cluster_peer_load_unanswered_total",
+        "Times a peer did not say what it weighs. To the balancer that node is neither a \
+         source nor a destination, so a climbing count is a cluster that will not reshape.",
+        c.counts.load_unanswered,
+    );
+    counter(
+        out,
+        "big_cluster_balance_moves_total",
+        "Ranges the balancer moved.",
+        c.counts.balance_moves,
+    );
+    counter(
+        out,
+        "big_cluster_balance_splits_total",
+        "Tails the balancer cut for a node with nothing.",
+        c.counts.balance_splits,
+    );
+    counter(
+        out,
+        "big_cluster_balance_admits_total",
+        "Learners the balancer made full members once they answered and had caught up.",
+        c.counts.balance_admits,
+    );
+    counter(
+        out,
+        "big_cluster_balance_errors_total",
+        "Balancing steps that failed.",
+        c.counts.balance_errors,
+    );
+    counter(
+        out,
+        "big_cluster_balance_drops_failed_total",
+        "Moves that landed but whose source could not let go of its copy. Space that is not \
+         reclaimed until somebody looks.",
+        c.counts.balance_drops_failed,
+    );
+    counter(
+        out,
+        "big_cluster_move_cancel_failed_total",
+        "Moves that failed and could not be called off either. Each one is a range still \
+         marked moving.",
+        c.counts.move_cancel_failed,
     );
     gauge(
         out,

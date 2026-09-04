@@ -21,7 +21,8 @@
 
 use big_cluster::config::ClusterFile;
 use big_cluster::raft::{
-    MapError, MergeError, Move, MoveError, MoveState, Range, RangeMap, SplitError,
+    MapError, Member, MemberState, MergeError, Move, MoveError, MoveState, Range, RangeMap,
+    SplitError,
 };
 use big_engine::ShardRange;
 use proptest::prelude::*;
@@ -31,7 +32,69 @@ fn range(id: u64, start: u64, end: Option<u64>, primary: usize) -> Range {
 }
 
 fn map(ranges: Vec<Range>) -> RangeMap {
-    RangeMap { epoch: 0, ranges, stale: Vec::new(), schema_leader: 0 }
+    RangeMap {
+        epoch: 0,
+        ranges,
+        stale: Vec::new(),
+        schema_leader: 0,
+        reserved: Vec::new(),
+        schema_ready: true,
+    }
+}
+
+// -------------------------------------------------------------------------------------------
+// What the schema leader may hand out
+// -------------------------------------------------------------------------------------------
+
+/// **A reservation only ever rises**, and a table nothing was reserved for is at zero. Rising
+/// only is what makes a reservation safe to apply twice and a block nobody used harmless: it
+/// is a promise about ids that *may* have been handed out, and the higher promise keeps both.
+#[test]
+fn a_reservation_only_ever_rises_and_stays_sorted_by_table() {
+    let mut m = map(vec![range(0, 0, None, 0)]);
+    assert_eq!(m.reserved_for("tx"), 0, "nothing reserved is a ceiling of nothing");
+
+    m.reserve("tx", 65_536);
+    m.reserve("aa", 10);
+    m.reserve("tx", 100);
+    assert_eq!(m.reserved_for("tx"), 65_536, "a lower reservation changes nothing");
+    assert_eq!(m.reserved_for("aa"), 10);
+    let tables: Vec<&str> = m.reserved.iter().map(|(t, _)| t.as_str()).collect();
+    assert_eq!(tables, ["aa", "tx"], "sorted, so two leaders build the same bytes");
+
+    m.reserve("tx", 131_072);
+    assert_eq!(m.reserved_for("tx"), 131_072);
+}
+
+/// **The schema leader has to be a node that can hold the namespace.** The map alone cannot
+/// tell - it holds an index into a membership it does not carry - so every proposal is checked
+/// against both, and a map naming a node that left or one still catching up is refused before
+/// it can commit and leave nobody assigning row ids.
+#[test]
+fn a_schema_leader_that_left_or_is_still_learning_is_refused() {
+    let member = |name: &str, state| Member {
+        name: name.to_string(),
+        addr: format!("10.0.0.1:{}", name.len()),
+        state,
+    };
+    let mut m = map(vec![range(0, 0, None, 0)]);
+    let members = vec![
+        member("a", MemberState::Voter),
+        member("b", MemberState::Learner),
+        member("c", MemberState::Gone),
+    ];
+    assert_eq!(m.check_with(&members), Ok(()), "a voter may lead");
+
+    m.schema_leader = 1;
+    assert_eq!(m.check_with(&members), Err(MapError::SchemaLeaderIsALearner { node: 1 }));
+    m.schema_leader = 2;
+    assert_eq!(m.check_with(&members), Err(MapError::SchemaLeaderNotAMember { node: 2 }));
+    m.schema_leader = 7;
+    assert_eq!(m.check_with(&members), Err(MapError::SchemaLeaderNotAMember { node: 7 }));
+
+    // And the space is still checked first: a gap is a gap whoever leads.
+    let gappy = map(vec![range(0, 0, Some(8), 0), range(1, 16, None, 0)]);
+    assert_eq!(gappy.check_with(&members), Err(MapError::Gap { from: 8, to: 16 }));
 }
 
 // -------------------------------------------------------------------------------------------
