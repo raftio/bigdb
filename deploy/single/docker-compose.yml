@@ -2,17 +2,24 @@
 # a four-machine deployment runs.
 #
 #   cd deploy/single
-#   mkdir -p secrets && printf 'change-me-please admin\n' > secrets/users
+#   mkdir -p secrets && chmod 700 secrets
+#   big passwd secrets/users set ops --role superuser
 #   docker compose up -d
-#   curl -u change-me-please:$PASSWORD localhost:7654/ready
+#   curl -u ops:$PASSWORD localhost:7654/ready
+#
+# The users file is written by `big passwd` and by nothing else - it holds an argon2 hash, which
+# a `printf` into a file cannot produce. `superuser` is the role to start with: every other role
+# is a catalog object made with `CREATE ROLE`, and a users file naming one the catalog does not
+# have yet is a credential that authenticates and may do nothing. See docs/access-control.md.
 
 services:
   big:
     build:
       context: ../..
-    # Published to loopback only. There is no TLS here and there is not going to be - put a
-    # reverse proxy in front of it if this has to be reachable from anywhere else, and see
-    # runbook.md for one that works.
+    # Published to loopback only, which is what makes the plaintext below a decision rather
+    # than an oversight. **TLS is no longer "never":** `big serve` takes `--tls-cert` and
+    # `--tls-key`, so a port reachable from anywhere else either terminates TLS here or behind a
+    # reverse proxy - runbook.md has one that works.
     ports:
       - "127.0.0.1:7654:7654"
     volumes:
@@ -37,6 +44,20 @@ services:
       # should not have to know what the default is to know what they are running.
       - --durability
       - full
+      # **Without this the container starts and exits.** `big serve` refuses a non-loopback bind
+      # in the clear, and a container binds `0.0.0.0` by definition - its loopback is its own, so
+      # there is no address here that would satisfy the check. What makes that safe is the port
+      # above: published to `127.0.0.1`, so the clear-text hop is inside one machine. Put TLS on
+      # this - `--tls-cert` and `--tls-key`, or a proxy in front - before publishing it wider,
+      # and drop this flag when you do.
+      - --insecure-no-tls
+      # Where `POST /admin/backup` may write. **This is the only way to back up a running node**:
+      # `big backup` needs the exclusive lock the daemon is holding, so it is for a file nothing
+      # has open. The directory is the volume itself, which exists and is writable by the
+      # daemon's user without any setup; a backup that stays here is not a backup, so copy it off
+      # - see deploy/readme.md.
+      - --backup-dir
+      - /data
     restart: unless-stopped
     # No memory limit here, and that is a decision rather than an omission. Reads come out of
     # the mapping, so most of what this process appears to use is page cache the kernel will

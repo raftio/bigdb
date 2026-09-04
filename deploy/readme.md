@@ -18,10 +18,14 @@ directories differ in is a config file and how many containers there are.
 ```sh
 cd single
 mkdir -p secrets && chmod 700 secrets
-printf 'change-me-please\n' | big passwd secrets/users set ops --role admin
+printf 'change-me-please\n' | big passwd secrets/users set ops --role superuser
 docker compose up -d
 curl -u ops:change-me-please localhost:7654/ready
 ```
+
+`superuser` and not `admin`: see [Who may do what](#who-may-do-what) below. A users file that
+names a role the catalog does not have is a credential that authenticates and may do nothing,
+which is what `--role admin` writes on a fresh database.
 
 ## Three nodes
 
@@ -30,20 +34,52 @@ cd cluster
 ./users.sh                       # writes secrets/users and prints the passwords it generated
 ./certs.sh                       # writes secrets/peer-ca.pem and one certificate per node
 docker compose up -d
-curl -u ops:$PASSWORD localhost:7654/ready
+
+# **HTTPS, not HTTP.** Each node serves its port with the certificate `certs.sh` issued it -
+# that is the same listener its peers dial, so there is no way for one to be TLS and the other
+# not. The certificate names the node (`DNS:a`), so from the host either skip the check or
+# resolve the name to loopback.
+curl -k https://localhost:7654/ready
 # {"status":"ready",...,"node":"a","shards":"0..64","serving":true,"term":1,"leader":"a","behind":[]}
-curl -u ops:$PASSWORD localhost:7654/verify
+curl -k -u ops:$PASSWORD https://localhost:7654/verify
+# {"agree":true,"ranges":[{"shards":"0..64","primary":"a","agree":true,"copies":[...]}, ...]}
+
+# Or without `-k`, checking the certificate against the CA that signed it:
+curl --cacert secrets/peer-ca.pem --resolve a:7654:127.0.0.1 -u ops:$PASSWORD https://a:7654/ready
+
+# The second credential `users.sh` wrote names a role that does not exist yet. Make it:
+ctl() { docker compose exec -e BIG_ADDR=https://a:7654 a bigctl --ca-file /run/big/peer-ca.pem --user ops "$@"; }
+ctl sql "CREATE ROLE dashboard"
+ctl sql "GRANT OPERATE ON *.* TO dashboard"
 ```
+
+`bigctl` is in the image, which is why the helper above reaches for it there rather than on your
+machine. The address is the node's *name* because that is what its certificate says, and
+`--ca-file` is the CA the entrypoint staged inside the container. `--user` asks for the password
+on the terminal, which is what you want at one; a script wants `BIG_CREDENTIALS=<file>` or
+`--credentials-file <file>`, one `user:password` line at mode 600, because a password given as an
+argument is visible in `ps`. `serving: true` with a
+`leader` is the line that says the three of them found each other; `serving: false` with
+`leader: null` and a term that keeps climbing is the shape of a peer handshake that is failing.
 
 Only `a` is published. Any node answers any request - the one that receives it plans the query
 and fans it out - so publishing three ports would suggest a client has to choose, and it does
 not.
 
-## Four things worth knowing before you run either
+## Five things worth knowing before you run either
 
 **`big serve` refuses to bind anywhere but loopback without a users file**, and a container's
 loopback is its own, so both compose files mount one. That refusal is the reason these examples
 have credentials in them at all; it is not decoration.
+
+**It refuses a non-loopback bind in the clear as well**, which is a second decision with a second
+flag, and the one most likely to be met as a container that starts and exits two lines later - a
+container binds `0.0.0.0`, so no address here satisfies the check by being local enough. **The two
+deployments answer it differently, and the difference is not cosmetic.** `single/` passes
+`--insecure-no-tls`, which is earned by the published port being `127.0.0.1` on the host: the
+plaintext hop never leaves the machine. `cluster/` cannot take that answer, because the port a
+person connects to is the same port the *peers* connect to - so every node gets `--tls-cert` and
+`--tls-key`, and the waiver would only break the cluster instead.
 
 **A users file that anyone but its owner can read is refused too**, and a bind mount carries
 whatever ownership and mode the *host* gave it - root-owned `600` on one machine, `0755` on
@@ -69,22 +105,175 @@ need one: a commit writes its pages, fsyncs, flips the meta page and fsyncs agai
 that dies leaves a file that is either before that flip or after it. There is no state in
 between, nothing to replay, and `stop_grace_period` is short on purpose.
 
-## Backups
+## Who may do what
 
-`big` serves the file and backs it up - one binary, two subcommands - so a backup does not have
-to happen somewhere else:
+**Two halves, in two places.** Who you are is a line in the users file on the server's disk,
+written by `big passwd` and read once at startup. What you may do is a set of grants in the
+catalog, written by `GRANT` and read on every statement. A users file cannot hand out a
+privilege, and no route can write a users file - one that could would let an `admin` credential
+rewrite the credential file over the network.
+
+**The `read`/`write`/`admin` ladder is gone.** A role is a name now, made with `CREATE ROLE` and
+given privileges with `GRANT`, and a name the catalog does not have is *no privileges at all* -
+the safe direction, and a silent one. A credential written `--role admin` on a fresh database
+authenticates, reaches `GET /schema`, and is refused everything else.
+
+**`superuser` is the way in.** Reserved by name, never stored, holds everything, cannot be
+created, dropped or granted to. It exists because a grant has to be made by somebody who already
+holds the privilege to make one, so an empty catalog has nobody who could write the first one.
+Give it to `ops` and to nothing else.
 
 ```sh
-# A consistent copy, taken while the daemon is running. `cp` is NOT safe - a commit can land
-# between the bytes it has already read and the ones it has not.
-docker compose exec big big backup /data/big.db /data/big.db.backup
-
-# And off the machine, because a backup on the same disk is not a backup.
-docker compose cp big:/data/big.db.backup ./big-$(date +%F).db
+bigctl --user ops sql "CREATE ROLE analyst"
+bigctl --user ops sql "GRANT SELECT ON sales.* TO analyst"
+big passwd secrets/users set alice --role analyst    # then restart this node
 ```
 
-In a cluster this is **per node**: each holds its own range, and a copy of one node is a copy
-of one range. `docker compose exec b big backup ...` for each service.
+The last line is the trap: the users file is read **once, at startup**, so changing which role
+somebody holds waits for a restart. Grants themselves are live - a `GRANT` or a `REVOKE` applies
+to the next statement, cluster-wide - and a role created *after* a users file already names it
+needs no restart either, which is why `users.sh` writes the name first and creates the role after.
+
+**The operational routes are one server-wide privilege**, not a role that also happened to read
+tables: `/metrics`, `/verify`, `/repair`, `/admin/backup` and everything under `/admin/cluster`
+need `OPERATE ON *.*`. `/health` and `/ready` are never authenticated - they have to answer while
+the database is unhealthy, which is exactly when a credential check might not.
+
+docs/access-control.md is the whole of it, including the privilege table and the recovery drill.
+
+## Changing the shape while it runs
+
+**`cluster.toml` says what the cluster was when it started.** Every committed decision after that
+replaces it: a range that split, a range that moved, a node that joined or left. The file is a
+seed, so two nodes of one cluster legitimately hold different ones - and `cluster_id` is what
+they recognise each other by, which is why the file has one and why every node's copy must carry
+the same string.
+
+`bigctl` is in the image, so these run from inside, with the same `ctl` helper the quickstart
+defines:
+
+```sh
+ctl cluster topology
+# node     addr          state  primary   copy    behind
+# a        a:7654        voter  0..64
+# b        b:7654        voter  64..900
+# a-spare  a-spare:7654  voter            0..64
+# d        d:7654        voter  900..
+# bigctl: leader `a`, schema leader `a`, epoch 1
+
+# Scale out. What a fourth node needs is below - certificate, file, service - and then:
+ctl cluster add-node d d:7654   # joins as a learner
+ctl cluster admit d             # makes it a full member
+
+# Give it something to hold: cut the tail above everything written, which moves no bytes...
+ctl cluster split 900 to d
+# ...or hand over a populated range, which does.
+ctl cluster move 2 to d
+
+# Scale in. Draining is not removal: the node still votes and still coordinates, it is just
+# given no new ranges and has its own taken away. Removing one that still holds a range is
+# refused.
+ctl cluster drain b
+ctl cluster remove b
+```
+
+One row per node, because a node is what both halves of that answer are about: `primary` is what
+it answers for, `copy` is what it holds against a failover, and a node with both columns empty is
+a learner that has joined and been given nothing yet. `--format json` hands over the whole
+document unchanged, which is what a script wants.
+
+**A node joins as a learner** - it replicates the log, holds no range and does not vote - so
+nothing reads from it while it catches up and it does not raise the bar for an election it could
+not help decide. `admit` is the step that makes it count.
+
+### What a joining node needs first
+
+Three things, and the second is the one that is not obvious.
+
+**A certificate from the CA the cluster already trusts.** Re-running `./certs.sh` would mint a new
+CA and lock out the three nodes that are talking, so it takes a name instead and signs one more
+against the CA that is there:
+
+```sh
+./certs.sh d          # writes secrets/d.pem and secrets/d.key, touching nothing else
+```
+
+**A `cluster.toml` that names the whole cluster, not just itself.** The agreement replaces what
+the file says about *ranges* the moment this node hears it - but the roster its listener starts
+with, the names a peer certificate is allowed to claim, comes from the file. A node whose file
+names only itself refuses every peer that dials it with `a client certificate that names no node
+in the cluster file`, and since it has no peers of its own to dial, it never hears the agreement
+that would fix the roster. It sits there healthy and alone. So copy the cluster's file and append
+the new node - as a `replica` of an existing primary, which is the shape that parses without
+overlapping anybody's range and is a seed the agreement overwrites within the second:
+
+```toml
+cluster_id    = "big-demo"     # the same string, or the cluster does not recognise it
+schema_leader = "a"
+peer_ca_file  = "/run/big/peer-ca.pem"
+
+# ... a, b and a-spare exactly as they appear in cluster.toml ...
+
+[[node]]
+name    = "d"
+addr    = "d:7654"
+replica = "b"
+```
+
+**Its own volume and a service in the compose file**, with the same command as the others and
+`--node d`. One volume per node, never a shared one.
+
+Then `add-node`, `admit`, and give it something to hold with `split` or `move`. `cluster topology`
+is how you check it landed, and `verify` is how you check the copies agree afterwards.
+
+**Nothing balances itself unless you ask.** The balancer is off by default, and
+`bigctl cluster rebalance` is one step against facts gathered afresh: a cluster needing three
+moves takes three calls, because each move is a moment where a query can fail. That is the call
+an autoscaler or a Kubernetes controller puts on a timer, and it is the same verb an operator
+runs by hand.
+
+Two of these deserve their own warning. `cluster move` holds the request for as long as the range
+takes to copy and refuses writes *to that range*, retryably, for the last pass only - reads never
+stop. `cluster schema-leader` is the one change that corrupts rather than fails if it is got
+wrong, which is why it copies every row key and every promised record id before it commits.
+
+docs/clustering.md has the shape of all of it.
+
+## Backups
+
+**A running node is backed up over its own port, not with `big backup`.** The subcommand wants the
+exclusive lock the daemon is holding, so `docker compose exec big big backup ...` answers `another
+process holds this file` and writes nothing - it is the tool for a file nothing has open. What
+works against a live node is the route, which both compose files configure with `--backup-dir
+/data`:
+
+```sh
+# A consistent copy, taken while the daemon is serving. `cp` is NOT safe - a commit can land
+# between the bytes it has already read and the ones it has not.
+curl -u ops:$PASSWORD -X POST "localhost:7654/admin/backup?name=big-$(date +%F).db"
+# {"backup":"big-2026-09-04.db","txn_id":41,"pages":8,"bytes":65536}
+
+# And off the machine, because a backup on the same disk is not a backup.
+docker compose cp big:/data/big-$(date +%F).db ./
+```
+
+The name is a file inside the backup directory and cannot name one outside it, and a name that
+already exists is refused rather than overwritten - which is what keeps `name=big.db` from being
+a way to lose the database. One at a time per node.
+
+Without `--backup-dir` the route answers `501 backup_not_configured` and says so; the directory
+is a command-line decision rather than a request one because a request that chose its own path
+could write anywhere the process can.
+
+In a cluster this is **per node**: each holds its own range, and a copy of one node is a copy of
+one range - and the copies are not one snapshot. Only `a` is published, so the other two are
+reached from inside, over their own TLS:
+
+```sh
+docker compose exec b curl -sk -u ops:$PASSWORD -X POST \
+  "https://localhost:7654/admin/backup?name=b-$(date +%F).db"
+docker compose cp b:/data/b-$(date +%F).db ./
+```
 
 Nothing runs this for you. That is a cron entry and a place to put the output, and neither is
 in this repository.
@@ -96,9 +285,19 @@ that is how the nodes authenticate to each other - there is no shared secret bet
 all. A leaked key is one node rather than the whole cluster, which is what the peer token it
 replaced could not offer.
 
-**The published port is plaintext, on loopback.** Both compose files publish to `127.0.0.1`
-because what is in front of the port is the operator's decision and the default should not be
-"the internet". For a port that is reachable from anywhere else, either terminate TLS at a
-reverse proxy - `runbook.md` has a configuration that works, and `--insecure-no-tls` is how you
-tell `big serve` you have done so - or give the published node `--tls-cert` and `--tls-key` of
-its own. `big serve` refuses a non-loopback bind that has neither.
+**One listener, so the client port and the peer port are the same port.** That is the fact the
+cluster's configuration follows from: give a node `--peer-cert` alone and it dials its peers over
+TLS while answering them in the clear, which is a handshake failure on every peer, an election
+that never settles, and `serving: false` on a node whose own logs look fine. So `cluster/` gives
+every node `--tls-cert` and `--tls-key` - the same certificate `certs.sh` issued it, which is why
+that script asks for `serverAuth` and `clientAuth` both - and its published port is HTTPS.
+
+**`single/` has no peers, so it has the other answer.** It publishes to `127.0.0.1` and passes
+`--insecure-no-tls`, because what is in front of the port is the operator's decision and the
+default should not be "the internet".
+
+**That flag is a promise about the port, and publishing it wider breaks the promise.** Two ways
+to keep it: terminate TLS at a reverse proxy - `runbook.md` has a configuration that works, and
+the flag is how you tell `big serve` you have done so - or give the published node `--tls-cert`
+and `--tls-key` of its own and drop the flag entirely. A client then reaches it as
+`bigctl --addr https://host:7654`, because TLS is chosen by the scheme rather than guessed.
