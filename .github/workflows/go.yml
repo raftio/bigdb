@@ -1,0 +1,78 @@
+# The Go client. A file of its own rather than jobs in ci.yml: every job there shares
+# `RUSTFLAGS: -D warnings` and `Swatinem/rust-cache`, and neither applies here.
+
+name: go client
+
+on:
+  push:
+    paths: ["clients/go/**", ".github/workflows/go.yml"]
+  pull_request:
+    paths: ["clients/go/**", ".github/workflows/go.yml"]
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: clients/go
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: "1.25", cache-dependency-path: clients/go/go.mod }
+      - run: make lint
+      - name: staticcheck
+        run: |
+          go install honnef.co/go/tools/cmd/staticcheck@latest
+          staticcheck ./...
+        # Installed here rather than required by the module: staticcheck is a dependency of this
+        # pipeline, not of the library, and `make check` must stay green on a machine without it.
+        working-directory: clients/go
+
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 1.23 is the floor, for iter.Seq2. The other two are what Go itself supports.
+        go: ["1.23", "1.24", "1.25"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: "${{ matrix.go }}", cache-dependency-path: clients/go/go.mod }
+      - run: go test -race -coverprofile=coverage.out ./...
+      - name: coverage gate
+        run: |
+          total=$(go tool cover -func=coverage.out | awk '/^total:/ {print substr($3, 1, length($3)-1)}')
+          echo "coverage ${total}%"
+          awk -v t="$total" 'BEGIN { exit (t+0 >= 80) ? 0 : 1 }' \
+            || { echo "coverage ${total}% is under the 80% gate"; exit 1; }
+
+  no-deps:
+    # The zero-dependency claim, asserted rather than stated. The counterpart of the `deps` job
+    # in ci.yml, and green from the first commit rather than added at the end.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: "1.25", cache-dependency-path: clients/go/go.mod }
+      - run: make deps
+
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-go@v5
+        with: { go-version: "1.25", cache-dependency-path: clients/go/go.mod }
+      - name: build the server
+        run: cargo build --release --bin big
+        working-directory: .
+      - name: integration
+        run: go test -tags integration -count=1 ./...
+        env:
+          BIGDB_BIN: ${{ github.workspace }}/target/release/big
