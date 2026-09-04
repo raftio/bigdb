@@ -135,7 +135,7 @@ impl<P: PagerMut + Sync> Cluster<P> {
     fn await_epoch(&self, epoch: u64) -> Result<()> {
         let deadline = Instant::now() + PROPOSAL_TIMEOUT;
         while Instant::now() < deadline {
-            if self.map().epoch >= epoch {
+            if self.map().epoch >= epoch && self.settled() {
                 return Ok(());
             }
             std::thread::sleep(Duration::from_millis(5));
@@ -287,6 +287,12 @@ impl<P: PagerMut + Sync> Cluster<P> {
         self.with_map(|m| m.cancel_move(id).map_err(|e| e.to_string())).map(|_| ())
     }
 
+    /// Whether everything this node appended has been agreed. `true` with no agreement at all,
+    /// where there is nothing to be in flight.
+    fn settled(&self) -> bool {
+        self.controller.as_ref().is_none_or(|c| c.settled())
+    }
+
     /// Waits until another node has applied the map at `epoch`.
     ///
     /// The map a node is answering from is its own, and it gets there by replication - about a
@@ -431,9 +437,12 @@ impl<P: PagerMut + Sync> Cluster<P> {
         controller
             .propose_members(next.clone())
             .map_err(|e| ClusterError::Refused(e.to_string()))?;
+        // **Settled, not merely visible.** A membership change takes effect when it is
+        // appended, so the new list appears here while the entry is still in flight - and a
+        // caller that stopped there would have its next proposal refused as busy.
         let deadline = Instant::now() + PROPOSAL_TIMEOUT;
         while Instant::now() < deadline {
-            if self.members() == next {
+            if self.members() == next && self.settled() {
                 return Ok(());
             }
             std::thread::sleep(Duration::from_millis(5));

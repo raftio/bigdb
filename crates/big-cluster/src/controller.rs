@@ -274,6 +274,17 @@ impl Controller {
         self.members().iter().filter(|m| m.reachable()).map(|m| m.name.clone()).collect()
     }
 
+    /// Whether everything this node has appended has also been agreed.
+    ///
+    /// **What a caller waits for between two changes.** A membership change takes effect when
+    /// it is *appended* - that is the rule Raft states for one - so a caller watching only for
+    /// the new member list stops waiting while the entry is still in flight, and the next
+    /// proposal is refused as busy. Nothing is settled until the log is.
+    pub fn settled(&self) -> bool {
+        let raft = self.raft.lock().expect("no panic holds this lock");
+        raft.commit_index() == raft.last_index()
+    }
+
     /// The map, as last committed.
     pub fn map(&self) -> RangeMap {
         self.ranges.read().expect("no panic holds this lock").clone()
