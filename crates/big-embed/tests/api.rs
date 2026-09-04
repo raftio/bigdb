@@ -223,3 +223,54 @@ fn paging_and_the_allocator_are_scoped_the_same_way() {
     assert_eq!(api.max_record_in("tx", Some(vec![r(0, Some(2))])).unwrap(), Some(w + 4));
     assert_eq!(api.max_record_in("tx", Some(vec![r(2, Some(5))])).unwrap(), None);
 }
+
+/// A dropped table must not take the tables *after* it with it.
+///
+/// `schema::snapshot` used to walk table ids from zero and stop at the first id the catalog did
+/// not answer for, on the stated grounds that tables are "interned from zero upwards and never
+/// removed". `Catalog::drop_table` removes them, so a drop punches a hole in that sequence and
+/// every table above it became invisible - to `/schema`, and to `/import`, which resolves a name
+/// through the same snapshot. The data stayed readable the whole time, which is what made it
+/// look like a listing quirk rather than a table nobody could write to any more.
+#[test]
+fn dropping_a_table_leaves_the_ones_after_it_in_the_schema() {
+    let api = Api::in_memory().unwrap();
+    for name in ["a", "b", "c"] {
+        api.create_table(name).unwrap();
+        api.create_field(name, "n", FieldKind::Int, 32).unwrap();
+    }
+
+    // The middle one, so the hole is in the middle of the id sequence rather than at its end.
+    assert!(api.drop_table("b").unwrap());
+
+    let names: Vec<String> = api.schema().into_iter().map(|t| t.name).collect();
+    assert_eq!(names, vec!["a".to_string(), "c".to_string()]);
+}
+
+/// And the lowest id is the case that hid every table at once.
+#[test]
+fn dropping_the_first_table_ever_created_does_not_empty_the_schema() {
+    let api = Api::in_memory().unwrap();
+    for name in ["first", "second"] {
+        api.create_table(name).unwrap();
+    }
+    assert!(api.drop_table("first").unwrap());
+
+    let names: Vec<String> = api.schema().into_iter().map(|t| t.name).collect();
+    assert_eq!(names, vec!["second".to_string()]);
+}
+
+/// A table created after a drop is reachable, which is what `/import` needs of the snapshot.
+#[test]
+fn a_table_created_after_a_drop_is_in_the_schema_and_can_be_written() {
+    let api = Api::in_memory().unwrap();
+    api.create_table("gone").unwrap();
+    api.drop_table("gone").unwrap();
+
+    api.create_table("later").unwrap();
+    api.create_field("later", "n", FieldKind::Int, 32).unwrap();
+    assert!(api.schema().iter().any(|t| t.name == "later"));
+
+    api.import("later", &[Fact::Int { field: "n", record: 1, value: 7 }]).unwrap();
+    assert_eq!(api.query("later", "Count(All())").unwrap().as_count(), Some(1));
+}
