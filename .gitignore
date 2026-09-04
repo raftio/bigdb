@@ -41,3 +41,8 @@ clients/python/*.egg-info/
 clients/go/*.test
 clients/go/coverage.out
 clients/go/dist/
+
+# Credentials, wherever somebody puts one. `examples/` tell you to write a `user:password` file
+# to try a demo, and the obvious place to write it is next to the demo - which is inside this
+# repository. One line here is cheaper than a rotated password.
+*.cred

@@ -1,0 +1,107 @@
+# bigdb and the Go example, on a network of their own.
+#
+#   ./run.sh
+#
+# The `big` service is examples/producer's, which is `deploy/single/docker-compose.yml` with the
+# comments removed - read that one for why each argument is there. What this file adds is a Go
+# client instead of a Rust one, and the reason this directory exists: a writer that names its
+# own record ids.
+
+services:
+  big:
+    build:
+      context: ../..
+    # Loopback only. There is no TLS here; see deploy/readme.md before this is reachable from
+    # anywhere else.
+    #
+    # Overridable because `make start` in this repository publishes the same port, and so does
+    # examples/producer. Nothing in run.sh needs it - goex reaches the server over the compose
+    # network - so it is here only so your own `bigctl` can talk to the same daemon.
+    ports:
+      - "127.0.0.1:${BIG_PORT:-7654}:7654"
+    volumes:
+      - data:/data
+    # `configs` rather than the bind mount `deploy/single` uses: a bind mount needs the daemon
+    # to be able to see this directory, which is true for a local daemon and false for a remote
+    # or rootless one - point `docker context` at something over SSH and a mounted secrets
+    # directory arrives empty, with no error anywhere. A config is sent to the daemon, so this
+    # demo runs the same against whatever docker you have.
+    configs:
+      - source: users
+        target: /etc/big/secrets/users
+    command:
+      - /data/big.db
+      - 0.0.0.0:7654
+      - --users
+      - /run/big/users
+      # Passwords over a plaintext socket, which `big serve` refuses to do on a non-loopback
+      # address unless it is told the port really is private. It is, here: the port is published
+      # on 127.0.0.1 and nothing but goex is on this network. Say it out loud rather than
+      # reaching for it - a demo that carried a certificate would be teaching how to make one,
+      # and deploy/readme.md is where that belongs.
+      - --insecure-no-tls
+      - --query-timeout
+      - "30"
+    stop_grace_period: 2s
+
+  goex:
+    build:
+      context: ../..
+      dockerfile: examples/golang-ex/Dockerfile
+    # The image already knows how to answer whether it is up, so waiting is a line of yaml
+    # rather than a poll loop in the script.
+    depends_on:
+      big:
+        condition: service_healthy
+    environment:
+      # One `user:password` line, which is what this name means everywhere - the Go client, the
+      # Rust one and this demo all read it the same way. The file is written below, in the open,
+      # because it is a demo credential for a daemon published on loopback; pretending otherwise
+      # would teach the wrong lesson more effectively than saying so.
+      BIG_CREDENTIALS: /etc/big/demo.cred
+    configs:
+      - source: credential
+        target: /etc/big/demo.cred
+        # `uid`/`gid` as well as `mode`, because this container is not root and a config lands
+        # owned by root by default - so 0400 without them is a file the process cannot read, and
+        # the failure ("permission denied") does not say which of the two things is wrong.
+        uid: "1000"
+        gid: "1000"
+        mode: 0400
+    # Never started by `up`, which is for things that stay up. run.sh reaches it with
+    # `compose run --rm`, and that enables this profile on its own.
+    profiles: ["run"]
+
+volumes:
+  data:
+
+# One user, and it holds `superuser`.
+#
+# Privileges are catalog objects here: `CREATE ROLE` makes a role and `GRANT` gives it something,
+# and `big passwd --help` says the part that matters for this file - a role name the catalog does
+# not have is simply no privileges. So a users file cannot, on its own, describe a user who may
+# write but may not define; the closest a demo can get without a provisioning step is one
+# superuser, which is what this is.
+#
+# `superuser` is not what a deployment should hand an application. `deploy/readme.md` is the one
+# to copy: a role per job, granted what that job needs, and the credential in a file the
+# deployment manages rather than in the yaml.
+#
+# The hash is argon2id and was made by `big passwd`, which is the only thing that writes a users
+# file. The password is the username - `demo-app:demo-app` - which is a thing that is only ever
+# true of a demo.
+#
+# Note the doubled `$$`. Compose interpolates `$name` everywhere in this file, `content:` blocks
+# included, so a hash pasted in raw comes out as `argon2idv=19...` with every field name eaten
+# and the daemon then rejects every password. `$$` is how compose is told to write one `$`.
+# `docker compose config` prints what it will actually send, and is the way to check.
+#
+# The image's entrypoint copies this to mode 600 owned by the daemon's user before `big serve`
+# reads it, because `big serve` refuses a users file anyone else can read.
+configs:
+  users:
+    content: |
+      demo-app superuser $$argon2id$$v=19$$m=19456,t=2,p=1$$RL+iSLibWyI6jGp/iyZLwA$$comMvXe6nfYfTayNwvOysH8mrZafxxHe34kCZd739S4
+  credential:
+    content: |
+      demo-app:demo-app
