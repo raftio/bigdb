@@ -86,11 +86,24 @@ impl Freelist {
     }
 
     /// Merges adjacent runs sharing a `freed_at`. This is where the run-length encoding pays off.
+    ///
+    /// **Ordered by page number, and that is what makes the file able to shrink.** It used to
+    /// be ordered by `freed_at` first, so [`Freelist::alloc`] handed out the oldest generation
+    /// before the lowest page - which is fine for correctness and hopeless for the tail: holes
+    /// near the front of the file stayed holes while writes kept landing at the end, and
+    /// nothing was ever flush against EOF for [`Freelist::trim_tail`] to release. Lowest first,
+    /// and ordinary writes fill from the front until the tail is free.
+    ///
+    /// The reclaim rule is untouched: `alloc` still skips any run newer than the horizon, so
+    /// this changes *which* reusable page is chosen and never whether one is reusable. The
+    /// merge is unaffected too - two runs that meet in page order cannot have another between
+    /// them - and so is the termination argument in `alloc_freelist_pages`, which rests on
+    /// `alloc` taking from the front of a *run* rather than on the order of the runs.
     pub fn compact(&mut self) {
         if self.runs.len() < 2 {
             return;
         }
-        self.runs.sort_unstable();
+        self.runs.sort_unstable_by_key(|r| (r.first, r.freed_at));
         let mut merged: Vec<FreeRun> = Vec::with_capacity(self.runs.len());
         for r in self.runs.drain(..) {
             match merged.last_mut() {
@@ -106,7 +119,11 @@ impl Freelist {
         self.runs = merged;
     }
 
-    /// Takes one reclaimable page. `None` means the file has to grow.
+    /// Takes one reclaimable page, the lowest there is. `None` means the file has to grow.
+    ///
+    /// Lowest because [`Freelist::compact`] leaves the runs in page order, which is what lets
+    /// the tail empty out and the file shrink. From the **front** of the run it picks, which is
+    /// what keeps the entry count non-increasing and `alloc_freelist_pages` terminating.
     pub fn alloc(&mut self, horizon: TxnId) -> Option<Pgno> {
         let idx = self.runs.iter().position(|r| r.freed_at <= horizon)?;
         let run = &mut self.runs[idx];
