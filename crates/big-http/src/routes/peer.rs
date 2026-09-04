@@ -41,6 +41,11 @@ pub(super) fn peer_query<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request) ->
         // it has rather than about the request that arrived.
         timeout: request.timeout_ms.map(Duration::from_millis).or(ctx.query_timeout),
         cancel: ctx.cancel.clone(),
+        // **What this node answers for is what it was asked for**, not what is on its disk. A
+        // node can hold more than one range, and one that has just handed a range away still
+        // holds those fragments until it deletes them. `None` from a peer that predates the
+        // scope would mean everything, which is why the coordinator always sends one.
+        shards: request.shards,
     };
     match ctx.api().execute(&request.plan, &opts) {
         Ok(value) => Response::binary(wire::encode_value(&value)),
@@ -59,7 +64,7 @@ pub(super) fn peer_records<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request) 
     // The coordinator asked for a page and will cut the merge to size itself; a limit that
     // does not fit this machine's `usize` is therefore harmless to clamp.
     let limit = request.limit.try_into().unwrap_or(usize::MAX);
-    match ctx.api().records(&request.table, request.after, limit) {
+    match ctx.api().records_in(&request.table, request.after, limit, request.shards) {
         Ok(ids) => {
             let mut out = Vec::new();
             wire::put_records(&mut out, &ids);
@@ -153,7 +158,7 @@ pub(super) fn peer_next_record<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Reque
         Ok(r) => r,
         Err(e) => return unreadable(&e),
     };
-    match ctx.cluster.local_next_record(&request.table) {
+    match ctx.cluster.local_next_record(&request.table, request.shards) {
         Ok(next) => Response::binary(wire::put_u64_body(next)),
         Err(e) => super::from_cluster(&e),
     }
@@ -176,8 +181,17 @@ pub(super) fn peer_ddl<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request) -> R
 ///
 /// A scan, and deliberately not on any probe's path: nothing calls this except `GET /verify`,
 /// which an operator runs on purpose.
-pub(super) fn peer_digest<P: PagerMut + Sync>(ctx: &Ctx<'_, P>) -> Response {
-    match big_cluster::digest::digest(ctx.api()) {
+pub(super) fn peer_digest<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request) -> Response {
+    // An empty body is a digest of everything, which is what `GET /verify` asked for before a
+    // node could hold two ranges. A body names the range being compared.
+    let shards = match req.body.is_empty() {
+        true => None,
+        false => match wire::get_shards_body(&req.body) {
+            Ok(s) => s,
+            Err(e) => return unreadable(&e),
+        },
+    };
+    match big_cluster::digest::digest_in(ctx.api(), shards) {
         Ok(d) => Response::binary(wire::put_u64_body(d)),
         Err(e) => Response::from_error(&e),
     }

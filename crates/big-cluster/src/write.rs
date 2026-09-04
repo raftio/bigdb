@@ -280,19 +280,36 @@ impl<P: PagerMut + Sync> Cluster<P> {
     /// One shard's work per node - see `big_embed::Api::max_record` - and one round trip per
     /// statement that allocates, rather than per row. Zero for a table nobody has written to.
     pub(super) fn next_record(&self, table: &str) -> Result<RecordId> {
-        let body = wire::TableRequest { table: table.to_string() }.encode();
         let asked = self.candidates(0..self.config.range_count());
-        let answers =
-            self.fan_out_over(&asked, None, path::NEXT_RECORD, &body, wire::get_u64_body, || {
+        let answers = self.fan_out_over(
+            &asked,
+            None,
+            path::NEXT_RECORD,
+            |slot| {
+                wire::TableRequest { table: table.to_string(), shards: self.scope_of_range(slot) }
+                    .encode()
+            },
+            wire::get_u64_body,
+            |slot| {
                 self.guard()?;
-                self.local_next_record(table)
-            })?;
+                self.local_next_record(table, self.scope_of_range(slot))
+            },
+        )?;
         Ok(answers.into_iter().map(|(_, next)| next).max().unwrap_or(0))
     }
 
     /// This node's share of that answer, which the peer route answers with.
-    pub fn local_next_record(&self, table: &str) -> Result<RecordId> {
-        let max = self.api.max_record(table).map_err(ClusterError::Local)?;
+    ///
+    /// Scoped, and that is load bearing. A node that has handed a range away still holds those
+    /// fragments until it deletes them, and a `max` over them would push the allocator past the
+    /// end of the range this node still owns - handing out record ids that belong to somebody
+    /// else. What it answers for is what it was asked for.
+    pub fn local_next_record(
+        &self,
+        table: &str,
+        shards: Option<Vec<big_engine::ShardRange>>,
+    ) -> Result<RecordId> {
+        let max = self.api.max_record_in(table, shards).map_err(ClusterError::Local)?;
         Ok(max.map_or(0, |m| m.saturating_add(1)))
     }
 

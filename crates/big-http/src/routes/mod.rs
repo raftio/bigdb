@@ -506,7 +506,7 @@ pub fn dispatch<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request) -> Answered
         Target::PeerAllocate => peer_allocate(ctx, req),
         Target::PeerNextRecord => peer_next_record(ctx, req),
         Target::PeerDdl => peer_ddl(ctx, req),
-        Target::PeerDigest => peer_digest(ctx),
+        Target::PeerDigest => peer_digest(ctx, req),
         Target::PeerRaft => peer_raft(ctx, req),
         Target::PeerFragments => peer_fragments(ctx, req),
         Target::PeerFragment => peer_fragment(ctx, req),

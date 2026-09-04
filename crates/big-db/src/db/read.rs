@@ -88,6 +88,23 @@ impl<P: PagerMut> Db<P> {
 /// across the fragments it has to visit. Both pagers here qualify; a hypothetical one that did
 /// not would still be usable for writes.
 impl<'db, P: Pager + Sync> DbRead<'db, P> {
+    /// Answers this transaction from a set of shard ranges and no others.
+    ///
+    /// **What makes one node able to hold two ranges.** Every scan reaches a fragment through
+    /// [`crate::Catalog::fragments_of_field`] or `fragments_of_table`, and both consult the
+    /// scope set here - so this is one call rather than a parameter on every enumerator, and a
+    /// scan cannot be written that forgets it.
+    ///
+    /// It is also what keeps a *leftover* honest. A node that has just handed a range to
+    /// somebody else still holds those fragments until it deletes them, and a coordinator that
+    /// asked it only about the ranges it still serves gets the right answer throughout - so
+    /// the answer depends on what the node was asked for rather than on what happens to be on
+    /// its disk.
+    pub fn with_shards(mut self, ranges: Vec<big_engine::ShardRange>) -> Self {
+        self.catalog.restrict_to_shards(ranges);
+        self
+    }
+
     /// Replaces the memory ceilings for this transaction.
     pub fn with_limits(mut self, limits: QueryLimits) -> Self {
         self.limits = limits;

@@ -24,6 +24,7 @@ use big_container::Container;
 use big_db::Matches;
 use big_embed::{GroupAt, Plan, Rows, TimeUnit, Value};
 use big_engine::bitmap::RowSet;
+use big_engine::ShardRange;
 use big_exec::Group;
 use big_plan::CmpOp;
 use proptest::prelude::*;
@@ -162,10 +163,45 @@ fn a_plan_survives_the_wire() {
             field: "amount".to_string(),
         }),
     };
-    let request = wire::QueryRequest { plan: plan.clone(), timeout_ms: Some(250) };
+    let shards = vec![ShardRange { start: 0, end: Some(64) }, ShardRange { start: 900, end: None }];
+    let request = wire::QueryRequest {
+        plan: plan.clone(),
+        timeout_ms: Some(250),
+        shards: Some(shards.clone()),
+    };
     let back = wire::QueryRequest::decode(&request.encode()).unwrap();
     assert_eq!(back.plan, plan);
     assert_eq!(back.timeout_ms, Some(250));
+    assert_eq!(back.shards, Some(shards));
+}
+
+/// **The scope a routed request carries survives, including its absence.**
+///
+/// `None` and `Some(vec![])` are different questions - everything this node holds, against
+/// nothing at all - and a codec that rolled them together would make a node asked about no
+/// shards answer with all of them.
+#[test]
+fn a_shard_scope_survives_including_the_difference_between_none_and_empty() {
+    for scope in [
+        None,
+        Some(vec![]),
+        Some(vec![ShardRange::ALL]),
+        Some(vec![ShardRange { start: 64, end: Some(900) }]),
+    ] {
+        let body = wire::put_shards_body(scope.as_deref());
+        assert_eq!(wire::get_shards_body(&body).unwrap(), scope, "{scope:?}");
+
+        let request = wire::RecordsRequest {
+            table: "tx".to_string(),
+            after: Some(7),
+            limit: 100,
+            shards: scope.clone(),
+        };
+        assert_eq!(wire::RecordsRequest::decode(&request.encode()).unwrap().shards, scope);
+
+        let request = wire::TableRequest { table: "tx".to_string(), shards: scope.clone() };
+        assert_eq!(wire::TableRequest::decode(&request.encode()).unwrap().shards, scope);
+    }
 }
 
 #[test]

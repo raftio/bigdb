@@ -77,21 +77,27 @@ impl<P: PagerMut + Sync> Cluster<P> {
         Err(ClusterError::NotServing { node: node.name.clone(), shards: node.shards.to_string() })
     }
 
-    /// Whether a range can hold a record id after the cursor.
+    /// The shards a range covers.
     ///
     /// A range's index is its configured primary's index - primaries come first, in range
     /// order - so the shards of range `r` are the shards node `r` was given in the file. That
     /// stays true when ownership moves, because a promotion moves who answers and not what
     /// the range is.
+    pub(super) fn shards_of_range(&self, range: usize) -> big_engine::ShardRange {
+        self.config.nodes()[range].shards
+    }
+
+    /// What one slot of a fan-out asks its owner to answer for.
+    ///
+    /// **A list rather than a range**, because a node will hold several before long and the
+    /// wire should not have to change again when it does.
+    pub(super) fn scope_of_range(&self, range: usize) -> Option<Vec<big_engine::ShardRange>> {
+        Some(vec![self.shards_of_range(range)])
+    }
+
+    /// Whether a range can hold a record id after the cursor.
     pub(super) fn may_hold_after(&self, range: usize, after: Option<RecordId>) -> bool {
-        let Some(after) = after else { return true };
-        let range = self.config.nodes()[range].shards;
-        match range.end {
-            // The first record id this node does *not* own. If the cursor has already reached
-            // it, everything here is behind the cursor.
-            Some(end) => end.saturating_mul(big_engine::SHARD_WIDTH) > after.saturating_add(1),
-            None => true,
-        }
+        self.shards_of_range(range).may_hold_after(after)
     }
 
     /// The node each range is read from.

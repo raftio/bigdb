@@ -270,6 +270,34 @@ fn put_count(out: &mut Vec<u8>, n: usize) {
     put_u32(out, n as u32);
 }
 
+/// The shards a request is asking about, or nothing for "everything you hold".
+///
+/// **A routed request says what it is for.** A node can hold more than one range, so a fan-out
+/// that asked it once per range without naming one would have it answer with all of its data
+/// each time - and `Count` would return double with nothing anywhere to contradict it. Sending
+/// the scope makes the answer a property of the question.
+pub fn put_shards(out: &mut Vec<u8>, shards: Option<&[big_engine::ShardRange]>) {
+    put_bool(out, shards.is_some());
+    let Some(shards) = shards else { return };
+    put_count(out, shards.len());
+    for r in shards {
+        put_u64(out, r.start);
+        put_opt_u64(out, r.end);
+    }
+}
+
+pub fn get_shards(r: &mut Reader<'_>) -> Result<Option<Vec<big_engine::ShardRange>>> {
+    if !r.bool()? {
+        return Ok(None);
+    }
+    let n = r.count()?;
+    let mut out = Vec::with_capacity(n.min(1024));
+    for _ in 0..n {
+        out.push(big_engine::ShardRange { start: r.u64()?, end: r.opt_u64()? });
+    }
+    Ok(Some(out))
+}
+
 /// Trailing bytes mean the two sides disagree about the shape of a message.
 ///
 /// Ignoring them would let a version skew read the first half of a message, answer confidently,

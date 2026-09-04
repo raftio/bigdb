@@ -56,5 +56,5 @@ pub mod signed;
 // caller passing an instant cannot work out for itself.
 pub use big_engine::bitmap::field::{day_view, Granularity, RangeOp};
 pub use big_engine::bitmap::{FragmentKey, RowSet};
-pub use big_engine::{RecordId, RowId, ShardId};
+pub use big_engine::{RecordId, RowId, ShardId, ShardRange, SHARD_WIDTH};
 pub use big_pager::Durability;

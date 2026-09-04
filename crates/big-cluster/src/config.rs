@@ -26,37 +26,21 @@
 //! range the operator did not write - `shard = "0..64"` for `shards` is a typo that costs a
 //! silent misconfiguration everywhere else and a startup error here.
 
-use big_engine::{RecordId, ShardId, SHARD_WIDTH};
+use big_engine::{RecordId, ShardId};
 
-/// A half-open range of shard ids, with an open end for "the rest of the space".
+/// A half-open range of shard ids. **Defined in [`big_engine`]**, because a range is also what
+/// a read can be scoped to and the storage layer cannot ask a crate above it what one is.
 ///
-/// The open end is not a convenience. Ownership has to be *total* - every record id a client
-/// can choose has to belong to somebody - and the space is `0..=u64::MAX`, which no half-open
-/// range with a written end can reach. `"64.."` is how the last node says it takes what is
-/// left, and a file whose ranges stop short is refused.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct ShardRange {
-    /// First shard owned.
-    pub start: ShardId,
-    /// One past the last shard owned; `None` runs to the end of the space.
-    pub end: Option<ShardId>,
+/// What lives here is only the part the storage layer has no use for: reading one out of a
+/// cluster file.
+pub use big_engine::ShardRange;
+
+/// Parsing a range as an operator writes it, which is a cluster-file concern and nothing else's.
+trait ParseRange: Sized {
+    fn parse(text: &str) -> Option<Self>;
 }
 
-impl ShardRange {
-    pub fn contains(&self, shard: ShardId) -> bool {
-        shard >= self.start && self.end.is_none_or(|e| shard < e)
-    }
-
-    /// Whether a record id falls in this range, which is the same question one shift earlier.
-    pub fn holds(&self, record: RecordId) -> bool {
-        self.contains(big_engine::shard_of(record))
-    }
-
-    /// The lowest record id this range can hold. What a paging cursor is clamped to.
-    pub fn first_record(&self) -> RecordId {
-        self.start.saturating_mul(SHARD_WIDTH)
-    }
-
+impl ParseRange for ShardRange {
     fn parse(text: &str) -> Option<Self> {
         let (lo, hi) = text.split_once("..")?;
         let start = lo.trim().parse().ok()?;
@@ -68,15 +52,6 @@ impl ShardRange {
             return None;
         }
         Some(Self { start, end })
-    }
-}
-
-impl core::fmt::Display for ShardRange {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self.end {
-            Some(e) => write!(f, "{}..{e}", self.start),
-            None => write!(f, "{}..", self.start),
-        }
     }
 }
 

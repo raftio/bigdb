@@ -118,9 +118,16 @@ use std::time::{Duration, Instant};
 /// adding three. A `4` node reading a `5` message would take that first tag as the top of a row
 /// id - a misread rather than a refusal, which is exactly what a version bump exists to prevent.
 ///
+/// `6` since a routed request says **which shards it is for**. `QueryRequest`, `RecordsRequest`
+/// and `TableRequest` each gained a scope at the end, and `/internal/digest` grew a body that
+/// used to be empty. A node may hold more than one range now, and a `5` node - which answers
+/// every request from everything on its disk - asked twice by a `6` coordinator would return
+/// its data twice, so `Count` would silently double. That is precisely the quiet mistake a
+/// version exists to turn into a refusal.
+///
 /// The retired numbers are **not** reused. A stale peer that somehow got past the handshake
 /// would then misparse rather than fail, which is what `finished` exists to prevent.
-pub const WIRE_VERSION: u32 = 5;
+pub const WIRE_VERSION: u32 = 6;
 
 /// The header carrying [`WIRE_VERSION`].
 pub const WIRE_HEADER: &str = "x-big-wire";
@@ -191,8 +198,12 @@ pub struct Cluster<P: PagerMut> {
 
 impl<P: PagerMut + Sync> Cluster<P> {
     /// A database that is not clustered: one node, every shard, nobody to disagree with.
+    ///
+    /// Infallible where [`Cluster::new`] is not, and provably: a cluster of one is not
+    /// replicated, so no agreement is started and no state file is read.
     pub fn solo(api: Api<P>) -> Self {
         Self::new(api, ClusterConfig::solo("127.0.0.1:7654"), None, Box::new(raft::Forgetful))
+            .expect("a cluster of one starts no agreement, so nothing can fail to load")
     }
 
     /// A node in a configured cluster. `tls` is what this node presents to its peers.
@@ -212,7 +223,7 @@ impl<P: PagerMut + Sync> Cluster<P> {
         config: ClusterConfig,
         tls: Option<Arc<big_tls::ClientTls>>,
         store: Box<dyn raft::Store>,
-    ) -> Self {
+    ) -> std::io::Result<Self> {
         Self::with_timing(api, config, tls, store, raft::Timing::default(), Leases::default())
     }
 
@@ -229,7 +240,7 @@ impl<P: PagerMut + Sync> Cluster<P> {
         store: Box<dyn raft::Store>,
         timing: raft::Timing,
         leases: Leases,
-    ) -> Self {
+    ) -> std::io::Result<Self> {
         let peers = Arc::new(client::HttpPeers::new(
             config.nodes().iter().map(|n| n.name.clone()),
             config.nodes().iter().map(|n| n.addr.clone()),
@@ -252,18 +263,19 @@ impl<P: PagerMut + Sync> Cluster<P> {
         store: Box<dyn raft::Store>,
         timing: raft::Timing,
         leases: Leases,
-    ) -> Self {
-        let controller = config
-            .is_replicated()
-            .then(|| Controller::start(&config, Arc::clone(&peers), store, timing, leases));
-        Self {
+    ) -> std::io::Result<Self> {
+        let controller = match config.is_replicated() {
+            false => None,
+            true => Some(Controller::start(&config, Arc::clone(&peers), store, timing, leases)?),
+        };
+        Ok(Self {
             config,
             api,
             peers,
             controller,
             counters: counters::Counters::new(),
             allocated: Default::default(),
-        }
+        })
     }
 
     /// What an operator can see about this node's place in the cluster.

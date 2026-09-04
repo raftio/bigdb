@@ -30,6 +30,8 @@ pub struct QueryRequest {
     pub plan: Plan,
     /// Milliseconds left of the coordinator's budget; `None` for no budget.
     pub timeout_ms: Option<u64>,
+    /// Which of the receiver's shards this plan is for. See [`crate::wire::put_shards`].
+    pub shards: Option<Vec<big_engine::ShardRange>>,
 }
 
 impl QueryRequest {
@@ -37,12 +39,14 @@ impl QueryRequest {
         let mut out = Vec::new();
         put_plan(&mut out, &self.plan);
         put_opt_u64(&mut out, self.timeout_ms);
+        put_shards(&mut out, self.shards.as_deref());
         out
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         let mut r = Reader::new(bytes);
-        let out = Self { plan: get_plan(&mut r)?, timeout_ms: r.opt_u64()? };
+        let out =
+            Self { plan: get_plan(&mut r)?, timeout_ms: r.opt_u64()?, shards: get_shards(&mut r)? };
         finished(&r)?;
         Ok(out)
     }
@@ -128,6 +132,8 @@ pub struct RecordsRequest {
     pub table: String,
     pub after: Option<RecordId>,
     pub limit: u64,
+    /// Which of the receiver's shards to page. See [`crate::wire::put_shards`].
+    pub shards: Option<Vec<big_engine::ShardRange>>,
 }
 
 impl RecordsRequest {
@@ -136,12 +142,18 @@ impl RecordsRequest {
         put_str(&mut out, &self.table);
         put_opt_u64(&mut out, self.after);
         put_u64(&mut out, self.limit);
+        put_shards(&mut out, self.shards.as_deref());
         out
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         let mut r = Reader::new(bytes);
-        let out = Self { table: r.str()?, after: r.opt_u64()?, limit: r.u64()? };
+        let out = Self {
+            table: r.str()?,
+            after: r.opt_u64()?,
+            limit: r.u64()?,
+            shards: get_shards(&mut r)?,
+        };
         finished(&r)?;
         Ok(out)
     }
@@ -218,20 +230,27 @@ impl AllocateRequest {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct TableRequest {
     pub table: String,
+    /// Which of the receiver's shards to answer for. See [`crate::wire::put_shards`].
+    ///
+    /// It matters most here. `/internal/next-record` is a `max`, so a node still holding
+    /// fragments for a range it has handed away would push every future allocation past the
+    /// end of that range - and a record id allocated there belongs to somebody else.
+    pub shards: Option<Vec<big_engine::ShardRange>>,
 }
 
 impl TableRequest {
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         put_str(&mut out, &self.table);
+        put_shards(&mut out, self.shards.as_deref());
         out
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         let mut r = Reader::new(bytes);
-        let table = r.str()?;
+        let out = Self { table: r.str()?, shards: get_shards(&mut r)? };
         finished(&r)?;
-        Ok(Self { table })
+        Ok(out)
     }
 }
 
@@ -626,4 +645,18 @@ pub fn put_node(node: usize) -> Vec<u8> {
 
 pub fn get_node(bytes: &[u8]) -> Result<usize> {
     get_u64_body(bytes).map(|v| v as usize)
+}
+
+/// A bare shard scope as a body, which is what `/internal/digest` takes.
+pub fn put_shards_body(shards: Option<&[big_engine::ShardRange]>) -> Vec<u8> {
+    let mut out = Vec::new();
+    put_shards(&mut out, shards);
+    out
+}
+
+pub fn get_shards_body(bytes: &[u8]) -> Result<Option<Vec<big_engine::ShardRange>>> {
+    let mut r = Reader::new(bytes);
+    let out = get_shards(&mut r)?;
+    finished(&r)?;
+    Ok(out)
 }

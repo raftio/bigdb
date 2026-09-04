@@ -38,9 +38,19 @@ impl<P: PagerMut + Sync> Cluster<P> {
         for range in 0..self.config.range_count() {
             let copies = self.copies_of_range(range);
             let primary = copies[0];
+            // **Every copy is asked about the same range**, not about everything it holds. Two
+            // nodes that agree perfectly about this range would otherwise produce different
+            // numbers the moment either of them held a second one, and `verify` would report a
+            // disagreement that is not one.
+            let scope_of = self.scope_of_range(range);
             let digests: Vec<CopyDigest> = std::thread::scope(|scope| {
-                let handles: Vec<_> =
-                    copies.iter().map(|&i| (i, scope.spawn(move || self.digest_of(i)))).collect();
+                let handles: Vec<_> = copies
+                    .iter()
+                    .map(|&i| {
+                        let shards = scope_of.clone();
+                        (i, scope.spawn(move || self.digest_in(i, shards)))
+                    })
+                    .collect();
                 handles
                     .into_iter()
                     .map(|(i, h)| {
@@ -75,11 +85,27 @@ impl<P: PagerMut + Sync> Cluster<P> {
         out
     }
 
-    pub(super) fn digest_of(&self, node: usize) -> Result<u64> {
+    /// Whether two copies of one range hold the same facts, right now.
+    ///
+    /// Scoped to the range, so that a node holding a second one - or a leftover it has not yet
+    /// deleted - does not make two copies that agree look as though they do not. Taken after a
+    /// repair as the proof that it worked.
+    pub(super) fn agreed(&self, range: usize, source: usize, target: usize) -> Result<bool> {
+        let shards = self.scope_of_range(range);
+        Ok(self.digest_in(source, shards.clone())? == self.digest_in(target, shards)?)
+    }
+
+    /// One copy's digest over a set of shard ranges. `None` is everything it holds.
+    pub(super) fn digest_in(
+        &self,
+        node: usize,
+        shards: Option<Vec<big_engine::ShardRange>>,
+    ) -> Result<u64> {
         if node == self.config.this_index() {
-            return digest::digest(&self.api).map_err(ClusterError::Local);
+            return digest::digest_in(&self.api, shards).map_err(ClusterError::Local);
         }
-        let bytes = self.ask(node, path::DIGEST, &[], None)?;
+        let body = wire::put_shards_body(shards.as_deref());
+        let bytes = self.ask(node, path::DIGEST, &body, None)?;
         wire::get_u64_body(&bytes)
             .map_err(|why| ClusterError::Wire { node: self.config.nodes()[node].name.clone(), why })
     }
@@ -124,18 +150,47 @@ impl<P: PagerMut + Sync> Cluster<P> {
             }
             let report = match self.catch_up(source, node) {
                 Ok(fragments) => {
-                    let cleared = self.clear_stale(node);
-                    RepairReport {
-                        node: self.config.nodes()[node].name.clone(),
-                        fragments,
-                        outcome: if cleared {
-                            "caught up".to_string()
-                        } else {
-                            // The data moved and the mark did not, so the copy is correct and
-                            // still will not be promoted. Saying so is the difference between
-                            // a repair to run again and a repair to worry about.
-                            "caught up, but the agreement did not record it".to_string()
+                    // **Proved, not assumed.** A fragment is replaced whole, and the copy being
+                    // repaired is still taking writes - it is in the range's group, which is
+                    // exactly why it can be behind by one batch rather than by a database. So a
+                    // write that reached the source after its fragments were listed, and the
+                    // target before they were pushed, is a write this pass overwrote. Clearing
+                    // the mark on the strength of "the copy ran without erroring" would be
+                    // recording that a copy is promotable when it is missing an acknowledged
+                    // write, and nothing downstream would ever contradict it.
+                    //
+                    // Two digests instead. They disagree when a write landed during the pass,
+                    // which is a repair to run again - the honest answer, and cheap to act on.
+                    // They cannot agree while the copy is missing a fact the source holds.
+                    match self.agreed(range, source, node) {
+                        Err(e) => RepairReport {
+                            node: self.config.nodes()[node].name.clone(),
+                            fragments,
+                            outcome: format!("copied, but could not be checked: {e}"),
                         },
+                        Ok(false) => RepairReport {
+                            node: self.config.nodes()[node].name.clone(),
+                            fragments,
+                            outcome: "copied, but the two still disagree - a write probably \
+                                      landed while this ran. The mark stands; run it again"
+                                .to_string(),
+                        },
+                        Ok(true) => {
+                            let cleared = self.clear_stale(node);
+                            RepairReport {
+                                node: self.config.nodes()[node].name.clone(),
+                                fragments,
+                                outcome: if cleared {
+                                    "caught up".to_string()
+                                } else {
+                                    // The data moved and the mark did not, so the copy is
+                                    // correct and still will not be promoted. Saying so is the
+                                    // difference between a repair to run again and a repair to
+                                    // worry about.
+                                    "caught up, but the agreement did not record it".to_string()
+                                },
+                            }
+                        }
                     }
                 }
                 Err(e) => RepairReport {

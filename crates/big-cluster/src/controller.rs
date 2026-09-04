@@ -100,17 +100,23 @@ impl Controller {
     /// `peers` is the same table everything else uses: agreement is traffic like any other,
     /// over the same routes with the same tokens. A trait object so that a test can drive an
     /// election without opening a socket.
+    /// **A state file that cannot be read stops this node**, rather than being ignored. Reading
+    /// it is how a node remembers the vote it already cast, so a node that starts without it
+    /// starts at term 0 with an empty log and is free to vote a second time in a term it has
+    /// already voted in - which is two leaders, the one failure this module exists to prevent.
+    /// A missing file is not that: it is a node that has never voted, and `load` says so with
+    /// `Ok(None)`. Only a file that exists and cannot be decoded lands here.
     pub fn start(
         config: &ClusterConfig,
         peers: Arc<dyn Peers>,
         store: Box<dyn Store>,
         timing: Timing,
         leases: Leases,
-    ) -> Arc<Self> {
+    ) -> std::io::Result<Arc<Self>> {
         let started = Instant::now();
         let members: Vec<NodeId> = (0..config.nodes().len()).collect();
         let mut raft = Raft::new(config.this_index(), members, timing, 0);
-        if let Ok(Some((term, voted_for, log))) = store.load() {
+        if let Some((term, voted_for, log)) = store.load()? {
             raft.restore(term, voted_for, log);
         }
 
@@ -183,7 +189,7 @@ impl Controller {
             .name("big-raft".to_string())
             .spawn(move || driver.run(rx))
             .expect("one driver thread");
-        controller
+        Ok(controller)
     }
 
     /// Which node serves each range, as last committed.

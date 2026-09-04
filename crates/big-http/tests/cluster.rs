@@ -95,7 +95,8 @@ fn start(file: &str, names: &[(&str, SocketAddr)]) {
     LAST_FILE.with(|f| *f.borrow_mut() = file.to_string());
     for (name, addr) in names {
         let config = ClusterFile::parse(file).unwrap().for_node(Some(name), "").unwrap();
-        let cluster = Cluster::new(Api::in_memory().unwrap(), config, None, Box::new(Forgetful));
+        let cluster =
+            Cluster::new(Api::in_memory().unwrap(), config, None, Box::new(Forgetful)).unwrap();
         let server = Server::bind_cluster(cluster, *addr, ServerConfig::default())
             .expect("the port was free");
         std::thread::spawn(move || {
@@ -590,7 +591,8 @@ fn an_unreachable_owner_fails_the_whole_query() {
          [[node]]\nname = \"gone\"\naddr = \"{gone}\"\nshards = \"1..\"\n"
     );
     let config = ClusterFile::parse(&file).unwrap().for_node(Some("a"), "").unwrap();
-    let cluster = Cluster::new(Api::in_memory().unwrap(), config, None, Box::new(Forgetful));
+    let cluster =
+        Cluster::new(Api::in_memory().unwrap(), config, None, Box::new(Forgetful)).unwrap();
     let server = Server::bind_cluster(cluster, a, ServerConfig::default()).unwrap();
     std::thread::spawn(move || {
         let _ = server.serve();
@@ -627,7 +629,7 @@ fn a_new_key_is_refused_when_the_leader_is_unreachable() {
     // The schema exists locally: this test is about the row key, not about the table.
     api.create_table("tx").unwrap();
     api.create_field("tx", "country", big_embed::FieldKind::Set, 0).unwrap();
-    let cluster = Cluster::new(api, config, None, Box::new(Forgetful));
+    let cluster = Cluster::new(api, config, None, Box::new(Forgetful)).unwrap();
     let server = Server::bind_cluster(cluster, b, ServerConfig::default()).unwrap();
     std::thread::spawn(move || {
         let _ = server.serve();
@@ -930,7 +932,8 @@ fn start_with(
         None => Box::new(Forgetful),
     };
     let cluster =
-        Cluster::with_timing(Api::in_memory().unwrap(), config, None, store, timing, leases);
+        Cluster::with_timing(Api::in_memory().unwrap(), config, None, store, timing, leases)
+            .unwrap();
     let server =
         Server::bind_cluster(cluster, addr, ServerConfig::default()).expect("the port was free");
     let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));

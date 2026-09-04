@@ -112,12 +112,26 @@ pub struct QueryOptions {
     /// A name the statement qualified itself is untouched: `sales.orders` in a request against
     /// `ops` means `sales`.
     pub database: Option<String>,
+    /// Which shards this request is asking about. `None` means every shard this node holds,
+    /// which is what a client asking a single-node database wants.
+    ///
+    /// **Set by a coordinator, never by a client.** A node can hold more than one range, and a
+    /// fan-out that asked such a node once per range without saying which one would count its
+    /// data twice - so what a peer answers for is what it was *asked* for, not what happens to
+    /// be on its disk. An empty slice is a node asked about nothing, and answers as such.
+    pub shards: Option<Vec<big_db::ShardRange>>,
 }
 
 impl QueryOptions {
     /// The database an unqualified name in this request means.
     pub fn database(&self) -> &str {
         self.database.as_deref().unwrap_or(big_db::DEFAULT_DATABASE_NAME)
+    }
+
+    /// The same options, restricted to a set of shard ranges.
+    pub fn in_shards(mut self, shards: Option<Vec<big_db::ShardRange>>) -> Self {
+        self.shards = shards;
+        self
     }
 }
 
@@ -139,6 +153,7 @@ pub fn remaining(opts: &QueryOptions, started: Instant) -> QueryOptions {
         timeout: opts.timeout.map(|t| t.saturating_sub(started.elapsed())),
         cancel: opts.cancel.clone(),
         database: opts.database.clone(),
+        shards: opts.shards.clone(),
     }
 }
 
@@ -1231,6 +1246,9 @@ impl<P: PagerMut + Sync> Api<P> {
     /// bug that cannot be seen in a result.
     pub fn execute(&self, plan: &Plan, opts: &QueryOptions) -> Result<Value> {
         let mut read = self.db.read();
+        if let Some(shards) = &opts.shards {
+            read = read.with_shards(shards.clone());
+        }
         if let Some(limits) = opts.limits {
             read = read.with_limits(limits);
         }
@@ -1330,8 +1348,23 @@ impl<P: PagerMut + Sync> Api<P> {
         after: Option<RecordId>,
         limit: usize,
     ) -> Result<Vec<RecordId>> {
+        self.records_in(table, after, limit, None)
+    }
+
+    /// The same, answering only for a set of shard ranges. See [`QueryOptions::shards`].
+    pub fn records_in(
+        &self,
+        table: &str,
+        after: Option<RecordId>,
+        limit: usize,
+        shards: Option<Vec<big_db::ShardRange>>,
+    ) -> Result<Vec<RecordId>> {
         let from = after.map_or(0, |a| a.saturating_add(1));
-        Ok(self.db.read().scan_records(table, from, limit)?)
+        let mut read = self.db.read();
+        if let Some(shards) = shards {
+            read = read.with_shards(shards);
+        }
+        Ok(read.scan_records(table, from, limit)?)
     }
 
     /// The highest record id this node holds for a table, or `None` when it holds none.
@@ -1339,7 +1372,24 @@ impl<P: PagerMut + Sync> Api<P> {
     /// One shard's work rather than the table's - see `DbRead::max_record`. This is what a
     /// record id is allocated above, and in a cluster it is one owner's share of the answer.
     pub fn max_record(&self, table: &str) -> Result<Option<RecordId>> {
-        Ok(self.db.read().max_record(table)?)
+        self.max_record_in(table, None)
+    }
+
+    /// The same, answering only for a set of shard ranges. See [`QueryOptions::shards`].
+    ///
+    /// **What keeps an allocation from being poisoned by a leftover.** The allocator takes the
+    /// highest id anywhere, so a node still holding fragments for a range it has handed away
+    /// would otherwise push every future allocation past the end of that range.
+    pub fn max_record_in(
+        &self,
+        table: &str,
+        shards: Option<Vec<big_db::ShardRange>>,
+    ) -> Result<Option<RecordId>> {
+        let mut read = self.db.read();
+        if let Some(shards) = shards {
+            read = read.with_shards(shards);
+        }
+        Ok(read.max_record(table)?)
     }
 
     /// What a commit currently promises.
