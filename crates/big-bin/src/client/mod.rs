@@ -218,6 +218,19 @@ fn request(command: &Command, input: &mut dyn BufRead) -> Result<Request, String
 
         Command::Verify => Request::new("GET", "/verify".to_string(), String::new()),
         Command::Repair => Request::new("POST", "/repair".to_string(), String::new()),
+        Command::ClusterTopology => {
+            Request::new("GET", "/cluster/topology".to_string(), String::new())
+        }
+        Command::ClusterSplit { at, to } => {
+            let path = match to {
+                Some(node) => format!("/admin/cluster/split?at={at}&to={node}"),
+                None => format!("/admin/cluster/split?at={at}"),
+            };
+            Request::new("POST", path, String::new())
+        }
+        Command::ClusterMerge { range } => {
+            Request::new("POST", format!("/admin/cluster/merge?range={range}"), String::new())
+        }
         Command::Health => Request::new("GET", "/health".to_string(), String::new()),
         Command::Ready => Request::new("GET", "/ready".to_string(), String::new()),
         Command::Metrics => Request {

@@ -20,7 +20,7 @@
 //! it would be a record id no node answers for, with nothing afterwards to notice.
 
 use big_cluster::config::ClusterFile;
-use big_cluster::raft::{MapError, Move, MoveState, Range, RangeMap};
+use big_cluster::raft::{MapError, MergeError, Move, MoveState, Range, RangeMap, SplitError};
 use big_engine::ShardRange;
 use proptest::prelude::*;
 
@@ -220,6 +220,115 @@ proptest! {
             prop_assert!(m.ranges[i].shards.contains(shard), "{} not in range {}", shard, i);
             let owners = m.ranges.iter().filter(|r| r.shards.contains(shard)).count();
             prop_assert_eq!(owners, 1, "{} has {} owners", shard, owners);
+        }
+    }
+}
+
+// -------------------------------------------------------------------------------------------
+// Changing the shape of the space
+// -------------------------------------------------------------------------------------------
+
+/// **The scale-out that moves no bytes.** Cutting the open tail and handing the upper half to
+/// an empty node is the only way to grow a cluster without copying anything - and it works only
+/// because both halves start out exactly where they already were.
+#[test]
+fn a_split_divides_a_range_and_leaves_both_halves_where_they_were() {
+    let mut m = map(vec![range(0, 0, Some(64), 0), range(1, 64, None, 1)]);
+    let id = m.split(900).unwrap();
+
+    assert_eq!(m.check(), Ok(()));
+    assert_eq!(id, 2, "a new name, not a reused one");
+    assert_eq!(m.len(), 3);
+    assert_eq!(m.ranges[1].shards, ShardRange { start: 64, end: Some(900) });
+    assert_eq!(m.ranges[2].shards, ShardRange { start: 900, end: None });
+    // Nothing moved: both halves are still held and served by the node that had them.
+    assert_eq!(m.ranges[2].group, vec![1]);
+    assert_eq!(m.ranges[2].primary, 1);
+}
+
+#[test]
+fn a_split_on_a_boundary_divides_nothing_and_is_refused() {
+    let mut m = map(vec![range(0, 0, Some(64), 0), range(1, 64, None, 1)]);
+    assert_eq!(m.split(64), Err(SplitError::OnABoundary { at: 64 }));
+    assert_eq!(m.split(0), Err(SplitError::OnABoundary { at: 0 }));
+}
+
+#[test]
+fn a_range_being_moved_is_not_cut_underneath_the_move() {
+    let mut m = map(vec![range(0, 0, None, 0)]);
+    m.ranges[0].moving = Some(Move { target: 1, state: MoveState::Seeding });
+    assert_eq!(m.split(64), Err(SplitError::Moving { id: 0 }));
+}
+
+/// Splitting and then assigning is two steps on purpose: the second is a claim about the data,
+/// and the map is not in a position to check it.
+#[test]
+fn assigning_the_upper_half_hands_it_over_without_reshaping_anything() {
+    let mut m = map(vec![range(0, 0, None, 0)]);
+    let id = m.split(900).unwrap();
+    m.assign(id, vec![2]).unwrap();
+
+    assert_eq!(m.check(), Ok(()));
+    assert_eq!(m.ranges[1].primary, 2);
+    assert_eq!(m.served_by(2), vec![1]);
+    assert_eq!(m.served_by(0), vec![0], "the lower half did not move");
+}
+
+#[test]
+fn assigning_to_nobody_is_refused() {
+    let mut m = map(vec![range(0, 0, None, 0)]);
+    assert_eq!(m.assign(0, vec![]), Err(MapError::EmptyGroup { id: 0 }));
+    assert_eq!(m.assign(9, vec![1]), Err(MapError::NoSuchRange { id: 9 }));
+}
+
+#[test]
+fn a_merge_joins_two_ranges_on_one_node_and_keeps_the_lower_name() {
+    let mut m =
+        map(vec![range(0, 0, Some(64), 0), range(1, 64, Some(900), 0), range(2, 900, None, 1)]);
+    m.merge(0).unwrap();
+
+    assert_eq!(m.check(), Ok(()));
+    assert_eq!(m.len(), 2);
+    assert_eq!(m.ranges[0].id, 0, "the lower range's name survives");
+    assert_eq!(m.ranges[0].shards, ShardRange { start: 0, end: Some(900) });
+}
+
+/// **Merging across owners would drop half the records.** It looks like a map operation and is
+/// really a move, so it is refused rather than done quietly.
+#[test]
+fn two_ranges_on_different_nodes_are_not_merged() {
+    let mut m = map(vec![range(0, 0, Some(64), 0), range(1, 64, None, 1)]);
+    assert_eq!(m.merge(0), Err(MergeError::DifferentOwners { id: 0, other: 1 }));
+    assert_eq!(m.merge(1), Err(MergeError::NothingAfter { id: 1 }));
+    assert_eq!(m.merge(9), Err(MergeError::NoSuchRange { id: 9 }));
+}
+
+/// A split followed by a merge at the same point is the map it started from, which is what
+/// makes a balancer that cuts too eagerly recoverable rather than permanent.
+#[test]
+fn a_split_and_a_merge_undo_each_other() {
+    let before = map(vec![range(0, 0, Some(64), 0), range(1, 64, None, 1)]);
+    let mut after = before.clone();
+    let _ = after.split(900).unwrap();
+    after.merge(1).unwrap();
+    assert_eq!(after.ranges, before.ranges);
+}
+
+proptest! {
+    /// **A split never breaks the invariant**, wherever the cut lands. That is the whole reason
+    /// the balancer is allowed to propose one without the operator checking its arithmetic.
+    #[test]
+    fn a_split_anywhere_leaves_the_space_covered_exactly_once(at in 1u64..100_000) {
+        let mut m = map(vec![range(0, 0, Some(64), 0), range(1, 64, None, 1)]);
+        let before = m.len();
+        match m.split(at) {
+            Ok(_) => {
+                prop_assert_eq!(m.check(), Ok(()));
+                prop_assert_eq!(m.len(), before + 1);
+            }
+            // The only refusal is a cut that divides nothing, and it leaves the map alone.
+            Err(SplitError::OnABoundary { .. }) => prop_assert_eq!(m.len(), before),
+            Err(e) => prop_assert!(false, "unexpected {:?}", e),
         }
     }
 }

@@ -93,6 +93,12 @@ pub(super) fn peer_import<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request) -
         .iter()
         .map(|a| big_embed::KeyAssignment { field: &a.field, key: &a.key, row: a.row })
         .collect();
+    // **Before anything lands.** The coordinator says which shards it believed this node owns;
+    // a batch routed by a map that has since changed belongs somewhere else, and writing it
+    // here would be a write no read ever finds.
+    if let Err(e) = ctx.cluster.check_route(request.routed.as_ref()) {
+        return super::from_cluster(&e);
+    }
     let facts: Vec<big_embed::Fact<'_>> = request.facts.iter().map(OwnedFact::as_fact).collect();
     match ctx.api().import_with_keys(&request.table, &keys, &facts) {
         Ok(()) => Response::binary(wire::put_u64_body(facts.len() as u64)),
@@ -108,6 +114,9 @@ pub(super) fn peer_delete<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request) -
         Ok(r) => r,
         Err(e) => return unreadable(&e),
     };
+    if let Err(e) = ctx.cluster.check_route(request.routed.as_ref()) {
+        return super::from_cluster(&e);
+    }
     match ctx.api().delete(&request.table, &request.records) {
         Ok(n) => Response::binary(wire::put_u64_body(n)),
         Err(e) => Response::from_error(&e),
@@ -231,6 +240,55 @@ pub(super) fn peer_raft<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request) -> 
 pub(super) fn repair<P: PagerMut + Sync>(ctx: &Ctx<'_, P>) -> Response {
     match ctx.cluster.repair() {
         Ok(reports) => Response::ok(json::repaired(&reports)),
+        Err(e) => from_cluster(&e),
+    }
+}
+
+// -------------------------------------------------------------------------------------------
+// Reshaping the cluster
+//
+// Three verbs, and all four ways of asking for one - an operator at a terminal, a node joining
+// itself, an autoscaler reading a metric, a controller reacting to a pod - come through them.
+// Nothing here decides *when*; that belongs to whoever is asking.
+// -------------------------------------------------------------------------------------------
+
+/// What the cluster looks like right now.
+pub(super) fn cluster_topology<P: PagerMut + Sync>(ctx: &Ctx<'_, P>) -> Response {
+    Response::ok(json::topology(&ctx.cluster.topology()))
+}
+
+/// `POST /admin/cluster/split?at=<shard>&to=<node>`
+///
+/// **The scale-out that moves no bytes.** Cutting the open tail above everything written so far
+/// and handing the upper half to an empty node costs one entry in the agreement and not one
+/// byte on the wire. `to` is optional: without it the range is merely divided, which is what an
+/// operator does before moving half of it somewhere.
+pub(super) fn cluster_split<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request) -> Response {
+    let Some(at) = req.param("at").and_then(|v| v.parse::<u64>().ok()) else {
+        return Response::failure(
+            400,
+            "bad_request",
+            "split needs ?at=<shard>, the first shard of the new upper range",
+        );
+    };
+    let to = req.param("to").map(|v| v.into_owned());
+    match ctx.cluster.split_range(at, to.as_deref()) {
+        Ok(id) => Response::ok(format!("{{\"range\":{id}}}")),
+        Err(e) => from_cluster(&e),
+    }
+}
+
+/// `POST /admin/cluster/merge?range=<id>` - joins a range to the one after it.
+pub(super) fn cluster_merge<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request) -> Response {
+    let Some(id) = req.param("range").and_then(|v| v.parse::<u64>().ok()) else {
+        return Response::failure(
+            400,
+            "bad_request",
+            "merge needs ?range=<id>, the lower of the two ranges to join",
+        );
+    };
+    match ctx.cluster.merge_range(id) {
+        Ok(()) => Response::ok(format!("{{\"range\":{id}}}")),
         Err(e) => from_cluster(&e),
     }
 }

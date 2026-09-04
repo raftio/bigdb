@@ -66,6 +66,18 @@ pub enum ClusterError {
     /// would say so, which is the one failure a client could never see - so a node that cannot
     /// prove it is still the primary stops being one.
     NotServing { node: String, shards: String },
+    /// An operator asked for something the cluster will not do, and the message says why.
+    ///
+    /// A string rather than a variant per cause: these are read by a person at a terminal, they
+    /// are not branched on, and every one of them names what to do instead.
+    Refused(String),
+    /// **The map moved underneath a routed request.** The coordinator sent these records to
+    /// whoever owned them a decision ago; this node does not own them now.
+    ///
+    /// Retryable, and the retry is the point: the coordinator learns the map it was missing
+    /// and sends the batch to the node that does own them. Without it, a write during a split
+    /// or a move lands on a node no read will ever ask - a loss with nothing to report it.
+    StaleRoute { node: String, wanted: String, epoch: u64, mine: u64 },
     /// **Half applied.** Some nodes took it and some did not.
     ///
     /// There is no transaction across nodes and this is what that costs. Stated as plainly as
@@ -89,12 +101,30 @@ impl ClusterError {
     pub fn status(&self) -> u16 {
         match self {
             Self::Local(_) | Self::Config(_) | Self::Overflow | Self::Partial { .. } => 500,
-            Self::Unreachable { .. } | Self::LeaderUnreachable { .. } | Self::NotServing { .. } => {
-                503
-            }
+            // The request was understood and will not be done. 409 rather than 400: nothing
+            // about it is malformed, and it may well succeed once the cluster is in another
+            // state.
+            Self::Refused(_) => 409,
+            Self::Unreachable { .. }
+            | Self::LeaderUnreachable { .. }
+            | Self::NotServing { .. }
+            | Self::StaleRoute { .. } => 503,
             Self::Peer { status, .. } => *status,
             Self::Wire { .. } | Self::Mismatch { .. } => 502,
             Self::Timeout => 504,
+        }
+    }
+
+    /// Whether this failure is a map that moved underneath a routed request, which is the one
+    /// failure worth trying again unchanged.
+    pub fn is_stale_route(&self) -> bool {
+        match self {
+            Self::StaleRoute { .. } => true,
+            // A refusal travels out of a peer as a status and a code, so the coordinator sees
+            // the peer's verdict rather than the typed error the peer built.
+            Self::Peer { code, .. } => code == "stale_route",
+            Self::Partial { failed, .. } => failed.iter().any(|f| f.contains("stale_route")),
+            _ => false,
         }
     }
 
@@ -106,7 +136,13 @@ impl ClusterError {
     /// A node that has stood down counts as unreachable, because that is exactly what it is
     /// asking to be treated as.
     pub fn is_unreachable(&self) -> bool {
-        matches!(self, Self::Unreachable { .. } | Self::NotServing { .. } | Self::Timeout)
+        matches!(
+            self,
+            Self::Unreachable { .. }
+                | Self::NotServing { .. }
+                | Self::StaleRoute { .. }
+                | Self::Timeout
+        )
     }
 
     /// The stable, machine-readable half. A client that matches on prose breaks when the prose
@@ -123,6 +159,8 @@ impl ClusterError {
             Self::Overflow => "sum_overflow",
             Self::Timeout => "query_timeout",
             Self::NotServing { .. } => "not_serving",
+            Self::Refused(_) => "refused",
+            Self::StaleRoute { .. } => "stale_route",
             Self::Partial { .. } => "partially_applied",
         }
     }
@@ -158,6 +196,13 @@ impl core::fmt::Display for ClusterError {
                 f,
                 "`{node}` holds shards {shards} and has lost touch with the agreement, so it \
                  has stopped answering for them rather than risk a second node answering too"
+            ),
+            Self::Refused(why) => write!(f, "{why}"),
+            Self::StaleRoute { node, wanted, epoch, mine } => write!(
+                f,
+                "`{node}` was sent records for shards {wanted} under map epoch {epoch}, and its \
+                 own map is at {mine}; the range moved. Send it again - a coordinator that \
+                 refreshes its map routes to whoever holds them now"
             ),
             Self::Partial { what, committed, failed } => write!(
                 f,

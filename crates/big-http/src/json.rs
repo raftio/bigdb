@@ -17,7 +17,7 @@
 //! The whole output surface is four shapes, so a serialisation library would be a dependency
 //! carried for one file. Escaping is the part worth getting right, and it is one function.
 
-use big_cluster::{RangeVerdict, RepairReport, WriteOutcome};
+use big_cluster::{RangeVerdict, RepairReport, Topology, WriteOutcome};
 use big_db::RecordId;
 use big_embed::{Datum, Format, GroupAt, GroupKey, ResultSet, TableInfo, TimeUnit};
 use big_exec::{Group, Value};
@@ -453,4 +453,46 @@ pub fn repaired(reports: &[RepairReport]) -> String {
         })
         .collect();
     format!("{{\"repaired\":[{}]}}", items.join(","))
+}
+
+/// What the cluster looks like right now.
+///
+/// **The one surface an autoscaler or a Kubernetes controller reads.** Everything a placement
+/// decision needs is here - which ranges exist, who holds each, what is moving - so nothing
+/// outside has to infer the shape from a config file it was not given.
+pub fn topology(t: &Topology) -> String {
+    let ranges: Vec<String> = t
+        .ranges
+        .iter()
+        .map(|r| {
+            let holders: Vec<String> = r.holders.iter().map(|h| string(h)).collect();
+            let moving = match (&r.moving_to, r.moving_state) {
+                (Some(to), Some(state)) => {
+                    format!(",\"moving_to\":{},\"moving_state\":{}", string(to), string(state))
+                }
+                _ => String::new(),
+            };
+            format!(
+                "{{\"id\":{},\"shards\":{},\"primary\":{},\"holders\":[{}]{}}}",
+                r.id,
+                string(&r.shards),
+                string(&r.primary),
+                holders.join(","),
+                moving
+            )
+        })
+        .collect();
+    let behind: Vec<String> = t.behind.iter().map(|b| string(b)).collect();
+    let leader = match &t.leader {
+        Some(l) => string(l),
+        None => "null".to_string(),
+    };
+    format!(
+        "{{\"epoch\":{},\"leader\":{},\"schema_leader\":{},\"ranges\":[{}],\"behind\":[{}]}}",
+        t.epoch,
+        leader,
+        string(&t.schema_leader),
+        ranges.join(","),
+        behind.join(",")
+    )
 }

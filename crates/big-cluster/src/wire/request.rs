@@ -58,6 +58,23 @@ pub struct ImportRequest {
     pub table: String,
     pub keys: Vec<Assignment>,
     pub facts: Vec<OwnedFact>,
+    /// The shards the coordinator believes the receiver owns, and the map epoch it routed by.
+    ///
+    /// **What makes a map that changed mid-write safe.** A coordinator holding a map one
+    /// decision old would otherwise send a batch to whoever used to own those records, and the
+    /// write would land on a node no read will ever ask. The owner compares and refuses, the
+    /// coordinator learns and retries - which is a retry rather than a silent loss.
+    ///
+    /// `None` from a caller that is not routing, which is every path where this node is the
+    /// only one that could hold the records.
+    pub routed: Option<Routed>,
+}
+
+/// What a request assumed about who owns what, so that the owner can disagree.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Routed {
+    pub epoch: u64,
+    pub shards: Vec<big_engine::ShardRange>,
 }
 
 impl ImportRequest {
@@ -74,6 +91,7 @@ impl ImportRequest {
         for f in &self.facts {
             put_fact(&mut out, f);
         }
+        put_routed(&mut out, self.routed.as_ref());
         out
     }
 
@@ -90,8 +108,9 @@ impl ImportRequest {
         for _ in 0..n {
             facts.push(get_fact(&mut r)?);
         }
+        let routed = get_routed(&mut r)?;
         finished(&r)?;
-        Ok(Self { table, keys, facts })
+        Ok(Self { table, keys, facts, routed })
     }
 }
 
@@ -100,6 +119,9 @@ impl ImportRequest {
 pub struct DeleteRequest {
     pub table: String,
     pub records: Vec<RecordId>,
+    /// As [`ImportRequest::routed`]. A delete sent to the wrong owner removes nothing and
+    /// reports success, which is the same silent loss in the other direction.
+    pub routed: Option<Routed>,
 }
 
 impl DeleteRequest {
@@ -110,6 +132,7 @@ impl DeleteRequest {
         for r in &self.records {
             put_u64(&mut out, *r);
         }
+        put_routed(&mut out, self.routed.as_ref());
         out
     }
 
@@ -121,8 +144,9 @@ impl DeleteRequest {
         for _ in 0..n {
             records.push(r.u64()?);
         }
+        let routed = get_routed(&mut r)?;
         finished(&r)?;
-        Ok(Self { table, records })
+        Ok(Self { table, records, routed })
     }
 }
 
@@ -659,4 +683,21 @@ pub fn get_shards_body(bytes: &[u8]) -> Result<Option<Vec<big_engine::ShardRange
     let out = get_shards(&mut r)?;
     finished(&r)?;
     Ok(out)
+}
+
+/// What a routed request assumed, so that the owner can disagree with it.
+pub fn put_routed(out: &mut Vec<u8>, routed: Option<&Routed>) {
+    put_bool(out, routed.is_some());
+    let Some(routed) = routed else { return };
+    put_u64(out, routed.epoch);
+    put_shards(out, Some(&routed.shards));
+}
+
+pub fn get_routed(r: &mut Reader<'_>) -> Result<Option<Routed>> {
+    if !r.bool()? {
+        return Ok(None);
+    }
+    let epoch = r.u64()?;
+    let shards = get_shards(r)?.unwrap_or_default();
+    Ok(Some(Routed { epoch, shards }))
 }

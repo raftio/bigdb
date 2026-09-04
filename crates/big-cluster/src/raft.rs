@@ -142,6 +142,7 @@ pub enum MapError {
     EmptyGroup { id: RangeId },
     PrimaryNotInGroup { id: RangeId, primary: NodeId },
     DuplicateId { id: RangeId },
+    NoSuchRange { id: RangeId },
 }
 
 impl core::fmt::Display for MapError {
@@ -167,6 +168,7 @@ impl core::fmt::Display for MapError {
                 write!(f, "range {id} is served by node {primary}, which does not hold it")
             }
             Self::DuplicateId { id } => write!(f, "two ranges are both called {id}"),
+            Self::NoSuchRange { id } => write!(f, "there is no range {id}"),
         }
     }
 }
@@ -273,6 +275,162 @@ impl RangeMap {
     /// One past the highest id in use, which is where the next range's id comes from.
     pub fn next_id(&self) -> RangeId {
         self.ranges.iter().map(|r| r.id).max().map_or(0, |m| m + 1)
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Changing the shape of the space
+    //
+    // Every one of these returns a *new* map and leaves the old one alone, and every one is
+    // checked before it is proposed. A change that got the shape wrong would be a record id
+    // nobody answers for, and there is nothing downstream that would notice.
+    // ---------------------------------------------------------------------------------------
+
+    /// Cuts the range containing `at` in two, at `at`.
+    ///
+    /// **This moves no data.** Both halves stay where they were, held by the same nodes; all
+    /// that changes is that there are now two names for what was one. Handing the upper half to
+    /// somebody else is [`RangeMap::assign`], and it is a separate step because it is a
+    /// separate question - whether that half is empty enough to hand over without a copy is a
+    /// fact about the data, which this type does not have.
+    ///
+    /// Returns the new range's id.
+    pub fn split(&mut self, at: ShardId) -> core::result::Result<RangeId, SplitError> {
+        if self.ranges.is_empty() {
+            return Err(SplitError::NoSuchRange { at });
+        }
+        let i = self.range_of(at);
+        let existing = &self.ranges[i];
+        // A cut on a boundary divides nothing: the shards below it are already a range.
+        if at == existing.shards.start {
+            return Err(SplitError::OnABoundary { at });
+        }
+        let id = self.next_id();
+        let upper = Range {
+            id,
+            shards: ShardRange { start: at, end: existing.shards.end },
+            group: existing.group.clone(),
+            primary: existing.primary,
+            // A range being moved is not a range to cut in half underneath the move.
+            moving: None,
+        };
+        if existing.moving.is_some() {
+            return Err(SplitError::Moving { id: existing.id });
+        }
+        self.ranges[i].shards.end = Some(at);
+        self.ranges.insert(i + 1, upper);
+        Ok(id)
+    }
+
+    /// Joins a range to the one after it, keeping the lower one's id.
+    ///
+    /// Refused unless the two are held by exactly the same nodes and served by the same one.
+    /// Merging across owners would mean deciding which of them keeps the data, which is a move
+    /// and not a merge - and doing it silently would drop half the records.
+    pub fn merge(&mut self, id: RangeId) -> core::result::Result<(), MergeError> {
+        let Some(i) = self.position(id) else { return Err(MergeError::NoSuchRange { id }) };
+        let Some(next) = self.ranges.get(i + 1) else {
+            return Err(MergeError::NothingAfter { id });
+        };
+        let (a, b) = (&self.ranges[i], next);
+        if a.moving.is_some() || b.moving.is_some() {
+            return Err(MergeError::Moving { id });
+        }
+        let (mut mine, mut theirs) = (a.group.clone(), b.group.clone());
+        mine.sort_unstable();
+        theirs.sort_unstable();
+        if mine != theirs || a.primary != b.primary {
+            return Err(MergeError::DifferentOwners { id, other: b.id });
+        }
+        self.ranges[i].shards.end = self.ranges[i + 1].shards.end;
+        self.ranges.remove(i + 1);
+        Ok(())
+    }
+
+    /// Hands a range to a set of nodes, the first of which serves it.
+    ///
+    /// **The map only records the decision.** Whether those nodes hold the data yet is not
+    /// something this type can know, so a caller that assigns a populated range to a node that
+    /// has not been seeded has moved the answer without moving the facts. That is what the
+    /// move protocol is for; this is the primitive underneath it.
+    pub fn assign(
+        &mut self,
+        id: RangeId,
+        group: Vec<NodeId>,
+    ) -> core::result::Result<(), MapError> {
+        let Some(i) = self.position(id) else { return Err(MapError::NoSuchRange { id }) };
+        let Some(&primary) = group.first() else { return Err(MapError::EmptyGroup { id }) };
+        self.ranges[i].group = group;
+        self.ranges[i].primary = primary;
+        Ok(())
+    }
+}
+
+/// Why a range could not be cut.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum SplitError {
+    NoSuchRange {
+        at: ShardId,
+    },
+    /// The cut is where a range already begins, so it divides nothing.
+    OnABoundary {
+        at: ShardId,
+    },
+    /// A range on its way to another node. Cutting it underneath the move would leave two
+    /// halves and one move that names neither.
+    Moving {
+        id: RangeId,
+    },
+}
+
+impl core::fmt::Display for SplitError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::NoSuchRange { at } => write!(f, "no range holds shard {at}"),
+            Self::OnABoundary { at } => {
+                write!(f, "a range already begins at {at}, so cutting there divides nothing")
+            }
+            Self::Moving { id } => {
+                write!(f, "range {id} is being moved; wait for that to finish or cancel it")
+            }
+        }
+    }
+}
+
+/// Why two ranges could not be joined.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum MergeError {
+    NoSuchRange {
+        id: RangeId,
+    },
+    /// The last range has nothing after it to join to.
+    NothingAfter {
+        id: RangeId,
+    },
+    Moving {
+        id: RangeId,
+    },
+    /// Two ranges on different nodes. Joining them would mean deciding which node's records
+    /// survive, which is a move rather than a merge.
+    DifferentOwners {
+        id: RangeId,
+        other: RangeId,
+    },
+}
+
+impl core::fmt::Display for MergeError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::NoSuchRange { id } => write!(f, "there is no range {id}"),
+            Self::NothingAfter { id } => {
+                write!(f, "range {id} is the last one; there is nothing after it to join")
+            }
+            Self::Moving { id } => write!(f, "range {id} or the one after it is being moved"),
+            Self::DifferentOwners { id, other } => write!(
+                f,
+                "ranges {id} and {other} are held by different nodes; joining them would mean \
+                 deciding which one's records survive, which is a move and not a merge"
+            ),
+        }
     }
 }
 
@@ -572,7 +730,7 @@ impl Raft {
         self.heard.get(&node).copied()
     }
 
-    fn last_index(&self) -> Index {
+    pub fn last_index(&self) -> Index {
         self.log.len() as Index - 1
     }
 

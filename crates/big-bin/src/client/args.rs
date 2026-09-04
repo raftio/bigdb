@@ -107,6 +107,17 @@ pub enum Command {
     },
     Verify,
     Repair,
+    /// `cluster topology` - what the cluster looks like right now.
+    ClusterTopology,
+    /// `cluster split <shard> [to <node>]` - cut a range in two.
+    ClusterSplit {
+        at: u64,
+        to: Option<String>,
+    },
+    /// `cluster merge <range>` - join a range to the one after it.
+    ClusterMerge {
+        range: u64,
+    },
     Health,
     Ready,
     Metrics,
@@ -485,6 +496,34 @@ fn command(positional: &[String], scoped: Vec<(String, String)>) -> Result<Comma
             only(&scoped, "repair", &[])?;
             Command::Repair
         }
+
+        // **Three verbs, and the shape of the cluster is all of them.** An operator types
+        // these; an autoscaler and a Kubernetes controller reach the same routes directly.
+        ["cluster", "topology"] => {
+            only(&scoped, "cluster topology", &[])?;
+            Command::ClusterTopology
+        }
+        ["cluster", "split", at] => {
+            only(&scoped, "cluster split", &[])?;
+            let at = at
+                .parse()
+                .map_err(|_| format!("`{at}` is not a shard number; write `cluster split 900`"))?;
+            Command::ClusterSplit { at, to: None }
+        }
+        ["cluster", "split", at, "to", node] => {
+            only(&scoped, "cluster split", &[])?;
+            let at = at
+                .parse()
+                .map_err(|_| format!("`{at}` is not a shard number; write `cluster split 900`"))?;
+            Command::ClusterSplit { at, to: Some((*node).to_string()) }
+        }
+        ["cluster", "merge", range] => {
+            only(&scoped, "cluster merge", &[])?;
+            let range = range
+                .parse()
+                .map_err(|_| format!("`{range}` is not a range id; write `cluster merge 2`"))?;
+            Command::ClusterMerge { range }
+        }
         ["health"] => {
             only(&scoped, "health", &[])?;
             Command::Health
@@ -524,9 +563,9 @@ const LOAD: [&str; 8] = [
 ];
 
 /// Every first word this client answers to, for telling a typo from a misuse.
-const KNOWN: [&str; 15] = [
+const KNOWN: [&str; 16] = [
     "sql", "query", "records", "import", "delete", "schema", "create", "drop", "verify", "repair",
-    "health", "ready", "metrics", "shell", "help",
+    "health", "ready", "metrics", "shell", "help", "cluster",
 ];
 
 fn source(arg: &str) -> Source {

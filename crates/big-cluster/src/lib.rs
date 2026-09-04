@@ -49,6 +49,8 @@
 
 #![deny(unsafe_code)]
 
+mod admin;
+pub use admin::{RangeReport, Topology};
 mod ddl;
 // The one item a sibling borrows across the split: `repair` recreates a field exactly as
 // another node has it, and that is a `Ddl` rather than a repair concern.

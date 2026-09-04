@@ -435,6 +435,34 @@ impl Controller {
         Some(Decision::Ranges(next))
     }
 
+    /// Proposes a new map, which every node will adopt once a majority has it.
+    ///
+    /// **Only the leader, and only when everything before it has settled.** A second proposal
+    /// while the first is in flight would be a decision made about a state that has not landed
+    /// - the same rule `promotion` follows, for the same reason.
+    ///
+    /// The map is checked before it is proposed rather than after it commits, because a
+    /// committed map that leaves a gap is a record id nobody answers for and there is nothing
+    /// downstream that would notice.
+    pub fn propose_map(&self, mut next: RangeMap) -> core::result::Result<u64, ProposeError> {
+        next.check().map_err(ProposeError::Invalid)?;
+        let mut raft = self.raft.lock().expect("no panic holds this lock");
+        if !raft.is_leader() {
+            return Err(ProposeError::NotLeader { leader: raft.leader() });
+        }
+        if raft.commit_index() != raft.last_index() {
+            return Err(ProposeError::Busy);
+        }
+        // Bumped here rather than by the caller, so that two callers racing cannot mint one
+        // epoch twice - and a routed request carrying an epoch is only useful if it counts.
+        next.epoch = self.map().epoch + 1;
+        let epoch = next.epoch;
+        match raft.propose(Decision::Ranges(next)) {
+            Some(_) => Ok(epoch),
+            None => Err(ProposeError::NotLeader { leader: raft.leader() }),
+        }
+    }
+
     /// Records that a copy has caught up, after a repair has made it true.
     ///
     /// Proposed rather than applied: whether a copy may be promoted is a fact every node has
@@ -480,4 +508,35 @@ fn lease_anchor(raft: &Raft, now: u64) -> Option<u64> {
         return Some(now);
     }
     raft.last_heard(leader)
+}
+
+/// Why a change to the map was not proposed.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum ProposeError {
+    /// This node is not the one that decides. The leader, when it knows who that is.
+    NotLeader {
+        leader: Option<NodeId>,
+    },
+    /// Something is already in flight. Deciding about a state that has not settled is how two
+    /// changes are made about one map and only one of them survives.
+    Busy,
+    Invalid(raft::MapError),
+}
+
+impl core::fmt::Display for ProposeError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::NotLeader { leader: Some(n) } => {
+                write!(f, "this node does not decide the map; node {n} leads the agreement")
+            }
+            Self::NotLeader { leader: None } => {
+                write!(f, "this node does not decide the map, and no leader is known yet")
+            }
+            Self::Busy => write!(
+                f,
+                "a change to the map is already in flight; wait for it to commit and try again"
+            ),
+            Self::Invalid(e) => write!(f, "the change would leave the map invalid: {e}"),
+        }
+    }
 }

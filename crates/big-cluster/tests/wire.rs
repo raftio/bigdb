@@ -219,6 +219,10 @@ fn a_batch_and_its_key_assignments_survive() {
             },
             OwnedFact { field: "active".to_string(), record: 4, value: FactValue::Bool(false) },
         ],
+        routed: Some(wire::Routed {
+            epoch: 12,
+            shards: vec![ShardRange { start: 0, end: Some(64) }],
+        }),
     };
     assert_eq!(wire::ImportRequest::decode(&request.encode()).unwrap(), request);
 }

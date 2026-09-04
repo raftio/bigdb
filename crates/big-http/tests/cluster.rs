@@ -802,6 +802,9 @@ fn the_digest_notices_when_two_copies_differ() {
             record: 99,
             value: big_cluster::wire::FactValue::Int(7),
         }],
+        // Straight at the node, claiming nothing about who owns what: this is the door a
+        // coordinator uses after it has already routed, and here there is no coordinator.
+        routed: None,
     }
     .encode();
     let (status, _) = send_bytes(spare, "/internal/import", &body, fingerprint);
@@ -1516,4 +1519,163 @@ fn a_top_n_widens_its_bound_until_a_group_hidden_on_every_node_can_be_seen() {
     assert!(counts.first().is_some_and(|c| c.starts_with("18")), "{three}");
     // The other two are tens, whichever pair of the ten-count groups the tie-break picks.
     assert_eq!(three.matches("\"count\":10").count(), 2, "{three}");
+}
+
+// -------------------------------------------------------------------------------------------
+// Reshaping the cluster while it runs
+//
+// The map used to be whatever `cluster.toml` said, for the life of every process that read it.
+// It is a value the agreement decides now, and these are the two things an operator can do to
+// it without stopping anybody.
+// -------------------------------------------------------------------------------------------
+
+/// **Scale-out that moves no bytes.** Cutting the open tail above everything written so far and
+/// handing the upper half to another node costs one entry in the agreement and nothing on the
+/// wire - and reads and writes never stop.
+#[test]
+fn a_tail_split_hands_a_range_over_without_copying_anything() {
+    let (a, b, spare) = (free_port(), free_port(), free_port());
+    let file = format!(
+        "schema_leader = \"a\"\n\
+         [[node]]\nname = \"a\"\naddr = \"{a}\"\nshards = \"0..64\"\n\
+         [[node]]\nname = \"b\"\naddr = \"{b}\"\nshards = \"64..\"\n\
+         [[node]]\nname = \"a-spare\"\naddr = \"{spare}\"\nreplica = \"a\"\n"
+    );
+    let _a = start_agreeing(&file, "a", a);
+    let _b = start_agreeing(&file, "b", b);
+    let _spare = start_agreeing(&file, "a-spare", spare);
+    until("an elected leader", || ready(a).contains(r#""leader":""#));
+
+    ok(a, "POST", "/table/tx", "");
+    ok(a, "POST", "/table/tx/field/amount?kind=int&bit_depth=32", "");
+    // One record low in the space and one high, so both existing ranges hold something.
+    ok(a, "POST", "/table/tx/import", "amount 1 5\n");
+    ok(a, "POST", "/table/tx/import", &format!("amount {} 9\n", 70 * (1 << 20)));
+    assert_eq!(ok(a, "POST", "/table/tx/query", "Count(All())"), r#"{"count":2}"#);
+
+    let before = ok(a, "GET", "/cluster/topology", "");
+    assert!(before.contains(r#""shards":"0..64""#), "{before}");
+    assert!(before.contains(r#""shards":"64..""#), "{before}");
+
+    // Split the tail well above anything written, and give the empty half to `a`. `a` now
+    // serves two ranges, which the map could not even express before.
+    let split = leader_of(&[a, b, spare]);
+    let body = ok(split, "POST", "/admin/cluster/split?at=900&to=a", "");
+    assert!(body.contains(r#""range":2"#), "{body}");
+
+    until("every node to see the new range", || {
+        [a, b, spare].iter().all(|p| ok(*p, "GET", "/cluster/topology", "").contains(r#""900..""#))
+    });
+
+    // **The count is still two.** `a` holds two ranges now, and a fan-out that asked it twice
+    // without saying which one would answer three.
+    assert_eq!(ok(a, "POST", "/table/tx/query", "Count(All())"), r#"{"count":2}"#);
+    assert_eq!(ok(b, "POST", "/table/tx/query", "Count(All())"), r#"{"count":2}"#);
+
+    // And the new range takes writes, on the node it was handed to.
+    let high = 1_000 * (1 << 20);
+    ok(a, "POST", "/table/tx/import", &format!("amount {high} 11\n"));
+    assert_eq!(ok(b, "POST", "/table/tx/query", "Count(All())"), r#"{"count":3}"#);
+    assert_eq!(
+        ok(b, "POST", "/table/tx/query", "Sum(All(), field=\"amount\")"),
+        r#"{"sum":25}"#,
+        "every owner contributed exactly once"
+    );
+}
+
+/// A range with records in it cannot change hands without a copy, so it is refused rather than
+/// silently losing them.
+#[test]
+fn splitting_a_populated_half_onto_another_node_is_refused() {
+    let (a, b, spare) = (free_port(), free_port(), free_port());
+    let file = format!(
+        "schema_leader = \"a\"\n\
+         [[node]]\nname = \"a\"\naddr = \"{a}\"\nshards = \"0..64\"\n\
+         [[node]]\nname = \"b\"\naddr = \"{b}\"\nshards = \"64..\"\n\
+         [[node]]\nname = \"a-spare\"\naddr = \"{spare}\"\nreplica = \"a\"\n"
+    );
+    let _a = start_agreeing(&file, "a", a);
+    let _b = start_agreeing(&file, "b", b);
+    let _spare = start_agreeing(&file, "a-spare", spare);
+    until("an elected leader", || ready(a).contains(r#""leader":""#));
+
+    ok(a, "POST", "/table/tx", "");
+    ok(a, "POST", "/table/tx/field/amount?kind=int&bit_depth=32", "");
+    ok(a, "POST", "/table/tx/import", &format!("amount {} 9\n", 1_000 * (1 << 20)));
+
+    let leader = leader_of(&[a, b, spare]);
+    let (status, body) = send(leader, "POST", "/admin/cluster/split?at=900&to=a", "");
+    assert_eq!(status, 409, "{body}");
+    assert!(body.contains("cannot change hands without a copy"), "{body}");
+
+    // Nothing changed: the map still has two ranges.
+    let after = ok(a, "GET", "/cluster/topology", "");
+    assert!(!after.contains(r#""900..""#), "{after}");
+}
+
+/// Splitting and merging back is the map it started from, so a cut made too eagerly is
+/// recoverable rather than permanent.
+#[test]
+fn a_split_can_be_merged_back() {
+    let (a, b, spare) = (free_port(), free_port(), free_port());
+    let file = format!(
+        "schema_leader = \"a\"\n\
+         [[node]]\nname = \"a\"\naddr = \"{a}\"\nshards = \"0..64\"\n\
+         [[node]]\nname = \"b\"\naddr = \"{b}\"\nshards = \"64..\"\n\
+         [[node]]\nname = \"a-spare\"\naddr = \"{spare}\"\nreplica = \"a\"\n"
+    );
+    let _a = start_agreeing(&file, "a", a);
+    let _b = start_agreeing(&file, "b", b);
+    let _spare = start_agreeing(&file, "a-spare", spare);
+    until("an elected leader", || ready(a).contains(r#""leader":""#));
+
+    let leader = leader_of(&[a, b, spare]);
+    ok(leader, "POST", "/admin/cluster/split?at=900", "");
+    until("the split to land", || {
+        ok(leader, "GET", "/cluster/topology", "").contains(r#""900..""#)
+    });
+
+    // The two halves are still both `b`'s, which is what makes them mergeable.
+    ok(leader, "POST", "/admin/cluster/merge?range=1", "");
+    until("the merge to land", || {
+        !ok(leader, "GET", "/cluster/topology", "").contains(r#""900..""#)
+    });
+    let after = ok(leader, "GET", "/cluster/topology", "");
+    assert!(after.contains(r#""shards":"64..""#), "{after}");
+}
+
+/// Whichever node an operator reaches, only one decides - so a command sent to a follower says
+/// where to send it rather than doing half of it.
+#[test]
+fn a_reshape_asked_of_a_follower_names_the_node_that_decides() {
+    let (a, b, spare) = (free_port(), free_port(), free_port());
+    let file = format!(
+        "schema_leader = \"a\"\n\
+         [[node]]\nname = \"a\"\naddr = \"{a}\"\nshards = \"0..64\"\n\
+         [[node]]\nname = \"b\"\naddr = \"{b}\"\nshards = \"64..\"\n\
+         [[node]]\nname = \"a-spare\"\naddr = \"{spare}\"\nreplica = \"a\"\n"
+    );
+    let _a = start_agreeing(&file, "a", a);
+    let _b = start_agreeing(&file, "b", b);
+    let _spare = start_agreeing(&file, "a-spare", spare);
+    until("an elected leader", || ready(a).contains(r#""leader":""#));
+
+    let leader = leader_of(&[a, b, spare]);
+    let follower = *[a, b, spare].iter().find(|p| **p != leader).expect("three nodes");
+    let (status, body) = send(follower, "POST", "/admin/cluster/split?at=900", "");
+    assert_eq!(status, 409, "{body}");
+    assert!(body.contains("does not decide the map"), "{body}");
+}
+
+/// The node that leads the agreement, asked of whichever of these is answering.
+fn leader_of(ports: &[SocketAddr]) -> SocketAddr {
+    let body = ready(ports[0]);
+    let name = body
+        .split(r#""leader":""#)
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .expect("a leader")
+        .to_string();
+    let index = ["a", "b", "a-spare"].iter().position(|n| *n == name).expect("a known node");
+    ports[index]
 }

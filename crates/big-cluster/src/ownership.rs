@@ -96,6 +96,42 @@ impl<P: PagerMut + Sync> Cluster<P> {
         Err(ClusterError::NotServing { node: node.name.clone(), shards: node.shards.to_string() })
     }
 
+    /// Refuses a routed request whose assumptions this node no longer shares.
+    ///
+    /// **The check that makes a map change safe while writes are in flight.** A coordinator
+    /// holding a map one decision old routes a batch to whoever owned those records before a
+    /// split or a move; without this the batch lands here, is reported as written, and is never
+    /// read again - because reads go to whoever owns them now.
+    ///
+    /// Two ways to disagree, and only the second is a refusal. A *newer* epoch on the request
+    /// than this node has is a coordinator that is ahead: it read the map from the leader, this
+    /// node has not applied it yet, and the records are still this node's until it does. What
+    /// is refused is a request for shards this node does not hold at all.
+    ///
+    /// `None` for a request that is not routed, which is every path where this node could only
+    /// ever have been the destination.
+    pub fn check_route(&self, routed: Option<&wire::Routed>) -> Result<()> {
+        let Some(routed) = routed else { return Ok(()) };
+        let map = self.ranges.read().expect("no panic holds this lock");
+        let this = self.config.this_index();
+        let mine: Vec<big_engine::ShardRange> =
+            map.ranges.iter().filter(|r| r.group.contains(&this)).map(|r| r.shards).collect();
+
+        // Held rather than served: a replica takes the write too, and is not the primary.
+        let held = |want: &big_engine::ShardRange| {
+            mine.iter().any(|m| m.start <= want.start && covers_end(m, want))
+        };
+        if routed.shards.iter().all(held) {
+            return Ok(());
+        }
+        Err(ClusterError::StaleRoute {
+            node: self.config.this().name.clone(),
+            wanted: routed.shards.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(", "),
+            epoch: routed.epoch,
+            mine: map.epoch,
+        })
+    }
+
     /// The shards a range covers.
     ///
     /// A range's index is its configured primary's index - primaries come first, in range
@@ -132,9 +168,21 @@ impl<P: PagerMut + Sync> Cluster<P> {
         ranges.map(|r| vec![self.serving(r)]).collect()
     }
 
+    /// Whether `held` reaches at least as far up as `want` does.
+    ///
+    /// A free function because it is arithmetic about two ranges and nothing about a cluster.
+    /// An open end covers everything, including another open end.
     /// `name (shards)`, which is what every report about a node says.
     pub(super) fn describe(&self, i: usize) -> String {
         let node = &self.config.nodes()[i];
         format!("{} ({})", node.name, node.shards)
+    }
+}
+
+fn covers_end(held: &big_engine::ShardRange, want: &big_engine::ShardRange) -> bool {
+    match (held.end, want.end) {
+        (None, _) => true,
+        (Some(_), None) => false,
+        (Some(h), Some(w)) => h >= w,
     }
 }

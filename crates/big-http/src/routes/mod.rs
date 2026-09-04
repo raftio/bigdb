@@ -245,6 +245,12 @@ enum Target<'a> {
     PeerSchema,
     Repair,
     Backup,
+    /// What the cluster looks like right now, for an operator or an autoscaler.
+    ClusterTopology,
+    /// Cut a range in two, and optionally hand the upper half to another node.
+    ClusterSplit,
+    /// Join a range to the one after it.
+    ClusterMerge,
 }
 
 impl<'a> Target<'a> {
@@ -315,6 +321,11 @@ impl<'a> Target<'a> {
             // About the process rather than about data, so it is one server-wide privilege
             // rather than a role that also happened to read tables.
             Self::Metrics | Self::Verify | Self::Repair | Self::Backup => {
+                Guard::Needs(Privilege::Operate, ObjectRef::Server)
+            }
+            // Reshaping the cluster is the same privilege as repairing it: about the process
+            // and its peers, not about anybody's rows.
+            Self::ClusterTopology | Self::ClusterSplit | Self::ClusterMerge => {
                 Guard::Needs(Privilege::Operate, ObjectRef::Server)
             }
             Self::Query(t) | Self::Records(t) => Guard::Needs(Privilege::Select, table(t)),
@@ -393,6 +404,9 @@ fn resolve<'a>(method: &str, segments: &[&'a str]) -> Option<Target<'a>> {
         ("POST", ["internal", "repaired"]) => Target::PeerRepaired,
         ("POST", ["internal", "schema"]) => Target::PeerSchema,
         ("POST", ["repair"]) => Target::Repair,
+        ("GET", ["cluster", "topology"]) => Target::ClusterTopology,
+        ("POST", ["admin", "cluster", "split"]) => Target::ClusterSplit,
+        ("POST", ["admin", "cluster", "merge"]) => Target::ClusterMerge,
         ("POST", ["admin", "backup"]) => Target::Backup,
         _ => return None,
     })
@@ -520,6 +534,9 @@ pub fn dispatch<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request) -> Answered
             Response::binary(out)
         }
         Target::Repair => repair(ctx),
+        Target::ClusterTopology => cluster_topology(ctx),
+        Target::ClusterSplit => cluster_split(ctx, req),
+        Target::ClusterMerge => cluster_merge(ctx, req),
         Target::Backup => backup(ctx, req),
     };
     Answered { response, who }
