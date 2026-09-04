@@ -55,7 +55,7 @@ impl Sim {
     /// waits seconds for are exercised in microseconds. What it cannot exercise is the *wall*
     /// clock - that is `a_range_fails_over_on_the_clocks_it_ships_with` over real sockets.
     fn with_timing(n: usize, timing: Timing) -> Self {
-        let members: Vec<NodeId> = (0..n).collect();
+        let members = voters(n);
         Self {
             nodes: (0..n).map(|i| Raft::new(i, members.clone(), timing, 0)).collect(),
             queue: Vec::new(),
@@ -137,6 +137,17 @@ impl Sim {
             None => false,
         }
     }
+}
+
+/// `n` nodes, all of them voting, which is what a cluster file describes.
+fn voters(n: usize) -> Vec<Member> {
+    (0..n)
+        .map(|i| Member {
+            name: format!("n{i}"),
+            addr: format!("10.0.0.{i}:7654"),
+            state: MemberState::Voter,
+        })
+        .collect()
 }
 
 /// A map in which node `primary[i]` serves range `i`, each over an arbitrary slice of the
@@ -332,7 +343,7 @@ fn a_returning_leader_gives_up_what_it_decided_alone() {
 /// candidates in the same term and a simulation is free not to produce one.
 #[test]
 fn a_node_votes_once_per_term() {
-    let members = vec![0, 1, 2];
+    let members = voters(3);
     let mut node = Raft::new(0, members, Timing::default(), 0);
 
     let ask = |candidate: NodeId| Message::RequestVote {
@@ -387,7 +398,7 @@ fn a_stale_log_cannot_win_a_vote() {
 /// A follower whose log disagrees has the disagreement removed, not merged.
 #[test]
 fn a_conflicting_log_is_truncated_and_repaired() {
-    let members = vec![0, 1, 2];
+    let members = voters(3);
     let mut node = Raft::new(1, members, Timing::default(), 0);
 
     // Term 1 appends two entries.
@@ -427,7 +438,7 @@ fn a_conflicting_log_is_truncated_and_repaired() {
 /// An append from a stale term is refused outright, and the stale leader is told the real one.
 #[test]
 fn an_append_from_an_old_term_is_refused() {
-    let members = vec![0, 1, 2];
+    let members = voters(3);
     let mut node = Raft::new(1, members, Timing::default(), 0);
     node.deliver(
         Message::Append {
@@ -554,7 +565,7 @@ fn a_restarted_node_still_refuses_a_stale_candidate() {
     store.save(&State { term: 7, voted_for: Some(1), commit: 1, log }).unwrap();
 
     let state = store.load().unwrap().unwrap();
-    let mut node = Raft::new(0, vec![0, 1, 2], Timing::default(), 0);
+    let mut node = Raft::new(0, voters(3), Timing::default(), 0);
     node.restore(state);
     assert_eq!(node.term(), 7);
 
@@ -642,4 +653,146 @@ fn the_shipped_clocks_do_not_re_elect_a_healthy_leader() {
         term,
         "the term moved with nothing wrong: an election was held for no reason"
     );
+}
+
+// -------------------------------------------------------------------------------------------
+// Membership, changed while the cluster runs
+//
+// **The part of Raft most often got wrong**, and the reason it stayed out of this file for so
+// long. Three rules, and every one of them has a way of failing quietly rather than loudly.
+// -------------------------------------------------------------------------------------------
+
+fn learner(name: &str) -> Member {
+    Member { name: name.to_string(), addr: "10.0.0.9:7654".to_string(), state: MemberState::Learner }
+}
+
+/// **A configuration change takes effect when it is appended, not when it commits.**
+///
+/// The majority that commits an entry has to be the majority the entry describes. A leader that
+/// waited for the commit would be counting a quorum the change is in the middle of abolishing.
+#[test]
+fn a_membership_change_counts_from_the_moment_it_is_appended() {
+    let mut node = Raft::new(0, voters(1), Timing::default(), 0);
+    node.tick(2_000);
+    assert!(node.is_leader(), "alone, so a majority of one");
+    assert_eq!(node.voters(), &[0]);
+
+    // A second voter: the majority is now two, immediately - before anything has committed.
+    let mut next = voters(1);
+    next.push(Member {
+        name: "n1".to_string(),
+        addr: "10.0.0.1:7654".to_string(),
+        state: MemberState::Voter,
+    });
+    node.propose(Decision::Members(next)).expect("the leader proposes");
+    assert_eq!(node.voters(), &[0, 1], "the new member counts at once");
+    assert_eq!(node.members(), 2);
+}
+
+/// **A learner replicates and does not vote.** Counting one towards a majority would raise the
+/// bar for every election while it contributed nothing to one - and a node still filling up is
+/// exactly the node least able to help.
+#[test]
+fn a_learner_is_replicated_to_and_does_not_count_towards_a_majority() {
+    let mut node = Raft::new(0, voters(1), Timing::default(), 0);
+    node.tick(2_000);
+
+    let mut next = voters(1);
+    next.push(learner("joining"));
+    node.propose(Decision::Members(next)).expect("the leader proposes");
+
+    assert_eq!(node.members(), 2, "it is replicated to");
+    assert_eq!(node.voters(), &[0], "and it does not vote");
+    // Still a majority of one, so this node can still commit on its own.
+    assert!(node.is_leader());
+}
+
+/// **A membership that was appended and then truncated away goes back.**
+///
+/// This is the one that fails silently. A leader with a better log can take away an entry this
+/// node already applied; a membership mutated in place would have no way back, and the node
+/// would go on counting a quorum that never existed. Deriving it from the log makes the undo
+/// free - which is the whole reason it is derived.
+#[test]
+fn a_membership_taken_away_by_a_better_log_is_taken_back() {
+    let mut node = Raft::new(1, voters(3), Timing::default(), 0);
+
+    // A leader at term 1 appends a change this node applies on the spot.
+    let mut grown = voters(3);
+    grown.push(learner("joining"));
+    let out = node.deliver(
+        Message::Append {
+            term: 1,
+            leader: 0,
+            prev_index: 0,
+            prev_term: 0,
+            entries: vec![big_cluster::raft::Entry { term: 1, decision: Decision::Members(grown) }],
+            commit: 0,
+        },
+        0,
+    );
+    assert!(matches!(out.send.first(), Some((0, Message::AppendReply { success: true, .. }))));
+    assert_eq!(node.members(), 4, "applied on append, before any commit");
+
+    // A different leader at a higher term overwrites that index with something else.
+    node.deliver(
+        Message::Append {
+            term: 2,
+            leader: 2,
+            prev_index: 0,
+            prev_term: 0,
+            entries: vec![big_cluster::raft::Entry { term: 2, decision: Decision::Noop }],
+            commit: 0,
+        },
+        0,
+    );
+    assert_eq!(node.members(), 3, "the change went away with the entry that carried it");
+    assert_eq!(node.voters(), &[0, 1, 2]);
+}
+
+/// A node that comes back reads its cluster out of its own log, not out of the file it was
+/// first started with - which, once a node has joined or left, describes a cluster that is gone.
+#[test]
+fn a_restarted_node_comes_back_with_the_cluster_as_the_log_left_it() {
+    let mut grown = voters(3);
+    grown.push(learner("joining"));
+    let log = vec![
+        big_cluster::raft::Entry { term: 0, decision: Decision::Noop },
+        big_cluster::raft::Entry { term: 5, decision: Decision::Members(grown) },
+    ];
+
+    // Started from a file that knows three nodes, restored from a log that knows four.
+    let mut node = Raft::new(0, voters(3), Timing::default(), 0);
+    assert_eq!(node.members(), 3);
+    node.restore(State { term: 5, voted_for: Some(0), commit: 1, log });
+
+    assert_eq!(node.members(), 4, "the log is what says who is in the cluster");
+    assert_eq!(node.voters(), &[0, 1, 2], "and the fourth is still catching up");
+}
+
+/// A node this cluster has removed can still be running and still campaigning. Granting it a
+/// vote would let a machine nobody has agreed to lead a cluster it has left.
+#[test]
+fn a_candidate_that_is_not_a_member_here_gets_no_vote() {
+    let mut node = Raft::new(0, voters(2), Timing::default(), 0);
+    let out = node
+        .deliver(Message::RequestVote { term: 9, candidate: 5, last_index: 0, last_term: 0 }, 0);
+    assert!(
+        matches!(out.send.first(), Some((5, Message::VoteReply { granted: false, .. }))),
+        "{:?}",
+        out.send
+    );
+}
+
+/// And the other half: a node that does not vote does not campaign either. One that did would
+/// depose a working leader once per election timeout for as long as it was running.
+#[test]
+fn a_node_that_does_not_vote_never_stands_for_election() {
+    let mut members = voters(2);
+    members[0].state = MemberState::Learner;
+    let mut node = Raft::new(0, members, Timing::default(), 0);
+
+    node.tick(100_000);
+    assert!(!node.is_leader());
+    assert_eq!(node.term(), 0, "it never even raised the term");
 }

@@ -273,14 +273,38 @@ pub trait Peers: Send + Sync {
         self.len() == 0
     }
 
-    /// Where a node is, for a report that has to name it. `None` for this node's own index.
-    fn addr(&self, node: usize) -> Option<&str>;
+    /// Makes sure this table can reach every node in `addrs`.
+    ///
+    /// **What a node joining at runtime needs.** The default does nothing, which is right for
+    /// a table that was handed a fixed list and for the fakes a test drives - neither can grow
+    /// and neither is ever asked to.
+    fn extend(&self, addrs: &[(String, String)]) {
+        let _ = addrs;
+    }
+
+    /// Where a node is, for a report that has to name it. `None` for this node's own index,
+    /// and for a slot no peer has been made for yet.
+    ///
+    /// Owned rather than borrowed, because the table can grow while the cluster runs and a
+    /// borrow would hold its lock for as long as the caller kept the string.
+    fn addr(&self, node: usize) -> Option<String>;
 }
 
 /// The peer table a running node uses: one pooled client per *other* node.
 ///
 /// `None` at this node's own index, because this node is reached by calling it.
-pub struct HttpPeers(Vec<Option<Peer>>);
+pub struct HttpPeers {
+    /// One slot per node, `None` at this node's own index and at any slot not filled yet.
+    ///
+    /// **Behind a lock because a node can join while the cluster runs.** The table used to be
+    /// built once from the cluster file and indexed directly, so a `NodeId` the file did not
+    /// contain was a panic on the request path. It grows now, and the lock is taken for the
+    /// length of a clone of one `Arc` - never across the request itself.
+    slots: std::sync::RwLock<Vec<Option<std::sync::Arc<Peer>>>>,
+    this: usize,
+    tls: Option<std::sync::Arc<big_tls::ClientTls>>,
+    fingerprint: u64,
+}
 
 impl HttpPeers {
     /// One client per node except this one.
@@ -296,16 +320,48 @@ impl HttpPeers {
         tls: Option<std::sync::Arc<big_tls::ClientTls>>,
         fingerprint: u64,
     ) -> Self {
-        Self(
-            names
-                .into_iter()
-                .zip(addrs)
-                .enumerate()
-                .map(|(i, (name, addr))| {
-                    (i != this).then(|| Peer::new(name, addr, tls.clone(), fingerprint))
-                })
-                .collect(),
-        )
+        let slots = names
+            .into_iter()
+            .zip(addrs)
+            .enumerate()
+            .map(|(i, (name, addr))| {
+                (i != this)
+                    .then(|| std::sync::Arc::new(Peer::new(name, addr, tls.clone(), fingerprint)))
+            })
+            .collect();
+        Self { slots: std::sync::RwLock::new(slots), this, tls, fingerprint }
+    }
+
+    /// Makes sure there is a client for every node in `addrs`, adding any that are new.
+    ///
+    /// **Called when the agreement says the cluster has changed.** A node that joined has an
+    /// index nothing in this table has ever seen, and the first message sent to it is a
+    /// heartbeat - so the table has to be able to grow without a restart, which is the whole
+    /// difference between membership as a file and membership as a decision.
+    ///
+    /// Existing peers are left alone. Replacing one would drop a connection pool that is
+    /// working, and an address that changed is a different question - a node keeps its name.
+    pub fn extend_to(&self, addrs: &[(String, String)]) {
+        let mut slots = self.slots.write().expect("no panic holds this lock");
+        if slots.len() < addrs.len() {
+            slots.resize_with(addrs.len(), || None);
+        }
+        for (i, (name, addr)) in addrs.iter().enumerate() {
+            if i == self.this || slots[i].is_some() {
+                continue;
+            }
+            slots[i] = Some(std::sync::Arc::new(Peer::new(
+                name.clone(),
+                addr.clone(),
+                self.tls.clone(),
+                self.fingerprint,
+            )));
+        }
+    }
+
+    /// The client for one node, or `None` for this node and for a slot nothing has filled.
+    fn peer(&self, node: usize) -> Option<std::sync::Arc<Peer>> {
+        self.slots.read().expect("no panic holds this lock").get(node)?.clone()
     }
 }
 
@@ -318,16 +374,27 @@ impl Peers for HttpPeers {
         budget: Option<Duration>,
         repeatable: Repeatable,
     ) -> Result<PeerResponse, ClientError> {
-        let peer = self.0[node].as_ref().expect("this node is never reached over a socket");
+        // **An index this table has never seen is a refusal, not a panic.** A node can join
+        // while this one is serving, and a coordinator that learned about it a heartbeat before
+        // this table did would otherwise take the whole process down.
+        let Some(peer) = self.peer(node) else {
+            return Err(ClientError::Unreachable(std::io::Error::other(format!(
+                "node {node} is not in this node's peer table yet"
+            ))));
+        };
         peer.post(path, body, budget, repeatable)
     }
 
-    fn len(&self) -> usize {
-        self.0.len()
+    fn extend(&self, addrs: &[(String, String)]) {
+        self.extend_to(addrs);
     }
 
-    fn addr(&self, node: usize) -> Option<&str> {
-        self.0.get(node)?.as_ref().map(Peer::addr)
+    fn len(&self) -> usize {
+        self.slots.read().expect("no panic holds this lock").len()
+    }
+
+    fn addr(&self, node: usize) -> Option<String> {
+        Some(self.peer(node)?.addr().to_string())
     }
 }
 

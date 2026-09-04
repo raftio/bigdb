@@ -110,8 +110,8 @@ impl Peers for Fake {
         self.replies.len()
     }
 
-    fn addr(&self, node: usize) -> Option<&str> {
-        self.replies[node].as_ref().map(|_| "fake")
+    fn addr(&self, node: usize) -> Option<String> {
+        self.replies.get(node)?.as_ref().map(|_| "fake".to_string())
     }
 }
 

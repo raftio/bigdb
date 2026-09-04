@@ -607,8 +607,16 @@ impl Output {
 /// One node's view of the agreement.
 pub struct Raft {
     id: NodeId,
-    /// Every member, this node included. Fixed for the life of the process.
-    members: Vec<NodeId>,
+    /// The cluster this node was started with, before the log said otherwise.
+    ///
+    /// Only ever consulted when no `Decision::Members` has been appended: the file seeds the
+    /// membership exactly as it seeds the map, and a decision replaces it.
+    seed: Vec<Member>,
+    /// Every node the agreement replicates to, this node included. **Derived from the log**,
+    /// never mutated in place - see [`Raft::refresh_members`].
+    members: Vec<Member>,
+    /// The subset of `members` whose agreement counts. A learner replicates and does not vote.
+    voters: Vec<NodeId>,
     timing: Timing,
 
     // --- persistent: none of this may be lost in a restart ---
@@ -635,10 +643,17 @@ pub struct Raft {
 }
 
 impl Raft {
-    pub fn new(id: NodeId, members: Vec<NodeId>, timing: Timing, now: u64) -> Self {
+    /// A node in a cluster described by a file, before the log has said anything.
+    ///
+    /// `members` is the seed. Every entry the log carries replaces it, which is what makes a
+    /// restart come back with the cluster as it is rather than as the file remembers it.
+    pub fn new(id: NodeId, members: Vec<Member>, timing: Timing, now: u64) -> Self {
+        let voters = voters_of(&members);
         let mut raft = Self {
             id,
+            seed: members.clone(),
             members,
+            voters,
             timing,
             term: 0,
             voted_for: None,
@@ -672,6 +687,10 @@ impl Raft {
         if !state.log.is_empty() {
             self.log = state.log;
         }
+        // **Before the commit index is used**, because who is in the cluster is a property of
+        // the log this node came back holding - not of the file it was first started with,
+        // which may describe a cluster that no longer exists.
+        self.refresh_members();
         // Clamped: a commit index past the log is a file that disagrees with itself, and
         // trusting it would index past the end.
         self.commit = state.commit.min(self.last_index());
@@ -691,9 +710,50 @@ impl Raft {
         self.id
     }
 
-    /// How many nodes are in the agreement, this one included.
+    /// How many nodes the agreement replicates to, this one included.
     pub fn members(&self) -> usize {
         self.members.len()
+    }
+
+    /// The nodes whose agreement counts, which is not every node it replicates to.
+    pub fn voters(&self) -> &[NodeId] {
+        &self.voters
+    }
+
+    /// The cluster as the log describes it.
+    pub fn membership(&self) -> &[Member] {
+        &self.members
+    }
+
+    /// Whether this node's own vote counts. A learner replicates without voting, and a node
+    /// that has left keeps neither.
+    fn i_vote(&self) -> bool {
+        self.voters.contains(&self.id)
+    }
+
+    /// Every node this one sends to: everybody but itself that has not left.
+    fn peers(&self) -> Vec<NodeId> {
+        (0..self.members.len()).filter(|n| *n != self.id && self.members[*n].reachable()).collect()
+    }
+
+    /// Recomputes the membership from the log.
+    ///
+    /// **Derived rather than mutated, and that is what makes it correct.** A configuration
+    /// change applies when it is *appended*, because the majority that commits an entry has to
+    /// be the one the entry describes - but an appended entry can be truncated away by a leader
+    /// with a better log, and a membership mutated in place would have no way back. Recomputing
+    /// from the log makes the undo free, and makes a restart that replays its log land in the
+    /// same place for the same reason.
+    ///
+    /// The log is short and cold - one entry per election, one per machine that dies, one per
+    /// deliberate change - so walking it is cheaper than the bookkeeping that would avoid it.
+    fn refresh_members(&mut self) {
+        let latest = self.log.iter().rev().find_map(|e| match &e.decision {
+            Decision::Members(ms) => Some(ms.clone()),
+            _ => None,
+        });
+        self.members = latest.unwrap_or_else(|| self.seed.clone());
+        self.voters = voters_of(&self.members);
     }
 
     pub fn term(&self) -> Term {
@@ -742,8 +802,10 @@ impl Raft {
         self.log.get(index as usize).map(|e| e.term)
     }
 
+    /// **Of the voters, not of everybody replicated to.** A learner catching up must not raise
+    /// the bar for an election while contributing nothing to one.
     fn majority(&self) -> usize {
-        self.members.len() / 2 + 1
+        self.voters.len() / 2 + 1
     }
 
     /// The randomised election timeout.
@@ -783,7 +845,7 @@ impl Raft {
             Role::Leader => {
                 if now >= self.heartbeat_at {
                     self.heartbeat_at = now + self.timing.heartbeat;
-                    for &peer in &self.members.clone() {
+                    for peer in self.peers() {
                         if peer != self.id {
                             self.send_append(peer, &mut out);
                         }
@@ -804,7 +866,16 @@ impl Raft {
     /// A single-member cluster wins here and now, which is not a special case so much as the
     /// general one with a majority of one - and it is what lets a node that is alone in its
     /// config file work at all.
+    ///
+    /// **A node that does not vote does not stand.** A learner is still catching up and a node
+    /// that has left is not in the cluster at all; either one campaigning would raise the term
+    /// on every node that heard it and depose a leader that was doing its job, once per
+    /// election timeout, for as long as it was running.
     fn stand(&mut self, now: u64, out: &mut Output) {
+        if !self.i_vote() {
+            self.reset_election(now);
+            return;
+        }
         self.term += 1;
         self.role = Role::Candidate;
         self.voted_for = Some(self.id);
@@ -817,8 +888,8 @@ impl Raft {
             self.win(now, out);
             return;
         }
-        for &peer in &self.members.clone() {
-            if peer != self.id {
+        for peer in self.peers() {
+            {
                 out.to(
                     peer,
                     Message::RequestVote {
@@ -837,7 +908,7 @@ impl Raft {
         self.leader = Some(self.id);
         self.next.clear();
         self.matched.clear();
-        for &peer in &self.members {
+        for peer in self.peers() {
             self.next.insert(peer, self.last_index() + 1);
             self.matched.insert(peer, 0);
         }
@@ -852,7 +923,7 @@ impl Raft {
         out.persist = true;
 
         self.heartbeat_at = now + self.timing.heartbeat;
-        for &peer in &self.members.clone() {
+        for peer in self.peers() {
             if peer != self.id {
                 self.send_append(peer, out);
             }
@@ -862,17 +933,28 @@ impl Raft {
 
     /// Proposes a decision. `None` when this node is not the leader, because a proposal has to
     /// go through one.
+    /// Appends one decision of this node's own, as the leader.
+    ///
+    /// **A configuration change takes effect here, before it commits**, which is the rule Raft
+    /// states for one: the majority that commits the entry has to be the majority the entry
+    /// describes, or a leader could commit a change using a quorum that the change abolishes.
+    /// Every other decision waits for the commit, because routing a read to a node no majority
+    /// has acknowledged is answering from a node nobody agreed on.
     pub fn propose(&mut self, decision: Decision) -> Option<Output> {
         if self.role != Role::Leader {
             return None;
         }
         let mut out = Output { persist: true, ..Default::default() };
+        let carries_members = matches!(decision, Decision::Members(_));
         self.log.push(Entry { term: self.term, decision });
+        // Before the appends go out, so that this node is already counting the majority the
+        // change describes rather than the one it replaces.
+        if carries_members {
+            self.refresh_members();
+        }
         self.matched.insert(self.id, self.last_index());
-        for &peer in &self.members.clone() {
-            if peer != self.id {
-                self.send_append(peer, &mut out);
-            }
+        for peer in self.peers() {
+            self.send_append(peer, &mut out);
         }
         self.advance_commit(&mut out);
         Some(out)
@@ -965,20 +1047,34 @@ impl Raft {
                 // agree are left alone rather than rewritten, so a heartbeat carrying a repeat
                 // of what is already there does not truncate a log that is ahead of `commit`.
                 let mut index = prev_index;
+                let mut membership_moved = false;
                 for entry in entries {
                     index += 1;
+                    let carries_members = matches!(entry.decision, Decision::Members(_));
                     match self.term_at(index) {
                         Some(t) if t == entry.term => continue,
                         Some(_) => {
+                            // **The truncation is where a membership can go backwards.** A
+                            // leader with a better log can take away an entry this node already
+                            // applied, and a membership mutated in place would have no way
+                            // back - so it is recomputed from the log below instead.
+                            membership_moved |= self.log[index as usize..]
+                                .iter()
+                                .any(|e| matches!(e.decision, Decision::Members(_)));
                             self.log.truncate(index as usize);
                             self.log.push(entry);
                             out.persist = true;
+                            membership_moved |= carries_members;
                         }
                         None => {
                             self.log.push(entry);
                             out.persist = true;
+                            membership_moved |= carries_members;
                         }
                     }
+                }
+                if membership_moved {
+                    self.refresh_members();
                 }
 
                 if commit > self.commit {
@@ -1030,8 +1126,11 @@ impl Raft {
             if self.term_at(index) != Some(self.term) {
                 continue;
             }
+            // **Voters, not everybody replicated to.** A learner holding the entry is not
+            // agreement about it: it does not vote, so counting it would let a leader commit
+            // on the strength of nodes that could never have elected it.
             let replicas = self
-                .members
+                .voters
                 .iter()
                 .filter(|m| self.matched.get(m).is_some_and(|x| *x >= index))
                 .count();
@@ -1060,6 +1159,12 @@ impl Raft {
     /// long log of entries nobody committed win over one with the entries that were.
     fn grant(&self, term: Term, candidate: NodeId, last_index: Index, last_term: Term) -> bool {
         if term < self.term {
+            return false;
+        }
+        // **A candidate that is not a voter here gets nothing.** A node this cluster has
+        // removed can still be running and still campaigning; granting it a vote would let a
+        // machine nobody has agreed to become the leader of a cluster it has left.
+        if !self.voters.contains(&candidate) {
             return false;
         }
         if self.voted_for.is_some_and(|v| v != candidate) {
@@ -1371,4 +1476,12 @@ fn decode_state(bytes: &[u8]) -> core::result::Result<State, &'static str> {
         return Err("bytes after the end");
     }
     Ok(State { term, voted_for, commit, log })
+}
+
+/// The members whose agreement counts, by index.
+///
+/// A free function because it is a property of a list rather than of a node, and both
+/// [`Raft::new`] and [`Raft::refresh_members`] need it before there is a `self` to ask.
+fn voters_of(members: &[Member]) -> Vec<NodeId> {
+    (0..members.len()).filter(|i| members[*i].votes()).collect()
 }

@@ -84,13 +84,93 @@ pub struct Controller {
     members: Arc<RwLock<Vec<Member>>>,
     /// This node's own index, kept because half the questions below are about it.
     this: NodeId,
+    /// How the other nodes are reached. Held so that a node which joins can be added to it.
+    peers: Arc<dyn Peers>,
     /// Milliseconds since this process started, at the last moment this node could prove it
     /// was still in touch with a majority. The lease, in one number.
     lease_at: AtomicU64,
     started: Instant,
     inbox: mpsc::Sender<Message>,
-    outbox: Vec<Option<mpsc::SyncSender<Message>>>,
+    /// One sender thread per peer, made on demand.
+    outbox: Outbox,
     stop: Arc<AtomicBool>,
+}
+
+/// The threads that carry the agreement to the other nodes.
+///
+/// **One per peer, made when the peer first appears.** It used to be a fixed vector built from
+/// the cluster file, so a message addressed to a node that joined at runtime went into
+/// `outbox.get(to)`, matched `None`, and was silently dropped - a new node that could never be
+/// reached and no error anywhere saying so.
+struct Outbox {
+    senders: RwLock<Vec<Option<mpsc::SyncSender<Message>>>>,
+    peers: Arc<dyn Peers>,
+    stop: Arc<AtomicBool>,
+    budget: u64,
+    this: NodeId,
+}
+
+impl Outbox {
+    fn new(peers: Arc<dyn Peers>, stop: Arc<AtomicBool>, budget: u64, this: NodeId) -> Self {
+        Self { senders: RwLock::new(Vec::new()), peers, stop, budget, this }
+    }
+
+    /// Makes sure there is a thread for every node below `len`.
+    fn reach(&self, len: usize) {
+        let mut senders = self.senders.write().expect("no panic holds this lock");
+        if senders.len() < len {
+            senders.resize_with(len, || None);
+        }
+        for i in 0..senders.len() {
+            if i == self.this || senders[i].is_some() {
+                continue;
+            }
+            // A short queue, and a heartbeat that cannot be queued is dropped rather than
+            // waited for: this protocol was designed for a network that loses messages, and
+            // blocking the one thread that drives it in order to reach a node that is not
+            // answering is how a live cluster is brought down by a dead node.
+            let (send, recv) = mpsc::sync_channel::<Message>(64);
+            senders[i] = Some(send);
+            let peers = Arc::clone(&self.peers);
+            let stop = Arc::clone(&self.stop);
+            let budget = self.budget;
+            std::thread::Builder::new()
+                .name(format!("big-raft-out-{i}"))
+                .spawn(move || {
+                    while let Ok(m) = recv.recv() {
+                        if stop.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        let body = wire::encode_raft(&m);
+                        let _ = peers.post(
+                            i,
+                            path::RAFT,
+                            &body,
+                            Some(Duration::from_millis(budget)),
+                            // A message that arrives twice decides nothing twice: a term and an
+                            // index say what a message means, so a retry on a connection that
+                            // was closed underneath us is free.
+                            Repeatable::Yes,
+                        );
+                    }
+                })
+                .expect("a thread per peer");
+        }
+    }
+
+    /// How many nodes this outbox can already reach.
+    fn len(&self) -> usize {
+        self.senders.read().expect("no panic holds this lock").len()
+    }
+
+    fn send(&self, to: NodeId, m: Message) {
+        let senders = self.senders.read().expect("no panic holds this lock");
+        if let Some(Some(sender)) = senders.get(to) {
+            // Full means this peer is not keeping up, and a queued heartbeat that is already
+            // stale helps nobody.
+            let _ = sender.try_send(m);
+        }
+    }
 }
 
 impl Controller {
@@ -114,8 +194,8 @@ impl Controller {
         ranges: Arc<RwLock<RangeMap>>,
     ) -> std::io::Result<Arc<Self>> {
         let started = Instant::now();
-        let voters: Vec<NodeId> = (0..config.nodes().len()).collect();
-        let mut raft = Raft::new(config.this_index(), voters, timing, 0);
+        let this = config.this_index();
+        let mut raft = Raft::new(this, config.seed_members(), timing, 0);
         if let Some(state) = store.load()? {
             raft.restore(state);
         }
@@ -144,40 +224,8 @@ impl Controller {
         // queued is dropped rather than waited for: this protocol was designed for a network
         // that loses messages, and blocking the one thread that drives it in order to reach a
         // node that is not answering is how a live cluster is brought down by a dead node.
-        let mut outbox = Vec::with_capacity(peers.len());
-        for i in 0..peers.len() {
-            match i == config.this_index() {
-                true => outbox.push(None),
-                false => {
-                    let (send, recv) = mpsc::sync_channel::<Message>(64);
-                    outbox.push(Some(send));
-                    let peers = Arc::clone(&peers);
-                    let stop = Arc::clone(&stop);
-                    let budget = timing.heartbeat;
-                    std::thread::Builder::new()
-                        .name(format!("big-raft-out-{i}"))
-                        .spawn(move || {
-                            while let Ok(m) = recv.recv() {
-                                if stop.load(Ordering::Relaxed) {
-                                    return;
-                                }
-                                let body = wire::encode_raft(&m);
-                                let _ = peers.post(
-                                    i,
-                                    path::RAFT,
-                                    &body,
-                                    Some(Duration::from_millis(budget)),
-                                    // A message that arrives twice decides nothing twice: a
-                                    // term and an index say what a message means, so a retry
-                                    // on a connection that was closed underneath us is free.
-                                    Repeatable::Yes,
-                                );
-                            }
-                        })
-                        .expect("a thread per peer");
-                }
-            }
-        }
+        let outbox = Outbox::new(Arc::clone(&peers), Arc::clone(&stop), timing.heartbeat, this);
+        outbox.reach(peers.len());
 
         let controller = Arc::new(Self {
             raft: Mutex::new(raft),
@@ -185,7 +233,8 @@ impl Controller {
             leases,
             ranges,
             members: Arc::new(RwLock::new(members)),
-            this: config.this_index(),
+            this,
+            peers: Arc::clone(&peers),
             lease_at: AtomicU64::new(0),
             started,
             inbox: tx,
@@ -325,6 +374,21 @@ impl Controller {
                 }
             }
 
+            // **Before anything is sent to a node that may be new.** The membership the raft
+            // core is working from is derived from its log, so a node that joined is already
+            // being addressed - and a message to a peer with no client and no thread would be
+            // dropped without a word. Cheap: both calls do nothing at all once the tables are
+            // long enough, which is every tick but the few where the cluster changed.
+            let membership =
+                self.raft.lock().expect("no panic holds this lock").membership().to_vec();
+            if membership.len() > self.outbox.len() {
+                let addrs: Vec<(String, String)> =
+                    membership.iter().map(|m| (m.name.clone(), m.addr.clone())).collect();
+                self.peers.extend(&addrs);
+                self.outbox.reach(membership.len());
+            }
+            *self.members.write().expect("no panic holds this lock") = membership;
+
             for decision in out.applied {
                 match decision {
                     // Applied on commit: routing a read to a node before a majority agreed it
@@ -332,22 +396,16 @@ impl Controller {
                     Decision::Ranges(m) => {
                         *self.ranges.write().expect("no panic holds this lock") = m
                     }
-                    // Membership is applied when the entry is *appended*, not here - see
-                    // `Raft::append_members`. Reaching this point again on commit is harmless
-                    // and idempotent, and it is what makes a follower that restarted converge.
-                    Decision::Members(ms) => {
-                        *self.members.write().expect("no panic holds this lock") = ms
-                    }
+                    // Membership is applied when the entry is *appended*, not here - the raft
+                    // core does it, and the loop above copies the result out every tick. A
+                    // committed one decides nothing new.
+                    Decision::Members(_) => {}
                     Decision::Noop => {}
                 }
             }
 
             for (to, m) in out.send {
-                if let Some(Some(sender)) = self.outbox.get(to) {
-                    // Full means this peer is not keeping up, and a queued heartbeat that is
-                    // already stale helps nobody.
-                    let _ = sender.try_send(m);
-                }
+                self.outbox.send(to, m);
             }
         }
     }
@@ -463,6 +521,30 @@ impl Controller {
         }
     }
 
+    /// Proposes a change to who is in the cluster.
+    ///
+    /// **One node at a time.** Adding or removing a single member keeps the old majority and
+    /// the new one overlapping, which is what makes the change safe without joint consensus -
+    /// two at once can split into two disjoint majorities that each elect a leader. The
+    /// "everything before it has committed" rule below is what enforces the one-at-a-time part.
+    pub fn propose_members(&self, next: Vec<Member>) -> core::result::Result<(), ProposeError> {
+        let mut raft = self.raft.lock().expect("no panic holds this lock");
+        if !raft.is_leader() {
+            return Err(ProposeError::NotLeader { leader: raft.leader() });
+        }
+        if raft.commit_index() != raft.last_index() {
+            return Err(ProposeError::Busy);
+        }
+        let before = raft.membership().to_vec();
+        if differences(&before, &next) > 1 {
+            return Err(ProposeError::TooManyAtOnce);
+        }
+        match raft.propose(Decision::Members(next)) {
+            Some(_) => Ok(()),
+            None => Err(ProposeError::NotLeader { leader: raft.leader() }),
+        }
+    }
+
     /// Records that a copy has caught up, after a repair has made it true.
     ///
     /// Proposed rather than applied: whether a copy may be promoted is a fact every node has
@@ -495,13 +577,20 @@ fn merge(into: &mut raft::Output, from: raft::Output) {
 /// one. A candidate has no lease at all, which is correct - it does not know who leads.
 fn lease_anchor(raft: &Raft, now: u64) -> Option<u64> {
     if raft.is_leader() {
-        let mut heard: Vec<u64> = (0..raft.members())
-            .filter_map(|n| if n == raft.id() { Some(now) } else { raft.last_heard(n) })
+        // **Over the voters, and by their ids.** This used to walk `0..members()` as though the
+        // member set were a dense range - true while membership was a file read once, and
+        // wrong the moment a node can leave and keep its slot. A learner is excluded for the
+        // same reason it does not count towards a majority: it cannot help prove this node is
+        // still the leader.
+        let voters = raft.voters();
+        let mut heard: Vec<u64> = voters
+            .iter()
+            .filter_map(|n| if *n == raft.id() { Some(now) } else { raft.last_heard(*n) })
             .collect();
         heard.sort_unstable_by(|a, b| b.cmp(a));
         // The majority-th most recent. With three nodes that is the second: this node and one
         // other, which is a majority that has answered within that time.
-        return heard.get(raft.members() / 2).copied();
+        return heard.get(voters.len() / 2).copied();
     }
     let leader = raft.leader()?;
     if leader == raft.id() {
@@ -520,6 +609,9 @@ pub enum ProposeError {
     /// Something is already in flight. Deciding about a state that has not settled is how two
     /// changes are made about one map and only one of them survives.
     Busy,
+    /// More than one member added, removed or changed at once. Two at a time can split the
+    /// cluster into two majorities that do not overlap, and each would elect its own leader.
+    TooManyAtOnce,
     Invalid(raft::MapError),
 }
 
@@ -536,7 +628,19 @@ impl core::fmt::Display for ProposeError {
                 f,
                 "a change to the map is already in flight; wait for it to commit and try again"
             ),
+            Self::TooManyAtOnce => write!(
+                f,
+                "a membership change moves one node at a time; two at once can leave two \
+                 majorities that do not overlap, and each would elect its own leader"
+            ),
             Self::Invalid(e) => write!(f, "the change would leave the map invalid: {e}"),
         }
     }
+}
+
+/// How many slots differ between two member lists, counting a longer list as that many more.
+fn differences(before: &[Member], after: &[Member]) -> usize {
+    let common = before.len().min(after.len());
+    let changed = (0..common).filter(|i| before[*i] != after[*i]).count();
+    changed + before.len().abs_diff(after.len())
 }
