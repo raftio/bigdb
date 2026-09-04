@@ -26,6 +26,10 @@
 use super::*;
 use crate::raft::{RangeId, RangeMap};
 
+/// How long a change to the map may take to be agreed before the caller is told it has not
+/// been. Generous: an election has to be able to finish inside it.
+const PROPOSAL_TIMEOUT: Duration = Duration::from_secs(10);
+
 impl<P: PagerMut + Sync> Cluster<P> {
     /// Cuts the range holding `at` in two, and optionally hands the upper half to another node.
     ///
@@ -104,7 +108,12 @@ impl<P: PagerMut + Sync> Cluster<P> {
         Ok(next.checked_sub(1))
     }
 
-    /// Puts a change to the agreement, wherever the leader happens to be.
+    /// Puts a change to the agreement and **waits for it to commit**.
+    ///
+    /// Waiting is what makes a sequence of changes - the three steps of a move - a sequence
+    /// rather than a race. A proposal returns as soon as it is appended, so a caller that read
+    /// the map straight afterwards would read the map it started from and build its next change
+    /// on a state that is about to be replaced.
     fn propose(&self, next: RangeMap) -> Result<()> {
         let Some(controller) = &self.controller else {
             return Err(ClusterError::Refused(
@@ -113,7 +122,29 @@ impl<P: PagerMut + Sync> Cluster<P> {
                     .to_string(),
             ));
         };
-        controller.propose_map(next).map(|_| ()).map_err(|e| ClusterError::Refused(e.to_string()))
+        let epoch =
+            controller.propose_map(next).map_err(|e| ClusterError::Refused(e.to_string()))?;
+        self.await_epoch(epoch)
+    }
+
+    /// Waits until this node has applied the map at `epoch`.
+    ///
+    /// A poll rather than a signal: the wait is over in about one round trip, this is an
+    /// operator's request rather than the query path, and a condition variable to save a few
+    /// milliseconds here would be machinery nobody could see the value of.
+    fn await_epoch(&self, epoch: u64) -> Result<()> {
+        let deadline = Instant::now() + PROPOSAL_TIMEOUT;
+        while Instant::now() < deadline {
+            if self.map().epoch >= epoch {
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        Err(ClusterError::Refused(format!(
+            "the change was proposed but has not been agreed after {}s; the cluster may have \
+             lost its leader. Nothing was applied - `cluster topology` says where it stands",
+            PROPOSAL_TIMEOUT.as_secs()
+        )))
     }
 
     /// A node's index by name, refusing a name the cluster does not have.
@@ -126,6 +157,178 @@ impl<P: PagerMut + Sync> Cluster<P> {
             .iter()
             .position(|n| n.name == name && n.state != raft::MemberState::Gone)
             .ok_or_else(|| ClusterError::Refused(format!("there is no node called `{name}`")))
+    }
+
+    /// Moves a populated range to another node, without stopping reads.
+    ///
+    /// **Three steps, each one committed decision.**
+    ///
+    /// 1. *Seeding.* The target is told to expect the range and then filled, **out of the write
+    ///    path entirely** - it is not in the group, nothing reads from it, and abandoning the
+    ///    move at any point up to the last step costs nothing.
+    /// 2. *Cutover.* Writes to this one range are refused, retryably, while the difference that
+    ///    accumulated during the seed is copied. This is the only window in which anything is
+    ///    denied, and it is one range wide.
+    /// 3. *Handover.* The group, the primary and the end of the move land in one entry, so there
+    ///    is no committed state in which two nodes could both be asked for these records. Then
+    ///    the source drops what it no longer owns.
+    ///
+    /// **Reads never stop.** The source serves the range right up to the instant the handover
+    /// commits, which is the same atomic act as a failover.
+    ///
+    /// Synchronous, like `POST /repair`: it is a scan and a copy, and a caller that wants it in
+    /// the background runs it in the background.
+    pub fn move_range(&self, id: RangeId, to: &str) -> Result<MoveReport> {
+        let target = self.node_named(to)?;
+        let map = self.map();
+        let Some(i) = map.position(id) else {
+            return Err(ClusterError::Refused(format!("there is no range {id}")));
+        };
+        let (source, shards) = (map.ranges[i].primary, map.ranges[i].shards);
+        if source == target {
+            return Err(ClusterError::Refused(format!("range {id} is already on `{to}`")));
+        }
+
+        // 1. Seeding. Announced before a byte moves, so that a leader elected in the middle of
+        // this finds a move it can finish or abandon rather than a half-filled node it has
+        // never heard of.
+        self.with_map(|m| m.begin_move(id, target).map_err(|e| e.to_string()))?;
+        let seeded = match self.catch_up_in(source, target, Some(shards)) {
+            Ok(n) => n,
+            Err(e) => return Err(self.abandon(id, e)),
+        };
+
+        // 2. Cutover.
+        //
+        // **The barrier is only real once the source knows about it.** Committing the decision
+        // makes it final; it does not make the source aware of it, and a source still on the
+        // old map goes on accepting writes for this range. Every one of those that lands after
+        // the pass below has read its fragments is a write that was acknowledged and then left
+        // behind - which is the exact failure this whole shape exists to prevent, and the one
+        // nothing downstream would ever contradict.
+        //
+        // So the epoch is waited for *at the source* before a byte of the final pass is read.
+        // After that the range is genuinely still, and the cardinality comparison underneath
+        // `catch_up_in` is a proof rather than a guess.
+        let epoch = self.with_map(|m| {
+            m.set_move_state(id, raft::MoveState::Cutover).map_err(|e| e.to_string())
+        })?;
+        if let Err(e) = self.await_applied(source, epoch) {
+            return Err(self.abandon(id, e));
+        }
+        let caught = match self.catch_up_in(source, target, Some(shards)) {
+            Ok(n) => n,
+            Err(e) => return Err(self.abandon(id, e)),
+        };
+
+        // The proof that it worked, before anything is handed over. A move that copied
+        // everything it could find and still disagrees is a move that must not complete.
+        match self.digests_agree(source, target, shards) {
+            Err(e) => return Err(self.abandon(id, e)),
+            Ok(false) => {
+                return Err(self.abandon(
+                    id,
+                    ClusterError::Refused(format!(
+                        "`{to}` still disagrees with the node it copied shards {shards} from, \
+                         so the range was left where it was"
+                    )),
+                ))
+            }
+            Ok(true) => {}
+        }
+
+        // 3. Handover, in one entry.
+        self.with_map(|m| m.finish_move(id).map_err(|e| e.to_string()))?;
+
+        // **After the source has applied the handover, not merely after it commits.**
+        //
+        // Committing makes the decision final; it does not make every node aware of it. A
+        // source still on the old map believes it serves this range, so emptying it first makes
+        // that node answer *zero* for records it thinks it owns - a wrong answer rather than a
+        // refusal, which is the one failure this whole layer is built to avoid. Once it has
+        // applied, it knows the range is not its own and refuses instead.
+        //
+        // A failure here leaves records nobody reads: it costs space and answers nothing
+        // wrongly, so it is reported rather than undone.
+        let dropped = self
+            .await_applied(source, self.map().epoch)
+            .and_then(|()| self.drop_shards(source, shards));
+        Ok(MoveReport {
+            range: id,
+            shards: shards.to_string(),
+            from: self.name_of(source).unwrap_or_default(),
+            to: to.to_string(),
+            fragments: seeded + caught,
+            dropped: dropped.is_ok(),
+            outcome: match dropped {
+                Ok(()) => "moved".to_string(),
+                Err(e) => format!("moved, but the old copy could not be dropped: {e}"),
+            },
+        })
+    }
+
+    /// Ends a move that cannot be finished, and reports why.
+    ///
+    /// Nothing was ever read from the target, so abandoning costs only the copying already
+    /// done. The original error is what the caller hears; a failure to even cancel is added to
+    /// it rather than replacing it.
+    fn abandon(&self, id: RangeId, why: ClusterError) -> ClusterError {
+        match self.with_map(|m| m.cancel_move(id).map_err(|e| e.to_string())) {
+            Ok(_) => why,
+            Err(e) => ClusterError::Refused(format!(
+                "{why} - and the move could not be called off either ({e}), so range {id} is \
+                 still marked as moving. `cluster cancel {id}` clears it"
+            )),
+        }
+    }
+
+    /// Abandons a move deliberately.
+    pub fn cancel_move(&self, id: RangeId) -> Result<()> {
+        self.with_map(|m| m.cancel_move(id).map_err(|e| e.to_string())).map(|_| ())
+    }
+
+    /// Waits until another node has applied the map at `epoch`.
+    ///
+    /// The map a node is answering from is its own, and it gets there by replication - about a
+    /// heartbeat behind whoever proposed the change.
+    fn await_applied(&self, node: usize, epoch: u64) -> Result<()> {
+        if node == self.config.this_index() {
+            return self.await_epoch(epoch);
+        }
+        let deadline = Instant::now() + PROPOSAL_TIMEOUT;
+        while Instant::now() < deadline {
+            let bytes = self.ask(node, path::EPOCH, &[], None)?;
+            if self.read(node, || wire::get_u64_body(&bytes))? >= epoch {
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        Err(ClusterError::Refused(format!(
+            "`{}` has not caught up with the handover, so its copy was left in place",
+            self.name_of(node).unwrap_or_default()
+        )))
+    }
+
+    /// Whether two nodes hold the same facts for a set of shards.
+    fn digests_agree(
+        &self,
+        source: usize,
+        target: usize,
+        shards: big_engine::ShardRange,
+    ) -> Result<bool> {
+        let scope = Some(vec![shards]);
+        Ok(self.digest_in(source, scope.clone())? == self.digest_in(target, scope)?)
+    }
+
+    /// Reads the map, changes it, proposes the result, and answers with the epoch it landed at.
+    fn with_map(
+        &self,
+        change: impl FnOnce(&mut RangeMap) -> core::result::Result<(), String>,
+    ) -> Result<u64> {
+        let mut next = self.map();
+        change(&mut next).map_err(ClusterError::Refused)?;
+        self.propose(next)?;
+        Ok(self.map().epoch)
     }
 
     // ---------------------------------------------------------------------------------------
@@ -213,6 +416,11 @@ impl<P: PagerMut + Sync> Cluster<P> {
         }
     }
 
+    /// Puts a change to who is in the cluster, and **waits for it to take effect**.
+    ///
+    /// Waiting for the same reason a map change waits: two changes in a row are a sequence, and
+    /// the second reads what the first decided. A membership has no epoch to watch, so what is
+    /// waited on is the list itself - which is exact, because it is replaced whole.
     fn propose_members(&self, next: Vec<raft::Member>) -> Result<()> {
         let Some(controller) = &self.controller else {
             return Err(ClusterError::Refused(
@@ -220,7 +428,21 @@ impl<P: PagerMut + Sync> Cluster<P> {
                     .to_string(),
             ));
         };
-        controller.propose_members(next).map_err(|e| ClusterError::Refused(e.to_string()))
+        controller
+            .propose_members(next.clone())
+            .map_err(|e| ClusterError::Refused(e.to_string()))?;
+        let deadline = Instant::now() + PROPOSAL_TIMEOUT;
+        while Instant::now() < deadline {
+            if self.members() == next {
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        Err(ClusterError::Refused(
+            "the membership change was proposed but has not been agreed; the cluster may have \
+             lost its leader. `cluster topology` says where it stands"
+                .to_string(),
+        ))
     }
 
     /// What the cluster looks like right now: every range, who holds it, and what is moving.
@@ -266,6 +488,21 @@ impl<P: PagerMut + Sync> Cluster<P> {
             behind: self.behind(),
         }
     }
+}
+
+/// What a move managed.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct MoveReport {
+    pub range: RangeId,
+    pub shards: String,
+    pub from: String,
+    pub to: String,
+    /// How many fragments crossed the wire, over both passes.
+    pub fragments: usize,
+    /// Whether the source let go of what it no longer owns. `false` leaves records nobody
+    /// reads: it costs space and answers nothing wrongly.
+    pub dropped: bool,
+    pub outcome: String,
 }
 
 /// The cluster's shape, as a report.

@@ -243,6 +243,8 @@ enum Target<'a> {
     PeerKeysPut,
     PeerRepaired,
     PeerSchema,
+    /// Which version of the map this node has applied.
+    PeerEpoch,
     Repair,
     Backup,
     /// What the cluster looks like right now, for an operator or an autoscaler.
@@ -256,6 +258,10 @@ enum Target<'a> {
     ClusterAdmit,
     ClusterDrain,
     ClusterRemove,
+    /// Hand a populated range to another node without stopping reads.
+    ClusterMove,
+    /// Abandon a move that is in flight.
+    ClusterCancel,
 }
 
 impl<'a> Target<'a> {
@@ -268,6 +274,7 @@ impl<'a> Target<'a> {
         matches!(
             self,
             Self::PeerQuery
+                | Self::PeerEpoch
                 | Self::PeerRecords
                 | Self::PeerDigest
                 | Self::PeerImport
@@ -336,7 +343,9 @@ impl<'a> Target<'a> {
             | Self::ClusterAddNode
             | Self::ClusterAdmit
             | Self::ClusterDrain
-            | Self::ClusterRemove => Guard::Needs(Privilege::Operate, ObjectRef::Server),
+            | Self::ClusterRemove
+            | Self::ClusterMove
+            | Self::ClusterCancel => Guard::Needs(Privilege::Operate, ObjectRef::Server),
             Self::Query(t) | Self::Records(t) => Guard::Needs(Privilege::Select, table(t)),
             Self::Import(t) => Guard::Needs(Privilege::Insert, table(t)),
             // Deleting records is not inserting them: a credential that may add facts is not
@@ -372,6 +381,7 @@ impl<'a> Target<'a> {
             | Self::PeerRaft
             | Self::PeerFragmentPut
             | Self::PeerKeysPut
+            | Self::PeerEpoch
             | Self::PeerRepaired => Guard::Node,
         }
     }
@@ -412,6 +422,7 @@ fn resolve<'a>(method: &str, segments: &[&'a str]) -> Option<Target<'a>> {
         ("POST", ["internal", "keys", "put"]) => Target::PeerKeysPut,
         ("POST", ["internal", "repaired"]) => Target::PeerRepaired,
         ("POST", ["internal", "schema"]) => Target::PeerSchema,
+        ("POST", ["internal", "epoch"]) => Target::PeerEpoch,
         ("POST", ["repair"]) => Target::Repair,
         ("GET", ["cluster", "topology"]) => Target::ClusterTopology,
         ("POST", ["admin", "cluster", "split"]) => Target::ClusterSplit,
@@ -420,6 +431,8 @@ fn resolve<'a>(method: &str, segments: &[&'a str]) -> Option<Target<'a>> {
         ("POST", ["admin", "cluster", "admit"]) => Target::ClusterAdmit,
         ("POST", ["admin", "cluster", "drain"]) => Target::ClusterDrain,
         ("DELETE", ["admin", "cluster", "node"]) => Target::ClusterRemove,
+        ("POST", ["admin", "cluster", "move"]) => Target::ClusterMove,
+        ("POST", ["admin", "cluster", "cancel"]) => Target::ClusterCancel,
         ("POST", ["admin", "backup"]) => Target::Backup,
         _ => return None,
     })
@@ -541,6 +554,7 @@ pub fn dispatch<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request) -> Answered
         Target::PeerKeys => peer_keys(ctx, req),
         Target::PeerKeysPut => peer_keys_put(ctx, req),
         Target::PeerRepaired => peer_repaired(ctx, req),
+        Target::PeerEpoch => Response::binary(wire::put_u64_body(ctx.cluster.map().epoch)),
         Target::PeerSchema => {
             let mut out = Vec::new();
             wire::put_schema(&mut out, &ctx.cluster.schema(), &ctx.cluster.views());
@@ -554,6 +568,8 @@ pub fn dispatch<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request) -> Answered
         Target::ClusterAdmit => cluster_member(ctx, req, Membership::Admit),
         Target::ClusterDrain => cluster_member(ctx, req, Membership::Drain),
         Target::ClusterRemove => cluster_member(ctx, req, Membership::Remove),
+        Target::ClusterMove => cluster_move(ctx, req),
+        Target::ClusterCancel => cluster_cancel(ctx, req),
         Target::Backup => backup(ctx, req),
     };
     Answered { response, who }

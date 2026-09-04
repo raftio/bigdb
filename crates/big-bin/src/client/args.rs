@@ -128,6 +128,15 @@ pub enum Command {
         verb: &'static str,
         name: String,
     },
+    /// `cluster move <range> to <node>` - hand a populated range over.
+    ClusterMove {
+        range: u64,
+        to: String,
+    },
+    /// `cluster cancel <range>` - abandon a move in flight.
+    ClusterCancel {
+        range: u64,
+    },
     Health,
     Ready,
     Metrics,
@@ -542,6 +551,20 @@ fn command(positional: &[String], scoped: Vec<(String, String)>) -> Result<Comma
         ["cluster", "remove", name] => {
             only(&scoped, "cluster remove", &[])?;
             Command::ClusterMember { verb: "remove", name: (*name).to_string() }
+        }
+        ["cluster", "move", range, "to", node] => {
+            only(&scoped, "cluster move", &[])?;
+            let range = range
+                .parse()
+                .map_err(|_| format!("`{range}` is not a range id; write `cluster move 2 to c`"))?;
+            Command::ClusterMove { range, to: (*node).to_string() }
+        }
+        ["cluster", "cancel", range] => {
+            only(&scoped, "cluster cancel", &[])?;
+            let range = range
+                .parse()
+                .map_err(|_| format!("`{range}` is not a range id; write `cluster cancel 2`"))?;
+            Command::ClusterCancel { range }
         }
         ["cluster", "merge", range] => {
             only(&scoped, "cluster merge", &[])?;

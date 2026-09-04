@@ -78,6 +78,13 @@ pub enum ClusterError {
     /// and sends the batch to the node that does own them. Without it, a write during a split
     /// or a move lands on a node no read will ever ask - a loss with nothing to report it.
     StaleRoute { node: String, wanted: String, epoch: u64, mine: u64 },
+    /// **The one window a move denies anything.** Writes to the range being handed over are
+    /// refused while the last difference is copied, so that the copy is made against something
+    /// that is not moving.
+    ///
+    /// Retryable, and one range wide: everything else the cluster holds is untouched, and
+    /// reads of this range are still answered by the node that has not let go of it yet.
+    RangeMoving { node: String, shards: String },
     /// **Half applied.** Some nodes took it and some did not.
     ///
     /// There is no transaction across nodes and this is what that costs. Stated as plainly as
@@ -108,7 +115,8 @@ impl ClusterError {
             Self::Unreachable { .. }
             | Self::LeaderUnreachable { .. }
             | Self::NotServing { .. }
-            | Self::StaleRoute { .. } => 503,
+            | Self::StaleRoute { .. }
+            | Self::RangeMoving { .. } => 503,
             Self::Peer { status, .. } => *status,
             Self::Wire { .. } | Self::Mismatch { .. } => 502,
             Self::Timeout => 504,
@@ -119,11 +127,13 @@ impl ClusterError {
     /// failure worth trying again unchanged.
     pub fn is_stale_route(&self) -> bool {
         match self {
-            Self::StaleRoute { .. } => true,
+            Self::StaleRoute { .. } | Self::RangeMoving { .. } => true,
             // A refusal travels out of a peer as a status and a code, so the coordinator sees
             // the peer's verdict rather than the typed error the peer built.
-            Self::Peer { code, .. } => code == "stale_route",
-            Self::Partial { failed, .. } => failed.iter().any(|f| f.contains("stale_route")),
+            Self::Peer { code, .. } => code == "stale_route" || code == "range_moving",
+            Self::Partial { failed, .. } => {
+                failed.iter().any(|f| f.contains("stale_route") || f.contains("range_moving"))
+            }
             _ => false,
         }
     }
@@ -141,6 +151,7 @@ impl ClusterError {
             Self::Unreachable { .. }
                 | Self::NotServing { .. }
                 | Self::StaleRoute { .. }
+                | Self::RangeMoving { .. }
                 | Self::Timeout
         )
     }
@@ -161,6 +172,7 @@ impl ClusterError {
             Self::NotServing { .. } => "not_serving",
             Self::Refused(_) => "refused",
             Self::StaleRoute { .. } => "stale_route",
+            Self::RangeMoving { .. } => "range_moving",
             Self::Partial { .. } => "partially_applied",
         }
     }
@@ -198,6 +210,12 @@ impl core::fmt::Display for ClusterError {
                  has stopped answering for them rather than risk a second node answering too"
             ),
             Self::Refused(why) => write!(f, "{why}"),
+            Self::RangeMoving { node, shards } => write!(
+                f,
+                "`{node}` is handing shards {shards} to another node and is not taking writes \
+                 for them while the last of the copy is made. Send it again in a moment - \
+                 reads of these shards are still being answered, and nothing else is affected"
+            ),
             Self::StaleRoute { node, wanted, epoch, mine } => write!(
                 f,
                 "`{node}` was sent records for shards {wanted} under map epoch {epoch}, and its \

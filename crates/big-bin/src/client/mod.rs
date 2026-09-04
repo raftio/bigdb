@@ -231,6 +231,14 @@ fn request(command: &Command, input: &mut dyn BufRead) -> Result<Request, String
         Command::ClusterMerge { range } => {
             Request::new("POST", format!("/admin/cluster/merge?range={range}"), String::new())
         }
+        Command::ClusterMove { range, to } => Request::new(
+            "POST",
+            format!("/admin/cluster/move?range={range}&to={to}"),
+            String::new(),
+        ),
+        Command::ClusterCancel { range } => {
+            Request::new("POST", format!("/admin/cluster/cancel?range={range}"), String::new())
+        }
         Command::ClusterAddNode { name, addr } => Request::new(
             "POST",
             format!("/admin/cluster/node?name={name}&addr={addr}"),

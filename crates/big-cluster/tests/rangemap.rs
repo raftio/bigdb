@@ -20,7 +20,9 @@
 //! it would be a record id no node answers for, with nothing afterwards to notice.
 
 use big_cluster::config::ClusterFile;
-use big_cluster::raft::{MapError, MergeError, Move, MoveState, Range, RangeMap, SplitError};
+use big_cluster::raft::{
+    MapError, MergeError, Move, MoveError, MoveState, Range, RangeMap, SplitError,
+};
 use big_engine::ShardRange;
 use proptest::prelude::*;
 
@@ -331,4 +333,71 @@ proptest! {
             Err(e) => prop_assert!(false, "unexpected {:?}", e),
         }
     }
+}
+
+// -------------------------------------------------------------------------------------------
+// A range on its way somewhere else
+// -------------------------------------------------------------------------------------------
+
+/// **The target is not in the group while it fills up.** Nothing reads from it, nothing writes
+/// to it, and abandoning the move costs only the copying already done.
+///
+/// Putting it in the group and letting the existing write path dual-write would make the final
+/// pass short, and would also lose writes: a fragment is replaced whole, so a seed copy landing
+/// after a live write discards it - and the two then have equal counts and different contents,
+/// which is exactly what the cardinality comparison cannot tell apart.
+#[test]
+fn a_range_being_moved_is_still_held_and_served_by_the_node_it_is_leaving() {
+    let mut m = map(vec![range(0, 0, Some(64), 0), range(1, 64, None, 1)]);
+    m.begin_move(1, 2).unwrap();
+
+    assert_eq!(m.check(), Ok(()));
+    assert_eq!(m.ranges[1].group, vec![1], "the target is not a holder yet");
+    assert_eq!(m.ranges[1].primary, 1, "and reads still go to the node it is leaving");
+    assert_eq!(m.served_by(2), Vec::<usize>::new());
+    assert_eq!(m.moving_at(70).map(|mv| mv.target), Some(2));
+    assert_eq!(m.moving_at(10), None, "another range is not moving");
+}
+
+#[test]
+fn a_move_that_is_already_running_is_not_started_again() {
+    let mut m = map(vec![range(0, 0, None, 0)]);
+    m.begin_move(0, 1).unwrap();
+    assert_eq!(m.begin_move(0, 2), Err(MoveError::AlreadyMoving { id: 0 }));
+    assert_eq!(m.begin_move(9, 1), Err(MoveError::NoSuchRange { id: 9 }));
+}
+
+#[test]
+fn a_move_to_a_node_that_already_holds_the_range_is_refused() {
+    let mut m = map(vec![range(0, 0, None, 0)]);
+    assert_eq!(m.begin_move(0, 0), Err(MoveError::AlreadyThere { id: 0, target: 0 }));
+}
+
+/// **The group, the primary and the end of the move land together.** There is no committed
+/// state in which two nodes could both be asked for these records.
+#[test]
+fn finishing_a_move_hands_over_everything_at_once() {
+    let mut m = map(vec![range(0, 0, Some(64), 0), range(1, 64, None, 1)]);
+    m.begin_move(1, 2).unwrap();
+    m.set_move_state(1, MoveState::Cutover).unwrap();
+    m.finish_move(1).unwrap();
+
+    assert_eq!(m.check(), Ok(()));
+    assert_eq!(m.ranges[1].group, vec![2]);
+    assert_eq!(m.ranges[1].primary, 2);
+    assert_eq!(m.ranges[1].moving, None);
+    assert_eq!(m.served_by(1), Vec::<usize>::new(), "the old owner serves nothing here now");
+}
+
+#[test]
+fn a_cancelled_move_leaves_the_range_exactly_as_it_was() {
+    let before = map(vec![range(0, 0, None, 0)]);
+    let mut after = before.clone();
+    after.begin_move(0, 1).unwrap();
+    after.cancel_move(0).unwrap();
+    assert_eq!(after.ranges, before.ranges);
+
+    // And a range that is not moving says so, rather than reporting success for nothing.
+    assert_eq!(after.cancel_move(0), Err(MoveError::NotMoving { id: 0 }));
+    assert_eq!(after.set_move_state(0, MoveState::Cutover), Err(MoveError::NotMoving { id: 0 }));
 }

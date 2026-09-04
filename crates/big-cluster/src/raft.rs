@@ -346,6 +346,81 @@ impl RangeMap {
         Ok(())
     }
 
+    /// Records that a range is on its way to another node.
+    ///
+    /// **The target is deliberately not added to the group.** It is filling up, out of the
+    /// write path entirely, and nothing reads from it - so abandoning the move costs nothing
+    /// and a half-seeded copy is never mistaken for one that can answer.
+    ///
+    /// It is tempting to put it in the group and let the existing write path dual-write to it,
+    /// which would make the final catch-up short. It is also wrong: a fragment is replaced
+    /// whole, so a seed copy landing after a live write silently discards that write, and the
+    /// two would then have equal counts and different contents - which the cardinality
+    /// comparison a repair depends on cannot tell apart. Correctness lives in the barrier at
+    /// cutover instead.
+    pub fn begin_move(
+        &mut self,
+        id: RangeId,
+        target: NodeId,
+    ) -> core::result::Result<(), MoveError> {
+        let Some(i) = self.position(id) else { return Err(MoveError::NoSuchRange { id }) };
+        if self.ranges[i].moving.is_some() {
+            return Err(MoveError::AlreadyMoving { id });
+        }
+        if self.ranges[i].group.contains(&target) {
+            return Err(MoveError::AlreadyThere { id, target });
+        }
+        self.ranges[i].moving = Some(Move { target, state: MoveState::Seeding });
+        Ok(())
+    }
+
+    /// Moves an in-flight move to its next state.
+    pub fn set_move_state(
+        &mut self,
+        id: RangeId,
+        state: MoveState,
+    ) -> core::result::Result<(), MoveError> {
+        let Some(i) = self.position(id) else { return Err(MoveError::NoSuchRange { id }) };
+        let Some(moving) = self.ranges[i].moving.as_mut() else {
+            return Err(MoveError::NotMoving { id });
+        };
+        moving.state = state;
+        Ok(())
+    }
+
+    /// Hands the range to the node it was being moved to, and ends the move.
+    ///
+    /// **One entry.** The group, the primary and the end of the move all land together, so
+    /// there is no committed state in which two nodes could both be asked for these records.
+    pub fn finish_move(&mut self, id: RangeId) -> core::result::Result<(), MoveError> {
+        let Some(i) = self.position(id) else { return Err(MoveError::NoSuchRange { id }) };
+        let Some(moving) = self.ranges[i].moving.clone() else {
+            return Err(MoveError::NotMoving { id });
+        };
+        self.ranges[i].group = vec![moving.target];
+        self.ranges[i].primary = moving.target;
+        self.ranges[i].moving = None;
+        Ok(())
+    }
+
+    /// Abandons a move. Nothing was read from the target, so nothing is lost.
+    ///
+    /// A range that is not moving is a refusal rather than a no-op: an operator naming the
+    /// wrong range wants to hear so, and "there was nothing to do" reads exactly like "done".
+    pub fn cancel_move(&mut self, id: RangeId) -> core::result::Result<(), MoveError> {
+        let Some(i) = self.position(id) else { return Err(MoveError::NoSuchRange { id }) };
+        if self.ranges[i].moving.is_none() {
+            return Err(MoveError::NotMoving { id });
+        }
+        self.ranges[i].moving = None;
+        Ok(())
+    }
+
+    /// The move in flight on the range holding these shards, if there is one.
+    pub fn moving_at(&self, shard: ShardId) -> Option<&Move> {
+        self.ranges.get(self.range_of(shard))?.moving.as_ref()
+    }
+
     /// Hands a range to a set of nodes, the first of which serves it.
     ///
     /// **The map only records the decision.** Whether those nodes hold the data yet is not
@@ -362,6 +437,40 @@ impl RangeMap {
         self.ranges[i].group = group;
         self.ranges[i].primary = primary;
         Ok(())
+    }
+}
+
+/// Why a move could not be started, advanced or finished.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum MoveError {
+    NoSuchRange {
+        id: RangeId,
+    },
+    AlreadyMoving {
+        id: RangeId,
+    },
+    NotMoving {
+        id: RangeId,
+    },
+    /// The target already holds this range, so there is nothing to move.
+    AlreadyThere {
+        id: RangeId,
+        target: NodeId,
+    },
+}
+
+impl core::fmt::Display for MoveError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::NoSuchRange { id } => write!(f, "there is no range {id}"),
+            Self::AlreadyMoving { id } => {
+                write!(f, "range {id} is already being moved; wait for it or cancel it")
+            }
+            Self::NotMoving { id } => write!(f, "range {id} is not being moved"),
+            Self::AlreadyThere { id, target } => {
+                write!(f, "node {target} already holds range {id}")
+            }
+        }
     }
 }
 

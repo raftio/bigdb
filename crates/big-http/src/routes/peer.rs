@@ -339,6 +339,38 @@ pub(super) fn cluster_member<P: PagerMut + Sync>(
     }
 }
 
+/// `POST /admin/cluster/move?range=<id>&to=<node>` - hand a populated range over.
+///
+/// **A scan and a copy, run deliberately**, like `POST /repair`: it holds this request for as
+/// long as the range takes to copy. Reads of the range never stop; writes to it are refused,
+/// retryably, only for the last pass.
+pub(super) fn cluster_move<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request) -> Response {
+    let (Some(range), Some(to)) = (req.param("range"), req.param("to")) else {
+        return Response::failure(400, "bad_request", "a move needs ?range=<id>&to=<node>");
+    };
+    let Ok(range) = range.parse::<u64>() else {
+        return Response::failure(400, "bad_request", "?range= takes a range id");
+    };
+    match ctx.cluster.move_range(range, &to) {
+        Ok(report) => Response::ok(json::moved(&report)),
+        Err(e) => from_cluster(&e),
+    }
+}
+
+/// `POST /admin/cluster/cancel?range=<id>` - abandon a move.
+///
+/// Nothing is ever read from the target of a move that has not completed, so this loses only
+/// the copying already done.
+pub(super) fn cluster_cancel<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request) -> Response {
+    let Some(range) = req.param("range").and_then(|v| v.parse::<u64>().ok()) else {
+        return Response::failure(400, "bad_request", "cancelling needs ?range=<id>");
+    };
+    match ctx.cluster.cancel_move(range) {
+        Ok(()) => Response::ok(format!("{{\"range\":{range}}}")),
+        Err(e) => from_cluster(&e),
+    }
+}
+
 /// Every fragment of a table, with the count that stands in for its contents.
 pub(super) fn peer_fragments<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request) -> Response {
     let request = match wire::FragmentsRequest::decode(&req.body) {

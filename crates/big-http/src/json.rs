@@ -17,7 +17,7 @@
 //! The whole output surface is four shapes, so a serialisation library would be a dependency
 //! carried for one file. Escaping is the part worth getting right, and it is one function.
 
-use big_cluster::{RangeVerdict, RepairReport, Topology, WriteOutcome};
+use big_cluster::{MoveReport, RangeVerdict, RepairReport, Topology, WriteOutcome};
 use big_db::RecordId;
 use big_embed::{Datum, Format, GroupAt, GroupKey, ResultSet, TableInfo, TimeUnit};
 use big_exec::{Group, Value};
@@ -508,5 +508,20 @@ pub fn topology(t: &Topology) -> String {
         members.join(","),
         ranges.join(","),
         behind.join(",")
+    )
+}
+
+/// What a move managed.
+pub fn moved(r: &MoveReport) -> String {
+    format!(
+        "{{\"range\":{},\"shards\":{},\"from\":{},\"to\":{},\"fragments\":{},\
+         \"dropped\":{},\"outcome\":{}}}",
+        r.range,
+        string(&r.shards),
+        string(&r.from),
+        string(&r.to),
+        r.fragments,
+        r.dropped,
+        string(&r.outcome)
     )
 }

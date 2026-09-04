@@ -218,8 +218,61 @@ impl<P: PagerMut + Sync> Cluster<P> {
         }
     }
 
+    /// Empties every fragment a node holds inside a set of shards.
+    ///
+    /// **What a node does with a range it has handed away.** The records are somebody else's
+    /// now; leaving them costs space, and - once that part of the space is split again - would
+    /// leave a node holding data for shards it was never given.
+    ///
+    /// Emptied rather than deleted, because emptying is what the wire already knows how to do:
+    /// a fragment replaced with nothing frees its pages, which is the same thing a repair does
+    /// to a fragment the truth no longer has.
+    pub(super) fn drop_shards(&self, node: usize, shards: big_engine::ShardRange) -> Result<()> {
+        for table in self.pull_schema(node)?.0 {
+            for (addr, _) in self.pull_fragments(node, &table.name)? {
+                if !shards.contains(addr.shard) {
+                    continue;
+                }
+                self.push_fragment(
+                    node,
+                    &wire::FragmentBody {
+                        // Emptied in whichever units this address stores, so that replacing a
+                        // segment with "no containers" cannot be what frees it.
+                        data: if addr.view.is_none() && addr.view_id == big_db::COLUMN_VIEW {
+                            big_embed::FragmentData::Cells(Vec::new())
+                        } else {
+                            big_embed::FragmentData::Containers(Vec::new())
+                        },
+                        addr,
+                        meta: big_embed::FragmentMeta::default(),
+                    },
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     /// Makes `target` hold what `source` holds. Returns how many fragments had to move.
     pub(super) fn catch_up(&self, source: usize, target: usize) -> Result<usize> {
+        self.catch_up_in(source, target, None)
+    }
+
+    /// The same, over a set of shard ranges rather than everything.
+    ///
+    /// **What a move copies.** A repair catches up a whole node because a replica holds
+    /// precisely its primary's range; a move copies one range and leaves the rest of both nodes
+    /// alone, which is what makes it affordable at all.
+    ///
+    /// The row keys are the exception and they are **not** scoped, because they cannot be: a
+    /// row key has to mean the same number in every shard, so a node taking one range still
+    /// needs the whole mapping. That is a real cost and it is the size of the key store rather
+    /// than the size of the range.
+    pub(super) fn catch_up_in(
+        &self,
+        source: usize,
+        target: usize,
+        shards: Option<big_engine::ShardRange>,
+    ) -> Result<usize> {
         // The schema first, or nothing else can land: a fragment belongs to a field, and a
         // node that was away while the field was created has never heard of it.
         let mut moved = self.match_schema(source, target)?;
@@ -231,8 +284,17 @@ impl<P: PagerMut + Sync> Cluster<P> {
             let keys = self.pull_keys(source, &table.name)?;
             self.push_keys(target, &table.name, keys)?;
 
-            let mine = self.pull_fragments(source, &table.name)?;
-            let theirs = self.pull_fragments(target, &table.name)?;
+            let keep = |addr: &big_db::FragmentAddr| shards.is_none_or(|s| s.contains(addr.shard));
+            let mine: Vec<_> = self
+                .pull_fragments(source, &table.name)?
+                .into_iter()
+                .filter(|(a, _)| keep(a))
+                .collect();
+            let theirs: Vec<_> = self
+                .pull_fragments(target, &table.name)?
+                .into_iter()
+                .filter(|(a, _)| keep(a))
+                .collect();
             for (addr, count) in &mine {
                 let same = theirs.iter().any(|(a, c)| a == addr && c == count);
                 if same {

@@ -50,7 +50,7 @@
 #![deny(unsafe_code)]
 
 mod admin;
-pub use admin::{MemberReport, RangeReport, Topology};
+pub use admin::{MemberReport, MoveReport, RangeReport, Topology};
 mod ddl;
 // The one item a sibling borrows across the split: `repair` recreates a field exactly as
 // another node has it, and that is a `Ddl` rather than a repair concern.
@@ -159,6 +159,8 @@ pub mod path {
     pub const KEYS_PUT: &str = "/internal/keys/put";
     pub const REPAIRED: &str = "/internal/repaired";
     pub const SCHEMA: &str = "/internal/schema";
+    /// Which version of the map a node has applied. Asked before its data is taken away.
+    pub const EPOCH: &str = "/internal/epoch";
 }
 
 /// One node, playing whichever of the three roles a given request needs.

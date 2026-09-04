@@ -29,6 +29,8 @@ use big_embed::Api;
 use big_http::{Server, ServerConfig};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 /// One shard's worth of record ids. A record id names its shard, so this is also the line
 /// between the two nodes.
@@ -1776,4 +1778,169 @@ fn a_draining_node_still_answers_for_what_it_has_not_handed_over() {
     // Still serving its range, and still usable as the node a client happens to reach.
     assert_eq!(ok(a, "POST", "/table/tx/query", "Count(All())"), r#"{"count":1}"#);
     assert_eq!(ok(b, "POST", "/table/tx/query", "Count(All())"), r#"{"count":1}"#);
+}
+
+// -------------------------------------------------------------------------------------------
+// Moving a populated range
+//
+// `docs/clustering.md` left this open with a question rather than an answer: *what does a query
+// do while a shard is in flight*. It does nothing different. The source serves the range right
+// up to the instant the handover commits, which is the same atomic act as a failover; the only
+// thing denied anywhere is a write to that one range, for the length of the final pass.
+// -------------------------------------------------------------------------------------------
+
+/// A three-node file in which `a` and `b` own a range each and `a-spare` copies `a`.
+fn three(a: SocketAddr, b: SocketAddr, spare: SocketAddr) -> String {
+    format!(
+        "schema_leader = \"a\"\n\
+         [[node]]\nname = \"a\"\naddr = \"{a}\"\nshards = \"0..64\"\n\
+         [[node]]\nname = \"b\"\naddr = \"{b}\"\nshards = \"64..\"\n\
+         [[node]]\nname = \"a-spare\"\naddr = \"{spare}\"\nreplica = \"a\"\n"
+    )
+}
+
+/// **The records arrive, the answer never changes, and the old copy goes.**
+#[test]
+fn a_populated_range_moves_to_another_node_and_reads_never_stop() {
+    let (a, b, spare) = (free_port(), free_port(), free_port());
+    let file = three(a, b, spare);
+    let _a = start_agreeing(&file, "a", a);
+    let _b = start_agreeing(&file, "b", b);
+    let _spare = start_agreeing(&file, "a-spare", spare);
+    until("an elected leader", || ready(a).contains(r#""leader":""#));
+
+    ok(a, "POST", "/table/tx", "");
+    ok(a, "POST", "/table/tx/field/amount?kind=int&bit_depth=32", "");
+    ok(a, "POST", "/table/tx/field/country?kind=set", "");
+    // Two records low (a's range) and two high (b's range).
+    let hi = 70 * (1 << 20);
+    ok(a, "POST", "/table/tx/import", "amount 1 5\ncountry 1 GB\namount 2 7\ncountry 2 FR\n");
+    ok(
+        a,
+        "POST",
+        "/table/tx/import",
+        &format!("amount {hi} 11\ncountry {hi} GB\namount {} 13\ncountry {} US\n", hi + 1, hi + 1),
+    );
+    assert_eq!(ok(a, "POST", "/table/tx/query", "Count(All())"), r#"{"count":4}"#);
+    let sum_before = ok(a, "POST", "/table/tx/query", "Sum(All(), field=\"amount\")");
+
+    // Move `b`'s populated range to `a`, which already serves one of its own.
+    let leader = leader_of(&[a, b, spare]);
+    let body = ok(leader, "POST", "/admin/cluster/move?range=1&to=a", "");
+    assert!(body.contains(r#""outcome":"moved""#), "{body}");
+    assert!(body.contains(r#""from":"b""#), "{body}");
+    assert!(body.contains(r#""dropped":true"#), "{body}");
+
+    until("every node to see the new owner", || {
+        [a, b, spare].iter().all(|p| {
+            ok(*p, "GET", "/cluster/topology", "").contains(r#""shards":"64..","primary":"a""#)
+        })
+    });
+
+    // **Nothing about the answer changed.** Not the count, not the sum, and not the row keys -
+    // which travel with the range, or a `GroupBy` would come back with nulls where names were.
+    assert_eq!(ok(a, "POST", "/table/tx/query", "Count(All())"), r#"{"count":4}"#);
+    assert_eq!(ok(b, "POST", "/table/tx/query", "Count(All())"), r#"{"count":4}"#);
+    assert_eq!(ok(b, "POST", "/table/tx/query", "Sum(All(), field=\"amount\")"), sum_before);
+    let groups = ok(b, "POST", "/table/tx/query", "GroupBy(All(), field=\"country\")");
+    assert!(groups.contains("US"), "the keys came across with the bits: {groups}");
+
+    // `b` holds nothing now, so it can be taken out of the cluster.
+    ok(leader, "POST", "/admin/cluster/drain?name=b", "");
+    let (status, said) = send(leader, "DELETE", "/admin/cluster/node?name=b", "");
+    assert_eq!(status, 200, "{said}");
+}
+
+/// **The failure a move must never have.** A write made while the range is in flight either
+/// lands or is refused - it is never accepted by a node that is about to stop being asked.
+///
+/// This is the regression test for the design that lost one: dual-writing to the target during
+/// the seed looks like it makes the final pass short, and instead lets a whole-fragment copy
+/// discard an acknowledged write with equal counts on both sides afterwards.
+#[test]
+fn a_write_during_a_move_is_never_lost() {
+    let (a, b, spare) = (free_port(), free_port(), free_port());
+    let file = three(a, b, spare);
+    let _a = start_agreeing(&file, "a", a);
+    let _b = start_agreeing(&file, "b", b);
+    let _spare = start_agreeing(&file, "a-spare", spare);
+    until("an elected leader", || ready(a).contains(r#""leader":""#));
+
+    ok(a, "POST", "/table/tx", "");
+    ok(a, "POST", "/table/tx/field/amount?kind=int&bit_depth=32", "");
+    let hi = 70 * (1 << 20);
+    ok(a, "POST", "/table/tx/import", &format!("amount {hi} 1\n"));
+
+    // Writes into the moving range, from another thread, for the whole of the move.
+    let stop = Arc::new(AtomicBool::new(false));
+    let accepted = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let writer = {
+        let (stop, accepted) = (Arc::clone(&stop), Arc::clone(&accepted));
+        std::thread::spawn(move || {
+            let mut record = hi + 1;
+            while !stop.load(Ordering::Relaxed) {
+                let (status, _) =
+                    send(a, "POST", "/table/tx/import", &format!("amount {record} 1\n"));
+                // A refusal is a correct outcome: the range is mid-cutover. What must never
+                // happen is a 200 for a write that is then not there.
+                if status == 200 {
+                    accepted.fetch_add(1, Ordering::Relaxed);
+                }
+                record += 1;
+            }
+        })
+    };
+
+    let leader = leader_of(&[a, b, spare]);
+    let body = ok(leader, "POST", "/admin/cluster/move?range=1&to=a", "");
+    assert!(body.contains(r#""outcome":"moved""#), "{body}");
+
+    stop.store(true, Ordering::Relaxed);
+    writer.join().expect("the writer thread");
+
+    // **Every write that was told it landed is there.** One for the seed record, plus every
+    // one the writer was given a 200 for.
+    let expected = 1 + accepted.load(Ordering::Relaxed);
+    // Every node routes from its own copy of the map, which it gets by replication - so a
+    // count taken the instant the handover commits can still be answered from the old one.
+    let mut last = String::new();
+    for _ in 0..200 {
+        last = ok(b, "POST", "/table/tx/query", "Count(All())");
+        if last == format!("{{\"count\":{expected}}}") {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert_eq!(
+        last,
+        format!("{{\"count\":{expected}}}"),
+        "every acknowledged write survived the move; a says {}",
+        ok(a, "POST", "/table/tx/query", "Count(All())")
+    );
+}
+
+/// A move that is abandoned leaves the range exactly where it was. Nothing was ever read from
+/// the target, so there is nothing to undo.
+#[test]
+fn a_cancelled_move_leaves_the_range_where_it_was() {
+    let (a, b, spare) = (free_port(), free_port(), free_port());
+    let file = three(a, b, spare);
+    let _a = start_agreeing(&file, "a", a);
+    let _b = start_agreeing(&file, "b", b);
+    let _spare = start_agreeing(&file, "a-spare", spare);
+    until("an elected leader", || ready(a).contains(r#""leader":""#));
+
+    let leader = leader_of(&[a, b, spare]);
+    // A move to a node that is not in the cluster never starts.
+    let (status, said) = send(leader, "POST", "/admin/cluster/move?range=1&to=nowhere", "");
+    assert_eq!(status, 409, "{said}");
+    assert!(said.contains("no node called `nowhere`"), "{said}");
+
+    // And cancelling one that is not running says so rather than pretending.
+    let (status, said) = send(leader, "POST", "/admin/cluster/cancel?range=1", "");
+    assert_eq!(status, 409, "{said}");
+    assert!(said.contains("not being moved"), "{said}");
+
+    let after = ok(a, "GET", "/cluster/topology", "");
+    assert!(after.contains(r#""shards":"64..","primary":"b""#), "{after}");
 }

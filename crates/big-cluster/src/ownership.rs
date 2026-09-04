@@ -122,6 +122,20 @@ impl<P: PagerMut + Sync> Cluster<P> {
             mine.iter().any(|m| m.start <= want.start && covers_end(m, want))
         };
         if routed.shards.iter().all(held) {
+            // **The one window a move denies anything.** During cutover the source still holds
+            // these shards - so the check above passes - and must nonetheless stop taking
+            // writes, or the difference being copied would never stop growing and the copy
+            // would be made against something still moving.
+            for want in &routed.shards {
+                if let Some(moving) = map.moving_at(want.start) {
+                    if moving.state == raft::MoveState::Cutover {
+                        return Err(ClusterError::RangeMoving {
+                            node: self.config.this().name.clone(),
+                            shards: want.to_string(),
+                        });
+                    }
+                }
+            }
             return Ok(());
         }
         Err(ClusterError::StaleRoute {
