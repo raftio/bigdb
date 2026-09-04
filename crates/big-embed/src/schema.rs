@@ -61,12 +61,20 @@ pub struct FieldInfo {
 /// Not public: `Catalog` comes from an unpublished crate, so no caller outside this one could
 /// build an argument for it. [`crate::Api::schema`] is the reachable form of the same thing.
 pub(crate) fn snapshot(catalog: &Catalog) -> Vec<TableInfo> {
-    let mut out = Vec::new();
-    let mut id = 0;
-    // Tables are interned from zero upwards and never removed, so walking ids covers them all
-    // without the catalog having to expose its map.
-    while let Some(table) = catalog.table_by_id(id) {
-        out.push(TableInfo {
+    // **Iterated, not counted up from zero.** This used to walk ids from zero and stop at the
+    // first one the catalog did not answer for, on the grounds that tables are interned from
+    // zero upwards and never removed. `Catalog::drop_table` removes them, so a drop punches a
+    // hole in that sequence and every table above the hole disappeared from here - and with it
+    // from `/schema` and from `/import`, which resolves a name through this snapshot. The data
+    // stayed readable throughout, because the query path looks a table up by name instead, which
+    // is what made it read as a listing quirk rather than as tables nobody could write to.
+    //
+    // `Catalog::tables` iterates the map, so a gap is nothing to it. Ids are still handed out
+    // upwards and never reissued; it is only the *contiguity* that a drop breaks, and nothing
+    // here needed contiguity in the first place.
+    catalog
+        .tables()
+        .map(|table| TableInfo {
             database: catalog
                 .database_name(table.database)
                 .unwrap_or(big_db::DEFAULT_DATABASE_NAME)
@@ -74,7 +82,7 @@ pub(crate) fn snapshot(catalog: &Catalog) -> Vec<TableInfo> {
             name: table.name.clone(),
             engine: table.engine,
             fields: catalog
-                .fields_of(id)
+                .fields_of(table.id)
                 .map(|f| FieldInfo {
                     name: f.name.clone(),
                     kind: f.kind,
@@ -83,8 +91,6 @@ pub(crate) fn snapshot(catalog: &Catalog) -> Vec<TableInfo> {
                     granularity: f.granularity.clone(),
                 })
                 .collect(),
-        });
-        id += 1;
-    }
-    out
+        })
+        .collect()
 }

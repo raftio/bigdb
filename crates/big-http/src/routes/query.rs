@@ -43,7 +43,7 @@ pub(super) fn query<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request, table: 
         // able to see half a cluster and call it an answer.
         shards: None,
     };
-    match ctx.cluster.query(table, text, &opts) {
+    match ctx.cluster.query(&scoped(req, table), text, &opts) {
         // Refused rather than ignored. `Count(All())&limit=10` is a client that believes it is
         // paging and is not; answering it with an unpaged count would be answering a question
         // they did not ask. 422 because the URI is fine and the combination is not.
@@ -126,6 +126,28 @@ pub(super) fn sql<P: PagerMut + Sync>(
     }
 }
 
+/// The table a request names, with `?database=` folded in.
+///
+/// **One meaning for the parameter, on every route that takes a table.** The route table says
+/// `?database=<name>` scopes an unqualified table name, and `refuse` reads it on every route to
+/// build the RBAC object - but only `/sql` and `/query` ever threaded it into the work. So
+/// `/import`, `/delete` and `/records` accepted the parameter, authorised against it, and then
+/// resolved the table in the default database anyway. `/import` was worse still: it also
+/// compared the raw path segment against `TableInfo::name`, which is the *bare* name, so a
+/// qualified `sales.orders` matched nothing either and the table was unreachable by any
+/// spelling.
+///
+/// A qualified path wins over a disagreeing parameter, being the more specific of the two.
+/// Everything downstream takes a qualified name already - `TableRef::parse` is the one decoder
+/// - so this returns a `String` rather than trying to pass a database alongside it.
+fn scoped(req: &Request, table: &str) -> String {
+    match req.param("database") {
+        // `check_name` refuses a `.` in a name, so a segment holding one is already qualified.
+        Some(database) if !table.contains('.') => format!("{database}.{table}"),
+        _ => table.to_string(),
+    }
+}
+
 /// `GET /table/{t}/records?after=<id>&limit=<n>` - every record in a table, in order.
 ///
 /// Deliberately not `POST /query` with `All()`. That path builds the whole table's exists row
@@ -145,7 +167,7 @@ pub(super) fn records<P: PagerMut + Sync>(
     // over all of it anyway, so this route has a default where `/query` cannot: nobody is
     // relying on an unpaged answer from an endpoint that did not exist yesterday.
     let limit = page.limit.unwrap_or(DEFAULT_PAGE);
-    match ctx.cluster.records(table, page.after, limit) {
+    match ctx.cluster.records(&scoped(req, table), page.after, limit) {
         Ok(ids) => Response::ok(json::records(&ids, limit)),
         Err(e) => from_cluster(&e),
     }
@@ -168,9 +190,15 @@ pub(super) fn import<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request, table:
     // is written - a batch that turns out to be malformed must not land halfway. In a cluster
     // it is resolved against this node's schema, which is every node's: a schema change is
     // applied everywhere or reported as half applied.
+    let name = scoped(req, table);
+    let target = big_db::TableRef::parse(&name);
     let schema = ctx.cluster.schema();
-    let Some(table_info) = schema.iter().find(|t| t.name == table) else {
-        return Response::failure(404, "unknown_table", &format!("no table named `{table}`"));
+    // Both halves, because `TableInfo::name` is the bare name and two databases may each hold
+    // a table called `orders`. The same comparison `Cluster::sql_insert` makes.
+    let Some(table_info) =
+        schema.iter().find(|t| t.name == target.table && t.database == target.database)
+    else {
+        return Response::failure(404, "unknown_table", &format!("no table named `{name}`"));
     };
 
     // Field lookup, built once. A linear scan per line is fine for the four-field table in a
@@ -191,10 +219,10 @@ pub(super) fn import<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request, table:
     // back. A node with peers still pays, because a batch that has to be shipped needs to own
     // what it ships.
     let outcome = if ctx.cluster.writes_alone() {
-        ctx.cluster.import_borrowed(table, &facts)
+        ctx.cluster.import_borrowed(&name, &facts)
     } else {
         let owned: Vec<OwnedFact> = facts.iter().map(OwnedFact::from_fact).collect();
-        ctx.cluster.import(table, &owned)
+        ctx.cluster.import(&name, &owned)
     };
     match outcome {
         Ok(outcome) => Response::ok(json::wrote("imported", &outcome)),
@@ -467,7 +495,7 @@ pub(super) fn delete<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request, table:
         records.push(record);
     }
 
-    match ctx.cluster.delete(table, &records) {
+    match ctx.cluster.delete(&scoped(req, table), &records) {
         Ok(outcome) => Response::ok(json::wrote("deleted", &outcome)),
         Err(e) => from_cluster(&e),
     }
