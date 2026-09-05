@@ -41,6 +41,17 @@ big-tls.workspace = true
 # For turning terminal echo off while a password is typed. One of the four dependencies the
 # engine already had; a crate for two ioctls would be a fifth for less code than its manifest.
 libc = "0.2"
+# **The argument parser, and a reversal.** Both binaries used to hand-roll one, and the module
+# docs said in as many words that a surface this size did not justify a dependency. That was
+# true when it was eight options. It stopped being true somewhere around thirty-five on
+# `big serve` and a two-phase parser on `bigctl` that had to re-implement subcommand scoping by
+# hand - `only()`, which existed because flags were once collected into one flat list and
+# silently dropped wherever they meant nothing. A parser that has to grow its own bug class is
+# not cheaper than the crate, and clap gives that check away for free.
+#
+# The feature set is pinned in `[workspace.dependencies]` at the root, not here, so that
+# `bigproxy` cannot end up with a different one.
+clap.workspace = true
 
 [dev-dependencies]
 # The client tests drive a real server in-process on a loopback port rather than a mock,

@@ -56,6 +56,39 @@ Twenty-one crates, and this is all of them. `big-tls` is the only crate that nam
 Twenty-five crates in total for `big-bin`, against four. That is the number, and it is the
 headline of the change rather than a footnote to it.
 
+## What the argument parser adds
+
+Eleven more, and this is the second reversal in this document. Both binaries hand-rolled their
+own `argv` loop, and two module docs said in as many words that a surface this size did not
+justify a dependency. That was a fair reading of eight options. It stopped being fair at
+thirty-five on `big serve`, and it stopped being fair on `bigctl` when the hand-rolled parser
+had to grow `only()` - a check that a subcommand's flag was not silently accepted and dropped
+on a different subcommand, which is a bug class the parser invented for itself and then had to
+police. clap answers that one by construction.
+
+**Five of the eleven link into the binary:**
+
+| | Reached through | For |
+|---|---|---|
+| `clap` | `big-bin`, `big-proxy` | the parser, the generated help, and per-subcommand flag scoping |
+| `clap_builder` | `clap` | the runtime half of it: `clap` itself is a facade |
+| `clap_lex` | `clap_builder` | splitting `argv` into flags, values and `--` |
+| `anstyle` | `clap_builder` | the style *markers* in help output, not a terminal writer - the `color` feature is off, so nothing here queries a TTY or emits an escape |
+| `strsim` | `clap_builder` | edit distance, for "did you mean `--durability`?" |
+
+**Six run at build time only** and are in no shipped artefact: `clap_derive`, the proc macro
+behind `#[derive(Parser)]`, and its own tree - `syn`, `quote`, `proc-macro2`, `unicode-ident`
+and `heck`. They are counted here anyway, because a build-time dependency is still something
+this repository has to trust and audit, and leaving them out would be the kind of accounting
+this document exists to avoid.
+
+Thirty-six crates in total for `big-bin`, of which thirty reach the binary. `cargo tree -p
+big-bin -e normal` is the check.
+
+The two features clap turns on by default and this repository does not are both crates rather
+than code: `color` pulls `anstream`, and `wrap_help` pulls `terminal_size`. Neither earns its
+place when as much of this output is read by a shell script as by a person.
+
 ## What is *not* in here
 
 - **No async runtime, no web framework, no serde.** Those decisions did not change, and nothing
