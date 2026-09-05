@@ -173,6 +173,47 @@ pub(super) fn records<P: PagerMut + Sync>(
     }
 }
 
+/// `?ack=commit|queued` - whether the caller waits for the commit that carries its facts.
+///
+/// **Refused by name where it is not offered, never quietly downgraded.** A client that asked
+/// to be answered early and was made to wait instead sees latency it cannot explain and has no
+/// way to find out why; a `422` naming the flag is something an operator can act on.
+///
+/// In a cluster it is refused outright. `WriteOutcome::missed` is only knowable once every copy
+/// has answered, so a node acking before it has written would turn the coordinator's report
+/// from a statement about reachability into a claim about durability that is not true.
+/// The code and the sentence, for the caller to shape - the way `page` hands back a reason
+/// rather than a whole `Response`.
+type Refusal = (&'static str, String);
+
+fn ack_of<P: PagerMut + Sync>(
+    ctx: &Ctx<'_, P>,
+    req: &Request,
+) -> core::result::Result<Ack, Refusal> {
+    match req.param("ack").as_deref() {
+        None | Some("commit") => Ok(Ack::Sync),
+        Some("queued") => {
+            if !ctx.cluster.writes_alone() {
+                return Err((
+                    "ack_not_available",
+                    "this node has peers; a write is answered when every copy has taken it"
+                        .to_string(),
+                ));
+            }
+            if !ctx.api().takes_async_writes() {
+                return Err((
+                    "ack_not_available",
+                    "this server was not started with --write-async".to_string(),
+                ));
+            }
+            Ok(Ack::Async)
+        }
+        Some(other) => {
+            Err(("bad_parameter", format!("ack takes commit or queued, got `{other}`")))
+        }
+    }
+}
+
 /// One fact per line: `field record value`.
 ///
 /// How the value is read is the field's kind to decide - a number for an integer, `true` or
@@ -190,6 +231,11 @@ pub(super) fn import<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request, table:
     // is written - a batch that turns out to be malformed must not land halfway. In a cluster
     // it is resolved against this node's schema, which is every node's: a schema change is
     // applied everywhere or reported as half applied.
+    let ack = match ack_of(ctx, req) {
+        Ok(ack) => ack,
+        Err((code, why)) => return Response::failure(422, code, &why),
+    };
+
     let name = scoped(req, table);
     let target = big_db::TableRef::parse(&name);
     let schema = ctx.cluster.schema();
@@ -219,6 +265,14 @@ pub(super) fn import<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request, table:
     // back. A node with peers still pays, because a batch that has to be shipped needs to own
     // what it ships.
     let outcome = if ctx.cluster.writes_alone() {
+        // Answering early is a single-node path, so it forks here rather than inside the
+        // cluster: `import_borrowed` is the one that already knows it is writing alone.
+        if ack == Ack::Async {
+            return match ctx.api().import_acked(&name, &facts, ack) {
+                Ok(a) => Response::ok(json::queued("imported", a.count)),
+                Err(e) => crate::status::response_for(&e),
+            };
+        }
         ctx.cluster.import_borrowed(&name, &facts)
     } else {
         let owned: Vec<OwnedFact> = facts.iter().map(OwnedFact::from_fact).collect();
@@ -473,6 +527,10 @@ fn three(line: &str) -> Option<(&str, &str, &str)> {
 
 /// One record id per line. Same shape as `/import`, so the same client code writes both.
 pub(super) fn delete<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request, table: &str) -> Response {
+    let ack = match ack_of(ctx, req) {
+        Ok(ack) => ack,
+        Err((code, why)) => return Response::failure(422, code, &why),
+    };
     let body = match req.text() {
         Ok(t) => t,
         Err(e) => return e.into_response(),
@@ -495,7 +553,14 @@ pub(super) fn delete<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request, table:
         records.push(record);
     }
 
-    match ctx.cluster.delete(&scoped(req, table), &records) {
+    let name = scoped(req, table);
+    if ack == Ack::Async {
+        return match ctx.api().delete_acked(&name, &records, ack) {
+            Ok(a) => Response::ok(json::queued("deleted", a.count)),
+            Err(e) => crate::status::response_for(&e),
+        };
+    }
+    match ctx.cluster.delete(&name, &records) {
         Ok(outcome) => Response::ok(json::wrote("deleted", &outcome)),
         Err(e) => from_cluster(&e),
     }

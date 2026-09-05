@@ -130,7 +130,7 @@ use crate::{json, Request, Response};
 use big_cluster::wire::{self, OwnedFact};
 use big_cluster::{Cluster, ClusterError};
 use big_db::catalog::FieldKind;
-use big_embed::{Api, Fact, FieldInfo, QueryOptions};
+use big_embed::{Ack, Api, Fact, FieldInfo, QueryOptions};
 use big_pager::PagerMut;
 use big_rbac::{Demand, ObjectRef, Privilege};
 use std::sync::atomic::AtomicBool;

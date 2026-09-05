@@ -49,6 +49,7 @@ pub mod routes;
 pub mod status;
 mod steward;
 mod watchdog;
+mod writer;
 
 /// Re-exported from [`big_wire`], which is where the HTTP/1.1 framing lives now.
 ///
@@ -337,6 +338,17 @@ impl<P: PagerMut + Sync + Send + 'static> Server<P> {
                 .expect("one steward thread")
         };
 
+        // The clock behind `?ack=queued`, and only when something can use it. A node that
+        // never answers a write early has nothing for this to commit, so it does not get a
+        // thread it would only wake to find an empty queue. See `writer.rs`.
+        let scribe = self.state.cluster.local().takes_async_writes().then(|| {
+            let state = Arc::clone(&self.state);
+            std::thread::Builder::new()
+                .name("big-writer".to_string())
+                .spawn(move || writer::run(&state))
+                .expect("one writer thread")
+        });
+
         let mut workers = Vec::with_capacity(self.state.config.workers);
         for _ in 0..self.state.config.workers {
             let rx = Arc::clone(&rx);
@@ -429,6 +441,11 @@ impl<P: PagerMut + Sync + Send + 'static> Server<P> {
                     }
                     let _ = shedder.join();
                     let _ = steward.join();
+                    if let Some(scribe) = scribe {
+                        let _ = scribe.join();
+                    }
+                    // After the workers, so nothing can still be submitting into the drain.
+                    writer::stop(&self.state);
                     return Err(e);
                 }
             }
@@ -441,6 +458,14 @@ impl<P: PagerMut + Sync + Send + 'static> Server<P> {
         }
         let _ = shedder.join();
         let _ = steward.join();
+        if let Some(scribe) = scribe {
+            let _ = scribe.join();
+        }
+        // **After the workers are joined, and that is the whole of it.** Only then can no
+        // thread submit another write, so what this drains is a queue that cannot grow under
+        // it. Placed earlier, it would leave behind exactly the acknowledged writes it exists
+        // to save.
+        writer::stop(&self.state);
         Ok(())
     }
 

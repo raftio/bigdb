@@ -242,3 +242,32 @@ fn the_group_ceilings_are_rejected_when_they_are_not_numbers() {
         run("big", &["serve", "/tmp/nothing.big", "--write-group-jobs", "lots"]).expect(2);
     assert!(refused.said("--write-group-jobs"), "and says which flag: {}", refused.err);
 }
+
+#[test]
+fn early_answers_are_announced_both_ways_and_need_coalescing() {
+    // The flag that changes what a write *promises* has to be visible in the log both ways:
+    // after a crash, "could anything have been acknowledged and lost" is the first question.
+    let on = Daemon::with(&["--write-coalesce", "--write-async", "--write-linger", "50"]);
+    until("the daemon to announce itself", || on.log().contains("ack=queued"));
+    assert!(on.log().contains("for at most 50ms"), "{}", on.log());
+
+    let off = Daemon::start();
+    until("the default daemon to announce itself", || off.log().contains("--write-async"));
+    assert!(off.log().contains("only once it is durable"), "{}", off.log());
+}
+
+#[test]
+fn asking_for_early_answers_without_coalescing_is_refused() {
+    // Not silently ignored: an operator who passed the flag and got durable answers would see
+    // the latency and no reason for it.
+    let refused = run("big", &["serve", "/tmp/nothing.big", "--write-async"]).expect(2);
+    assert!(refused.said("--write-async needs --write-coalesce"), "{}", refused.err);
+}
+
+#[test]
+fn a_when_full_policy_that_is_not_one_of_the_two_is_refused_with_both() {
+    let refused =
+        run("big", &["serve", "/tmp/nothing.big", "--write-when-full", "panic"]).expect(2);
+    assert!(refused.said("block or refuse"), "lists what it takes: {}", refused.err);
+    assert!(refused.said("panic"), "and repeats what it got: {}", refused.err);
+}

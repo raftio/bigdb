@@ -31,7 +31,13 @@ pub use big_sql::SqlError;
 /// see [`SqlError::Plan`]. What the variant records is which surface the text came through,
 /// which is what lets a refusal that only SQL has (`sql_no_joins`) exist at all without the
 /// query language growing an error it can never produce.
+///
+/// Marked `#[non_exhaustive]` from the change that added [`ApiError::Busy`]: the next variant
+/// after that one should not be a second breaking change, and a caller that matches on this has
+/// to have a fallback arm anyway - there is no useful thing to do with an error kind you have
+/// never heard of except report it.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum ApiError {
     /// The query was not understood, or storage could not answer it.
     Query(ExecError),
@@ -54,6 +60,15 @@ pub enum ApiError {
     /// because it is the rare variant and the widest, and an error is returned by value on every
     /// path that can fail.
     Denied(Box<big_rbac::Denied>),
+    /// The database cannot take this write right now, and the caller should try again.
+    ///
+    /// **Temporary, and that is the whole distinction.** Every other variant here says the
+    /// request was wrong; this one says the request was fine and arrived at a bad moment - the
+    /// write buffer is full, or this database is shutting down. It carries the same
+    /// `server_busy` code the connection shedder uses, because it is the same instruction to
+    /// the same client, and a retry policy that already backs off on one should back off on the
+    /// other without being taught a second name.
+    Busy(String),
 }
 
 impl From<ExecError> for ApiError {
@@ -82,6 +97,7 @@ impl core::fmt::Display for ApiError {
             Self::Db(e) => write!(f, "{e}"),
             Self::Value(why) => write!(f, "{why}"),
             Self::Denied(d) => write!(f, "{d}"),
+            Self::Busy(why) => write!(f, "{why}"),
         }
     }
 }
@@ -100,6 +116,8 @@ impl ApiError {
             // The code an import line with the same mistake already carries.
             Self::Value(_) => "malformed_line",
             Self::Denied(_) => "denied",
+            // The shedder's code, deliberately. See the variant.
+            Self::Busy(_) => "server_busy",
         }
     }
 }

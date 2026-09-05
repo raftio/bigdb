@@ -117,6 +117,23 @@ usage: big serve <file> [addr] [options]
   --write-group-facts <n>     facts one commit may carry, default 1048576. Bounds the wait
                               a small batch inherits from a large one it arrived behind;
                               a batch larger than this still goes on its own
+  --write-async               allow `?ack=queued` on an import or a delete: answered when the
+                              facts are held rather than when they are committed. **A different
+                              promise, not a faster one** - what has been acknowledged and not
+                              committed is lost if this process dies, and a batch the engine
+                              then refuses has nobody left to tell, so it is counted in
+                              big_write_acknowledged_lost_total instead. Single node only; a
+                              node with peers refuses ?ack=queued and says so. Needs
+                              --write-coalesce. Watch big_write_queue_oldest_seconds
+  --write-linger <ms>         the longest an acknowledged write may wait to be committed,
+                              default 200. A ceiling, not a delay: any writer arriving sooner
+                              carries it along
+  --write-queue-bytes <size>  acknowledged writes this may hold, default 64M. Past it, see
+                              --write-when-full. Suffixes K, M, G
+  --write-when-full block|refuse
+                              what a full buffer does, default block. block answers the write
+                              the durable way instead, which is backpressure aimed at whoever
+                              filled it; refuse answers 503 server_busy
 
   BIG_LOG=off|error|warn|info|debug   log level, default info
 
@@ -190,6 +207,10 @@ pub fn main(args: &[String]) -> std::io::Result<()> {
         enabled: opts.write_coalesce,
         max_jobs: opts.write_group_jobs,
         max_facts: opts.write_group_facts,
+        async_writes: opts.write_async,
+        max_async_bytes: opts.write_queue_bytes,
+        linger: opts.write_linger,
+        when_full: opts.write_when_full,
     });
 
     let server = Server::bind_cluster(cluster, opts.addr.as_str(), serving(auth, tls, &opts))?;
@@ -499,6 +520,18 @@ fn announce(server: &Server<big_embed::MmapPager>, bound: std::net::SocketAddr, 
     } else {
         eprintln!("big: no --write-coalesce; every write is its own commit and its own fsyncs");
     }
+    // Both ways, and this one says what is at risk rather than only what is on: an operator
+    // reading a log after a crash needs to know whether anything could have been acknowledged
+    // and lost.
+    if opts.write_async && opts.write_coalesce {
+        eprintln!(
+            "big: ?ack=queued offered, holding at most {} for at most {}ms",
+            human_size(opts.write_queue_bytes as u64),
+            opts.write_linger.as_millis()
+        );
+    } else {
+        eprintln!("big: no --write-async; a write is answered only once it is durable");
+    }
     // Printed both ways for the reason the balancer is, and with the consequence spelled out:
     // an automatic handover can burn row ids the dead leader promised to writes that never
     // landed, which is not something to find out from a doc after the fact.
@@ -556,6 +589,14 @@ struct Options {
     write_group_jobs: usize,
     /// Facts one commit may carry, across every batch in it.
     write_group_facts: usize,
+    /// Whether `?ack=queued` is offered at all.
+    write_async: bool,
+    /// The ceiling on how stale an acknowledged write may be.
+    write_linger: Duration,
+    /// Acknowledged, uncommitted bytes this node may hold.
+    write_queue_bytes: usize,
+    /// What a full buffer does.
+    write_when_full: big_embed::WhenFull,
     durability: Option<big_db::Durability>,
     cluster: Option<String>,
     node: Option<String>,
@@ -589,6 +630,10 @@ impl Default for Options {
             write_coalesce: big_embed::GroupConfig::default().enabled,
             write_group_jobs: big_embed::GroupConfig::default().max_jobs,
             write_group_facts: big_embed::GroupConfig::default().max_facts,
+            write_async: big_embed::GroupConfig::default().async_writes,
+            write_linger: big_embed::GroupConfig::default().linger,
+            write_queue_bytes: big_embed::GroupConfig::default().max_async_bytes,
+            write_when_full: big_embed::GroupConfig::default().when_full,
             durability: None,
             cluster: None,
             node: None,
@@ -693,6 +738,31 @@ impl Options {
                     out.write_group_facts = parse_num(&value()?, arg)?.max(1);
                     i += 2;
                 }
+                "--write-async" => {
+                    out.write_async = true;
+                    i += 1;
+                }
+                "--write-linger" => {
+                    out.write_linger = Duration::from_millis(parse_num(&value()?, arg)? as u64);
+                    i += 2;
+                }
+                "--write-queue-bytes" => {
+                    out.write_queue_bytes = parse_size(&value()?, arg)? as usize;
+                    i += 2;
+                }
+                "--write-when-full" => {
+                    let v = value()?;
+                    out.write_when_full = match v.as_str() {
+                        "block" => big_embed::WhenFull::Block,
+                        "refuse" => big_embed::WhenFull::Refuse,
+                        _ => {
+                            return Err(format!(
+                                "--write-when-full takes block or refuse, got `{v}`"
+                            ))
+                        }
+                    };
+                    i += 2;
+                }
                 "--durability" => {
                     let v = value()?;
                     out.durability = Some(big_db::Durability::parse(&v).ok_or_else(|| {
@@ -746,6 +816,12 @@ impl Options {
             (Some(_), Some(_)) | (None, None) => {}
             (Some(_), None) => return Err("--peer-cert needs --peer-key".to_string()),
             (None, Some(_)) => return Err("--peer-key needs --peer-cert".to_string()),
+        }
+        // Refused rather than quietly ignored. An operator who asked for early answers and got
+        // durable ones would see the flag in the command line, the writes going through, and no
+        // reason at all for the latency.
+        if out.write_async && !out.write_coalesce {
+            return Err("--write-async needs --write-coalesce".to_string());
         }
 
         match positional.as_slice() {

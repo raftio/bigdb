@@ -93,6 +93,15 @@ pub fn status_of(e: &ApiError) -> u16 {
         // That is correct: answering `404` would make this surface a way to ask which tables
         // exist, for somebody with no privilege to know.
         ApiError::Denied(_) => 403,
+        // **`503`, the shedder's answer, and it is not a `429`.** The request was well formed
+        // and arrived at a bad moment; what the client should do is wait and send it again,
+        // which is exactly what it already does when a connection is shed. A rate-limit status
+        // would say the *client* is sending too much, and the buffer being full is as often
+        // this node being slow.
+        ApiError::Busy(_) => 503,
+        // `ApiError` is `#[non_exhaustive]`, and a kind this build has not heard of is a bug
+        // here rather than the caller's. Reported as one.
+        _ => 500,
     }
 }
 

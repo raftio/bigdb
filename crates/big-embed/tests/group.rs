@@ -318,3 +318,165 @@ fn a_group_never_carries_more_jobs_than_the_cap() {
         assert!(Instant::now() < deadline, "sixteen writers never once overlapped: {after:?}");
     }
 }
+
+// ---------------------------------------------------------------------------------------
+// Answering before the commit.
+// ---------------------------------------------------------------------------------------
+
+fn early(config: GroupConfig) -> Arc<Api<big_pager::MemPager>> {
+    let api = Api::in_memory().unwrap();
+    api.create_table("tx").unwrap();
+    api.create_field("tx", "amount", FieldKind::Int, 32).unwrap();
+    api.configure_group_commit(config);
+    Arc::new(api)
+}
+
+fn asking_early() -> GroupConfig {
+    GroupConfig { enabled: true, async_writes: true, ..GroupConfig::default() }
+}
+
+/// The whole bargain in one test: answered at once, readable only after a commit.
+#[test]
+fn an_early_answer_comes_before_the_commit_and_says_so() {
+    let api = early(asking_early());
+
+    let accepted = api
+        .import_acked("tx", &[Fact::Int { field: "amount", record: 1, value: 100 }], Ack::Async)
+        .unwrap();
+    assert_eq!(accepted.count, 1);
+    assert_eq!(accepted.txn, None, "there is no transaction yet, and it must not claim one");
+    assert_eq!(count_all(&api), 0, "nothing is readable until something commits it");
+
+    let stats = api.group_stats();
+    assert!(stats.async_held_bytes > 0, "what would be lost is measurable: {stats:?}");
+
+    assert_eq!(api.flush_pending(), 1);
+    assert_eq!(count_all(&api), 1);
+    assert_eq!(api.group_stats().async_held_bytes, 0, "and it stops being at risk");
+}
+
+/// A flush with nothing to flush is not a commit.
+#[test]
+fn flushing_an_empty_queue_writes_nothing() {
+    let api = early(asking_early());
+    assert_eq!(api.flush_pending(), 0);
+    assert_eq!(api.group_stats().commits, 0, "an empty flush must not cost a transaction");
+}
+
+/// Asking to be answered early where it is not offered gets the durable answer, not an error.
+///
+/// The refusal belongs at the edge, which can say *why* and can name the flag. Down here the
+/// only honest thing is to do the safe thing.
+#[test]
+fn asking_early_where_it_is_not_offered_still_commits() {
+    let api = early(GroupConfig { enabled: true, ..GroupConfig::default() });
+    assert!(!api.takes_async_writes());
+
+    let accepted = api
+        .import_acked("tx", &[Fact::Int { field: "amount", record: 1, value: 100 }], Ack::Async)
+        .unwrap();
+    assert!(accepted.txn.is_some(), "it was committed, so it has a transaction");
+    assert_eq!(count_all(&api), 1, "and it is readable immediately");
+}
+
+/// Past the ceiling, `Refuse` refuses — with the code a client already backs off on.
+#[test]
+fn a_full_buffer_refuses_with_the_code_the_shedder_uses() {
+    let api = early(GroupConfig {
+        enabled: true,
+        async_writes: true,
+        max_async_bytes: 1,
+        when_full: WhenFull::Refuse,
+        ..GroupConfig::default()
+    });
+
+    // The first one fits: a job is admitted when the buffer is empty whatever its size, or a
+    // batch bigger than the ceiling could never be written at all.
+    api.import_acked("tx", &[Fact::Int { field: "amount", record: 1, value: 1 }], Ack::Async)
+        .unwrap();
+    let err = api
+        .import_acked("tx", &[Fact::Int { field: "amount", record: 2, value: 2 }], Ack::Async)
+        .expect_err("the buffer is over its ceiling");
+    assert_eq!(err.code(), "server_busy", "{err}");
+    assert_eq!(api.group_stats().async_refused, 1);
+
+    // And it recovers: once the buffer drains, the same write is taken.
+    api.flush_pending();
+    api.import_acked("tx", &[Fact::Int { field: "amount", record: 2, value: 2 }], Ack::Async)
+        .unwrap();
+}
+
+/// Past the ceiling, `Block` answers durably instead — backpressure, not an error.
+#[test]
+fn a_full_buffer_blocks_rather_than_refusing_by_default() {
+    let api = early(GroupConfig {
+        enabled: true,
+        async_writes: true,
+        max_async_bytes: 1,
+        ..GroupConfig::default()
+    });
+    assert_eq!(GroupConfig::default().when_full, WhenFull::Block, "and that is the default");
+
+    api.import_acked("tx", &[Fact::Int { field: "amount", record: 1, value: 1 }], Ack::Async)
+        .unwrap();
+    let accepted = api
+        .import_acked("tx", &[Fact::Int { field: "amount", record: 2, value: 2 }], Ack::Async)
+        .expect("blocked, not refused");
+    assert!(accepted.txn.is_some(), "the one that waited was committed: {accepted:?}");
+    assert_eq!(api.group_stats().async_refused, 0);
+    // The one it waited behind went in with it.
+    assert_eq!(count_all(&api), 2);
+}
+
+/// **The cost of answering early, made visible.** A batch the engine refuses has nobody left to
+/// tell, so it is counted instead — and it must not take the good ones with it.
+#[test]
+fn an_early_answer_that_turns_out_to_be_wrong_is_counted_not_reported() {
+    let api = early(asking_early());
+
+    api.import_acked("tx", &[Fact::Int { field: "amount", record: 1, value: 1 }], Ack::Async)
+        .unwrap();
+    api.import_acked("tx", &[Fact::Int { field: "nosuchfield", record: 2, value: 2 }], Ack::Async)
+        .expect("accepted, because nothing has looked at it yet");
+    api.import_acked("tx", &[Fact::Int { field: "amount", record: 3, value: 3 }], Ack::Async)
+        .unwrap();
+
+    api.flush_pending();
+
+    let stats = api.group_stats();
+    assert_eq!(stats.async_failed, 1, "the bad one is counted: {stats:?}");
+    assert_eq!(count_all(&api), 2, "and the two good ones landed anyway");
+}
+
+/// Shutdown commits what was promised. Losing it would be a bug, not a trade-off.
+#[test]
+fn stopping_commits_everything_that_was_acknowledged() {
+    let api = early(asking_early());
+    for record in 1..=5 {
+        api.import_acked("tx", &[Fact::Int { field: "amount", record, value: 1 }], Ack::Async)
+            .unwrap();
+    }
+    assert_eq!(count_all(&api), 0);
+
+    assert_eq!(api.stop_writer(), 5, "every job it was given");
+    assert_eq!(count_all(&api), 5);
+
+    // And afterwards it takes nothing new rather than accepting what it cannot commit.
+    let err = api
+        .import_acked("tx", &[Fact::Int { field: "amount", record: 6, value: 1 }], Ack::Async)
+        .expect_err("a stopped writer takes nothing");
+    assert_eq!(err.code(), "server_busy", "{err}");
+}
+
+/// A queue deeper than one commit still drains completely.
+#[test]
+fn stopping_drains_more_than_one_commit_worth() {
+    let api = early(GroupConfig { max_jobs: 4, ..asking_early() });
+    for record in 1..=30 {
+        api.import_acked("tx", &[Fact::Int { field: "amount", record, value: 1 }], Ack::Async)
+            .unwrap();
+    }
+    assert_eq!(api.stop_writer(), 30);
+    assert_eq!(count_all(&api), 30);
+    assert!(api.group_stats().commits >= 30 / 4, "more than one commit was needed");
+}

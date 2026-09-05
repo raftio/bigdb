@@ -503,6 +503,34 @@ pub fn render_group(out: &mut String, g: &big_embed::GroupStats) {
          big_write_isolations_total, what one bad batch costs everybody else.",
         g.isolation_attempts,
     );
+    gauge(
+        out,
+        "big_write_queue_bytes",
+        "Writes this node has acknowledged and not yet committed. What is lost if it dies now.",
+        g.async_held_bytes,
+    );
+    // Seconds as a gauge, rounded to milliseconds. Prometheus takes a float and this is a
+    // duration, so the alternative is a counter that is not one.
+    gauge_f(
+        out,
+        "big_write_queue_oldest_seconds",
+        "How long the oldest acknowledged, uncommitted write has been waiting. The durability \
+         lag, and the number to alert on when writes are answered early.",
+        g.async_oldest_seconds,
+    );
+    counter(
+        out,
+        "big_write_queue_refused_total",
+        "Writes turned away because the buffer was full. Backpressure reaching the client.",
+        g.async_refused,
+    );
+    counter(
+        out,
+        "big_write_acknowledged_lost_total",
+        "Writes this node acknowledged and then could not commit. Nobody was told: the caller \
+         had already been answered. Any value above zero is accepted data that did not land.",
+        g.async_failed,
+    );
 }
 
 /// What this node can say about the cluster it is part of.
@@ -645,6 +673,15 @@ pub fn render_cluster(out: &mut String, c: &big_cluster::counters::Snapshot, bal
 
 fn counter(out: &mut String, name: &str, help: &str, value: u64) {
     sample(out, name, "counter", help, value);
+}
+
+/// A gauge whose value is not a whole number.
+///
+/// Three decimals: this exists for durations, and a millisecond is as fine as any lag graph
+/// here is meaningful to.
+fn gauge_f(out: &mut String, name: &str, help: &str, value: f64) {
+    let help: String = help.chars().map(|c| if c == '\n' { ' ' } else { c }).collect();
+    out.push_str(&format!("# HELP {name} {help}\n# TYPE {name} gauge\n{name} {value:.3}\n"));
 }
 
 fn gauge(out: &mut String, name: &str, help: &str, value: u64) {

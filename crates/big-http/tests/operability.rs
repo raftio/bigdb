@@ -68,6 +68,25 @@ fn spawn_coalescing(requests: usize, jobs: usize) -> SocketAddr {
     addr
 }
 
+/// The same, offering `?ack=queued`.
+fn spawn_early(requests: usize) -> SocketAddr {
+    let api = Api::in_memory().unwrap();
+    api.create_table("tx").unwrap();
+    api.create_field("tx", "amount", big_db::catalog::FieldKind::Int, 32).unwrap();
+    api.configure_group_commit(big_embed::GroupConfig {
+        enabled: true,
+        async_writes: true,
+        ..big_embed::GroupConfig::default()
+    });
+
+    let server = Server::bind_with(api, "127.0.0.1:0", config()).unwrap();
+    let addr = server.local_addr().unwrap();
+    std::thread::spawn(move || {
+        let _ = server.serve_n(requests);
+    });
+    addr
+}
+
 /// The same, on the real worker pool rather than the inline path, for the tests that are
 /// about the pool itself.
 fn spawn_pooled(config: ServerConfig) -> SocketAddr {
@@ -640,4 +659,121 @@ fn a_refused_batch_reads_the_same_whether_or_not_writes_are_coalesced() {
     assert_eq!(a.status, b.status, "{} vs {}", a.body, b.body);
     assert_eq!(a.body, b.body);
     assert!(a.body.contains("nosuchfield"), "{}", a.body);
+}
+
+/// `?ack=queued` says what it is: a count, and a flag saying it is not durable yet.
+#[test]
+fn an_early_acknowledgement_says_it_is_not_durable() {
+    let addr = spawn_early(3);
+
+    let queued = send(addr, "POST", "/table/tx/import?ack=queued", "amount 1 100\namount 2 200\n");
+    assert_eq!(queued.status, 200, "{}", queued.body);
+    assert_eq!(queued.body, r#"{"imported":2,"durable":false}"#);
+
+    // The buffer says what is at risk.
+    let r = send(addr, "GET", "/metrics", "");
+    assert!(r.body.contains("# TYPE big_write_queue_bytes gauge"), "{}", r.body);
+    assert!(
+        !r.body.contains("big_write_queue_bytes 0\n"),
+        "two facts were acknowledged and nothing is held: {}",
+        r.body
+    );
+    assert!(r.body.contains("big_write_acknowledged_lost_total 0"), "{}", r.body);
+}
+
+/// The default answer is unchanged, byte for byte. This is the regression that matters most.
+#[test]
+fn a_write_that_does_not_ask_is_answered_exactly_as_before() {
+    let addr = spawn_early(2);
+
+    let durable = send(addr, "POST", "/table/tx/import", "amount 1 100\n");
+    assert_eq!(durable.body, r#"{"imported":1}"#, "no new field on a write that did not ask");
+
+    let explicit = send(addr, "POST", "/table/tx/import?ack=commit", "amount 2 200\n");
+    assert_eq!(explicit.body, r#"{"imported":1}"#);
+}
+
+/// Asking for it where it is not offered is refused by name, never quietly downgraded.
+#[test]
+fn asking_to_be_answered_early_where_it_is_off_names_the_flag() {
+    let addr = spawn_coalescing(1, 64);
+
+    let r = send(addr, "POST", "/table/tx/import?ack=queued", "amount 1 100\n");
+    assert_eq!(r.status, 422, "{}", r.body);
+    assert!(r.body.contains("ack_not_available"), "{}", r.body);
+    assert!(r.body.contains("--write-async"), "and says which flag: {}", r.body);
+}
+
+/// A value the parameter does not take is a refusal that lists what it does take.
+#[test]
+fn an_ack_that_is_not_one_of_the_two_is_refused_with_both() {
+    let addr = spawn_early(1);
+
+    let r = send(addr, "POST", "/table/tx/import?ack=whenever", "amount 1 100\n");
+    assert_eq!(r.status, 422, "{}", r.body);
+    assert!(r.body.contains("commit or queued"), "{}", r.body);
+    assert!(r.body.contains("whenever"), "and repeats what it got: {}", r.body);
+}
+
+/// **The reason the writer thread exists.** An acknowledged write on a node that then goes
+/// quiet still becomes durable, without another request arriving to carry it.
+///
+/// A wait rather than an assertion, like the reclaim test: the thread runs on `--write-linger`,
+/// which is its own clock and not this test's.
+#[test]
+fn an_early_acknowledgement_is_committed_even_if_nothing_else_arrives() {
+    let api = Api::in_memory().unwrap();
+    api.create_table("tx").unwrap();
+    api.create_field("tx", "amount", big_db::catalog::FieldKind::Int, 32).unwrap();
+    api.configure_group_commit(big_embed::GroupConfig {
+        enabled: true,
+        async_writes: true,
+        linger: Duration::from_millis(20),
+        ..big_embed::GroupConfig::default()
+    });
+
+    let server = Server::bind_with(api, "127.0.0.1:0", config()).unwrap();
+    let addr = server.local_addr().unwrap();
+    let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let flag = std::sync::Arc::clone(&running);
+    let done = std::thread::spawn(move || {
+        let _ = server.serve_while(&flag);
+    });
+
+    let queued = send(addr, "POST", "/table/tx/import?ack=queued", "amount 7 700\n");
+    assert_eq!(queued.status, 200, "{}", queued.body);
+
+    // Nothing else is sent from here on. The only thing that can commit it is the writer.
+    let started = std::time::Instant::now();
+    loop {
+        let body = send(addr, "GET", "/metrics", "").body;
+        if body.contains("big_write_commits_total 1") {
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "nothing ever committed the acknowledged write: {body}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // And it is readable, which is the claim that actually matters.
+    let answer = send(addr, "POST", "/sql", "SELECT sum(amount) FROM tx");
+    assert!(answer.body.contains("700"), "{}", answer.body);
+
+    let held = send(addr, "GET", "/metrics", "").body;
+    assert!(held.contains("big_write_queue_bytes 0"), "and nothing is still at risk: {held}");
+
+    running.store(false, std::sync::atomic::Ordering::Relaxed);
+    let _ = done.join();
+}
+
+/// A node that offers no early answers starts no writer thread, and nothing about it changes.
+#[test]
+fn a_node_that_answers_only_durably_publishes_an_empty_queue() {
+    let addr = spawn_coalescing(1, 64);
+    let r = send(addr, "GET", "/metrics", "");
+    assert!(r.body.contains("big_write_queue_bytes 0"), "{}", r.body);
+    assert!(r.body.contains("big_write_queue_oldest_seconds 0.000"), "{}", r.body);
+    assert!(r.body.contains("big_write_queue_refused_total 0"), "{}", r.body);
 }
