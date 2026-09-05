@@ -24,6 +24,27 @@
 # that is up, it cannot pick data that is not there. Failing over needs a copy of a range, and a
 # copy needs a third node to settle the vote - see docs/clustering.md, "Replication, and failing
 # over", and deploy/readme.md, "What a joining node needs first", for what adds one.
+#
+# **Three things a node can now do for itself, and only one of them is on here.** Each is a flag
+# and each is off by default, for one reason: a deployment that reshapes itself unasked is one
+# whose shape an operator cannot predict.
+#
+#   --reclaim               on below. Purely local - it asks no peer and proposes nothing, so it
+#                           runs on every node, clustered or not, leader or not. See the flag.
+#   --balance               off. It works, and it moves the facts rather than only the map: a
+#                           range handed over is seeded, caught up, cut over behind a write
+#                           barrier, checked by digest, and only then dropped from the source.
+#                           Off because the two ranges here are the thing this file is
+#                           explaining, and a cluster that redraws them mid-demo is explaining
+#                           something else. It also needs both nodes up to decide anything, for
+#                           the reason below.
+#   --elect-schema-leader   off, and here it would be **inert rather than merely cautious**. It
+#                           hands the row-key namespace on after fifteen seconds of silence from
+#                           whoever holds it, and handing it on is a decision the agreement has
+#                           to commit. A majority of two is two - so at the moment the schema
+#                           leader is the node that went away, there is no majority left to
+#                           commit anything with. This flag wants the same third node that
+#                           replication wants.
 
 # Everything the two nodes share. Not the volumes: a merge key replaces a list rather than
 # extending it, so a `volumes` here would be silently overridden by each service's own and read
@@ -88,6 +109,16 @@ services:
       # ceiling is a daemon one expensive query can hold a worker on for as long as it likes.
       - --query-timeout
       - "30"
+      # Trailing free pages go back to the filesystem while this node serves. Local, and gated
+      # on nothing but this switch: no peer is asked and nothing is proposed, so it does not
+      # care that this is a cluster. It waits for the file to reach 4096 pages with a quarter of
+      # it reusable, which a demo this small never reaches - it is here because this file is
+      # also a template. **What it gives back is the free run at the end of the file and nothing
+      # else**: a database that has churned in the middle keeps those holes until an offline
+      # `big compact` rewrites it, because moving a live page means rewriting whoever points at
+      # it. `big leaks <file>` prints the accounting, offline. Watch big_pages_reclaimed_total
+      # and big_reclaim_blocked_total; the second one climbing means readers, not a fault.
+      - --reclaim
       # **The same certificate again, and this is the pair that makes the cluster work.**
       # `--peer-cert` is the identity this node presents when it *dials* another; `--tls-cert` is
       # what its own listener presents when it is dialled. A node given only the first speaks TLS
@@ -137,6 +168,16 @@ services:
       # ceiling is a daemon one expensive query can hold a worker on for as long as it likes.
       - --query-timeout
       - "30"
+      # Trailing free pages go back to the filesystem while this node serves. Local, and gated
+      # on nothing but this switch: no peer is asked and nothing is proposed, so it does not
+      # care that this is a cluster. It waits for the file to reach 4096 pages with a quarter of
+      # it reusable, which a demo this small never reaches - it is here because this file is
+      # also a template. **What it gives back is the free run at the end of the file and nothing
+      # else**: a database that has churned in the middle keeps those holes until an offline
+      # `big compact` rewrites it, because moving a live page means rewriting whoever points at
+      # it. `big leaks <file>` prints the accounting, offline. Watch big_pages_reclaimed_total
+      # and big_reclaim_blocked_total; the second one climbing means readers, not a fault.
+      - --reclaim
       # **The same certificate again, and this is the pair that makes the cluster work.**
       # `--peer-cert` is the identity this node presents when it *dials* another; `--tls-cert` is
       # what its own listener presents when it is dialled. A node given only the first speaks TLS
