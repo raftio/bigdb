@@ -228,7 +228,7 @@ fn there_is_no_password_flag() {
     let users = dir.path().join("users");
     let run = passwd(&users, &["set", "alice", "--password", "s3cret"], "");
     assert_ne!(run.code, 0, "a --password flag was accepted: {}", run.err);
-    assert!(run.said("unknown option --password"), "{}", run.err);
+    assert!(run.said("--password"), "{}", run.err);
 }
 
 #[test]

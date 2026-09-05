@@ -36,125 +36,13 @@ use std::time::Duration;
 
 const DEFAULT_ADDR: &str = "127.0.0.1:7654";
 
-const USAGE: &str = "\
-usage: big serve <file> [addr] [options]
-
-  addr                        defaults to 127.0.0.1:7654
-
-  --users <file>              one `username role hash` per line, made by `big passwd`
-                              a role is a name the catalog holds - made with CREATE ROLE,
-                              given privileges with GRANT - and a name it does not hold is
-                              no privileges at all. `superuser` is reserved and holds
-                              everything, which is how a new database gets its first GRANT.
-                              The file must be mode 600
-  --tls-cert <file>           PEM certificate chain this server presents
-  --tls-key <file>            PEM private key for it; file must be mode 600
-                              both need a build with the `tls` feature
-  --peer-cert <file>          PEM chain this node presents to its peers
-  --peer-key <file>           PEM private key for it; file must be mode 600
-                              a cluster whose file names a peer CA needs both. Nodes
-                              prove themselves to each other with a certificate, not a
-                              shared secret, so one leaked key is one node
-  --join <addr>               take the cluster from a node already in it, instead of a file.
-                              Needs --cluster-id and --node, and needs this node to have been
-                              added already: run `bigctl cluster add-node <name> <addr>` against
-                              a node that is in the cluster first, or this one is refused by
-                              name at startup. Add --peer-ca where the peers speak TLS
-  --cluster-id <name>         what names the cluster, as in the cluster file. Required with
-                              --join: every peer request carries a stamp derived from it, so a
-                              joining node cannot ask for what it has not been told
-  --peer-ca <file>            PEM CA the peers' certificates chain to, for --join. The cluster
-                              file's `peer_ca_file` says the same thing for everybody else
-  --cluster <file>            who owns which shards; see docs/clustering.md
-                              without it, this node owns every shard and has no peers
-                              a node owns a range (shards) or copies one (replica)
-                              a cluster with any replica needs three nodes or more
-  --node <name>               which node in the cluster file this daemon is
-                              defaults to the one whose addr is the addr above
-  --insecure-no-auth          allow a non-loopback bind with no users. Says what it is.
-  --insecure-no-tls           allow a non-loopback bind in the clear. Says what it is.
-                              what you want when a reverse proxy terminates TLS in front
-  --workers <n>               requests handled at once
-  --queue <n>                 connections allowed to wait; past this, 503
-  --read-timeout <seconds>    how long a client may take to send a request
-  --query-timeout <seconds>   wall-clock budget for one query; 0 means none
-  --reclaim                   give trailing free pages back to the filesystem while serving.
-                              Copy-on-write leaves holes and the freelist reuses them, so a
-                              file that has churned is mostly free space it never hands back;
-                              without this only an offline `big compact` shrinks it. Acts once
-                              a quarter of the file is reclaimable, needs a moment with no
-                              query in flight, and takes the write lock for one truncation.
-                              Watch big_pages_reclaimed_total and big_reclaim_blocked_total
-  --elect-schema-leader       let the agreement give the row-key namespace to another node
-                              when the one holding it has been silent for fifteen seconds.
-                              Without it, `bigctl cluster schema-leader` is the only way it
-                              moves, and a dead leader means no *new* row key can be assigned
-                              until it is back. With it, a failover copies every row key of
-                              every table to the successor - and can burn row ids the dead
-                              leader assigned to writes that never landed, so the deposed node
-                              must be repaired before it is trusted again. See
-                              docs/clustering.md. Needs --cluster
-  --balance                   let the cluster reshape itself: a node that is draining has its
-                              ranges moved away, a node with nothing is given the tail, and a
-                              node much fuller than another gives a range up. One step at a
-                              time, decided by the agreement's leader. Off unless passed - a
-                              cluster that reshapes itself unasked is one whose shape an
-                              operator cannot predict. Needs --cluster to mean anything
-  --max-row-keys <n>          refuse to invent more than n row keys; 0 means no limit
-                              every row key is resident in memory in both directions, so
-                              this is the ceiling on the one allocation that grows with
-                              cardinality rather than with size. Watch big_row_keys
-  --backup-dir <dir>          where POST /admin/backup may write; without it that
-                              route is not configured and says so. The request names
-                              a file inside this directory and cannot name one outside
-  --mapsize <size>            address space reserved for the file, default 1T
-                              suffixes K, M, G, T; reserved once and never remapped,
-                              so it is this file's ceiling until the daemon restarts
-  --durability full|barrier|none
-                              how hard a commit flushes, default full
-                              full    survives power loss
-                              barrier survives the OS dying, not the drive's cache
-                              none    survives this process dying, nothing more
-  --write-coalesce            let concurrent writes share a commit. The store allows one
-                              writer, so writes arriving together are serialised anyway;
-                              this makes them share one transaction and therefore one pair
-                              of fsyncs instead of one pair each. The group is collected
-                              while the first writer waits for the write lock, so a write
-                              with no company waits for none. A batch the engine refuses
-                              still fails alone. Off unless passed; watch
-                              big_write_commit_jobs_total / big_write_commits_total
-  --write-group-jobs <n>      batches one commit may carry, default 64
-  --write-group-facts <n>     facts one commit may carry, default 1048576. Bounds the wait
-                              a small batch inherits from a large one it arrived behind;
-                              a batch larger than this still goes on its own
-  --write-async               allow `?ack=queued` on an import or a delete: answered when the
-                              facts are held rather than when they are committed. **A different
-                              promise, not a faster one** - what has been acknowledged and not
-                              committed is lost if this process dies, and a batch the engine
-                              then refuses has nobody left to tell, so it is counted in
-                              big_write_acknowledged_lost_total instead. Single node only; a
-                              node with peers refuses ?ack=queued and says so. Needs
-                              --write-coalesce. Watch big_write_queue_oldest_seconds
-  --write-linger <ms>         the longest an acknowledged write may wait to be committed,
-                              default 200. A ceiling, not a delay: any writer arriving sooner
-                              carries it along
-  --write-queue-bytes <size>  acknowledged writes this may hold, default 64M. Past it, see
-                              --write-when-full. Suffixes K, M, G
-  --watch-max <n>             subscriptions GET /watch may hold at once, default 0 (off).
-                              A client subscribes with a SELECT and is pushed the answer
-                              again whenever it changes - a live query, not a change feed:
-                              the engine keeps no log of logical changes, and an answer here
-                              is a number rather than a row. **Each subscriber holds a worker
-                              for as long as it stays connected**, so this is the one route
-                              that can take the pool away from everything else; keep it well
-                              under --workers. On a node writing alone a push follows a commit
-                              at once; with peers it follows ?interval= instead, because a
-                              commit elsewhere notifies nothing here
-  --write-when-full block|refuse
-                              what a full buffer does, default block. block answers the write
-                              the durable way instead, which is backpressure aimed at whoever
-                              filled it; refuse answers 503 server_busy
-
+/// The prose that is about the *server* rather than about a flag.
+///
+/// It used to be the tail of one hand-written usage string. It is still hand-written - these are
+/// routes and their privileges, which no argument parser can generate - but it is now attached to
+/// `--help` rather than being the thing `--help` printed.
+const AFTER_LONG_HELP: &str = "\
+Environment:
   BIG_LOG=off|error|warn|info|debug   log level, default info
 
 Listing:
@@ -190,19 +78,12 @@ happened to read tables - GRANT OPERATE ON *.* TO <role>. So is everything under
 /admin/cluster. See docs/access-control.md.
 ";
 
-/// `big serve`, with the word already stripped by the dispatcher.
-pub fn main(args: &[String]) -> std::io::Result<()> {
-    let opts = match Options::parse(args) {
+/// `big serve`, already parsed by the dispatcher.
+pub fn main(opts: Options) -> std::io::Result<()> {
+    let opts = match opts.normalize() {
         Ok(o) => o,
-        // `--help` is not a failure, so it prints the usage to stdout and exits zero.
-        // Anything else is, and says what was wrong before repeating the usage.
-        Err(e) if e.is_empty() => {
-            print!("{USAGE}");
-            return Ok(());
-        }
         Err(e) => {
-            eprintln!("big serve: {e}\n");
-            eprint!("{USAGE}");
+            eprintln!("big serve: {e}");
             std::process::exit(2);
         }
     };
@@ -695,66 +576,281 @@ fn announce(server: &Server<big_embed::MmapPager>, bound: std::net::SocketAddr, 
     );
 }
 
-struct Options {
+/// Everything `big serve` was told, before the two flags that spell "no limit" as `0` are folded.
+///
+/// **This is the clap type and the daemon's type at once.** They were separate for about an hour
+/// while this was being written, and the copy between them was thirty-five lines that could only
+/// ever be wrong in one direction. What keeps the defaults honest instead is
+/// `clap_defaults_match_the_engines`, below: the engine owns them in
+/// `big_embed::GroupConfig::default()`, `Default for Options` names them once, and the test
+/// asserts the command line agrees.
+#[derive(clap::Args, Debug)]
+#[command(after_long_help = AFTER_LONG_HELP)]
+pub struct Options {
+    /// The database file. One process holds it: the engine takes an exclusive lock.
+    #[arg(value_name = "FILE")]
     path: String,
+
+    /// What to bind.
+    #[arg(value_name = "ADDR", default_value = DEFAULT_ADDR)]
     addr: String,
+
+    /// One `username role hash` per line, made by `big passwd`. Must be mode 600.
+    ///
+    /// A role is a name the catalog holds - made with CREATE ROLE, given privileges with GRANT -
+    /// and a name it does not hold is no privileges at all. `superuser` is reserved and holds
+    /// everything, which is how a new database gets its first GRANT.
+    #[arg(long, value_name = "FILE", verbatim_doc_comment)]
     users: Option<String>,
+
+    /// PEM certificate chain this server presents. Needs a build with the `tls` feature.
+    #[arg(long, value_name = "FILE", requires = "tls_key")]
     tls_cert: Option<String>,
-    peer_cert: Option<String>,
-    peer_key: Option<String>,
+
+    /// PEM private key for --tls-cert; file must be mode 600.
+    #[arg(long, value_name = "FILE", requires = "tls_cert")]
     tls_key: Option<String>,
-    insecure: bool,
-    insecure_no_tls: bool,
-    workers: Option<usize>,
-    queue: Option<usize>,
-    read_timeout: Option<Duration>,
-    query_timeout: Option<Duration>,
-    /// Whether the agreement's leader may reshape the cluster on its own.
-    balance: bool,
-    /// Whether the agreement may give the row-key namespace to another node on its own.
-    elect_schema_leader: bool,
-    /// Whether this node may hand trailing free pages back to the filesystem while serving.
-    reclaim: bool,
-    /// Whether concurrent writers may share one commit.
-    write_coalesce: bool,
-    /// Batches one commit may carry. Not `Option`: the default belongs to the engine, and
-    /// `big_embed::GroupConfig` is where it is written down.
-    write_group_jobs: usize,
-    /// Facts one commit may carry, across every batch in it.
-    write_group_facts: usize,
-    /// Whether `?ack=queued` is offered at all.
-    write_async: bool,
-    /// The ceiling on how stale an acknowledged write may be.
-    write_linger: Duration,
-    /// Acknowledged, uncommitted bytes this node may hold.
-    write_queue_bytes: usize,
-    /// What a full buffer does.
-    write_when_full: big_embed::WhenFull,
-    /// Subscriptions `GET /watch` may hold at once. `0` turns the route off.
-    watch_max: usize,
-    durability: Option<big_db::Durability>,
-    cluster: Option<String>,
-    /// The address of a node already in the cluster, for a daemon started with no cluster file.
-    join: Option<String>,
-    /// What names the cluster, needed with `--join`: the request that fetches the membership
-    /// carries the stamp derived from it, so it cannot be learned by asking.
-    cluster_id: Option<String>,
-    /// The CA a joining node's peers are signed by. In the cluster file for everybody else.
+
+    /// PEM chain this node presents to its peers.
+    ///
+    /// A cluster whose file names a peer CA needs this and --peer-key. Nodes prove themselves to
+    /// each other with a certificate, not a shared secret, so one leaked key is one node.
+    #[arg(long, value_name = "FILE", requires = "peer_key", verbatim_doc_comment)]
+    peer_cert: Option<String>,
+
+    /// PEM private key for --peer-cert; file must be mode 600.
+    #[arg(long, value_name = "FILE", requires = "peer_cert")]
+    peer_key: Option<String>,
+
+    /// PEM CA the peers' certificates chain to, for --join.
+    ///
+    /// The cluster file's `peer_ca_file` says the same thing for everybody else.
+    #[arg(long, value_name = "FILE", verbatim_doc_comment)]
     peer_ca: Option<String>,
+
+    /// Take the cluster from a node already in it, instead of from a file.
+    ///
+    /// Needs --cluster-id and --node, and needs this node to have been added already: run
+    /// `bigctl cluster add-node <name> <addr>` against a node that is in the cluster first, or
+    /// this one is refused by name at startup. Add --peer-ca where the peers speak TLS.
+    #[arg(
+        long,
+        value_name = "ADDR",
+        conflicts_with = "cluster",
+        requires_all = ["cluster_id", "node"],
+        verbatim_doc_comment
+    )]
+    join: Option<String>,
+
+    /// What names the cluster, as in the cluster file. Required with --join.
+    ///
+    /// Every peer request carries a stamp derived from it, so a joining node cannot ask for what
+    /// it has not been told.
+    #[arg(long, value_name = "NAME", verbatim_doc_comment)]
+    cluster_id: Option<String>,
+
+    /// Who owns which shards; see docs/clustering.md.
+    ///
+    /// Without it, this node owns every shard and has no peers. A node owns a range (shards) or
+    /// copies one (replica), and a cluster with any replica needs three nodes or more.
+    #[arg(long, value_name = "FILE", verbatim_doc_comment)]
+    cluster: Option<String>,
+
+    /// Which node in the cluster file this daemon is.
+    ///
+    /// Defaults to the one whose addr is the addr above.
+    #[arg(long, value_name = "NAME", verbatim_doc_comment)]
     node: Option<String>,
-    backup_dir: Option<String>,
+
+    /// Allow a non-loopback bind with no users. Says what it is.
+    #[arg(long = "insecure-no-auth")]
+    insecure: bool,
+
+    /// Allow a non-loopback bind in the clear. Says what it is.
+    ///
+    /// What you want when a reverse proxy terminates TLS in front.
+    #[arg(long, verbatim_doc_comment)]
+    insecure_no_tls: bool,
+
+    /// Requests handled at once.
+    #[arg(long, value_name = "N")]
+    workers: Option<usize>,
+
+    /// Connections allowed to wait; past this, 503.
+    #[arg(long, value_name = "N")]
+    queue: Option<usize>,
+
+    /// How long a client may take to send a request.
+    #[arg(long, value_name = "SECONDS", value_parser = secs)]
+    read_timeout: Option<Duration>,
+
+    /// Wall-clock budget for one query; 0 means none.
+    #[arg(long, value_name = "SECONDS", value_parser = secs)]
+    query_timeout: Option<Duration>,
+
+    /// Let the cluster reshape itself. Needs --cluster to mean anything.
+    ///
+    /// A node that is draining has its ranges moved away, a node with nothing is given the tail,
+    /// and a node much fuller than another gives a range up. One step at a time, decided by the
+    /// agreement's leader. Off unless passed - a cluster that reshapes itself unasked is one
+    /// whose shape an operator cannot predict.
+    #[arg(long, verbatim_doc_comment)]
+    balance: bool,
+
+    /// Let the agreement move the row-key namespace after fifteen seconds of silence.
+    ///
+    /// Without it, `bigctl cluster schema-leader` is the only way it moves, and a dead leader
+    /// means no *new* row key can be assigned until it is back. With it, a failover copies every
+    /// row key of every table to the successor - and can burn row ids the dead leader assigned to
+    /// writes that never landed, so the deposed node must be repaired before it is trusted again.
+    /// See docs/clustering.md. Needs --cluster.
+    #[arg(long, verbatim_doc_comment)]
+    elect_schema_leader: bool,
+
+    /// Give trailing free pages back to the filesystem while serving.
+    ///
+    /// Copy-on-write leaves holes and the freelist reuses them, so a file that has churned is
+    /// mostly free space it never hands back; without this only an offline `big compact` shrinks
+    /// it. Acts once a quarter of the file is reclaimable, needs a moment with no query in
+    /// flight, and takes the write lock for one truncation. Watch big_pages_reclaimed_total and
+    /// big_reclaim_blocked_total.
+    #[arg(long, verbatim_doc_comment)]
+    reclaim: bool,
+
+    /// Let concurrent writes share a commit.
+    ///
+    /// The store allows one writer, so writes arriving together are serialised anyway; this makes
+    /// them share one transaction and therefore one pair of fsyncs instead of one pair each. The
+    /// group is collected while the first writer waits for the write lock, so a write with no
+    /// company waits for none. A batch the engine refuses still fails alone. Off unless passed;
+    /// watch big_write_commit_jobs_total / big_write_commits_total.
+    #[arg(long, default_value_t = big_embed::GroupConfig::default().enabled, verbatim_doc_comment)]
+    write_coalesce: bool,
+
+    /// Batches one commit may carry.
+    #[arg(long, value_name = "N", default_value_t = big_embed::GroupConfig::default().max_jobs)]
+    write_group_jobs: usize,
+
+    /// Facts one commit may carry, across every batch in it.
+    ///
+    /// Bounds the wait a small batch inherits from a large one it arrived behind; a batch larger
+    /// than this still goes on its own.
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = big_embed::GroupConfig::default().max_facts,
+        verbatim_doc_comment
+    )]
+    write_group_facts: usize,
+
+    /// Allow `?ack=queued` on an import or a delete. Needs --write-coalesce.
+    ///
+    /// Answered when the facts are held rather than when they are committed. **A different
+    /// promise, not a faster one** - what has been acknowledged and not committed is lost if this
+    /// process dies, and a batch the engine then refuses has nobody left to tell, so it is
+    /// counted in big_write_acknowledged_lost_total instead. Single node only; a node with peers
+    /// refuses ?ack=queued and says so. Watch big_write_queue_oldest_seconds.
+    #[arg(
+        long,
+        default_value_t = big_embed::GroupConfig::default().async_writes,
+        requires = "write_coalesce",
+        verbatim_doc_comment
+    )]
+    write_async: bool,
+
+    /// The longest an acknowledged write may wait to be committed, in milliseconds.
+    ///
+    /// A ceiling, not a delay: any writer arriving sooner carries it along.
+    #[arg(
+        long,
+        value_name = "MS",
+        value_parser = millis,
+        default_value = "200",
+        verbatim_doc_comment
+    )]
+    write_linger: Duration,
+
+    /// Acknowledged writes this may hold. Suffixes K, M, G. Past it, see --write-when-full.
+    #[arg(
+        long,
+        value_name = "SIZE",
+        value_parser = size_usize,
+        default_value_t = big_embed::GroupConfig::default().max_async_bytes
+    )]
+    write_queue_bytes: usize,
+
+    /// What a full buffer does.
+    ///
+    /// `block` answers the write the durable way instead, which is backpressure aimed at whoever
+    /// filled it; `refuse` answers 503 server_busy.
+    #[arg(
+        long,
+        value_name = "WHEN",
+        value_parser = when_full,
+        default_value = "block",
+        verbatim_doc_comment
+    )]
+    write_when_full: big_embed::WhenFull,
+
+    /// Subscriptions GET /watch may hold at once; 0 turns the route off.
+    ///
+    /// A client subscribes with a SELECT and is pushed the answer again whenever it changes - a
+    /// live query, not a change feed: the engine keeps no log of logical changes, and an answer
+    /// here is a number rather than a row. **Each subscriber holds a worker for as long as it
+    /// stays connected**, so this is the one route that can take the pool away from everything
+    /// else; keep it well under --workers. On a node writing alone a push follows a commit at
+    /// once; with peers it follows ?interval= instead, because a commit elsewhere notifies
+    /// nothing here.
+    #[arg(long, value_name = "N", default_value_t = 0, verbatim_doc_comment)]
+    watch_max: usize,
+
+    /// How hard a commit flushes.
+    ///
+    /// full    survives power loss
+    /// barrier survives the OS dying, not the drive's cache
+    /// none    survives this process dying, nothing more
+    #[arg(long, value_name = "LEVEL", value_parser = durability, verbatim_doc_comment)]
+    durability: Option<big_db::Durability>,
+
+    /// Refuse to invent more than n row keys; 0 means no limit.
+    ///
+    /// Every row key is resident in memory in both directions, so this is the ceiling on the one
+    /// allocation that grows with cardinality rather than with size. Watch big_row_keys.
+    #[arg(long, value_name = "N", verbatim_doc_comment)]
     max_row_keys: Option<usize>,
-    /// Address space reserved for the mapping, in bytes. Never `None`: a default that is
-    /// applied here rather than deep in the pager is one an operator can read back in the
-    /// startup line.
+
+    /// Where POST /admin/backup may write.
+    ///
+    /// Without it that route is not configured and says so. The request names a file inside this
+    /// directory and cannot name one outside.
+    #[arg(long, value_name = "DIR", verbatim_doc_comment)]
+    backup_dir: Option<String>,
+
+    /// Address space reserved for the file. Suffixes K, M, G, T.
+    ///
+    /// Reserved once and never remapped, so it is this file's ceiling until the daemon restarts.
+    #[arg(
+        long,
+        value_name = "SIZE",
+        value_parser = size_u64,
+        default_value_t = big_embed::DEFAULT_MAPSIZE,
+        verbatim_doc_comment
+    )]
     mapsize: u64,
+
+    /// Gone: bearer tokens were replaced by usernames and passwords.
+    ///
+    /// Recognised so that it can say what happened, rather than falling through to "unknown
+    /// option" and sending an operator to check their spelling.
+    #[arg(long, hide = true, num_args = 0..=1, value_name = "FILE")]
+    tokens: Option<Option<String>>,
 }
 
 impl Default for Options {
     fn default() -> Self {
         Self {
             path: String::new(),
-            addr: String::new(),
+            addr: DEFAULT_ADDR.to_string(),
             users: None,
             tls_cert: None,
             peer_cert: None,
@@ -786,216 +882,36 @@ impl Default for Options {
             backup_dir: None,
             max_row_keys: None,
             mapsize: big_embed::DEFAULT_MAPSIZE,
+            tokens: None,
         }
     }
 }
 
 impl Options {
-    /// Positional first, then flags. Hand-rolled for the same reason the HTTP parser is: eight
-    /// options do not justify an argument-parsing dependency.
-    fn parse(args: &[String]) -> Result<Self, String> {
-        let mut out = Self { addr: DEFAULT_ADDR.to_string(), ..Default::default() };
-        let mut positional = Vec::new();
-        let mut i = 0;
-
-        while i < args.len() {
-            let arg = args[i].as_str();
-            // A flag's value is required, and saying which flag is missing one is the whole
-            // difference between a usable error and "invalid arguments".
-            let value = || args.get(i + 1).cloned().ok_or_else(|| format!("{arg} needs a value"));
-            match arg {
-                "--users" => {
-                    out.users = Some(value()?);
-                    i += 2;
-                }
-                // Recognised for one release so that it can say what happened. A flag that has
-                // been removed and explains itself is worth more than a clean parser: falling
-                // through to "unknown option" would send an operator to check their spelling.
-                "--tokens" => {
-                    return Err("--tokens is gone: bearer tokens were replaced by usernames and \
-                         passwords. Make a users file with `big passwd <file> set <user>` and \
-                         pass --users."
-                        .to_string())
-                }
-                "--tls-cert" => {
-                    out.tls_cert = Some(value()?);
-                    i += 2;
-                }
-                "--tls-key" => {
-                    out.tls_key = Some(value()?);
-                    i += 2;
-                }
-                "--peer-cert" => {
-                    out.peer_cert = Some(value()?);
-                    i += 2;
-                }
-                "--peer-key" => {
-                    out.peer_key = Some(value()?);
-                    i += 2;
-                }
-                "--cluster" => {
-                    out.cluster = Some(value()?);
-                    i += 2;
-                }
-                "--join" => {
-                    out.join = Some(value()?);
-                    i += 2;
-                }
-                "--cluster-id" => {
-                    out.cluster_id = Some(value()?);
-                    i += 2;
-                }
-                "--peer-ca" => {
-                    out.peer_ca = Some(value()?);
-                    i += 2;
-                }
-                "--node" => {
-                    out.node = Some(value()?);
-                    i += 2;
-                }
-                "--workers" => {
-                    out.workers = Some(parse_num(&value()?, arg)?);
-                    i += 2;
-                }
-                "--queue" => {
-                    out.queue = Some(parse_num(&value()?, arg)?);
-                    i += 2;
-                }
-                "--read-timeout" => {
-                    out.read_timeout = Some(Duration::from_secs(parse_num(&value()?, arg)? as u64));
-                    i += 2;
-                }
-                "--query-timeout" => {
-                    let secs = parse_num(&value()?, arg)? as u64;
-                    // Zero means "no budget", not "a budget of nothing", which would refuse
-                    // every query and be a confusing way to spell it.
-                    out.query_timeout = (secs > 0).then(|| Duration::from_secs(secs));
-                    i += 2;
-                }
-                "--balance" => {
-                    out.balance = true;
-                    i += 1;
-                }
-                "--elect-schema-leader" => {
-                    out.elect_schema_leader = true;
-                    i += 1;
-                }
-                "--reclaim" => {
-                    out.reclaim = true;
-                    i += 1;
-                }
-                "--write-coalesce" => {
-                    out.write_coalesce = true;
-                    i += 1;
-                }
-                "--write-group-jobs" => {
-                    out.write_group_jobs = parse_num(&value()?, arg)?.max(1);
-                    i += 2;
-                }
-                "--write-group-facts" => {
-                    out.write_group_facts = parse_num(&value()?, arg)?.max(1);
-                    i += 2;
-                }
-                "--watch-max" => {
-                    out.watch_max = parse_num(&value()?, arg)?;
-                    i += 2;
-                }
-                "--write-async" => {
-                    out.write_async = true;
-                    i += 1;
-                }
-                "--write-linger" => {
-                    out.write_linger = Duration::from_millis(parse_num(&value()?, arg)? as u64);
-                    i += 2;
-                }
-                "--write-queue-bytes" => {
-                    out.write_queue_bytes = parse_size(&value()?, arg)? as usize;
-                    i += 2;
-                }
-                "--write-when-full" => {
-                    let v = value()?;
-                    out.write_when_full = match v.as_str() {
-                        "block" => big_embed::WhenFull::Block,
-                        "refuse" => big_embed::WhenFull::Refuse,
-                        _ => {
-                            return Err(format!(
-                                "--write-when-full takes block or refuse, got `{v}`"
-                            ))
-                        }
-                    };
-                    i += 2;
-                }
-                "--durability" => {
-                    let v = value()?;
-                    out.durability = Some(big_db::Durability::parse(&v).ok_or_else(|| {
-                        format!("--durability takes full, barrier or none, got `{v}`")
-                    })?);
-                    i += 2;
-                }
-                "--max-row-keys" => {
-                    let n = parse_num(&value()?, arg)?;
-                    // Zero spells "no ceiling" rather than "a ceiling of nothing", which
-                    // would refuse every keyed write and be a confusing way to say it. Same
-                    // convention as --query-timeout.
-                    out.max_row_keys = (n > 0).then_some(n);
-                    i += 2;
-                }
-                "--backup-dir" => {
-                    out.backup_dir = Some(value()?);
-                    i += 2;
-                }
-                "--mapsize" => {
-                    out.mapsize = parse_size(&value()?, arg)?;
-                    i += 2;
-                }
-                "--insecure-no-auth" => {
-                    out.insecure = true;
-                    i += 1;
-                }
-                "--insecure-no-tls" => {
-                    out.insecure_no_tls = true;
-                    i += 1;
-                }
-                "-h" | "--help" => return Err("".to_string()),
-                other if other.starts_with('-') => return Err(format!("unknown option {other}")),
-                other => {
-                    positional.push(other.to_string());
-                    i += 1;
-                }
-            }
+    /// Folds the two flags that spell "no limit" as `0`, and the removed one that explains itself.
+    ///
+    /// Everything else clap has already checked. What is left here is the handful of rules that
+    /// are about a *value* rather than about which flags may appear together: `0` meaning "none"
+    /// rather than "a budget of nothing", which would refuse every query and be a confusing way
+    /// to spell it.
+    fn normalize(mut self) -> Result<Self, String> {
+        if self.tokens.is_some() {
+            return Err("--tokens is gone: bearer tokens were replaced by usernames and \
+                        passwords. Make a users file with `big passwd <file> set <user>` and \
+                        pass --users."
+                .to_string());
         }
-
-        // Flags that need other flags, checked here so they exit 2 and reprint the usage the way
-        // every other usage error does.
-        match (&out.tls_cert, &out.tls_key) {
-            (Some(_), Some(_)) | (None, None) => {}
-            // Named individually rather than "both are required": the operator passed one of
-            // them, so the useful sentence is which one is missing, not what the pair is called.
-            (Some(_), None) => return Err("--tls-cert needs --tls-key".to_string()),
-            (None, Some(_)) => return Err("--tls-key needs --tls-cert".to_string()),
+        if self.query_timeout == Some(Duration::ZERO) {
+            self.query_timeout = None;
         }
-        match (&out.peer_cert, &out.peer_key) {
-            (Some(_), Some(_)) | (None, None) => {}
-            (Some(_), None) => return Err("--peer-cert needs --peer-key".to_string()),
-            (None, Some(_)) => return Err("--peer-key needs --peer-cert".to_string()),
+        if self.max_row_keys == Some(0) {
+            self.max_row_keys = None;
         }
-        // Refused rather than quietly ignored. An operator who asked for early answers and got
-        // durable ones would see the flag in the command line, the writes going through, and no
-        // reason at all for the latency.
-        if out.write_async && !out.write_coalesce {
-            return Err("--write-async needs --write-coalesce".to_string());
-        }
-
-        match positional.as_slice() {
-            [path] => out.path = path.clone(),
-            [path, addr] => {
-                out.path = path.clone();
-                out.addr = addr.clone();
-            }
-            [] => return Err("a database file is required".to_string()),
-            _ => return Err("too many positional arguments".to_string()),
-        }
-        Ok(out)
+        // Clamped rather than refused, which is what the hand-rolled parser did: a group of zero
+        // batches is a group of one, and there is nothing for an operator to fix.
+        self.write_group_jobs = self.write_group_jobs.max(1);
+        self.write_group_facts = self.write_group_facts.max(1);
+        Ok(self)
     }
 }
 
@@ -1009,8 +925,28 @@ fn human_size(bytes: u64) -> String {
     format!("{bytes}")
 }
 
-fn parse_num(s: &str, flag: &str) -> Result<usize, String> {
-    s.parse().map_err(|_| format!("{flag} needs a number, got `{s}`"))
+fn secs(s: &str) -> Result<Duration, String> {
+    s.parse().map(Duration::from_secs).map_err(|_| format!("`{s}` is not a number of seconds"))
+}
+
+fn millis(s: &str) -> Result<Duration, String> {
+    s.parse().map(Duration::from_millis).map_err(|_| format!("`{s}` is not a number of ms"))
+}
+
+fn durability(s: &str) -> Result<big_db::Durability, String> {
+    big_db::Durability::parse(s).ok_or_else(|| format!("expected full, barrier or none, got `{s}`"))
+}
+
+fn when_full(s: &str) -> Result<big_embed::WhenFull, String> {
+    match s {
+        "block" => Ok(big_embed::WhenFull::Block),
+        "refuse" => Ok(big_embed::WhenFull::Refuse),
+        _ => Err(format!("expected block or refuse, got `{s}`")),
+    }
+}
+
+fn size_usize(s: &str) -> Result<usize, String> {
+    size_u64(s).map(|n| n as usize)
 }
 
 /// A byte count, with the suffixes an operator actually types.
@@ -1018,7 +954,7 @@ fn parse_num(s: &str, flag: &str) -> Result<usize, String> {
 /// Powers of 1024 rather than 1000: the number is a count of pages times 8 KiB, and a
 /// "gigabyte" that did not divide by the page size would be a number the pager silently
 /// rounds. Zero is refused here rather than in the pager, so the message names the flag.
-fn parse_size(s: &str, flag: &str) -> Result<u64, String> {
+fn size_u64(s: &str) -> Result<u64, String> {
     let (digits, scale) = match s.as_bytes().last() {
         Some(b'K' | b'k') => (&s[..s.len() - 1], 1u64 << 10),
         Some(b'M' | b'm') => (&s[..s.len() - 1], 1u64 << 20),
@@ -1026,12 +962,105 @@ fn parse_size(s: &str, flag: &str) -> Result<u64, String> {
         Some(b'T' | b't') => (&s[..s.len() - 1], 1u64 << 40),
         _ => (s, 1),
     };
-    let n: u64 = digits.parse().map_err(|_| format!("{flag} needs a size like 64G, got `{s}`"))?;
+    let n: u64 = digits.parse().map_err(|_| format!("expected a size like 64G, got `{s}`"))?;
     let bytes = n
         .checked_mul(scale)
-        .ok_or_else(|| format!("{flag} is larger than this machine can address: `{s}`"))?;
+        .ok_or_else(|| format!("larger than this machine can address: `{s}`"))?;
     if bytes == 0 {
-        return Err(format!("{flag} cannot be zero"));
+        return Err("cannot be zero".to_string());
     }
     Ok(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[derive(clap::Parser)]
+    struct Harness {
+        #[command(flatten)]
+        options: Options,
+    }
+
+    fn parse(args: &[&str]) -> Result<Options, clap::Error> {
+        let argv = std::iter::once("big serve").chain(args.iter().copied());
+        Harness::try_parse_from(argv).map(|h| h.options)
+    }
+
+    /// The command line's defaults are the engine's defaults.
+    ///
+    /// **This is what lets `Options` be the clap type and the daemon's type at once.** clap needs
+    /// every default spelled in an attribute; the engine owns them in
+    /// `big_embed::GroupConfig::default()`. Two spellings of one number is exactly the drift the
+    /// rest of this port was about, so it is asserted rather than commented.
+    #[test]
+    fn clap_defaults_match_the_engines() {
+        let parsed = parse(&["data.big"]).expect("a path is the only required argument");
+        let expected = Options { path: "data.big".to_string(), ..Options::default() };
+
+        assert_eq!(parsed.addr, expected.addr);
+        assert_eq!(parsed.write_coalesce, expected.write_coalesce);
+        assert_eq!(parsed.write_group_jobs, expected.write_group_jobs);
+        assert_eq!(parsed.write_group_facts, expected.write_group_facts);
+        assert_eq!(parsed.write_async, expected.write_async);
+        assert_eq!(parsed.write_linger, expected.write_linger);
+        assert_eq!(parsed.write_queue_bytes, expected.write_queue_bytes);
+        assert_eq!(parsed.write_when_full, expected.write_when_full);
+        assert_eq!(parsed.watch_max, expected.watch_max);
+        assert_eq!(parsed.mapsize, expected.mapsize);
+    }
+
+    /// `0` spells "no limit" on the two flags that have one, rather than "a limit of nothing".
+    #[test]
+    fn zero_means_no_limit_rather_than_a_limit_of_zero() {
+        let o = parse(&["f", "--query-timeout", "0", "--max-row-keys", "0"]).unwrap();
+        let o = o.normalize().unwrap();
+        assert_eq!(o.query_timeout, None);
+        assert_eq!(o.max_row_keys, None);
+
+        let o = parse(&["f", "--query-timeout", "30", "--max-row-keys", "5"]).unwrap();
+        let o = o.normalize().unwrap();
+        assert_eq!(o.query_timeout, Some(Duration::from_secs(30)));
+        assert_eq!(o.max_row_keys, Some(5));
+    }
+
+    /// The flags that need other flags are refused together, not silently half-applied.
+    #[test]
+    fn a_flag_that_needs_another_is_refused_without_it() {
+        for args in [
+            vec!["f", "--write-async"],
+            vec!["f", "--tls-cert", "c"],
+            vec!["f", "--tls-key", "k"],
+            vec!["f", "--peer-cert", "c"],
+            vec!["f", "--peer-key", "k"],
+            vec!["f", "--join", "a:1"],
+            vec!["f", "--join", "a:1", "--cluster-id", "c"],
+            // `--cluster` and `--join` are two ways to learn the same thing, so naming both is a
+            // question about which one wins that has no good answer.
+            vec!["f", "--cluster", "c.toml", "--join", "a:1"],
+        ] {
+            assert!(parse(&args).is_err(), "`{}` should be refused", args.join(" "));
+        }
+    }
+
+    /// The removed flag says what happened rather than "unknown option".
+    #[test]
+    fn the_removed_tokens_flag_explains_itself() {
+        let o = parse(&["f", "--tokens", "t"]).expect("still recognised, so it can explain itself");
+        let e = o.normalize().expect_err("but refused");
+        assert!(e.contains("--tokens is gone"), "{e}");
+    }
+
+    /// Sizes carry the suffixes an operator types, in powers of 1024.
+    #[test]
+    fn a_size_takes_the_suffixes_an_operator_types() {
+        assert_eq!(size_u64("64M").unwrap(), 64 << 20);
+        assert_eq!(size_u64("1t").unwrap(), 1 << 40);
+        assert_eq!(size_u64("4096").unwrap(), 4096);
+        assert!(size_u64("0").is_err());
+        assert!(size_u64("").is_err());
+        assert!(size_u64("64X").is_err());
+        assert!(size_u64("99999999T").is_err(), "overflow is refused, not wrapped");
+    }
 }
