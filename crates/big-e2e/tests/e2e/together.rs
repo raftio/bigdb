@@ -113,11 +113,11 @@ fn an_interrupted_load_resumes_where_its_checkpoint_says() {
     std::fs::write(&half, &all[..all.len() / 2]).unwrap();
     daemon
         .bigctl(&[
-            "--resume",
-            &resume.display().to_string(),
             "import",
             "tx",
             &half.display().to_string(),
+            "--resume",
+            &resume.display().to_string(),
         ])
         .expect(0);
 
@@ -130,11 +130,11 @@ fn an_interrupted_load_resumes_where_its_checkpoint_says() {
     // the full file - and lands on exactly the same bits for the first hundred.
     daemon
         .bigctl(&[
-            "--resume",
-            &resume.display().to_string(),
             "import",
             "tx",
             &facts.display().to_string(),
+            "--resume",
+            &resume.display().to_string(),
         ])
         .expect(0);
 
@@ -148,7 +148,10 @@ fn a_dry_run_sends_nothing() {
     let facts = dir.path().join("facts.txt");
     std::fs::write(&facts, FACTS).unwrap();
 
-    let run = daemon.bigctl(&["--dry-run", "import", "tx", &facts.display().to_string()]).expect(0);
+    // **After the subcommand, not before.** `--dry-run` belongs to a load and to nothing else,
+    // which is now a fact about where it is declared rather than a table checked by hand - so it
+    // is only accepted where it means something.
+    let run = daemon.bigctl(&["import", "tx", &facts.display().to_string(), "--dry-run"]).expect(0);
 
     assert_eq!(run.out, "would_send\n0\n", "it says it would: {:?}", run.out);
     let count = daemon.bigctl(&["--format", "json", "sql", "SELECT count(*) FROM tx"]).expect(0);

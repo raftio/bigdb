@@ -304,18 +304,23 @@ fn every_exit_code_means_what_the_usage_says() {
 }
 
 /// `--help` is not a failure: usage to stdout, exit zero. A bad flag is the reverse.
+///
+/// **The stream and the code are the assertion; the wording is not.** The parser renders these
+/// messages now, so what is checked is that a refusal names the thing that was wrong and goes
+/// where a script's `2>` will catch it. Pinning the sentence would be pinning clap's release
+/// notes.
 #[test]
 fn help_goes_to_stdout_and_a_mistake_goes_to_stderr() {
     let addr = stocked(0);
 
     let r = run(addr, &["--help"]);
     assert_eq!(r.code, exit::OK);
-    assert!(r.out.starts_with("usage: bigctl"), "{}", r.out);
+    assert!(r.out.contains("Usage: bigctl"), "{}", r.out);
     assert!(r.err.is_empty());
 
     let r = run(addr, &["--nope"]);
     assert_eq!(r.code, exit::USAGE);
-    assert!(r.err.contains("unknown option --nope"), "{}", r.err);
+    assert!(r.err.contains("--nope"), "{}", r.err);
     assert!(r.out.is_empty());
 }
 
@@ -361,7 +366,7 @@ fn a_password_is_presented_from_a_file_and_never_from_a_flag() {
     // uses somewhere else.
     let r = run(addr, &["--password", "s3cret", "schema"]);
     assert_eq!(r.code, exit::USAGE);
-    assert!(r.err.contains("unknown option --password"), "{}", r.err);
+    assert!(r.err.contains("--password"), "{}", r.err);
 }
 
 /// The flag and the environment variable that are gone say so, rather than falling through to
@@ -474,6 +479,10 @@ fn create_table_carries_the_engine_through() {
 /// was accepted and then thrown away - no error, no difference in the output, and nothing for
 /// the caller to notice. A client that swallows what it was given is worse than one that
 /// refuses it, and this is the direction that actually goes wrong.
+///
+/// It is now structural rather than checked: each flag is declared on the subcommand that takes
+/// it, so `--engine` does not exist on `records` and there is no table left to fall out of date.
+/// This test outlived the `only()` it was written against, which is the point of it.
 #[test]
 fn a_flag_from_another_subcommand_is_refused() {
     let addr = stocked(1);
@@ -495,12 +504,7 @@ fn a_flag_from_another_subcommand_is_refused() {
     ] {
         let r = run_at(addr, &args, "", true);
         assert_eq!(r.code, 2, "`{}` should be a usage error: {} {}", args.join(" "), r.out, r.err);
-        assert!(
-            r.err.contains(flag) && r.err.contains("does not belong"),
-            "`{}` should name {flag}: {}",
-            args.join(" "),
-            r.err
-        );
+        assert!(r.err.contains(flag), "`{}` should name {flag}: {}", args.join(" "), r.err);
     }
 }
 
@@ -521,4 +525,26 @@ fn a_subcommands_own_flags_still_reach_it() {
         let r = run_at(addr, &args, "", true);
         assert_ne!(r.code, 2, "`{}` was refused as usage: {}", args.join(" "), r.err);
     }
+}
+
+/// A subcommand's own positional never overwrites a global flag of the same name.
+///
+/// **This was a real defect, and a quiet one.** `--addr` is global and `cluster add-node` takes
+/// an address of its own; clap keys arguments by id, so while both were called `addr` they were
+/// one argument written twice, and the *new node's* address replaced the one this client had
+/// been told to talk to. Nothing failed loudly - the client simply dialled a machine that was
+/// not running yet and reported that as the error, which sent the reader looking at the wrong
+/// end of the cluster.
+#[test]
+fn a_node_address_does_not_become_the_client_address() {
+    // Two, because this makes two requests and the harness's server serves exactly its budget.
+    let addr = stocked(2);
+    // The node address is deliberately unroutable-quickly and different from the server's. If it
+    // were used as the target, this would fail to connect there rather than being answered here.
+    let r = run(addr, &["cluster", "add-node", "d", "10.255.255.1:7654"]);
+    assert_ne!(r.code, exit::UNREACHABLE, "it talked to the wrong host: {}", r.err);
+
+    // The same shape on `cluster join`, which has the same pair of arguments.
+    let r = run(addr, &["cluster", "join", "d", "10.255.255.1:7654"]);
+    assert_ne!(r.code, exit::UNREACHABLE, "it talked to the wrong host: {}", r.err);
 }
