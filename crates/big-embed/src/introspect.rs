@@ -174,9 +174,17 @@ pub fn show_views(views: &[ViewInfo], database: Option<&str>) -> ResultSet {
 /// The question every JDBC driver and BI tool opens with. The default database is always in
 /// the answer, whether or not it holds anything: it is the one a request lands in when nothing
 /// says otherwise, so a client that could not see it could not explain where its tables went.
-pub fn show_databases(tables: &[TableInfo]) -> ResultSet {
+///
+/// `names` is the catalog's own list and is what decides which rows exist; `tables` only
+/// decides the counts. Deriving the list from the tables instead would hide a database that
+/// holds nothing yet - which is every database between its `CREATE` and its first table, and
+/// the one state where an operator most needs the listing to confirm the `CREATE` landed.
+pub fn show_databases(names: &[String], tables: &[TableInfo]) -> ResultSet {
     let mut counts: std::collections::BTreeMap<&str, usize> =
         [(big_db::DEFAULT_DATABASE_NAME, 0)].into_iter().collect();
+    for name in names {
+        counts.entry(name.as_str()).or_default();
+    }
     for t in tables {
         *counts.entry(t.database.as_str()).or_default() += 1;
     }

@@ -740,7 +740,9 @@ impl<P: PagerMut + Sync> Cluster<P> {
             big_embed::SqlShown::Views { database } => {
                 Ok(big_embed::introspect::show_views(&views, database.as_deref()))
             }
-            big_embed::SqlShown::Databases => Ok(big_embed::introspect::show_databases(&schema)),
+            big_embed::SqlShown::Databases => {
+                Ok(big_embed::introspect::show_databases(&self.api.database_names(), &schema))
+            }
             big_embed::SqlShown::Roles => Ok(big_embed::introspect::show_roles(&self.api.roles())),
             // A bare `SHOW GRANTS` is about the caller's own role, which is why it needs no
             // privilege: reading what you hold tells you nothing you could not find out by

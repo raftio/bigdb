@@ -845,9 +845,17 @@ impl<P: PagerMut + Sync> Api<P> {
         self.db.catalog().database(name).is_some()
     }
 
+    /// Every database this node holds, by name, the default one first.
+    ///
+    /// The catalog is the only thing that knows a database exists before a table is put in it,
+    /// so this is what a listing has to be built from - see [`introspect::show_databases`].
+    pub fn database_names(&self) -> Vec<String> {
+        self.db.catalog().databases().map(|(_, name)| name.to_string()).collect()
+    }
+
     /// Every database, with the tables each holds.
     pub fn databases(&self) -> ResultSet {
-        introspect::show_databases(&self.schema())
+        introspect::show_databases(&self.database_names(), &self.schema())
     }
 
     /// Makes a role. **`Ok(false)` means nothing changed** - it was already there.
