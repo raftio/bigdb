@@ -23,8 +23,49 @@ The question it answers is narrower and has a published answer: *which node is a
 /ready` is unauthenticated and reports `serving`, which the daemon documents as the one field a
 load balancer may act on.
 
-**It holds nothing.** No file, no lock, no credential. `Authorization: Basic` is forwarded byte
-for byte and never parsed here; the daemon stays the only process that has seen a password.
+**It holds no client's credential.** `Authorization: Basic` is forwarded byte for byte and
+never parsed here; the daemon stays the only process that has seen a client's password. No file
+and no lock either, with one exception the operator asks for: `--discover-credentials` names a
+file holding a credential of this proxy's own, used for one read and nothing else. See
+**Membership** below.
+
+**It does not decide what a node holds.** With `--discover` it reads *who is in the cluster*;
+the `ranges` in the same answer are deliberately ignored, for the reason routing by key is.
+
+## Membership
+
+The upstreams above are the cluster as it was when this process started. A node admitted after
+that is one no request can reach, so a front door in front of a cluster that grows is a front
+door that has to be restarted to see the growth.
+
+```
+bigproxy 127.0.0.1:7650 --upstream a=a:7654 --discover --discover-credentials /etc/big/proxy.cred
+```
+
+`--discover` reads `GET /cluster/topology` from a node already in rotation, on the health
+interval, and adopts what it finds. That route demands `Operate`, so a cluster with a users file
+needs a credential here - one `user:password` line, mode 600, checked the way `bigctl` checks
+its own. A cluster with no users file needs nothing.
+
+**Off by default.** A deployment that grew an upstream nobody wrote down is one whose shape an
+operator cannot predict from what they wrote, and that is worth more than the restart it saves.
+It is the same stance the daemon takes with `--balance` and `--reclaim`.
+
+**A discovered node starts out of rotation** and earns its way in with `--health-pass` probes,
+where a node named on the command line starts in. The asymmetry is the point: an optimistic
+start is right at startup because the alternative is answering `503` while every node is fine,
+but a node that appears mid-flight invents no outage by waiting - and the moment a cluster
+announces a node is the moment it is least likely to have caught up. **A node already known
+keeps its health record**, so reading the membership every two seconds cannot become a way of
+quietly resetting the health check.
+
+**The answer comes from one node, chosen without telling anybody.** That is the honest weakness
+of reading membership here, and it is why only a node in rotation is asked and why nothing in
+this loop decides that a node is *ready* - it decides only that a node exists. Which of them get
+requests stays the health check's call.
+
+`big_proxy_upstreams_discovered_total` and `big_proxy_upstreams_removed_total` count the moves;
+`/ready` lists the set as it stands.
 
 ## The route table
 

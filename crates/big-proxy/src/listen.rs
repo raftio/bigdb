@@ -78,6 +78,9 @@ pub struct Config {
     pub health: HealthConfig,
     /// What the *downstream* leg was, for `X-Forwarded-Proto`. Not the leg to the node.
     pub proto: &'static str,
+    /// Following the cluster's membership, when the operator asked for it. `None` is the list
+    /// this proxy was started with and nothing else - see [`crate::discover`].
+    pub discovery: Option<crate::discover::Discovery>,
     /// The listener's own certificate, when it has one.
     ///
     /// Built with `peer_ca: None`, which takes rustls' `with_no_client_auth()` branch: this
@@ -95,6 +98,7 @@ impl Default for Config {
             allowed: crate::allowlist::Tier::Ddl,
             trust_forwarded_for: false,
             health: HealthConfig::default(),
+            discovery: None,
             proto: "http",
             tls: None,
         }
@@ -164,6 +168,18 @@ impl Proxy {
             let pool = Arc::clone(&self.pool);
             let health = self.config.health;
             scope.spawn(move || pool.poll_while(running, health.every, health.budget));
+
+            // Membership, on a thread of its own and in the same scope. Separate from the
+            // health poller because they answer different questions at different costs: one is
+            // an unauthenticated probe of every node, the other one authenticated read from a
+            // single node, and folding them together would make each wait for the other.
+            if let Some(discovery) = self.config.discovery.clone() {
+                let pool = Arc::clone(&self.pool);
+                let metrics = &self.metrics;
+                scope.spawn(move || {
+                    crate::discover::follow_while(&pool, &discovery, Some(metrics), running)
+                });
+            }
 
             while running.load(Ordering::Relaxed) {
                 match self.listener.accept() {

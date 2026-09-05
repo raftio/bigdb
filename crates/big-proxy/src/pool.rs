@@ -28,13 +28,22 @@ use crate::allowlist::Repeatable;
 use crate::health::{Health, Policy, Verdict};
 use crate::upstream::{Upstream, UpstreamError, UpstreamResponse};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 /// One node and what this proxy currently believes about it.
+///
+/// `Debug` is by name and address only: the health record behind the lock would be read by a
+/// formatter, and a formatter that takes a lock is a formatter that can deadlock a panic.
 pub struct Node {
     pub up: Upstream,
     pub health: RwLock<Health>,
+}
+
+impl std::fmt::Debug for Node {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Node({} at {})", self.up.name(), self.up.addr())
+    }
 }
 
 impl Node {
@@ -42,8 +51,22 @@ impl Node {
         Self { up, health: RwLock::new(Health::new(policy)) }
     }
 
+    /// A node this proxy learned about while running. See [`Health::joining`].
+    pub fn joining(up: Upstream, policy: Policy) -> Self {
+        Self { up, health: RwLock::new(Health::joining(policy)) }
+    }
+
     pub fn in_rotation(&self) -> bool {
         self.health.read().unwrap_or_else(|e| e.into_inner()).in_rotation()
+    }
+
+    /// Fold one probe into this node's health. `true` when the rotation changed.
+    ///
+    /// On the node rather than on the pool, because a node can leave the pool between a probe
+    /// being taken and its verdict being recorded - and an index into a list that has changed
+    /// underneath it would record the answer against somebody else.
+    pub fn observe(&self, verdict: Verdict) -> bool {
+        self.health.write().unwrap_or_else(|e| e.into_inner()).observe(verdict, Instant::now())
     }
 }
 
@@ -58,7 +81,11 @@ pub enum NoNode {
 
 /// The nodes behind one address.
 pub struct Pool {
-    nodes: Vec<Node>,
+    /// **Behind a lock because the membership can change while this proxy runs.** A node
+    /// admitted to the cluster after this process started is one a frozen list could never
+    /// send anything to, which is the whole of what discovery fixes. Held as `Arc`s so that a
+    /// request already in flight to a node keeps working on it after the list has moved on.
+    nodes: RwLock<Vec<Arc<Node>>>,
     /// Breaks ties between equally loaded nodes without a lock. Round robin *within* a tie is
     /// what stops several workers choosing the same idle node in the same instant.
     turn: AtomicUsize,
@@ -68,22 +95,83 @@ pub struct Pool {
 impl Pool {
     pub fn new(upstreams: Vec<Upstream>, policy: Policy, max_retries: usize) -> Self {
         Self {
-            nodes: upstreams.into_iter().map(|u| Node::new(u, policy)).collect(),
+            nodes: RwLock::new(
+                upstreams.into_iter().map(|u| Arc::new(Node::new(u, policy))).collect(),
+            ),
             turn: AtomicUsize::new(0),
             max_retries,
         }
     }
 
-    pub fn nodes(&self) -> &[Node] {
-        &self.nodes
+    /// The nodes as they are right now.
+    ///
+    /// A snapshot rather than a borrow: holding the lock across a request would make one slow
+    /// node able to block a membership change, and cloning a handful of `Arc`s is nothing next
+    /// to the round trip that follows.
+    pub fn nodes(&self) -> Vec<Arc<Node>> {
+        self.nodes.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.nodes.is_empty()
+        self.nodes.read().unwrap_or_else(|e| e.into_inner()).is_empty()
     }
 
     pub fn in_rotation(&self) -> usize {
-        self.nodes.iter().filter(|n| n.in_rotation()).count()
+        self.nodes
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|n| n.in_rotation())
+            .count()
+    }
+
+    /// Replaces the membership with what the cluster says it is, keeping what is already known.
+    ///
+    /// Returns `(added, removed)` by name, for the caller that logs and counts them.
+    ///
+    /// **A node that is already here is kept as the same object**, health and connection pool
+    /// and all. Rebuilding it on every poll would restart its health record every couple of
+    /// seconds, so a node that had been failing would look healthy forever - a discovery loop
+    /// that quietly disabled the health check.
+    ///
+    /// **What is added starts out of rotation**, because `Node::new` starts a health record
+    /// with nothing in it and the poller has to fill it in. Discovery says a node *exists*;
+    /// only the probe says it is worth a request, and letting membership imply readiness would
+    /// send traffic to a node that has not answered anything yet.
+    pub fn adopt(
+        &self,
+        members: &[(String, String)],
+        policy: Policy,
+        secure: Option<&Arc<big_tls::ClientTls>>,
+    ) -> (Vec<String>, Vec<String>) {
+        let mut held = self.nodes.write().unwrap_or_else(|e| e.into_inner());
+        let removed: Vec<String> = held
+            .iter()
+            .filter(|n| !members.iter().any(|(name, _)| name == n.up.name()))
+            .map(|n| n.up.name().to_string())
+            .collect();
+        let mut added = Vec::new();
+        let mut next: Vec<Arc<Node>> = Vec::with_capacity(members.len());
+        for (name, addr) in members {
+            // Matched on the name, which is what a peer certificate claims and therefore what
+            // identifies a node. An address that moved is the same node at a new place, and
+            // rebuilding it there is the point.
+            match held.iter().find(|n| n.up.name() == name && n.up.addr() == addr) {
+                Some(known) => next.push(Arc::clone(known)),
+                None => {
+                    added.push(name.clone());
+                    let up = match secure {
+                        Some(tls) => {
+                            crate::upstream::Upstream::secured(name, addr, Arc::clone(tls))
+                        }
+                        None => crate::upstream::Upstream::new(name, addr),
+                    };
+                    next.push(Arc::new(Node::joining(up, policy)));
+                }
+            }
+        }
+        *held = next;
+        (added, removed)
     }
 
     /// The nodes to try, best first, skipping anything out of rotation.
@@ -92,15 +180,21 @@ impl Pool {
     /// down**: a node answering `serving:false` will answer `503` anyway, so sending it work
     /// trades a clear refusal for a slower one, and a node that is merely *behind* would answer
     /// a count that is quietly wrong.
-    pub fn candidates(&self) -> Vec<usize> {
-        let live: Vec<(usize, usize)> = (0..self.nodes.len())
-            .filter(|i| self.nodes[*i].in_rotation())
-            .map(|i| (i, self.nodes[i].up.in_flight()))
+    pub fn candidates(&self) -> Vec<Arc<Node>> {
+        let all = self.nodes();
+        let live: Vec<(usize, usize)> = all
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| n.in_rotation())
+            .map(|(i, n)| (i, n.up.in_flight()))
             .collect();
         if live.is_empty() {
             return Vec::new();
         }
-        order(&live, self.turn.fetch_add(1, Ordering::Relaxed), self.nodes.len())
+        order(&live, self.turn.fetch_add(1, Ordering::Relaxed), all.len())
+            .into_iter()
+            .map(|i| Arc::clone(&all[i]))
+            .collect()
     }
 
     /// Send one request, trying another node when it is safe to.
@@ -125,7 +219,7 @@ impl Pool {
         body: &[u8],
         budget: Duration,
         repeatable: Repeatable,
-    ) -> Result<(usize, UpstreamResponse), (NoNode, Option<UpstreamError>)> {
+    ) -> Result<(Arc<Node>, UpstreamResponse), (NoNode, Option<UpstreamError>)> {
         let candidates = self.candidates();
         if candidates.is_empty() {
             return Err((NoNode::NoneInRotation, None));
@@ -134,21 +228,21 @@ impl Pool {
         let mut last: Option<UpstreamError> = None;
         let tries = candidates.len().min(self.max_retries + 1);
 
-        for (attempt, &i) in candidates.iter().take(tries).enumerate() {
+        for (attempt, node) in candidates.iter().take(tries).enumerate() {
             let more = attempt + 1 < tries;
-            match self.nodes[i].up.send(method, target, header_block, body, budget) {
+            match node.up.send(method, target, header_block, body, budget) {
                 Ok(answer) => {
                     if more && retryable_answer(&answer, repeatable) {
                         continue;
                     }
-                    return Ok((i, answer));
+                    return Ok((Arc::clone(node), answer));
                 }
                 Err(e) => {
                     // A transport failure on real traffic is evidence the poller has not seen
                     // yet. A node that died between two polls should not eat every request in
                     // between waiting for one.
                     if !matches!(e, UpstreamError::Unreadable(_)) {
-                        let mut h = self.nodes[i].health.write().unwrap_or_else(|e| e.into_inner());
+                        let mut h = node.health.write().unwrap_or_else(|e| e.into_inner());
                         h.saw_failure(Instant::now());
                     }
                     let may_retry = e.not_sent() || repeatable == Repeatable::Yes;
@@ -162,13 +256,6 @@ impl Pool {
             }
         }
         Err((NoNode::AllFailed, last))
-    }
-
-    /// Fold one probe into a node's health. `true` when the rotation changed.
-    pub fn observe(&self, i: usize, verdict: Verdict) -> bool {
-        let Some(node) = self.nodes.get(i) else { return false };
-        let mut h = node.health.write().unwrap_or_else(|e| e.into_inner());
-        h.observe(verdict, Instant::now())
     }
 
     /// Ask every node `GET /ready` on an interval, until `running` goes false.
@@ -186,13 +273,15 @@ impl Pool {
         budget: Duration,
     ) {
         while running.load(Ordering::Relaxed) {
-            for (i, node) in self.nodes.iter().enumerate() {
+            // Snapshot per round, so a node that joins is probed from the next round on and one
+            // that leaves stops being probed without the loop having to notice mid-walk.
+            for node in self.nodes() {
                 if !running.load(Ordering::Relaxed) {
                     return;
                 }
                 let verdict = probe(node.up.addr(), budget);
                 let was = node.in_rotation();
-                if self.observe(i, verdict) {
+                if node.observe(verdict) {
                     let now = node.in_rotation();
                     let why = node
                         .health
@@ -337,7 +426,7 @@ mod tests {
     }
 
     fn eject(pool: &Pool, i: usize) {
-        assert!(pool.observe(i, Verdict::Down(Why::NotServing)));
+        assert!(pool.nodes()[i].observe(Verdict::Down(Why::NotServing)));
     }
 
     #[test]
@@ -352,7 +441,7 @@ mod tests {
         let p = pool(3);
         eject(&p, 1);
         assert_eq!(p.in_rotation(), 2);
-        assert!(!p.candidates().contains(&1));
+        assert!(!p.candidates().iter().any(|n| n.up.name() == "n1"));
     }
 
     /// Fail closed. A node that said it is not serving will answer 503 anyway.
@@ -372,7 +461,7 @@ mod tests {
     #[test]
     fn ties_are_broken_round_robin_so_workers_do_not_collide() {
         let p = pool(3);
-        let first: Vec<usize> = (0..6).map(|_| p.candidates()[0]).collect();
+        let first: Vec<String> = (0..6).map(|_| p.candidates()[0].up.name().to_string()).collect();
         assert!(
             first.windows(2).any(|w| w[0] != w[1]),
             "every worker chose the same node: {first:?}"
