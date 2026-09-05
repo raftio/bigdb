@@ -266,6 +266,7 @@ enum Target<'a> {
     PeerSchema,
     /// Which version of the map this node has applied.
     PeerEpoch,
+    PeerJoin,
     /// What this node weighs, for the balancer.
     PeerLoad,
     /// The record ids this node has handed out, read and written when the row-key namespace
@@ -287,6 +288,8 @@ enum Target<'a> {
     ClusterRemove,
     /// Hand a populated range to another node without stopping reads.
     ClusterMove,
+    ClusterAddReplica,
+    ClusterDropReplica,
     /// Abandon a move that is in flight.
     ClusterCancel,
     /// Take one balancing step, if the facts call for one.
@@ -306,6 +309,7 @@ impl<'a> Target<'a> {
             self,
             Self::PeerQuery
                 | Self::PeerEpoch
+                | Self::PeerJoin
                 | Self::PeerLoad
                 | Self::PeerFloors
                 | Self::PeerFloorsPut
@@ -384,6 +388,8 @@ impl<'a> Target<'a> {
             | Self::ClusterDrain
             | Self::ClusterRemove
             | Self::ClusterMove
+            | Self::ClusterAddReplica
+            | Self::ClusterDropReplica
             | Self::ClusterCancel
             | Self::ClusterRebalance
             | Self::ClusterSchemaLeader => Guard::Needs(Privilege::Operate, ObjectRef::Server),
@@ -425,6 +431,7 @@ impl<'a> Target<'a> {
             | Self::PeerFragmentPut
             | Self::PeerKeysPut
             | Self::PeerEpoch
+            | Self::PeerJoin
             | Self::PeerLoad
             | Self::PeerFloors
             | Self::PeerFloorsPut
@@ -472,6 +479,7 @@ fn resolve<'a>(method: &str, segments: &[&'a str]) -> Option<Target<'a>> {
         ("POST", ["internal", "repaired"]) => Target::PeerRepaired,
         ("POST", ["internal", "schema"]) => Target::PeerSchema,
         ("POST", ["internal", "epoch"]) => Target::PeerEpoch,
+        ("POST", ["internal", "join"]) => Target::PeerJoin,
         ("POST", ["internal", "load"]) => Target::PeerLoad,
         ("POST", ["internal", "floors"]) => Target::PeerFloors,
         ("POST", ["internal", "floors", "put"]) => Target::PeerFloorsPut,
@@ -484,6 +492,8 @@ fn resolve<'a>(method: &str, segments: &[&'a str]) -> Option<Target<'a>> {
         ("POST", ["admin", "cluster", "drain"]) => Target::ClusterDrain,
         ("DELETE", ["admin", "cluster", "node"]) => Target::ClusterRemove,
         ("POST", ["admin", "cluster", "move"]) => Target::ClusterMove,
+        ("POST", ["admin", "cluster", "replica"]) => Target::ClusterAddReplica,
+        ("DELETE", ["admin", "cluster", "replica"]) => Target::ClusterDropReplica,
         ("POST", ["admin", "cluster", "cancel"]) => Target::ClusterCancel,
         ("POST", ["admin", "cluster", "rebalance"]) => Target::ClusterRebalance,
         ("POST", ["admin", "cluster", "schema-leader"]) => Target::ClusterSchemaLeader,
@@ -647,6 +657,32 @@ pub fn dispatch<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request) -> Answered
         Target::PeerKeysPut => peer_keys_put(ctx, req),
         Target::PeerRepaired => peer_repaired(ctx, req),
         Target::PeerEpoch => Response::binary(wire::put_u64_body(ctx.cluster.map().epoch)),
+        Target::PeerJoin => match ctx.cluster.config().cluster_id() {
+            // **A cluster with no `cluster_id` cannot be joined, and says so here rather than
+            // letting it fail later.** Without an id the stamp every peer request carries is
+            // the *shape of the file*, and a joining node has no file - so it would be handed a
+            // membership, start happily, and have every request it made afterwards refused as a
+            // cluster mismatch. Answering nothing is the honest version of that.
+            "" => Response::failure(
+                409,
+                "cluster_unnamed",
+                "this cluster is identified by the shape of its file rather than by a name, so                  there is nothing to give a node that has no file. Set the same `cluster_id` on                  every node, restart them, and this node can be joined",
+            ),
+            // **And a cluster that commits no decisions cannot admit anybody.** Joining ends in
+            // `add-node`, which is a proposal, and a cluster whose ranges have no copies runs no
+            // agreement to propose into. Answering the membership here would send an operator to
+            // a command that is itself refused - two correct messages making a loop.
+            _ if ctx.cluster.controller().is_none() => Response::failure(
+                409,
+                "no_agreement",
+                "this cluster runs no agreement, so there is nothing to record a new node in.                  Give a range a copy - which needs three nodes, because a majority of two is                  two - and members become something that can be added",
+            ),
+            id => {
+                let t = ctx.cluster.topology();
+                let members: Vec<_> = t.members.into_iter().map(|m| (m.name, m.addr)).collect();
+                Response::binary(wire::put_join(id, &members))
+            }
+        },
         Target::PeerFloors => Response::binary(wire::put_floors(&ctx.cluster.floors_here())),
         Target::PeerFloorsPut => match wire::get_floors(&req.body) {
             Err(e) => unreadable(&e),
@@ -673,6 +709,8 @@ pub fn dispatch<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request) -> Answered
         Target::ClusterDrain => cluster_member(ctx, req, Membership::Drain),
         Target::ClusterRemove => cluster_member(ctx, req, Membership::Remove),
         Target::ClusterMove => cluster_move(ctx, req),
+        Target::ClusterAddReplica => cluster_add_replica(ctx, req),
+        Target::ClusterDropReplica => cluster_drop_replica(ctx, req),
         Target::ClusterCancel => cluster_cancel(ctx, req),
         Target::ClusterRebalance => cluster_rebalance(ctx, req),
         Target::ClusterSchemaLeader => cluster_schema_leader(ctx, req),

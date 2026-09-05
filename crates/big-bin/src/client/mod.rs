@@ -95,6 +95,14 @@ pub fn run(args: &[String], io: &mut Io<'_>, env: &dyn Fn(&str) -> Option<String
         return crate::ingest::run(&client, *verb, table, input, load, io, format);
     }
 
+    // The other command that is not one request. Adding a node and starting it are two halves
+    // that have to happen in that order, on two machines, and getting them the wrong way round
+    // is the mistake this exists to remove - so one verb does the half that belongs here and
+    // prints the half that does not.
+    if let Command::ClusterJoin { name, addr } = &options.command {
+        return cluster_join(&client, &options, name, addr, io);
+    }
+
     let request = match request(&options.command, io.input) {
         Ok(r) => r,
         Err(e) => {
@@ -244,8 +252,23 @@ fn request(command: &Command, input: &mut dyn BufRead) -> Result<Request, String
             format!("/admin/cluster/move?range={range}&to={to}"),
             String::new(),
         ),
+        Command::ClusterReplica { add: true, range, node } => Request::new(
+            "POST",
+            format!("/admin/cluster/replica?range={range}&to={node}"),
+            String::new(),
+        ),
+        Command::ClusterReplica { add: false, range, node } => Request::new(
+            "DELETE",
+            format!("/admin/cluster/replica?range={range}&from={node}"),
+            String::new(),
+        ),
         Command::ClusterCancel { range } => {
             Request::new("POST", format!("/admin/cluster/cancel?range={range}"), String::new())
+        }
+        // Handled before this point: it is two requests, not one. Named here so that adding a
+        // command cannot forget to route it.
+        Command::ClusterJoin { .. } => {
+            return Err("cluster join is handled before a request is built".to_string())
         }
         Command::ClusterAddNode { name, addr } => Request::new(
             "POST",
@@ -313,6 +336,72 @@ pub fn escape(s: &str) -> String {
         }
     }
     out
+}
+
+/// `cluster join`: admit the node here, then say what to run over there.
+///
+/// **Nothing is started remotely, and that is the point rather than a limitation.** This tool
+/// talks to one daemon over one socket; a verb that reached a second machine would need a way
+/// in to it, which is a much larger thing to own than the two lines it would save. What it can
+/// do is make the order impossible to get wrong, and name the flags from what it can see.
+fn cluster_join(
+    client: &Client,
+    options: &args::Options,
+    name: &str,
+    addr: &str,
+    io: &mut Io<'_>,
+) -> i32 {
+    let added =
+        match client.send("POST", &format!("/admin/cluster/node?name={name}&addr={addr}"), "") {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = writeln!(io.err, "bigctl: {e}");
+                return exit::UNREACHABLE;
+            }
+        };
+    if !added.ok() {
+        let failure = Failure::read(&added.body);
+        let _ = writeln!(io.err, "bigctl: {} [{}]", failure.message, failure.code);
+        return exit::REFUSED;
+    }
+
+    // The cluster's name is the one flag the operator cannot work out from what they typed, so
+    // it is read rather than asked for. A cluster that has none cannot be joined at all - the
+    // daemon refuses the request with `cluster_unnamed` - so it is worth saying here, where
+    // there is still something to do about it, instead of on the far machine.
+    let id = match client.send("GET", "/cluster/topology", "") {
+        Ok(r) if r.ok() => json::parse(&r.body)
+            .ok()
+            .and_then(|v| v.get("cluster_id").and_then(json::Value::cell))
+            .filter(|s| !s.is_empty()),
+        _ => None,
+    };
+    let Some(id) = id else {
+        let _ = writeln!(
+            io.err,
+            "bigctl: `{name}` was added, but this cluster has no `cluster_id` - so it cannot be \
+             joined by address. Set the same `cluster_id` in every node's cluster file, restart \
+             them, and run this again"
+        );
+        return exit::REFUSED;
+    };
+
+    let _ = writeln!(io.out, "added `{name}` at {addr}, as a learner. Now run this on {addr}:");
+    let _ = writeln!(io.out);
+    let _ = writeln!(
+        io.out,
+        "  big serve <file> {addr} --join {} --cluster-id {id} --node {name}",
+        // The address this tool is talking to: a node already in the cluster, which is exactly
+        // what the joining one has to dial.
+        options.addr.trim_start_matches("https://").trim_start_matches("http://")
+    );
+    let _ = writeln!(io.out);
+    let _ = writeln!(
+        io.out,
+        "Add --peer-ca, --peer-cert and --peer-key where the nodes speak TLS to each other. It \
+         is admitted once it has caught up, and holds a range once it is given one."
+    );
+    exit::OK
 }
 
 /// The credential this run will present, from a file or from the terminal.

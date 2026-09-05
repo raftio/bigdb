@@ -80,7 +80,10 @@ impl Server {
             .lines()
             .filter(|l| l.trim_start().starts_with(|c: char| c.is_alphabetic()))
             .count();
-        Self { addr: spawn(cases + 16), local: Cluster::solo(Api::in_memory().unwrap()) }
+        Self {
+            addr: spawn(cases + 16),
+            local: Cluster::solo(Api::in_memory().unwrap(), "127.0.0.1:7654"),
+        }
     }
 
     /// Runs one case both ways and answers with what disagreed, or with nothing.

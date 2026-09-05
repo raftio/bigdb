@@ -55,6 +55,16 @@ usage: big serve <file> [addr] [options]
                               a cluster whose file names a peer CA needs both. Nodes
                               prove themselves to each other with a certificate, not a
                               shared secret, so one leaked key is one node
+  --join <addr>               take the cluster from a node already in it, instead of a file.
+                              Needs --cluster-id and --node, and needs this node to have been
+                              added already: run `bigctl cluster add-node <name> <addr>` against
+                              a node that is in the cluster first, or this one is refused by
+                              name at startup. Add --peer-ca where the peers speak TLS
+  --cluster-id <name>         what names the cluster, as in the cluster file. Required with
+                              --join: every peer request carries a stamp derived from it, so a
+                              joining node cannot ask for what it has not been told
+  --peer-ca <file>            PEM CA the peers' certificates chain to, for --join. The cluster
+                              file's `peer_ca_file` says the same thing for everybody else
   --cluster <file>            who owns which shards; see docs/clustering.md
                               without it, this node owns every shard and has no peers
                               a node owns a range (shards) or copies one (replica)
@@ -336,16 +346,110 @@ fn read_cluster_file(opts: &Options) -> std::io::Result<Option<ClusterFile>> {
     ClusterFile::parse(&text).map(Some).map_err(|e| std::io::Error::other(format!("{path}: {e}")))
 }
 
+/// How long one attempt at the joining request may take, and how long the whole thing may.
+///
+/// A peer that is mid-election answers nothing for a moment, so a single attempt would make
+/// startup a coin toss. A cap rather than forever, because the common failure here is a typo in
+/// an address, and a daemon that retries a typo until somebody notices is worse than one that
+/// exits saying what it could not reach.
+const JOIN_ATTEMPT: Duration = Duration::from_secs(5);
+const JOIN_LIMIT: Duration = Duration::from_secs(60);
+
+/// Builds this node's configuration from a node already in the cluster.
+///
+/// Three things have to be given rather than discovered, and each has a reason it cannot be
+/// asked for: the id, because the request carries a stamp derived from it; the name, because
+/// the answer is a list this node has to find itself in; and the CA, because trusting a peer is
+/// what makes its answer worth reading at all.
+fn join_cluster(opts: &Options, addr: &str) -> std::io::Result<big_cluster::ClusterConfig> {
+    let want = |flag: &str, why: &str| std::io::Error::other(format!("--join needs {flag}: {why}"));
+    let id = opts.cluster_id.as_deref().ok_or_else(|| {
+        want("--cluster-id", "the request that asks who is in the cluster is stamped with it")
+    })?;
+    let me = opts.node.as_deref().ok_or_else(|| {
+        want("--node", "the answer is a list of nodes, and this one has to know which it is")
+    })?;
+    if opts.cluster.is_some() {
+        return Err(std::io::Error::other(
+            "--join and --cluster are two answers to one question: either this node is told the              cluster or it asks for it. Pass one",
+        ));
+    }
+
+    let tls = match (&opts.peer_ca, &opts.peer_cert, &opts.peer_key) {
+        (Some(ca), Some(cert), Some(key)) => Some(std::sync::Arc::new(
+            big_tls::ClientTls::new(Some(Path::new(ca)), Some((Path::new(cert), Path::new(key))))
+                .map_err(|e| std::io::Error::new(e.kind(), format!("--peer-ca: {e}")))?,
+        )),
+        (Some(_), _, _) => {
+            return Err(std::io::Error::other(
+                "--peer-ca names a CA, so this node needs --peer-cert and --peer-key as well: a                  peer that asks for a certificate refuses a node that presents none",
+            ))
+        }
+        _ => None,
+    };
+
+    // The name is what a peer certificate must claim, and this node's certificate names it.
+    let peer = big_cluster::Peer::new(me, addr, tls, big_cluster::config::fingerprint_of(id));
+    let started = std::time::Instant::now();
+    let mut wait = Duration::from_millis(200);
+    let body = loop {
+        match peer.post(
+            big_cluster::path::JOIN,
+            &[],
+            Some(JOIN_ATTEMPT),
+            big_cluster::client::Repeatable::Yes,
+        ) {
+            Ok(r) if r.is_ok() => break r.body,
+            // A refusal is an answer: the cluster is there and has said no. Retrying a `409`
+            // for a minute would turn "these are different clusters" into a slow hang.
+            Ok(r) => {
+                return Err(std::io::Error::other(format!(
+                    "{addr} refused the joining request: {} {}",
+                    r.status,
+                    r.message().unwrap_or_else(|| "no message".to_string())
+                )))
+            }
+            Err(e) if started.elapsed() + wait < JOIN_LIMIT => {
+                eprintln!("big: {addr} did not answer ({e}); trying again in {wait:?}");
+                std::thread::sleep(wait);
+                wait = (wait * 2).min(Duration::from_secs(5));
+            }
+            Err(e) => {
+                return Err(std::io::Error::other(format!(
+                    "could not reach {addr} to join in {JOIN_LIMIT:?}: {e}"
+                )))
+            }
+        }
+    };
+
+    let (id, members) = big_cluster::wire::get_join(&body)
+        .map_err(|e| std::io::Error::other(format!("{addr} answered something unreadable: {e}")))?;
+    big_cluster::ClusterConfig::joining(&id, &members, me)
+        .map_err(|e| std::io::Error::other(format!("{addr}: {e}")))
+}
+
 fn assemble(
     api: Api<big_embed::MmapPager>,
     opts: &Options,
     file: Option<ClusterFile>,
 ) -> std::io::Result<Cluster<big_embed::MmapPager>> {
-    let (Some(path), Some(file)) = (&opts.cluster, file) else { return Ok(Cluster::solo(api)) };
-    let peer_ca = file.peer_ca_file().map(str::to_string);
-    let config = file
-        .for_node(opts.node.as_deref(), &opts.addr)
-        .map_err(|e| std::io::Error::other(format!("{path}: {e}")))?;
+    let (path, peer_ca, config) = match (&opts.join, &opts.cluster, file) {
+        // Dialled rather than read. What comes back is the same kind of configuration a file
+        // produces, so everything below this line is the path a clustered node has always taken.
+        (Some(addr), _, _) => {
+            let config = join_cluster(opts, addr)?;
+            (format!("--join {addr}"), opts.peer_ca.clone(), config)
+        }
+        (None, Some(path), Some(file)) => {
+            let peer_ca = file.peer_ca_file().map(str::to_string);
+            let config = file
+                .for_node(opts.node.as_deref(), &opts.addr)
+                .map_err(|e| std::io::Error::other(format!("{path}: {e}")))?;
+            (path.clone(), peer_ca, config)
+        }
+        _ => return Ok(Cluster::solo(api, &opts.addr)),
+    };
+    let path = &path;
     eprintln!(
         "big: node `{}` owns shards {}, schema leader is `{}`, {} peers",
         config.this().name,
@@ -630,6 +734,13 @@ struct Options {
     watch_max: usize,
     durability: Option<big_db::Durability>,
     cluster: Option<String>,
+    /// The address of a node already in the cluster, for a daemon started with no cluster file.
+    join: Option<String>,
+    /// What names the cluster, needed with `--join`: the request that fetches the membership
+    /// carries the stamp derived from it, so it cannot be learned by asking.
+    cluster_id: Option<String>,
+    /// The CA a joining node's peers are signed by. In the cluster file for everybody else.
+    peer_ca: Option<String>,
     node: Option<String>,
     backup_dir: Option<String>,
     max_row_keys: Option<usize>,
@@ -648,6 +759,9 @@ impl Default for Options {
             tls_cert: None,
             peer_cert: None,
             peer_key: None,
+            peer_ca: None,
+            join: None,
+            cluster_id: None,
             tls_key: None,
             insecure: false,
             insecure_no_tls: false,
@@ -721,6 +835,18 @@ impl Options {
                 }
                 "--cluster" => {
                     out.cluster = Some(value()?);
+                    i += 2;
+                }
+                "--join" => {
+                    out.join = Some(value()?);
+                    i += 2;
+                }
+                "--cluster-id" => {
+                    out.cluster_id = Some(value()?);
+                    i += 2;
+                }
+                "--peer-ca" => {
+                    out.peer_ca = Some(value()?);
                     i += 2;
                 }
                 "--node" => {

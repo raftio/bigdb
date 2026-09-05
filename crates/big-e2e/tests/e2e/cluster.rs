@@ -146,3 +146,145 @@ fn a_schema_change_reaches_every_node() {
     let after = b.bigctl(&["--format", "json", "schema"]).expect(0);
     assert!(!after.out.contains("country"), "and the drop reached it too: {}", after.out);
 }
+
+// -------------------------------------------------------------------------------------------
+// Joining with no cluster file
+// -------------------------------------------------------------------------------------------
+
+/// Three nodes and a copy of the range, which is the smallest cluster that commits anything.
+///
+/// A range with no copy runs no agreement, and a node is admitted *by* the agreement - so this
+/// shape is not a detail of the test, it is the precondition of the feature.
+fn a_named_group(dir: &Path, id: &str, a: &str, spare: &str, third: &str) -> std::path::PathBuf {
+    let path = dir.join("cluster.toml");
+    std::fs::write(
+        &path,
+        format!(
+            "cluster_id = \"{id}\"\nschema_leader = \"a\"\n\n\
+             [[node]]\nname = \"a\"\naddr = \"{a}\"\nshards = \"0..\"\n\n\
+             [[node]]\nname = \"a-spare\"\naddr = \"{spare}\"\nreplica = \"a\"\n\n\
+             [[node]]\nname = \"a-third\"\naddr = \"{third}\"\nreplica = \"a\"\n"
+        ),
+    )
+    .expect("a cluster file");
+    path
+}
+
+/// **A fourth node joins holding no cluster file at all**, which is the whole feature end to
+/// end: two flags and an address where there used to be a file that had to be copied to the
+/// new machine and kept current.
+///
+/// The order matters and is the thing most likely to be got wrong, so it is what the test
+/// asserts: `add-node` first, against a node already in the cluster, because the joining node's
+/// certificate has to name somebody the roster already knows before it can be let through the
+/// handshake at all.
+#[test]
+#[ignore = "four processes and an election; run with make e2e-cluster"]
+fn a_node_with_no_cluster_file_joins_by_address() {
+    let w = Workspace::new();
+    let (pa, ps, pt, pd) = (reserved_port(), reserved_port(), reserved_port(), reserved_port());
+    let addr = |p: u16| format!("127.0.0.1:{p}");
+    let (aa, as_, at, ad) = (addr(pa), addr(ps), addr(pt), addr(pd));
+    let file = a_named_group(w.path(), "big-e2e", &aa, &as_, &at).display().to_string();
+
+    let a = w.daemon_at("a.big", &aa, &["--cluster", &file, "--node", "a"]);
+    let _spare = w.daemon_at("s.big", &as_, &["--cluster", &file, "--node", "a-spare"]);
+    let _third = w.daemon_at("t.big", &at, &["--cluster", &file, "--node", "a-third"]);
+    // `bigctl` prints ``leader `a` `` when there is one and "no leader" when there is not, so
+    // the backtick is what tells the two apart.
+    until("an elected leader", || a.bigctl(&["cluster", "topology"]).said("leader `"));
+
+    // **The step that has to come first.** Until this is committed, `d` names nobody the
+    // cluster knows, and a node that dialled in would be refused by name.
+    a.bigctl(&["cluster", "add-node", "d", &ad]).expect(0);
+
+    // No `--cluster` anywhere in this command line. That is the point.
+    let d = w.daemon_at("d.big", &ad, &["--join", &aa, "--cluster-id", "big-e2e", "--node", "d"]);
+
+    until("d to see the cluster it joined", || d.bigctl(&["cluster", "topology"]).said("a-spare"));
+    // One row per node, tab separated, so the name is the whole first field - `said("d")`
+    // would match the `d` in an address or in `a-third`.
+    let names_d = |r: &Run| r.out.lines().any(|line| line.starts_with("d\t"));
+
+    let seen = d.bigctl(&["cluster", "topology"]).expect(0);
+    assert!(names_d(&seen), "d is in the membership it was given: {}", seen.out);
+
+    // And the cluster it dialled says the same, which is what makes this one cluster rather
+    // than a node that believes it joined.
+    let from_a = a.bigctl(&["cluster", "topology"]).expect(0);
+    assert!(names_d(&from_a), "a holds d too: {}", from_a.out);
+}
+
+/// **A node the cluster has never been told about is refused at startup, by name**, rather than
+/// starting up healthy and talking to nobody. The message names the command that was skipped.
+#[test]
+#[ignore = "three processes and an election; run with make e2e-cluster"]
+fn a_node_that_was_never_added_is_refused_and_told_which_step_it_missed() {
+    let w = Workspace::new();
+    let (pa, ps, pt, pd) = (reserved_port(), reserved_port(), reserved_port(), reserved_port());
+    let addr = |p: u16| format!("127.0.0.1:{p}");
+    let (aa, as_, at, ad) = (addr(pa), addr(ps), addr(pt), addr(pd));
+    let file = a_named_group(w.path(), "big-e2e", &aa, &as_, &at).display().to_string();
+
+    let a = w.daemon_at("a.big", &aa, &["--cluster", &file, "--node", "a"]);
+    let _spare = w.daemon_at("s.big", &as_, &["--cluster", &file, "--node", "a-spare"]);
+    let _third = w.daemon_at("t.big", &at, &["--cluster", &file, "--node", "a-third"]);
+    // `bigctl` prints ``leader `a` `` when there is one and "no leader" when there is not, so
+    // the backtick is what tells the two apart.
+    until("an elected leader", || a.bigctl(&["cluster", "topology"]).said("leader `"));
+
+    // `add-node` deliberately not run.
+    let refused = run(
+        "big",
+        &[
+            "serve",
+            &w.join("d.big").display().to_string(),
+            &ad,
+            "--join",
+            &aa,
+            "--cluster-id",
+            "big-e2e",
+            "--node",
+            "d",
+        ],
+    );
+    assert_ne!(refused.code, 0, "it exits rather than serving: {}{}", refused.out, refused.err);
+    assert!(refused.said("add-node"), "and names the step: {}{}", refused.out, refused.err);
+}
+
+/// **`cluster join` does the half that belongs here and prints the half that does not.**
+///
+/// The two steps happen on two machines and only work in one order, so the verb that owns the
+/// first one is also the thing best placed to say what the second one is - with the cluster's
+/// name filled in, which is the flag an operator cannot work out from what they typed.
+#[test]
+#[ignore = "three processes and an election; run with make e2e-cluster"]
+fn cluster_join_adds_the_node_and_prints_the_command_to_start_it() {
+    let w = Workspace::new();
+    let (pa, ps, pt, pd) = (reserved_port(), reserved_port(), reserved_port(), reserved_port());
+    let addr = |p: u16| format!("127.0.0.1:{p}");
+    let (aa, as_, at, ad) = (addr(pa), addr(ps), addr(pt), addr(pd));
+    let file = a_named_group(w.path(), "big-e2e", &aa, &as_, &at).display().to_string();
+
+    let a = w.daemon_at("a.big", &aa, &["--cluster", &file, "--node", "a"]);
+    let _spare = w.daemon_at("s.big", &as_, &["--cluster", &file, "--node", "a-spare"]);
+    let _third = w.daemon_at("t.big", &at, &["--cluster", &file, "--node", "a-third"]);
+    until("an elected leader", || a.bigctl(&["cluster", "topology"]).said("leader `"));
+
+    let joined = a.bigctl(&["cluster", "join", "d", &ad]).expect(0);
+
+    // The command it prints has to be the one that works, so the test asserts every part an
+    // operator would otherwise have to look up.
+    assert!(joined.said("--join"), "{}", joined.out);
+    assert!(
+        joined.said("--cluster-id big-e2e"),
+        "the cluster's name, read not guessed: {}",
+        joined.out
+    );
+    assert!(joined.said("--node d"), "{}", joined.out);
+    assert!(joined.said(&aa), "the address of a node already in the cluster: {}", joined.out);
+
+    // And the node really was added, which is what makes the printed command work at all.
+    let seen = a.bigctl(&["cluster", "topology"]).expect(0);
+    assert!(seen.out.lines().any(|l| l.starts_with("d\t")), "d is a member: {}", seen.out);
+}

@@ -55,6 +55,32 @@ Health:
   --max-retries <n>           tries on other nodes, default 2. Never applied to a write whose
                               bytes have already left; see readme.md
 
+Membership:
+  --discover                  follow the cluster's membership instead of only the list above.
+                              Off by default: a proxy that grows an upstream nobody wrote down
+                              is one whose shape an operator cannot predict from what they
+                              wrote. On, a node admitted after this process started becomes
+                              reachable without restarting it - and a node removed from the
+                              cluster stops being sent requests.
+                              A discovered node starts *out* of rotation and earns its way in
+                              with --health-pass probes, because the moment a cluster announces
+                              a node is the moment it is least likely to have caught up
+  --discover-credentials <f>  one `user:password` line, mode 600, for a role holding Operate.
+                              Reading the membership is `GET /cluster/topology`, which demands
+                              it; a cluster with no users file needs nothing here
+  --admin-addr <host:port>    a second listener where upstreams can be seeded while this runs:
+                                POST   /admin/upstream?name=a&addr=10.0.0.1:7654
+                                DELETE /admin/upstream?name=a
+                              **Loopback only, and refused anywhere else.** This proxy checks no
+                              credential of its own - it forwards the client's and never reads
+                              it - so a port that could add an upstream is a port that could
+                              point client traffic at anything. Reaching it has to mean already
+                              being on the machine.
+                              With --cluster-id, a seed must answer with that id before it is
+                              adopted, so a local caller cannot point this at another cluster
+  --cluster-id <name>         what the nodes behind this proxy call their cluster, checked
+                              against what a seeded node reports
+
 Forwarding:
   --allow-ops                 also forward /verify, /repair, /cluster/topology and /admin/*.
                               Off by default: every one of them asks about one node, and a
@@ -112,6 +138,14 @@ struct Options {
     health_fail: Option<u8>,
     health_pass: Option<u8>,
     max_retries: Option<usize>,
+    /// Follow the cluster's membership rather than only the list this proxy was given.
+    discover: bool,
+    /// A second listener, loopback only, where upstreams can be seeded while this runs.
+    admin_addr: Option<String>,
+    /// What the cluster behind this proxy is called, checked before a seed is adopted.
+    cluster_id: Option<String>,
+    /// A file holding one `user:password` line, for the read that follows it.
+    discover_credentials: Option<String>,
     tls_cert: Option<String>,
     tls_key: Option<String>,
     upstream_ca: Option<String>,
@@ -154,6 +188,10 @@ fn parse(args: &[String]) -> Result<Options, String> {
         health_fail: None,
         health_pass: None,
         max_retries: None,
+        discover: false,
+        admin_addr: None,
+        cluster_id: None,
+        discover_credentials: None,
         tls_cert: None,
         tls_key: None,
         upstream_ca: None,
@@ -193,6 +231,10 @@ fn parse(args: &[String]) -> Result<Options, String> {
             "--health-fail" => o.health_fail = Some(number(&value()?, flag)?.clamp(1, 255) as u8),
             "--health-pass" => o.health_pass = Some(number(&value()?, flag)?.clamp(1, 255) as u8),
             "--max-retries" => o.max_retries = Some(number(&value()?, flag)?),
+            "--discover" => o.discover = true,
+            "--admin-addr" => o.admin_addr = Some(value()?),
+            "--cluster-id" => o.cluster_id = Some(value()?),
+            "--discover-credentials" => o.discover_credentials = Some(value()?),
             "--tls-cert" => o.tls_cert = Some(value()?),
             "--tls-key" => o.tls_key = Some(value()?),
             "--upstream-ca" => o.upstream_ca = Some(value()?),
@@ -215,6 +257,36 @@ fn parse(args: &[String]) -> Result<Options, String> {
         return Err("--no-ddl and --allow-ops contradict each other".to_string());
     }
     Ok(o)
+}
+
+/// Reads `user:password` from a file and encodes the header the membership read carries.
+///
+/// The mode check is the one `bigctl` makes of `--credentials-file`, and it is made here for
+/// the same reason it is made there: a credential anybody on the machine can read is not a
+/// credential. Split on the *first* colon, so a password containing one still works and a file
+/// cannot disagree with a header about where a password starts.
+fn basic_auth(path: &str) -> Result<String, String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(path)
+            .map_err(|e| format!("could not read {path}: {e}"))?
+            .permissions()
+            .mode()
+            & 0o777;
+        if mode & 0o077 != 0 {
+            return Err(format!(
+                "{path} is mode {mode:o}; a credentials file must not be readable by anyone \
+                 else (chmod 600 {path})"
+            ));
+        }
+    }
+    let text = std::fs::read_to_string(path).map_err(|e| format!("could not read {path}: {e}"))?;
+    let line = text.lines().next().unwrap_or_default().trim();
+    if line.split_once(':').is_none() {
+        return Err(format!("{path} must hold one `user:password` line"));
+    }
+    Ok(format!("Basic {}", big_tls::base64::encode(line.as_bytes())))
 }
 
 fn number(raw: &str, flag: &str) -> Result<usize, String> {
@@ -245,11 +317,20 @@ fn upstreams(o: &Options) -> Result<Vec<(String, String)>, String> {
 
 fn run(o: Options) -> Result<(), String> {
     let nodes = upstreams(&o)?;
-    // There is no sensible default for "where do requests go". A proxy with nowhere to send
-    // them is a misconfiguration rather than a mode.
-    if nodes.is_empty() {
+    // **Empty is a state, not a misconfiguration - but only when something can fill it.**
+    //
+    // A proxy whose upstreams are all down answers `503` and keeps running; that is the same
+    // state as having none, one entry short. Refusing it at startup while tolerating it at
+    // runtime was the inconsistency, and it made "start the front door, bring the nodes up
+    // after" impossible for no reason a running proxy could name.
+    //
+    // Still refused without a way to be filled: a proxy with no upstreams, no discovery and no
+    // admin port is a process that will answer `503` until somebody restarts it, and starting
+    // one is a mistake worth hearing about at the moment it is made.
+    if nodes.is_empty() && !o.discover && o.admin_addr.is_none() {
         return Err(format!(
-            "no upstreams. Pass --upstream <name=addr> or --cluster <file>.\n\n{USAGE}"
+            "no upstreams, and nothing that could find one. Pass --upstream <name=addr> or \
+             --cluster <file>; or --discover, or --admin-addr to seed one while it runs.\n\n{USAGE}"
         ));
     }
 
@@ -337,6 +418,42 @@ fn run(o: Options) -> Result<(), String> {
             None => Upstream::new(name, addr),
         })
         .collect();
+    if o.discover {
+        // Read before the listener binds, so a credentials file that cannot be read is a
+        // startup failure rather than a warning every two seconds afterwards.
+        let authorization = match &o.discover_credentials {
+            Some(path) => Some(basic_auth(path)?),
+            None => None,
+        };
+        config.discovery = Some(big_proxy::discover::Discovery {
+            every: health.every,
+            budget: health.budget,
+            authorization,
+            tls: upstream_tls.clone(),
+            policy,
+        });
+    } else if o.discover_credentials.is_some() {
+        return Err("--discover-credentials does nothing without --discover".to_string());
+    }
+
+    if let Some(addr) = &o.admin_addr {
+        // Bound before the public listener, so a refused address is a startup failure rather
+        // than a port that is open with no way to fill it.
+        config.admin = Some(
+            big_proxy::admin::Admin::bind(
+                addr,
+                policy,
+                upstream_tls.clone(),
+                o.cluster_id.clone(),
+                health.budget,
+            )
+            .map_err(|e| e.to_string())?,
+        );
+    } else if o.cluster_id.is_some() {
+        return Err("--cluster-id is checked when an upstream is seeded, which needs --admin-addr"
+            .to_string());
+    }
+
     let pool = Pool::new(ups, policy, o.max_retries.unwrap_or(2));
 
     let proxy = Proxy::bind(o.addr.as_str(), pool, config)
@@ -460,6 +577,30 @@ fn announce(bound: SocketAddr, o: &Options, nodes: &[(String, String)]) {
         o.health_fail.unwrap_or(Policy::default().fail),
         o.health_pass.unwrap_or(Policy::default().pass),
     );
+    // Said either way. An operator reading a log to find out why a new node is getting no
+    // traffic should not have to remember whether they passed the flag.
+    if let Some(addr) = &o.admin_addr {
+        println!(
+            "bigproxy: seeding port on http://{addr} — loopback only, and it checks no \
+             credential; reaching it means being on this machine"
+        );
+    }
+    match (o.discover, o.discover_credentials.is_some()) {
+        (true, true) => println!(
+            "bigproxy: following the cluster's membership every {}ms, as the credentials file says",
+            o.health_interval.unwrap_or(2000)
+        ),
+        (true, false) => println!(
+            "bigproxy: following the cluster's membership every {}ms, unauthenticated — a \
+             cluster with a users file needs --discover-credentials",
+            o.health_interval.unwrap_or(2000)
+        ),
+        (false, _) => println!(
+            "bigproxy: upstreams are the {} given here and nothing else; --discover follows the \
+             cluster's membership instead",
+            nodes.len()
+        ),
+    }
     println!(
         "bigproxy: set --query-timeout at or above the daemon's, or this proxy gives up while \
          a node is still working"

@@ -78,7 +78,7 @@ pub fn forward(req: &Request, pool: &Pool, cx: &Context<'_>) -> Response {
     // is rebuilt on a retry rather than reused, so a second attempt is addressed to the node it
     // is actually being sent to.
     let candidates = pool.candidates();
-    let Some(first) = candidates.first().copied() else {
+    let Some(first) = candidates.first().cloned() else {
         if let Some(m) = cx.metrics {
             m.no_upstream_available();
         }
@@ -86,7 +86,7 @@ pub fn forward(req: &Request, pool: &Pool, cx: &Context<'_>) -> Response {
     };
     let block = headers::upstream_block(
         &req.headers,
-        pool.nodes()[first].up.addr(),
+        first.up.addr(),
         cx.client,
         cx.proto,
         cx.request_id,
@@ -96,8 +96,10 @@ pub fn forward(req: &Request, pool: &Pool, cx: &Context<'_>) -> Response {
 
     match pool.send(&req.method, &target, &block, &req.body, hit.route.budget, hit.route.repeatable)
     {
-        Ok((i, answer)) => {
-            if i != first {
+        Ok((answered, answer)) => {
+            // Pointer identity, not name: the node that answered is the very object the first
+            // candidate was, or it is a different one and this was a retry.
+            if !std::sync::Arc::ptr_eq(&answered, &first) {
                 if let Some(m) = cx.metrics {
                     m.retried();
                 }
@@ -111,7 +113,7 @@ pub fn forward(req: &Request, pool: &Pool, cx: &Context<'_>) -> Response {
             no_healthy_upstream()
         }
         Err((NoNode::AllFailed, e)) => match e {
-            Some(e) => refused(&e, pool.nodes()[first].up.name()),
+            Some(e) => refused(&e, first.up.name()),
             None => no_healthy_upstream(),
         },
     }

@@ -126,6 +126,11 @@ pub struct Controller {
     /// at all - which is exactly a node that has restarted and may already have been replaced
     /// while it was away.
     lease_at: AtomicU64,
+    /// The log index up to which applied decisions have been folded into the shared state.
+    ///
+    /// Trails `Raft::applied_index` by the width of one turn of the loop below. See
+    /// [`Controller::behind_agreement`], which is the only thing that reads it.
+    published: AtomicU64,
     started: Instant,
     inbox: mpsc::Sender<Message>,
     /// One sender thread per peer, made on demand.
@@ -277,6 +282,7 @@ impl Controller {
             peers: Arc::clone(&peers),
             roster: RwLock::new(None),
             lease_at: AtomicU64::new(NEVER),
+            published: AtomicU64::new(0),
             started,
             inbox: tx,
             outbox,
@@ -387,6 +393,23 @@ impl Controller {
     /// the schema leader can always be replaced, so it acts only while it has heard from the
     /// agreement recently enough to know it has not been. The same lease as a range, and the
     /// same margin against `promote_after` is what makes replacing it safe.
+    /// Whether this node is missing entries the agreement has already committed. See
+    /// [`crate::raft::Raft::behind`].
+    /// Whether this node is missing anything the agreement has decided - either because the
+    /// entries have not arrived, or because they have not yet been acted on.
+    ///
+    /// **Two questions, and both have to be asked here.** `Raft::behind` compares what the
+    /// leader says it has committed against what this log holds, which is the first. The second
+    /// is subtler and is what a restart actually trips over: entries are marked applied while
+    /// the agreement's lock is held, and the decisions they carry are folded into the map
+    /// *after* it is released - so there is a window in which this node has applied everything
+    /// and is still reading the map it started with. A schema leader allocating in that window
+    /// reads no reservation at all and re-issues every id its predecessor promised.
+    pub fn behind_agreement(&self) -> bool {
+        let raft = self.raft.lock().expect("no panic holds this lock");
+        raft.behind() || self.published.load(Ordering::Relaxed) < raft.applied_index()
+    }
+
     pub fn may_lead_schema(&self) -> bool {
         self.since_lease() < self.leases.serve_for.as_millis() as u64
     }
@@ -437,6 +460,7 @@ impl Controller {
             let incoming = rx.recv_timeout(tick).ok();
             let now = self.now();
 
+            let applied_to;
             let (out, persist_state) = {
                 let mut raft = self.raft.lock().expect("no panic holds this lock");
                 let mut out = raft::Output::default();
@@ -461,6 +485,9 @@ impl Controller {
                 }
 
                 let state = out.persist.then(|| raft.state());
+                // Read under the same lock that advanced it, so the watermark published below
+                // cannot name an index this turn did not actually carry.
+                applied_to = raft.applied_index();
                 (out, state)
             };
 
@@ -515,6 +542,11 @@ impl Controller {
                     Decision::Noop => {}
                 }
             }
+
+            // **After the decisions above, never before.** This is what says the shared state
+            // has caught up with the log, and a watermark raised ahead of the work it stands
+            // for would be a promise this node cannot keep.
+            self.published.store(applied_to, Ordering::Relaxed);
 
             for (to, m) in out.send {
                 self.outbox.send(to, m);

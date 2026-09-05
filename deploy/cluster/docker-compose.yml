@@ -231,6 +231,16 @@ services:
       - /etc/bigproxy/cluster.toml
       - --upstream-ca
       - /run/bigproxy/peer-ca.pem
+      # **`--discover` is off here, and the file above is why.** It would make this proxy follow
+      # the cluster's membership rather than the two nodes cluster.toml names - which is what a
+      # deployment that grows wants, and is beside the point in one whose whole subject is those
+      # two nodes. Turning it on also needs a credential: reading the membership is
+      # `GET /cluster/topology`, which demands `Operate`.
+      #
+      #   - --discover
+      #   - --discover-credentials
+      #   - /run/bigproxy/proxy.cred
+      #
       # Published to 127.0.0.1 above, so the clear-text hop is inside one machine. Drop this and
       # add --tls-cert before publishing it wider.
       - --insecure-no-tls

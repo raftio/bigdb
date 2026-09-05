@@ -58,6 +58,44 @@ fn two_nodes() -> (SocketAddr, SocketAddr) {
     (a, b)
 }
 
+/// Two nodes that know what their cluster is called, which is what a node with no file has to
+/// be told before it can ask anything.
+fn two_named_nodes(id: &str) -> (SocketAddr, SocketAddr) {
+    let (a, b) = (free_port(), free_port());
+    let file = format!(
+        "cluster_id = \"{id}\"\nschema_leader = \"a\"\n\
+         [[node]]\nname = \"a\"\naddr = \"{a}\"\nshards = \"0..1\"\n\
+         [[node]]\nname = \"b\"\naddr = \"{b}\"\nshards = \"1..\"\n"
+    );
+    start(&file, &[("a", a), ("b", b)]);
+    (a, b)
+}
+
+/// A named cluster that runs an agreement: one primary and two copies, which is the smallest
+/// shape that can commit anything and therefore the smallest that can admit a node.
+fn a_named_replicated_group(id: &str) -> (SocketAddr, SocketAddr, SocketAddr) {
+    let (a, spare, third) = (free_port(), free_port(), free_port());
+    let file = format!(
+        "cluster_id = \"{id}\"\nschema_leader = \"a\"\n\
+         [[node]]\nname = \"a\"\naddr = \"{a}\"\nshards = \"0..\"\n\
+         [[node]]\nname = \"a-spare\"\naddr = \"{spare}\"\nreplica = \"a\"\n\
+         [[node]]\nname = \"a-third\"\naddr = \"{third}\"\nreplica = \"a\"\n"
+    );
+    start(&file, &[("a", a), ("a-spare", spare), ("a-third", third)]);
+    waiting("an elected leader", std::time::Duration::from_secs(15), || {
+        ready(a).contains(r#""leader":""#)
+    });
+    (a, spare, third)
+}
+
+/// The fingerprint of the file the harness last started, for a cluster that has no name and is
+/// therefore known by its shape.
+fn shape_fingerprint() -> u64 {
+    LAST_FILE.with(|f| {
+        ClusterFile::parse(&f.borrow()).unwrap().for_node(Some("a"), "").unwrap().fingerprint()
+    })
+}
+
 /// The fingerprint of the file [`a_replicated_group`] writes, for a test that has to send a
 /// request the way a peer would.
 fn a_replicated_group_fingerprint() -> u64 {
@@ -853,6 +891,151 @@ fn send_bytes(addr: SocketAddr, target: &str, body: &[u8], fingerprint: u64) -> 
     let head = String::from_utf8_lossy(&raw[..split]).to_string();
     let status = head.split(' ').nth(1).and_then(|s| s.parse().ok()).expect("a status");
     (status, raw[split + 4..].to_vec())
+}
+
+// -------------------------------------------------------------------------------------------
+// Giving a live range one more copy
+// -------------------------------------------------------------------------------------------
+
+/// **A range that was serving alone gains a copy, and nothing is refused while it does.**
+///
+/// The copy enters the group marked behind in one decision, so a promotion cannot reach it
+/// before a repair has proved it agrees - and writes reach it from that moment, so it stops
+/// falling further behind while it fills in.
+#[test]
+fn a_range_gains_a_copy_without_refusing_anything() {
+    let (a, spare, third) = a_named_replicated_group("big-copy");
+    // A second range, held by `a-third` alone, is what there is to give a copy to.
+    ok(a, "POST", "/table/tx", "");
+    ok(a, "POST", "/table/tx/field/amount?kind=int&bit_depth=32", "");
+    ok(a, "POST", "/admin/cluster/split?at=64&to=a-third", "");
+
+    let (status, body) = send(a, "POST", "/admin/cluster/replica?range=1&to=a-spare", "");
+    assert_eq!(status, 200, "{body}");
+
+    let seen = ok(a, "GET", "/cluster/topology", "");
+    assert!(
+        seen.contains(r#""holders":["a-third","a-spare"]"#),
+        "the copy is in the group, primary unchanged: {seen}"
+    );
+    let _ = (spare, third);
+}
+
+/// **A learner is refused, by all three verbs that hand out a range.**
+///
+/// A learner receives the agreement and holds nothing - that is the state's whole purpose, so
+/// that adding a node never raises the bar for an election before the node can help clear it.
+/// `split` and `move` accepted one, which produced a holder the agreement does not count: a
+/// range whose availability rests on a node with no vote.
+#[test]
+fn a_range_is_never_handed_to_a_node_that_does_not_vote() {
+    let (a, _, _) = a_named_replicated_group("big-learner");
+    let d = free_port();
+    ok(a, "POST", &format!("/admin/cluster/node?name=d&addr={d}"), "");
+
+    for (method, target) in [
+        ("POST", "/admin/cluster/split?at=64&to=d".to_string()),
+        ("POST", "/admin/cluster/replica?range=0&to=d".to_string()),
+        ("POST", "/admin/cluster/move?range=0&to=d".to_string()),
+    ] {
+        let (status, body) = send(a, method, &target, "");
+        // `refused`, the code every "the cluster will not do this" answer carries.
+        assert_eq!(status, 409, "{target}: {body}");
+        assert!(body.contains("admit"), "{target} names the step that fixes it: {body}");
+    }
+}
+
+/// A copy can be taken away again, and the node a read goes to is not one of them.
+#[test]
+fn a_copy_can_be_dropped_but_the_primary_cannot() {
+    let (a, _, _) = a_named_replicated_group("big-drop");
+
+    let (status, body) = send(a, "DELETE", "/admin/cluster/replica?range=0&from=a", "");
+    assert_ne!(status, 200, "the primary is not a copy: {body}");
+    assert!(body.contains("cluster move"), "it names the verb that is: {body}");
+
+    let (status, body) = send(a, "DELETE", "/admin/cluster/replica?range=0&from=a-third", "");
+    assert_eq!(status, 200, "{body}");
+    let seen = ok(a, "GET", "/cluster/topology", "");
+    assert!(!seen.contains("a-third\"]"), "it is out of the group: {seen}");
+}
+
+// -------------------------------------------------------------------------------------------
+// Joining without a file
+// -------------------------------------------------------------------------------------------
+
+/// **A node already in the cluster hands a joining one everything a file would have said.**
+///
+/// The whole point is that the answer is the *agreement's* membership rather than the text
+/// anybody read: a node admitted after these two started is in it, and no file on any machine
+/// has been edited.
+#[test]
+fn a_node_in_the_cluster_answers_who_is_in_it() {
+    let (a, spare, third) = a_named_replicated_group("big-test");
+
+    let (status, body) = send_bytes(
+        a,
+        big_cluster::path::JOIN,
+        &[],
+        big_cluster::config::fingerprint_of("big-test"),
+    );
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+
+    let (id, members) = big_cluster::wire::get_join(&body).unwrap();
+    assert_eq!(id, "big-test");
+    assert_eq!(
+        members,
+        vec![
+            ("a".to_string(), a.to_string()),
+            ("a-spare".to_string(), spare.to_string()),
+            ("a-third".to_string(), third.to_string()),
+        ],
+        "every node the agreement holds, with the address a peer reaches it on"
+    );
+
+    // And what comes back builds the configuration a joining node starts from: it names every
+    // peer, and claims no range for a node the cluster has not given one.
+    let config = big_cluster::ClusterConfig::joining(&id, &members, "a-third").unwrap();
+    assert_eq!(config.fingerprint(), big_cluster::config::fingerprint_of("big-test"));
+    assert!(config.this().replica_of.is_some());
+}
+
+/// **A cluster that runs no agreement refuses the joining request, and says which step is
+/// impossible rather than which one is next.**
+///
+/// Found by writing the end-to-end test rather than by reading: joining ends in `add-node`,
+/// `add-node` is a decision, and a cluster whose ranges have no copies commits no decisions.
+/// Without this the answer would name a command that is itself refused - an operator sent
+/// round a loop by two messages that are each individually correct.
+#[test]
+fn a_cluster_that_runs_no_agreement_refuses_the_joining_request() {
+    let (a, _) = two_named_nodes("big-unreplicated");
+
+    let (status, body) = send_bytes(
+        a,
+        big_cluster::path::JOIN,
+        &[],
+        big_cluster::config::fingerprint_of("big-unreplicated"),
+    );
+    assert_eq!(status, 409, "{}", String::from_utf8_lossy(&body));
+    let said = String::from_utf8_lossy(&body);
+    assert!(said.contains("no_agreement"), "{said}");
+    assert!(said.contains("copy"), "it names what the cluster is missing: {said}");
+}
+
+/// **A cluster identified by the shape of its file cannot be joined, and refuses rather than
+/// letting the node break later.** Handing over a membership with no name would produce a node
+/// that started cleanly and had every subsequent request refused as a mismatch — the failure
+/// that is hardest to read, because startup said nothing.
+#[test]
+fn a_cluster_with_no_name_refuses_the_joining_request() {
+    let (a, _) = two_nodes();
+
+    let (status, body) = send_bytes(a, big_cluster::path::JOIN, &[], shape_fingerprint());
+    assert_eq!(status, 409, "{}", String::from_utf8_lossy(&body));
+    let said = String::from_utf8_lossy(&body);
+    assert!(said.contains("cluster_unnamed"), "{said}");
+    assert!(said.contains("cluster_id"), "it names the key to set: {said}");
 }
 
 // -------------------------------------------------------------------------------------------

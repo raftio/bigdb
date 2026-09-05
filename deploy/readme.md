@@ -209,14 +209,34 @@ against the CA that is there:
 ./certs.sh d          # writes secrets/d.pem and secrets/d.key, touching nothing else
 ```
 
-**A `cluster.toml` that names the whole cluster, not just itself.** The agreement replaces what
-the file says about *ranges* the moment this node hears it - but the roster its listener starts
-with, the names a peer certificate is allowed to claim, comes from the file. A node whose file
-names only itself refuses every peer that dials it with `a client certificate that names no node
-in the cluster file`, and since it has no peers of its own to dial, it never hears the agreement
-that would fix the roster. It sits there healthy and alone. So copy the cluster's file and append
-the new node - as a `replica` of an existing primary, which is the shape that parses without
-overlapping anybody's range and is a seed the agreement overwrites within the second:
+**Either an address, or a `cluster.toml` that names the whole cluster.** The short way is
+`--join`:
+
+```sh
+bigctl cluster join d d:7654      # run against a node already in the cluster
+# added `d` at d:7654, as a learner. Now run this on d:7654:
+#
+#   big serve <file> d:7654 --join a:7654 --cluster-id big-demo --node d
+```
+
+`cluster join` adds the node here and prints the command to run over there, because the two
+steps happen on two machines and only work in that order. **The order is not a formality**: a
+node dials in presenting a certificate, and a certificate naming somebody the cluster has never
+heard of is refused at the handshake - so the node has to be added before it starts, not after.
+
+Two things the joining node still has to be told, because neither can be asked for. `--cluster-id`
+is what stamps every peer request, so a node cannot dial its way to an id it does not have; and
+`--peer-ca` is what makes a peer's answer worth reading. Both are flags an orchestrator can
+template, where a file had to be copied to the machine and kept current.
+
+**A cluster that runs no agreement cannot admit anybody**, and says so rather than letting the
+node start and fail later. Admission is a decision, and a cluster whose ranges have no copies
+commits none - so growing this way needs the third node that replication needs anyway.
+
+The long way still works and is what a fixed deployment should keep using: copy the cluster's
+file, append the new node as a `replica` of an existing primary - the shape that parses without
+overlapping anybody's range, and a seed the agreement overwrites within the second - and start
+it with `--cluster` and `--node d`.
 
 ```toml
 cluster_id    = "big-demo"     # the same string, or the cluster does not recognise it
@@ -234,8 +254,15 @@ replica = "b"
 **Its own volume and a service in the compose file**, with the same command as the others and
 `--node d`. One volume per node, never a shared one.
 
-Then `add-node`, `admit`, and give it something to hold with `split` or `move`. `cluster topology`
-is how you check it landed, and `verify` is how you check the copies agree afterwards.
+Then `admit` - or let the node be admitted on its own once it has caught up - and give it
+something to hold with `split` or `move`. `cluster topology` is how you check it landed, and
+`verify` is how you check the copies agree afterwards.
+
+**A proxy in front does not see any of this until it is told to look.** `bigproxy` reads its
+upstreams once at startup, so a node admitted afterwards is one no request can reach; `--discover`
+makes it follow the cluster's membership instead. Off by default, because a front door that grew
+an upstream nobody wrote down is one whose shape an operator cannot predict. See
+`crates/big-proxy/readme.md`.
 
 **Nothing balances itself unless you ask.** The balancer is off by default, and
 `bigctl cluster rebalance` is one step against facts gathered afresh: a cluster needing three

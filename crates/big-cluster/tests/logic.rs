@@ -61,7 +61,10 @@ fn the_corpus() {
     big_testfile::run(dir, move |case| {
         let fresh = db.as_ref().is_none_or(|(path, _)| path != &case.file);
         if fresh {
-            db = Some((case.file.clone(), Cluster::solo(Api::in_memory().unwrap())));
+            db = Some((
+                case.file.clone(),
+                Cluster::solo(Api::in_memory().unwrap(), "127.0.0.1:7654"),
+            ));
         }
         dispatch(&db.as_ref().unwrap().1, case)
     });

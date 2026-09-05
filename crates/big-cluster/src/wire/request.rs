@@ -757,6 +757,35 @@ pub fn get_load(bytes: &[u8]) -> Result<(u64, u64)> {
 }
 
 /// One past the highest record id handed out for each table.
+/// What a node dialled by `--join` answers: the cluster's id, and an address for every node
+/// the agreement currently holds.
+///
+/// The id is in the answer even though the joining node had to know it to ask - the request
+/// carries the fingerprint, not the id, and a node that has just learned the membership should
+/// not then have to be told separately what to call the cluster it is in.
+pub fn put_join(cluster_id: &str, members: &[(String, String)]) -> Vec<u8> {
+    let mut out = Vec::new();
+    put_str(&mut out, cluster_id);
+    put_count(&mut out, members.len());
+    for (name, addr) in members {
+        put_str(&mut out, name);
+        put_str(&mut out, addr);
+    }
+    out
+}
+
+pub fn get_join(bytes: &[u8]) -> Result<(String, Vec<(String, String)>)> {
+    let mut r = Reader::new(bytes);
+    let cluster_id = r.str()?;
+    let n = r.count()?;
+    let mut members = Vec::with_capacity(n);
+    for _ in 0..n {
+        members.push((r.str()?, r.str()?));
+    }
+    finished(&r)?;
+    Ok((cluster_id, members))
+}
+
 pub fn put_floors(floors: &[(String, RecordId)]) -> Vec<u8> {
     let mut out = Vec::new();
     put_count(&mut out, floors.len());

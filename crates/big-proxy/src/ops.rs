@@ -205,7 +205,7 @@ mod tests {
     #[test]
     fn ready_reports_every_node_and_counts_the_live_ones() {
         let p = pool(&["a", "b", "a-spare"]);
-        p.observe(2, Verdict::Down(Why::NotServing));
+        p.nodes()[2].observe(Verdict::Down(Why::NotServing));
         let b = body(&ready(&p));
         assert!(b.contains(r#""in_rotation":2"#), "{b}");
         assert!(b.contains(r#""total":3"#), "{b}");
@@ -219,7 +219,7 @@ mod tests {
     fn a_node_with_no_agreement_reports_serving_null_not_false() {
         let p = pool(&["solo"]);
         let solo = r#"{"status":"ready","tables":2,"node":"local","shards":"0..","version":"0.1.0","wire":6}"#;
-        p.observe(0, Verdict::of(200, solo.as_bytes()));
+        p.nodes()[0].observe(Verdict::of(200, solo.as_bytes()));
         let b = body(&ready(&p));
         assert!(b.contains(r#""serving":null"#), "absent must not become false: {b}");
         assert!(b.contains(r#""state":"in""#), "{b}");
@@ -229,7 +229,7 @@ mod tests {
     #[test]
     fn no_node_in_rotation_is_a_503_not_an_empty_success() {
         let p = pool(&["a"]);
-        p.observe(0, Verdict::Down(Why::NotServing));
+        p.nodes()[0].observe(Verdict::Down(Why::NotServing));
         let answer = ready(&p);
         assert_eq!(answer.status, 503);
         assert_eq!(answer.code, Some("no_healthy_upstream"));
@@ -242,7 +242,7 @@ mod tests {
     #[test]
     fn health_is_still_ok_when_ready_is_not() {
         let p = pool(&["a"]);
-        p.observe(0, Verdict::Down(Why::NotServing));
+        p.nodes()[0].observe(Verdict::Down(Why::NotServing));
         assert_eq!(ready(&p).status, 503);
         assert_eq!(health().status, 200);
     }
@@ -260,9 +260,9 @@ mod tests {
         let up = r#"{"status":"ready","node":"a","shards":"0..64","wire":6,"serving":true}"#;
         let solo = r#"{"status":"ready","node":"local","shards":"0..","wire":6}"#;
         let stopped = r#"{"status":"ready","node":"c","shards":"","wire":6,"serving":false}"#;
-        p.observe(0, Verdict::of(200, up.as_bytes()));
-        p.observe(1, Verdict::of(200, solo.as_bytes()));
-        p.observe(2, Verdict::of(200, stopped.as_bytes()));
+        p.nodes()[0].observe(Verdict::of(200, up.as_bytes()));
+        p.nodes()[1].observe(Verdict::of(200, solo.as_bytes()));
+        p.nodes()[2].observe(Verdict::of(200, stopped.as_bytes()));
 
         let text = body(&metrics(&p, &Metrics::new()));
         assert!(text.contains(r#"big_proxy_upstream_serving{node="clustered"} 1"#), "{text}");
@@ -275,8 +275,8 @@ mod tests {
     #[test]
     fn in_rotation_reaches_zero_when_everything_stops_serving() {
         let p = pool(&["a", "b"]);
-        p.observe(0, Verdict::Down(Why::NotServing));
-        p.observe(1, Verdict::Down(Why::NotServing));
+        p.nodes()[0].observe(Verdict::Down(Why::NotServing));
+        p.nodes()[1].observe(Verdict::Down(Why::NotServing));
         let text = body(&metrics(&p, &Metrics::new()));
         assert!(text.contains("big_proxy_upstreams_in_rotation 0"), "{text}");
     }

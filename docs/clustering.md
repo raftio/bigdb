@@ -773,6 +773,33 @@ the source went on accepting writes because it had not yet *applied* the cutover
 its copy before it had applied the handover made it answer zero for records it still believed it
 served. Both wait for the source now.
 
+### Changing how many copies a range has
+
+`cluster add-replica <range> to <node>` gives a range that is already serving one more copy of
+itself; `cluster drop-replica <range> from <node>` takes one away. Until these existed, a range's
+replication was fixed when the cluster started and could not be changed at all — so going from
+one copy to two on a running deployment had no answer.
+
+**Nothing is refused while it copies**, which is the one way this differs from a move. A move
+ends by dropping its source, so the new holder has to be provably exact before the handover —
+that is what the cutover window is for. Nothing is dropped here, so a copy that is incomplete
+cannot lose a record; it can only *be* behind, and being behind is a state the agreement already
+models. The copy joins the group **and is marked behind in the same decision**: writes reach it
+from that moment, so it stops falling further behind, and no read is ever answered from it until
+a repair has proved it agrees.
+
+That single decision is the whole safety argument. Two decisions would leave a window in which
+the map names a holder the agreement believes is current and which is missing records — and a
+promotion in that window answers a smaller count with no symptom.
+
+A catch-up that fails leaves a copy that is in the group and behind. **That is a resting state,
+not a half-finished change**: it is what a node that missed a write looks like, `/repair` is what
+finishes it, and `verify` is how you check afterwards.
+
+Neither verb runs by itself. How many copies a range *should* have is a policy with real teeth —
+a loop that adds them can fill a disk, and one that removes them can take a cluster below the
+majority it needs — so the balancer is deliberately not given it.
+
 ### Joining and leaving
 
 A node joins as a **learner**: it replicates the log, holds no range, and does not vote — so
@@ -783,6 +810,43 @@ not help decide. `admit` makes it a full member.
 keeps the single address a client is holding from going dark halfway through a scale-in; what
 changes is that the balancer takes its ranges away and gives it no new ones. Removing a node
 that still holds a range is refused.
+
+**A node holding a range is always a full member.** `split`, `move` and `add-replica` all refuse
+a learner by name and say `admit` first. A learner receives the agreement and holds nothing —
+that is what the state is *for*, so that adding a node never raises the bar for an election
+before the node can help clear it — and a range whose availability rested on a node the
+agreement does not count would undo that in one command.
+
+**A joining node needs an address, not a file.** `big serve --join <addr> --cluster-id <id>
+--node <name>` builds this node's configuration by asking a node that is already in the cluster,
+instead of reading a `cluster.toml` that had to be copied to the machine and kept current. What
+comes back is the membership the agreement holds — so a node admitted last week is in it, and no
+file anywhere had to be edited when it was.
+
+Three things still have to be *given*, and each is something that cannot be asked for.
+
+- **The name**, because the answer is a list this node has to find itself in.
+- **The cluster's id**, because every peer request carries a stamp derived from it: a node
+  cannot dial its way to an id it does not have. This is the rule `cluster_id` always had —
+  *a node that joins must be given the id, or it cannot be admitted* — and `--join` is what
+  makes it the whole of the configuration rather than one line of it.
+- **The peer CA**, where the nodes speak TLS, because trusting a peer is what makes its answer
+  worth reading at all.
+
+**Being added comes before starting, and the order is enforced rather than advised.** A node
+dials in presenting a certificate, and the roster a listener starts with decides which names a
+certificate may claim — so a node the cluster has never heard of is refused at the handshake.
+Startup says so by name, and names the command that was skipped, rather than leaving a daemon
+that looks healthy and is talking to nobody. `bigctl cluster join` does the adding and prints
+the starting command, so the two halves cannot be run the wrong way round.
+
+**A cluster that runs no agreement refuses the request.** Admission is a decision and a cluster
+whose ranges have no copies commits none — so this needs the third node that replication needs
+anyway, and says which step is impossible rather than which one is next.
+
+There is no discovery service to run and nothing gossips. A process that could name itself and
+be believed is a process that could start holding data because it said so; admission stays a
+decision recorded in the agreement, and identity stays a certificate signed by the cluster's CA.
 
 ### Deciding when
 

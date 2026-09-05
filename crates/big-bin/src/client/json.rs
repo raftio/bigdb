@@ -326,8 +326,16 @@ impl Answer {
             ["agree", "ranges"] => verify(&value),
             // `POST /repair`.
             ["repaired"] => repaired(&value),
-            // `GET /cluster/topology`.
-            ["epoch", "leader", "schema_leader", "members", "ranges", "behind"] => topology(&value),
+            // `GET /cluster/topology`, recognised by the two arrays it is *about* rather than
+            // by its whole field list.
+            //
+            // **A field added to this answer must not stop an older client reading it.** The
+            // exact list here was one, and adding `cluster_id` to the route duly broke every
+            // `bigctl` built before it: the answer fell through to `flat`, which cannot render
+            // an array, and the operator got the raw JSON and an error. The daemon is allowed
+            // to grow a field, so what identifies a shape has to be what that shape is for -
+            // the same rule the proxy's reader of `cluster.toml` already follows.
+            _ if keys.contains(&"members") && keys.contains(&"ranges") => topology(&value),
             // Everything else the server writes is a flat object of scalars: a count, a sum, a
             // value, an id, a probe. Rendered as one row of its own keys, which is the reading
             // that needs no per-route knowledge and cannot be wrong about a shape it has not
@@ -560,6 +568,11 @@ fn topology(v: &Value) -> Result<Answer, String> {
     let mut notes = Vec::new();
     // `null` is a cell, and the cell it is is the empty string - so the check is emptiness
     // rather than absence.
+    // The cluster's name first, because it is what somebody reading this to add a node needs
+    // and the one field they cannot work out from the rows.
+    if let Some(id) = v.get("cluster_id").and_then(Value::cell).filter(|s| !s.is_empty()) {
+        notes.push(format!("cluster `{id}`"));
+    }
     match v.get("leader").and_then(Value::cell) {
         Some(leader) if !leader.is_empty() => notes.push(format!(
             "leader `{leader}`, schema leader `{}`, epoch {}",

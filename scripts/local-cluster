@@ -1,0 +1,245 @@
+#!/usr/bin/env bash
+#
+# A three-node cluster and a proxy, on this machine, in one command.
+#
+#   ./scripts/local-cluster up        # build, start, wait until it is serving
+#   ./scripts/local-cluster status    # who is up, who leads, what each holds
+#   ./scripts/local-cluster logs a    # follow one node
+#   ./scripts/local-cluster down      # stop everything, keep the data
+#   ./scripts/local-cluster clean     # stop everything and delete the data
+#   ./scripts/local-cluster join d    # add a fourth node, by address, with no cluster file
+#
+# **Three nodes and not one, and the reason is not caution.** A cluster whose ranges have no
+# copies runs no agreement, and admission is a decision - so a cluster of one or two can never
+# be joined, split, or reshaped at all. Three with a copy is the smallest that can change its
+# own shape. See docs/clustering.md, "Why two nodes never serve one range".
+#
+# Everything lives under local/, which .gitignore already covers. Nothing here belongs in a
+# deployment: the ports are loopback, there is no users file, and the peers speak in the clear.
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+DIR=local
+CONF=$DIR/cluster.toml
+BIG=./target/release/big
+CTL=./target/release/bigctl
+PROXY=./target/release/bigproxy
+
+# name:port:file, primaries first. The proxy takes the last two fields of its own line.
+NODES=(
+  "a:7655:a"
+  "a-spare:7656:as"
+  "a-third:7657:at"
+)
+PROXY_PORT=7650
+PROXY_ADMIN=7651
+SEED=127.0.0.1:7655
+
+say() { printf '\033[1m%s\033[0m\n' "$*"; }
+die() { printf 'local-cluster: %s\n' "$*" >&2; exit 1; }
+
+# The pid of whatever is listening on a port, or nothing.
+holder() { lsof -ti "tcp:$1" 2>/dev/null || true; }
+
+write_conf() {
+  [ -f "$CONF" ] && return
+  say "writing $CONF"
+  mkdir -p "$DIR"
+  cat > "$CONF" <<'TOML'
+# One range with two copies of it: three nodes, so a majority survives one of them going away.
+# The addresses are loopback, so nothing here needs TLS or a users file.
+cluster_id    = "big-local"
+schema_leader = "a"
+
+[[node]]
+name   = "a"
+addr   = "127.0.0.1:7655"
+shards = "0.."
+
+[[node]]
+name    = "a-spare"
+addr    = "127.0.0.1:7656"
+replica = "a"
+
+[[node]]
+name    = "a-third"
+addr    = "127.0.0.1:7657"
+replica = "a"
+TOML
+}
+
+build() {
+  say "building"
+  cargo build --release --bin big --bin bigctl --bin bigproxy
+}
+
+# Waits for a condition, printing what it is waiting for rather than a bare hang.
+waiting() {
+  local what=$1 tries=${2:-100}; shift 2
+  local i=0
+  until "$@" >/dev/null 2>&1; do
+    i=$((i + 1))
+    [ "$i" -ge "$tries" ] && die "waited for $what and it never happened"
+    sleep 0.2
+  done
+}
+
+up() {
+  write_conf
+  build
+  mkdir -p "$DIR"
+
+  for entry in "${NODES[@]}"; do
+    IFS=: read -r name port file <<< "$entry"
+    if [ -n "$(holder "$port")" ]; then
+      echo "  $name already on $port"
+      continue
+    fi
+    say "starting $name on 127.0.0.1:$port"
+    nohup "$BIG" serve "$DIR/$file.big" "127.0.0.1:$port" \
+      --cluster "$CONF" --node "$name" >"$DIR/$file.log" 2>&1 &
+    waiting "$name to answer" 100 curl -fsS -m 1 "http://127.0.0.1:$port/health"
+  done
+
+  # **After the nodes, and waiting for a leader before the proxy is told anything.** A proxy
+  # started against a cluster that has not elected one would seed from a node that cannot yet
+  # answer for the membership, log a failure, and try again - which works, and reads like a
+  # fault when it is only impatience.
+  waiting "an elected leader" 150 leader_elected
+
+  if [ -z "$(holder "$PROXY_PORT")" ]; then
+    say "starting proxy on 127.0.0.1:$PROXY_PORT"
+    # One seed and --discover: the other two are found rather than listed, which is the point.
+    # --allow-ops so the console's cluster page works through it.
+    nohup "$PROXY" "127.0.0.1:$PROXY_PORT" \
+      --upstream "a=$SEED" --discover --allow-ops \
+      --admin-addr "127.0.0.1:$PROXY_ADMIN" --cluster-id big-local \
+      >"$DIR/proxy.log" 2>&1 &
+    waiting "the proxy to answer" 100 curl -fsS -m 1 "http://127.0.0.1:$PROXY_PORT/health"
+    waiting "every node to reach the proxy" 100 proxy_sees_all
+  else
+    echo "  proxy already on $PROXY_PORT"
+  fi
+
+  echo
+  status
+  echo
+  echo "  console:  BIGD_URL=http://127.0.0.1:$PROXY_PORT"
+  echo "  seed one: curl -X POST '127.0.0.1:$PROXY_ADMIN/admin/upstream?name=x&addr=host:port'"
+}
+
+leader_elected() {
+  # **Both streams.** `bigctl` puts the rows on stdout and the notes - which is where the
+  # leader is named - on stderr, so a check that read only stdout would wait for ever on a
+  # cluster that had elected one within the second.
+  "$CTL" --addr "$SEED" cluster topology 2>&1 | grep -q 'leader `'
+}
+
+proxy_sees_all() {
+  local want=${#NODES[@]}
+  local got
+  got=$(curl -fsS -m 1 "http://127.0.0.1:$PROXY_PORT/ready" 2>/dev/null \
+    | tr ',' '\n' | grep -c '"state":"in"' || true)
+  [ "$got" -ge "$want" ]
+}
+
+down() {
+  for entry in "${NODES[@]}"; do
+    IFS=: read -r name port _ <<< "$entry"
+    local pid; pid=$(holder "$port")
+    [ -n "$pid" ] && { say "stopping $name"; kill $pid 2>/dev/null || true; }
+  done
+  for port in "$PROXY_PORT" "$PROXY_ADMIN"; do
+    local pid; pid=$(holder "$port")
+    [ -n "$pid" ] && { say "stopping proxy ($port)"; kill $pid 2>/dev/null || true; }
+  done
+  # A moment for the sockets to go, so `up` straight after this does not race the port.
+  sleep 0.5
+  echo "stopped"
+}
+
+clean() {
+  down
+  say "deleting $DIR/*.big, *.raft and the logs"
+  # The cluster file is left alone: it is the one thing here somebody edited on purpose.
+  rm -f "$DIR"/*.big "$DIR"/*.raft "$DIR"/*.log
+}
+
+status() {
+  for entry in "${NODES[@]}"; do
+    IFS=: read -r name port _ <<< "$entry"
+    if curl -fsS -m 1 "http://127.0.0.1:$port/health" >/dev/null 2>&1; then
+      printf '  %-10s 127.0.0.1:%-5s up\n' "$name" "$port"
+    else
+      printf '  %-10s 127.0.0.1:%-5s down\n' "$name" "$port"
+    fi
+  done
+  if curl -fsS -m 1 "http://127.0.0.1:$PROXY_PORT/health" >/dev/null 2>&1; then
+    printf '  %-10s 127.0.0.1:%-5s up\n' proxy "$PROXY_PORT"
+  else
+    printf '  %-10s 127.0.0.1:%-5s down\n' proxy "$PROXY_PORT"
+  fi
+  echo
+  "$CTL" --addr "$SEED" cluster topology 2>/dev/null || echo "  (no cluster answering yet)"
+}
+
+# Adds a node the way a real one is added: told to the cluster first, then started with an
+# address and no cluster file at all.
+join() {
+  local name=${1:-} port=${2:-7658}
+  [ -n "$name" ] || die "usage: local-cluster join <name> [port]"
+  local addr="127.0.0.1:$port"
+  [ -n "$(holder "$port")" ] && die "something is already on $port"
+
+  # Membership is a decision, so it has to be asked of whoever leads the agreement.
+  local leader_addr
+  leader_addr=$(leader_address) || die "no leader to ask; is the cluster up?"
+  say "adding $name to the cluster, via $leader_addr"
+  "$CTL" --addr "$leader_addr" cluster join "$name" "$addr"
+
+  say "starting $name on $addr with no cluster file"
+  nohup "$BIG" serve "$DIR/$name.big" "$addr" \
+    --join "$leader_addr" --cluster-id big-local --node "$name" >"$DIR/$name.log" 2>&1 &
+  waiting "$name to answer" 100 curl -fsS -m 1 "http://127.0.0.1:$port/health"
+  echo
+  echo "  it is a learner until it has caught up. Give it work with:"
+  echo "    $CTL --addr $leader_addr cluster admit $name"
+  echo "    $CTL --addr $leader_addr cluster split <shard> to $name"
+}
+
+# The address of whoever leads the agreement - membership changes go there and nowhere else.
+leader_address() {
+  local name
+  name=$("$CTL" --addr "$SEED" --format json cluster topology 2>/dev/null \
+    | tr ',' '\n' | grep '"leader"' | cut -d'"' -f4) || return 1
+  [ -n "$name" ] || return 1
+  "$CTL" --addr "$SEED" --format json cluster topology 2>/dev/null \
+    | tr '{' '\n' | grep "\"name\":\"$name\"" | cut -d'"' -f8
+}
+
+logs() {
+  local which=${1:-proxy}
+  case $which in
+    proxy) tail -f "$DIR/proxy.log" ;;
+    *)
+      for entry in "${NODES[@]}"; do
+        IFS=: read -r name _ file <<< "$entry"
+        [ "$name" = "$which" ] && exec tail -f "$DIR/$file.log"
+      done
+      # A node added by `join` is logged under its own name.
+      [ -f "$DIR/$which.log" ] && exec tail -f "$DIR/$which.log"
+      die "no log for \`$which\`"
+      ;;
+  esac
+}
+
+case ${1:-up} in
+  up)     up ;;
+  down)   down ;;
+  clean)  clean ;;
+  status) status ;;
+  join)   shift; join "$@" ;;
+  logs)   shift; logs "$@" ;;
+  *)      die "usage: local-cluster up|down|clean|status|join <name> [port]|logs [node]" ;;
+esac

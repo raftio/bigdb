@@ -123,6 +123,17 @@ pub enum Command {
         name: String,
         addr: String,
     },
+    /// `cluster join <name> <addr>` - `add-node`, then the command to run on the new machine.
+    ClusterJoin {
+        name: String,
+        addr: String,
+    },
+    /// `cluster add-replica <range> to <node>` / `drop-replica <range> from <node>`.
+    ClusterReplica {
+        add: bool,
+        range: u64,
+        node: String,
+    },
     /// `cluster admit|drain|remove <name>` - the three one-node changes.
     ClusterMember {
         verb: &'static str,
@@ -224,6 +235,24 @@ Operations:
   verify                      do the copies of every range still agree
   repair                      catch up every copy that is behind
   health | ready | metrics    the three probes
+
+Cluster:
+  cluster topology            who is in it, what each holds, and who leads
+  cluster join <name> <addr>  add a node and print the command that starts it. Two steps on
+                              two machines, in an order that only works one way round, so this
+                              does the half that belongs here
+  cluster add-node <n> <a>    the first half on its own, when the second is scripted elsewhere
+  cluster admit|drain|remove <name>
+  cluster split <shard> [to <node>] | cluster merge <range>
+  cluster move <range> to <node>
+  cluster add-replica <range> to <node>
+                              one more copy of a range that is already serving. It refuses
+                              nothing while it copies: the copy joins the group marked behind,
+                              so writes reach it at once and no read does until it agrees
+  cluster drop-replica <range> from <node>
+                              one copy fewer. The map stops naming it; nothing is deleted
+  cluster rebalance           one step, against facts gathered afresh
+  cluster schema-leader <node>
 
 Options:
   --addr <host:port>          default 127.0.0.1:7654, or $BIG_ADDR
@@ -545,6 +574,24 @@ fn command(positional: &[String], scoped: Vec<(String, String)>) -> Result<Comma
         ["cluster", "add-node", name, addr] => {
             only(&scoped, "cluster add-node", &[])?;
             Command::ClusterAddNode { name: (*name).to_string(), addr: (*addr).to_string() }
+        }
+        ["cluster", "add-replica", range, "to", node] => {
+            only(&scoped, "cluster add-replica", &[])?;
+            let range = range.parse().map_err(|_| {
+                format!("`{range}` is not a range id; write `cluster add-replica 1 to d`")
+            })?;
+            Command::ClusterReplica { add: true, range, node: (*node).to_string() }
+        }
+        ["cluster", "drop-replica", range, "from", node] => {
+            only(&scoped, "cluster drop-replica", &[])?;
+            let range = range.parse().map_err(|_| {
+                format!("`{range}` is not a range id; write `cluster drop-replica 1 from d`")
+            })?;
+            Command::ClusterReplica { add: false, range, node: (*node).to_string() }
+        }
+        ["cluster", "join", name, addr] => {
+            only(&scoped, "cluster join", &[])?;
+            Command::ClusterJoin { name: (*name).to_string(), addr: (*addr).to_string() }
         }
         ["cluster", "admit", name] => {
             only(&scoped, "cluster admit", &[])?;

@@ -43,6 +43,9 @@ pub struct Metrics {
     pub route_denied: AtomicU64,
     pub no_upstream: AtomicU64,
     pub retries: AtomicU64,
+    /// Nodes this proxy adopted from the cluster's membership, and nodes it dropped.
+    pub discovered: AtomicU64,
+    pub undiscovered: AtomicU64,
     pub bytes_in: AtomicU64,
     pub bytes_out: AtomicU64,
     /// Non-cumulative: each request lands in exactly one bucket, plus `overflow`.
@@ -98,6 +101,14 @@ impl Metrics {
         self.retries.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn upstream_discovered(&self) {
+        self.discovered.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn upstream_removed(&self) {
+        self.undiscovered.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Prometheus text, without the per-node gauges — those come from the pool, which knows.
     pub fn render(&self, out: &mut String) {
         let g = |a: &AtomicU64| a.load(Ordering::Relaxed);
@@ -131,6 +142,20 @@ impl Metrics {
             g(&self.no_upstream),
         );
         counter(out, "big_proxy_retries_total", "requests sent to a second node", g(&self.retries));
+        // Two counters rather than a gauge of the current count: the count is already on
+        // `/ready`, and what an operator cannot reconstruct from it is *when the set moved*.
+        counter(
+            out,
+            "big_proxy_upstreams_discovered_total",
+            "nodes added to this proxy from the cluster's membership",
+            g(&self.discovered),
+        );
+        counter(
+            out,
+            "big_proxy_upstreams_removed_total",
+            "nodes dropped from this proxy because the cluster no longer holds them",
+            g(&self.undiscovered),
+        );
         counter(
             out,
             "big_proxy_request_bytes_total",

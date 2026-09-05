@@ -559,3 +559,56 @@ fn who_leads_the_schema_is_not_part_of_the_shape() {
     // map, and a fresh cluster has nothing else to start from.
     assert!(matches!(ClusterFile::parse(&with("nobody")), Err(ConfigError::UnknownLeader { .. })));
 }
+
+// ------------------------------------------------------------------------------------------
+// Joining without a file
+//
+// A node that joins is given the cluster's id and one address, and takes the rest from the
+// node it dials. What it builds has to be the same kind of thing a file produces, because
+// everything downstream of startup knows only `ClusterConfig`.
+// ------------------------------------------------------------------------------------------
+
+/// The configuration a joining node builds is a *seed*: it names every peer so the agreement
+/// can be reached, and claims no range for the node itself.
+#[test]
+fn a_joining_node_names_every_peer_and_owns_nothing() {
+    let members = [
+        ("a".to_string(), "10.0.0.1:7654".to_string()),
+        ("b".to_string(), "10.0.0.2:7654".to_string()),
+    ];
+    let config = ClusterConfig::joining("big-demo", &members, "b").unwrap();
+
+    assert_eq!(config.nodes().len(), 2, "every peer is reachable: {:?}", config.nodes());
+    let me = config.this();
+    assert_eq!(me.name, "b");
+    assert!(me.replica_of.is_some(), "a joining node holds no range of its own");
+}
+
+/// **The id is what makes two nodes one cluster**, so a joining node computes the same
+/// fingerprint as the cluster it dialled - which is the check every peer request carries.
+#[test]
+fn a_joining_node_matches_the_fingerprint_of_the_cluster_it_dialled() {
+    let file = ClusterFile::parse(&format!("cluster_id = \"big-demo\"\n{TWO}")).unwrap();
+    let from_file = file.for_node(Some("a"), "").unwrap();
+
+    let members = [
+        ("a".to_string(), "10.0.0.1:7654".to_string()),
+        ("b".to_string(), "10.0.0.2:7654".to_string()),
+    ];
+    let joined = ClusterConfig::joining("big-demo", &members, "b").unwrap();
+
+    assert_eq!(joined.fingerprint(), from_file.fingerprint(), "same cluster, same stamp");
+}
+
+/// **A node the cluster has never heard of is refused at startup, by name.** This is the whole
+/// ergonomic point: the answer names the step that was skipped rather than leaving a daemon
+/// that looks healthy and is talking to nobody.
+#[test]
+fn a_node_the_cluster_does_not_know_is_refused_with_the_step_it_is_missing() {
+    let members = [("a".to_string(), "10.0.0.1:7654".to_string())];
+    let e = ClusterConfig::joining("big-demo", &members, "b").unwrap_err();
+
+    assert!(matches!(e, ConfigError::NotAMember { .. }), "{e:?}");
+    let said = e.to_string();
+    assert!(said.contains("add-node"), "it names the command that fixes it: {said}");
+}

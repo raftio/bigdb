@@ -197,6 +197,19 @@ impl Health {
         }
     }
 
+    /// A node discovered while this proxy was running starts **out** of rotation.
+    ///
+    /// The opposite of [`Health::new`], and the argument for that one is what inverts it. An
+    /// optimistic start is right at startup because the alternative is answering `503` while
+    /// every node is fine - an outage this process invented. A node that appeared mid-flight
+    /// invents no outage by waiting: the nodes already in rotation are still serving it. What
+    /// it does risk is the other way round - a node is admitted to a cluster *before* it has
+    /// caught up, so the one moment membership announces a node is the moment it is least
+    /// likely to be ready. It earns its place with `pass` probes like anything else.
+    pub fn joining(policy: Policy) -> Self {
+        Self { in_rotation: false, why: Some(Why::NotServing), ..Self::new(policy) }
+    }
+
     pub fn in_rotation(&self) -> bool {
         self.in_rotation
     }
