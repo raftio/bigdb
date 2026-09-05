@@ -160,3 +160,71 @@ fn an_unreadable_answer_names_nobody() {
     assert!(big_proxy::discover::members_of("not json at all").is_empty());
     assert!(big_proxy::discover::members_of(r#"{"members":[]}"#).is_empty());
 }
+
+// -------------------------------------------------------------------------------------------
+// Seeding one in while it runs
+// -------------------------------------------------------------------------------------------
+
+/// **A bind that is not loopback is refused, and the message says why rather than what.**
+///
+/// This port can point every client's traffic at a machine of the caller's choosing, and this
+/// proxy checks no credential of its own - so the bind is the whole of the access control.
+#[test]
+fn the_seeding_port_refuses_to_listen_anywhere_but_loopback() {
+    let err = big_proxy::admin::Admin::bind(
+        "0.0.0.0:0",
+        Policy::default(),
+        None,
+        None,
+        std::time::Duration::from_secs(1),
+    )
+    .expect_err("0.0.0.0 is not loopback");
+
+    assert!(err.contains("loopback"), "{err}");
+    assert!(err.contains("credential"), "it says why, not just what: {err}");
+}
+
+#[test]
+fn the_seeding_port_binds_on_loopback() {
+    let admin = big_proxy::admin::Admin::bind(
+        "127.0.0.1:0",
+        Policy::default(),
+        None,
+        None,
+        std::time::Duration::from_secs(1),
+    )
+    .expect("127.0.0.1 is loopback");
+    assert!(admin.local_addr().is_ok());
+}
+
+/// A seeded upstream is added, and starts out of rotation like anything else discovered.
+#[test]
+fn a_seeded_upstream_starts_out_of_rotation() {
+    let pool = pool_of(&[("a", "127.0.0.1:1")]);
+
+    assert!(pool.adopt_one(Upstream::new("b", "127.0.0.1:2"), Policy::default()));
+
+    let b = pool.nodes().into_iter().find(|n| n.up.name() == "b").expect("b was seeded");
+    assert!(!b.in_rotation(), "seeded, and not yet trusted with a request");
+}
+
+/// Seeding a name that is already here moves it rather than adding a second entry: a name is
+/// one node, and saying it again at a new address is that node having moved.
+#[test]
+fn seeding_a_name_that_is_already_here_moves_it() {
+    let pool = pool_of(&[("a", "127.0.0.1:1")]);
+
+    assert!(!pool.adopt_one(Upstream::new("a", "127.0.0.1:9"), Policy::default()), "not new");
+
+    assert_eq!(pool.nodes().len(), 1);
+    assert_eq!(pool.nodes()[0].up.addr(), "127.0.0.1:9");
+}
+
+#[test]
+fn an_upstream_can_be_forgotten_and_forgetting_an_unknown_one_says_so() {
+    let pool = pool_of(&[("a", "127.0.0.1:1"), ("b", "127.0.0.1:2")]);
+
+    assert!(pool.forget("b"));
+    assert!(!pool.forget("b"), "gone already");
+    assert_eq!(pool.nodes().len(), 1);
+}

@@ -174,6 +174,35 @@ impl Pool {
         (added, removed)
     }
 
+    /// Adds one upstream, or replaces the one of that name that is already here.
+    ///
+    /// `true` when it was new. Out of rotation to start with, for the reason
+    /// [`crate::health::Health::joining`] gives: existing is not serving.
+    pub fn adopt_one(&self, up: crate::upstream::Upstream, policy: Policy) -> bool {
+        let mut held = self.nodes.write().unwrap_or_else(|e| e.into_inner());
+        let node = Arc::new(Node::joining(up, policy));
+        match held.iter().position(|n| n.up.name() == node.up.name()) {
+            // Named again with a different address is the same node somewhere else, and the
+            // point of saying so is to be reached there.
+            Some(i) => {
+                held[i] = node;
+                false
+            }
+            None => {
+                held.push(node);
+                true
+            }
+        }
+    }
+
+    /// Removes an upstream by name. `true` when there was one.
+    pub fn forget(&self, name: &str) -> bool {
+        let mut held = self.nodes.write().unwrap_or_else(|e| e.into_inner());
+        let before = held.len();
+        held.retain(|n| n.up.name() != name);
+        held.len() != before
+    }
+
     /// The nodes to try, best first, skipping anything out of rotation.
     ///
     /// Returns empty when nothing is in rotation. **It does not fall back to a node known to be

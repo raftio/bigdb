@@ -48,6 +48,7 @@
 //! certificate either, which is what keeps `/internal/*` closed at the connection as well as at
 //! the route table.
 
+pub mod admin;
 pub mod allowlist;
 pub mod config;
 pub mod discover;

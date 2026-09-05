@@ -432,7 +432,7 @@ fn first_param(raw_query: &str, key: &str) -> Option<String> {
 }
 
 /// Percent-decode, treating `+` as a space the way a query string does.
-fn decode(s: &str) -> String {
+pub(crate) fn decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;

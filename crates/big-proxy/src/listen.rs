@@ -81,6 +81,8 @@ pub struct Config {
     /// Following the cluster's membership, when the operator asked for it. `None` is the list
     /// this proxy was started with and nothing else - see [`crate::discover`].
     pub discovery: Option<crate::discover::Discovery>,
+    /// A second listener where upstreams can be seeded while this runs. See [`crate::admin`].
+    pub admin: Option<crate::admin::Admin>,
     /// The listener's own certificate, when it has one.
     ///
     /// Built with `peer_ca: None`, which takes rustls' `with_no_client_auth()` branch: this
@@ -99,6 +101,7 @@ impl Default for Config {
             trust_forwarded_for: false,
             health: HealthConfig::default(),
             discovery: None,
+            admin: None,
             proto: "http",
             tls: None,
         }
@@ -173,6 +176,14 @@ impl Proxy {
             // health poller because they answer different questions at different costs: one is
             // an unauthenticated probe of every node, the other one authenticated read from a
             // single node, and folding them together would make each wait for the other.
+            // The seeding port, on a listener of its own. Separate from the one above because
+            // it is a different audience on a different address: this one is for whoever is on
+            // the machine, and the check that keeps it that way is the bind.
+            if let Some(admin) = &self.config.admin {
+                let pool = Arc::clone(&self.pool);
+                scope.spawn(move || admin.serve_while(&pool, running));
+            }
+
             if let Some(discovery) = self.config.discovery.clone() {
                 let pool = Arc::clone(&self.pool);
                 let metrics = &self.metrics;

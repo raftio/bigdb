@@ -68,6 +68,18 @@ Membership:
   --discover-credentials <f>  one `user:password` line, mode 600, for a role holding Operate.
                               Reading the membership is `GET /cluster/topology`, which demands
                               it; a cluster with no users file needs nothing here
+  --admin-addr <host:port>    a second listener where upstreams can be seeded while this runs:
+                                POST   /admin/upstream?name=a&addr=10.0.0.1:7654
+                                DELETE /admin/upstream?name=a
+                              **Loopback only, and refused anywhere else.** This proxy checks no
+                              credential of its own - it forwards the client's and never reads
+                              it - so a port that could add an upstream is a port that could
+                              point client traffic at anything. Reaching it has to mean already
+                              being on the machine.
+                              With --cluster-id, a seed must answer with that id before it is
+                              adopted, so a local caller cannot point this at another cluster
+  --cluster-id <name>         what the nodes behind this proxy call their cluster, checked
+                              against what a seeded node reports
 
 Forwarding:
   --allow-ops                 also forward /verify, /repair, /cluster/topology and /admin/*.
@@ -128,6 +140,10 @@ struct Options {
     max_retries: Option<usize>,
     /// Follow the cluster's membership rather than only the list this proxy was given.
     discover: bool,
+    /// A second listener, loopback only, where upstreams can be seeded while this runs.
+    admin_addr: Option<String>,
+    /// What the cluster behind this proxy is called, checked before a seed is adopted.
+    cluster_id: Option<String>,
     /// A file holding one `user:password` line, for the read that follows it.
     discover_credentials: Option<String>,
     tls_cert: Option<String>,
@@ -173,6 +189,8 @@ fn parse(args: &[String]) -> Result<Options, String> {
         health_pass: None,
         max_retries: None,
         discover: false,
+        admin_addr: None,
+        cluster_id: None,
         discover_credentials: None,
         tls_cert: None,
         tls_key: None,
@@ -214,6 +232,8 @@ fn parse(args: &[String]) -> Result<Options, String> {
             "--health-pass" => o.health_pass = Some(number(&value()?, flag)?.clamp(1, 255) as u8),
             "--max-retries" => o.max_retries = Some(number(&value()?, flag)?),
             "--discover" => o.discover = true,
+            "--admin-addr" => o.admin_addr = Some(value()?),
+            "--cluster-id" => o.cluster_id = Some(value()?),
             "--discover-credentials" => o.discover_credentials = Some(value()?),
             "--tls-cert" => o.tls_cert = Some(value()?),
             "--tls-key" => o.tls_key = Some(value()?),
@@ -297,11 +317,20 @@ fn upstreams(o: &Options) -> Result<Vec<(String, String)>, String> {
 
 fn run(o: Options) -> Result<(), String> {
     let nodes = upstreams(&o)?;
-    // There is no sensible default for "where do requests go". A proxy with nowhere to send
-    // them is a misconfiguration rather than a mode.
-    if nodes.is_empty() {
+    // **Empty is a state, not a misconfiguration - but only when something can fill it.**
+    //
+    // A proxy whose upstreams are all down answers `503` and keeps running; that is the same
+    // state as having none, one entry short. Refusing it at startup while tolerating it at
+    // runtime was the inconsistency, and it made "start the front door, bring the nodes up
+    // after" impossible for no reason a running proxy could name.
+    //
+    // Still refused without a way to be filled: a proxy with no upstreams, no discovery and no
+    // admin port is a process that will answer `503` until somebody restarts it, and starting
+    // one is a mistake worth hearing about at the moment it is made.
+    if nodes.is_empty() && !o.discover && o.admin_addr.is_none() {
         return Err(format!(
-            "no upstreams. Pass --upstream <name=addr> or --cluster <file>.\n\n{USAGE}"
+            "no upstreams, and nothing that could find one. Pass --upstream <name=addr> or \
+             --cluster <file>; or --discover, or --admin-addr to seed one while it runs.\n\n{USAGE}"
         ));
     }
 
@@ -405,6 +434,24 @@ fn run(o: Options) -> Result<(), String> {
         });
     } else if o.discover_credentials.is_some() {
         return Err("--discover-credentials does nothing without --discover".to_string());
+    }
+
+    if let Some(addr) = &o.admin_addr {
+        // Bound before the public listener, so a refused address is a startup failure rather
+        // than a port that is open with no way to fill it.
+        config.admin = Some(
+            big_proxy::admin::Admin::bind(
+                addr,
+                policy,
+                upstream_tls.clone(),
+                o.cluster_id.clone(),
+                health.budget,
+            )
+            .map_err(|e| e.to_string())?,
+        );
+    } else if o.cluster_id.is_some() {
+        return Err("--cluster-id is checked when an upstream is seeded, which needs --admin-addr"
+            .to_string());
     }
 
     let pool = Pool::new(ups, policy, o.max_retries.unwrap_or(2));
@@ -532,6 +579,12 @@ fn announce(bound: SocketAddr, o: &Options, nodes: &[(String, String)]) {
     );
     // Said either way. An operator reading a log to find out why a new node is getting no
     // traffic should not have to remember whether they passed the flag.
+    if let Some(addr) = &o.admin_addr {
+        println!(
+            "bigproxy: seeding port on http://{addr} — loopback only, and it checks no \
+             credential; reaching it means being on this machine"
+        );
+    }
     match (o.discover, o.discover_credentials.is_some()) {
         (true, true) => println!(
             "bigproxy: following the cluster's membership every {}ms, as the credentials file says",
