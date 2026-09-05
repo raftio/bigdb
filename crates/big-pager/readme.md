@@ -445,6 +445,24 @@ in one or two passes.
 
 *Test:* `repeated_commits_do_not_grow_the_file_without_bound`.
 
+**Pages a transaction gives back to itself feed this loop, and safely.** `WriteTxn::free` sends a
+page the transaction itself allocated to a scratch list rather than the freelist, so `alloc` can
+hand it straight back; `commit` calls `Freelist::absorb_scratch` on what is left, which lowers
+`next_pgno` past pages flush with the end of the file and pushes the rest. **Without that, those
+pages were lost outright:** materialised in the file, counted in `meta.page_count`, and named by
+nothing — and a single one of them at the end of the file stops §7.4 releasing anything at all.
+Every transaction whose tree shrinks produces some.
+
+They arrive stamped `freed_at = txn_id`, the committing transaction's own, which is above the
+horizon by construction (all three horizon terms are `.min(base.txn_id)`). So they inflate
+`entry_count` **without being allocatable**, and a shrinking commit may take one more chain page
+from the tail than it otherwise would; the next commit, whose horizon has moved, takes it back.
+The argument above is untouched — it rests on `alloc` taking from the front of a run, and
+`absorb_scratch` only ever calls `push`.
+
+*Tests:* `a_transaction_that_abandons_its_own_pages_leaves_no_trace`,
+`repeated_churning_commits_do_not_grow_the_file_without_bound`.
+
 ### 7.4 Returning space to the filesystem
 
 `truncate_tail` drops reclaimable runs that sit flush against the end of the file, repeatedly,

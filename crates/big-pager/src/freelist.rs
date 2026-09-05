@@ -85,6 +85,54 @@ impl Freelist {
         self.runs.push(FreeRun { freed_at, first: pgno, len: 1 });
     }
 
+    /// Takes back the pages a transaction both allocated and freed, and answers with the
+    /// `next_pgno` it should commit.
+    ///
+    /// **Without this they are lost.** A page a transaction allocates from the tail and then
+    /// frees never reaches the freelist - it goes to the transaction's scratch list, to be
+    /// handed straight back out if the same transaction allocates again. A transaction whose
+    /// tree *shrinks* allocates fewer times than it frees, so what is left over at commit is
+    /// counted in `page_count`, materialised in the file, and referenced by nothing: a page
+    /// the database will never read and never reuse. One of those at the end of the file is
+    /// enough to stop [`crate::Store::truncate_tail`] releasing anything at all.
+    ///
+    /// A page flush against the end is given back by lowering `next_pgno` rather than by being
+    /// recorded as free - the file simply never grows that far. Everything else is pushed.
+    ///
+    /// `freed_at` must be the committing transaction's own id, never lower: all three horizon
+    /// computations are at or below the *base* transaction, so a page stamped with this one is
+    /// pending for the whole of its own commit and cannot be handed out by the allocations
+    /// that follow - including the freelist's own, whose termination argument (readme §7.3)
+    /// assumes the entry count only falls while it runs.
+    pub fn absorb_scratch(
+        &mut self,
+        mut scratch: Vec<Pgno>,
+        next_pgno: u64,
+        freed_at: TxnId,
+    ) -> u64 {
+        if scratch.is_empty() {
+            return next_pgno;
+        }
+        scratch.sort_unstable();
+        // Freeing one page twice inside a transaction is a bug above this line either way, and
+        // it is already one today: `alloc` would hand the same page out twice. Collapsing it
+        // here makes the consequence the survivable one - a leak rather than two owners of one
+        // page - while the assertion still fails the test that produced it.
+        let before = scratch.len();
+        scratch.dedup();
+        debug_assert_eq!(before, scratch.len(), "a page was freed twice inside one transaction");
+
+        let mut next = next_pgno;
+        while scratch.last().is_some_and(|p| *p as u64 + 1 == next) {
+            scratch.pop();
+            next -= 1;
+        }
+        for p in scratch {
+            self.push(p, freed_at);
+        }
+        next
+    }
+
     /// Merges adjacent runs sharing a `freed_at`. This is where the run-length encoding pays off.
     ///
     /// **Ordered by page number, and that is what makes the file able to shrink.** It used to

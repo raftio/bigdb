@@ -128,6 +128,52 @@ impl<P: PagerMut> Db<P> {
         Ok(total)
     }
 
+    /// Counts the pages this file contains that nothing points at and nothing has recorded as
+    /// free.
+    ///
+    /// **It changes nothing.** A page like that is space the file will never use and never
+    /// give back, and - because [`Db::reclaim`] can only release pages flush against the end -
+    /// one of them at the top pins every free page beneath it. This says how many there are;
+    /// it does not free them, and the page numbers it reports must not be fed to anything that
+    /// does. See [`big_pager::LeakReport::leaked_sample`].
+    ///
+    /// **Cost is a full read of the live data**, the same as [`Db::scrub`] or a backup, and it
+    /// holds a read transaction throughout - so the reclaim horizon does not move while it
+    /// runs. Not for a request path and not for a timer.
+    ///
+    /// This is not a scrub: the walk parses every page it reads but does not verify checksums,
+    /// except on the chains, where an unverified `next` would send the walk to an arbitrary
+    /// page and count it as live. Run `big scrub` for the checksums.
+    ///
+    /// Any error aborts the whole audit rather than skipping a tree. A mark phase that
+    /// swallowed an error would under-mark, and under-marking reports leaks that are not
+    /// there - a wrong number presented as a fact is worse than a failure.
+    pub fn audit_pages(&self) -> Result<big_pager::LeakReport> {
+        let mut audit = self.store.begin_audit()?;
+
+        // The current trees. `visit_tree` yields branch pages, leaf pages and every page a
+        // leaf cell owns - dense bitmaps, the base page of a delta, and a columnar segment's
+        // spill page. Columnar segments share the root-record namespace, so they are already
+        // in `roots` and need no separate enumeration.
+        for root in core::mem::take(&mut audit.roots) {
+            big_btree::visit_tree(self.store.pager(), root, &mut |pgno, _| {
+                audit.mark_tree_page(pgno, false);
+                Ok(())
+            })?;
+        }
+
+        // **And the trees only a snapshot still names.** These are unreachable from the
+        // current roots and entirely live; `scrub` and `copy_to` both walk past them.
+        for root in core::mem::take(&mut audit.snapshot_roots) {
+            big_btree::visit_tree(self.store.pager(), root, &mut |pgno, _| {
+                audit.mark_tree_page(pgno, true);
+                Ok(())
+            })?;
+        }
+
+        Ok(audit.finish())
+    }
+
     /// What the row-key dictionary costs this process right now.
     ///
     /// Every row key is resident, in both directions, for the life of the process: a key has

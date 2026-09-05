@@ -43,6 +43,37 @@ pub fn load_chain<P: Pager>(
     Ok(out)
 }
 
+/// The same walk as [`chain_pgnos`], with every page's checksum verified before its `next` is
+/// followed.
+///
+/// **For a caller that is auditing rather than recycling.** `chain_pgnos` trusts `next`, which
+/// is right on the write path: it is reading a chain this process just wrote, and a checksum
+/// failure there would turn a damaged file into a refused *commit*. An audit is the opposite
+/// case - it reads a file it has no reason to trust, and an unverified `next` sends the walk to
+/// an arbitrary page which it would then count as live. That under-reports, which is the
+/// silent direction, so this one pays for the checksum.
+pub fn chain_pgnos_checked<P: Pager>(
+    pager: &P,
+    root: Option<Pgno>,
+    ty: PageType,
+    stride: usize,
+) -> Result<Vec<Pgno>> {
+    let mut out = Vec::new();
+    let mut cur = root;
+    let limit = pager.page_count() + 1;
+
+    while let Some(pgno) = cur {
+        if out.len() as u64 > limit {
+            return Err(StoreError::ChainCycle { root: root.unwrap_or(0) });
+        }
+        out.push(pgno);
+        let page = pager.read(pgno)?;
+        page.verify_checksum()?;
+        cur = ChainPage::parse(&page, ty, stride)?.next();
+    }
+    Ok(out)
+}
+
 /// Walks the chain and returns every page number, needed to hand them back to the freelist
 /// when the chain is rewritten.
 pub fn chain_pgnos<P: Pager>(

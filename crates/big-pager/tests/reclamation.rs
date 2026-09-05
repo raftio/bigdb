@@ -276,6 +276,58 @@ fn a_file_that_churns_can_be_given_back_to_the_filesystem() {
     );
 }
 
+// -------------------------------------------------------------------------------------------
+// Pages a transaction allocated and then gave up on
+//
+// A page freed above the tail floor goes to the transaction's scratch list rather than the
+// freelist, so `alloc` can hand it straight back. What is left there at commit used to be lost:
+// counted in `page_count`, present in the file, and referenced by nothing. Against the freelist
+// directly, for the reason at the top of this file.
+// -------------------------------------------------------------------------------------------
+
+/// A page flush against the end is given back by not growing the file that far, which is
+/// better than recording it as free: there is nothing to record and nothing to reuse.
+#[test]
+fn scratch_against_the_tail_is_given_back_rather_than_freed() {
+    let mut f = Freelist::default();
+    assert_eq!(f.absorb_scratch(vec![10, 11], 12, 5), 10);
+    assert!(f.is_empty(), "the file simply never grew that far");
+}
+
+/// A page with something live above it cannot be given back that way, so it is recorded free.
+#[test]
+fn scratch_below_the_tail_goes_to_the_freelist() {
+    let mut f = Freelist::default();
+    assert_eq!(f.absorb_scratch(vec![10], 12, 5), 12, "page 11 is live, so 10 cannot be dropped");
+    assert_eq!(f.runs(), [FreeRun { freed_at: 5, first: 10, len: 1 }]);
+}
+
+/// The giveback stops at the first gap - everything below the gap is recorded instead.
+#[test]
+fn the_giveback_stops_at_the_first_gap() {
+    let mut f = Freelist::default();
+    assert_eq!(f.absorb_scratch(vec![100, 102], 103, 7), 102);
+    assert_eq!(f.runs(), [FreeRun { freed_at: 7, first: 100, len: 1 }]);
+}
+
+/// **Stamped with the committing transaction, so it is pending for the whole of that commit.**
+/// A lower stamp would make the page allocatable while the freelist's own pages are still being
+/// chosen, which is the loop whose termination argument assumes the entry count only falls.
+#[test]
+fn an_absorbed_page_is_not_reusable_inside_its_own_commit() {
+    let mut f = Freelist::default();
+    f.absorb_scratch(vec![10], 12, 5);
+    assert_eq!(f.alloc(4), None, "the horizon is below this transaction");
+    assert_eq!(f.alloc(5), Some(10), "and it is reusable once the horizon reaches it");
+}
+
+#[test]
+fn absorbing_nothing_changes_nothing() {
+    let mut f = Freelist::default();
+    assert_eq!(f.absorb_scratch(Vec::new(), 12, 5), 12);
+    assert!(f.is_empty());
+}
+
 #[test]
 fn readers_are_refcounted_not_flagged() {
     let store = Store::init(MemPager::new()).unwrap();

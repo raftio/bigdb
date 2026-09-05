@@ -51,6 +51,10 @@ Offline, on a file nothing else has open:
   scrub <file>           recompute every checksum <file> can reach
                          opening checks the meta page and the chains; this checks the
                          trees, which nothing on the query path ever does
+  leaks <file>           account for every page: reachable, free, or neither
+                         a page in neither is one nothing will ever read and nothing
+                         will ever reuse; one at the end of the file stops `compact`
+                         giving anything back. reads only, and never repairs
 
 A backup is an ordinary database file. Restoring is opening it - `restore` exists so that the
 procedure has a name, not because the file needs converting.
