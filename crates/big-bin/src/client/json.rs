@@ -326,10 +326,16 @@ impl Answer {
             ["agree", "ranges"] => verify(&value),
             // `POST /repair`.
             ["repaired"] => repaired(&value),
-            // `GET /cluster/topology`.
-            ["cluster_id", "epoch", "leader", "schema_leader", "members", "ranges", "behind"] => {
-                topology(&value)
-            }
+            // `GET /cluster/topology`, recognised by the two arrays it is *about* rather than
+            // by its whole field list.
+            //
+            // **A field added to this answer must not stop an older client reading it.** The
+            // exact list here was one, and adding `cluster_id` to the route duly broke every
+            // `bigctl` built before it: the answer fell through to `flat`, which cannot render
+            // an array, and the operator got the raw JSON and an error. The daemon is allowed
+            // to grow a field, so what identifies a shape has to be what that shape is for -
+            // the same rule the proxy's reader of `cluster.toml` already follows.
+            _ if keys.contains(&"members") && keys.contains(&"ranges") => topology(&value),
             // Everything else the server writes is a flat object of scalars: a count, a sum, a
             // value, an id, a probe. Rendered as one row of its own keys, which is the reading
             // that needs no per-route knowledge and cannot be wrong about a shape it has not
