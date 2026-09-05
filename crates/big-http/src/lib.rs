@@ -224,12 +224,19 @@ impl<P: PagerMut + Sync + Send + 'static> Server<P> {
     }
 
     /// Binds with an explicit configuration, serving one database and no peers.
+    ///
+    /// The listener comes first here, where every other path builds the coordinator first.
+    /// That is what lets the solo node report the address it is *actually* on rather than the
+    /// one it was asked for - the two differ whenever the caller asked for port zero, and the
+    /// difference is the whole value of the report. See [`Cluster::solo`].
     pub fn bind_with(
         api: Api<P>,
         addr: impl ToSocketAddrs,
         config: ServerConfig,
     ) -> std::io::Result<Self> {
-        Self::bind_cluster(Cluster::solo(api), addr, config)
+        let listener = TcpListener::bind(addr)?;
+        let local = listener.local_addr()?.to_string();
+        Self::assembled(Cluster::solo(api, &local), listener, config)
     }
 
     /// Binds as one node of a configured cluster.
@@ -239,6 +246,16 @@ impl<P: PagerMut + Sync + Send + 'static> Server<P> {
     pub fn bind_cluster(
         cluster: Cluster<P>,
         addr: impl ToSocketAddrs,
+        config: ServerConfig,
+    ) -> std::io::Result<Self> {
+        Self::assembled(cluster, TcpListener::bind(addr)?, config)
+    }
+
+    /// The two `bind` paths once they each have a listener, so that what a server *is* is
+    /// written once however it was reached.
+    fn assembled(
+        cluster: Cluster<P>,
+        listener: TcpListener,
         config: ServerConfig,
     ) -> std::io::Result<Self> {
         // Once, here, because the ceiling on concurrent password verifications is a fact about
@@ -261,7 +278,7 @@ impl<P: PagerMut + Sync + Send + 'static> Server<P> {
                 backing_up: AtomicBool::new(false),
                 stopping: AtomicBool::new(false),
             }),
-            listener: TcpListener::bind(addr)?,
+            listener,
         })
     }
 

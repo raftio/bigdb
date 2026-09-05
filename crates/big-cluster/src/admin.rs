@@ -803,6 +803,7 @@ impl<P: PagerMut + Sync> Cluster<P> {
     pub fn topology(&self) -> Topology {
         let map = self.map();
         Topology {
+            cluster_id: self.config.cluster_id().to_string(),
             epoch: map.epoch,
             leader: self.controller.as_ref().and_then(|c| c.leader()).and_then(|n| self.name_of(n)),
             schema_leader: self.name_of_agreed(map.schema_leader),
@@ -886,6 +887,11 @@ impl Balanced {
 /// The cluster's shape, as a report.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Topology {
+    /// What names this cluster, empty when the operator never named one.
+    ///
+    /// Reported because it is what a node joining has to be given, and an operator who has to
+    /// go and read a file on another machine to find it is one who will copy the wrong one.
+    pub cluster_id: String,
     pub epoch: u64,
     /// Who leads the agreement, when this node knows.
     pub leader: Option<String>,

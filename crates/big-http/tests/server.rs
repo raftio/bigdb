@@ -412,6 +412,20 @@ fn a_table_in_another_database_is_reachable_by_path_and_by_parameter() {
     assert_eq!(body, r#"{"deleted":1}"#);
 }
 
+/// **A solo node reports the address it is actually serving**, which is the whole use of the
+/// field: an operator reading `/cluster/topology` through a proxy holding several upstreams is
+/// asking which node answered. The address used to be a hardcoded `127.0.0.1:7654`, so it named
+/// a port the daemon was not on the moment anybody served anywhere else - and this test binds
+/// port zero, so the answer cannot be a constant.
+#[test]
+fn a_solo_node_reports_the_address_it_is_actually_serving() {
+    let addr = spawn(1);
+
+    let (status, body) = send(addr, "GET", "/cluster/topology", "");
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains(&format!(r#""name":"local","addr":"{addr}""#)), "{body}");
+}
+
 /// A bare name still means the default database, even when another database has that table.
 ///
 /// The half of the change that could go wrong quietly: folding `?database=` into the name must

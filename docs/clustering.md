@@ -784,6 +784,37 @@ keeps the single address a client is holding from going dark halfway through a s
 changes is that the balancer takes its ranges away and gives it no new ones. Removing a node
 that still holds a range is refused.
 
+**A joining node needs an address, not a file.** `big serve --join <addr> --cluster-id <id>
+--node <name>` builds this node's configuration by asking a node that is already in the cluster,
+instead of reading a `cluster.toml` that had to be copied to the machine and kept current. What
+comes back is the membership the agreement holds — so a node admitted last week is in it, and no
+file anywhere had to be edited when it was.
+
+Three things still have to be *given*, and each is something that cannot be asked for.
+
+- **The name**, because the answer is a list this node has to find itself in.
+- **The cluster's id**, because every peer request carries a stamp derived from it: a node
+  cannot dial its way to an id it does not have. This is the rule `cluster_id` always had —
+  *a node that joins must be given the id, or it cannot be admitted* — and `--join` is what
+  makes it the whole of the configuration rather than one line of it.
+- **The peer CA**, where the nodes speak TLS, because trusting a peer is what makes its answer
+  worth reading at all.
+
+**Being added comes before starting, and the order is enforced rather than advised.** A node
+dials in presenting a certificate, and the roster a listener starts with decides which names a
+certificate may claim — so a node the cluster has never heard of is refused at the handshake.
+Startup says so by name, and names the command that was skipped, rather than leaving a daemon
+that looks healthy and is talking to nobody. `bigctl cluster join` does the adding and prints
+the starting command, so the two halves cannot be run the wrong way round.
+
+**A cluster that runs no agreement refuses the request.** Admission is a decision and a cluster
+whose ranges have no copies commits none — so this needs the third node that replication needs
+anyway, and says which step is impossible rather than which one is next.
+
+There is no discovery service to run and nothing gossips. A process that could name itself and
+be believed is a process that could start holding data because it said so; admission stays a
+decision recorded in the agreement, and identity stays a certificate signed by the cluster's CA.
+
 ### Deciding when
 
 The balancer is a **pure function** of the map, the membership and one number per node, so two

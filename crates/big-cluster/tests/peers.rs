@@ -229,7 +229,7 @@ fn a_cluster_of_one_runs_the_same_coordinator_and_asks_nobody() {
     // would be the path nobody tests, so this checks it is not a second path.
     let api = Api::in_memory().unwrap();
     api.create_table("tx").unwrap();
-    let c = Cluster::solo(api);
+    let c = Cluster::solo(api, "127.0.0.1:7654");
 
     assert_eq!(count(&c).unwrap().as_count(), Some(0));
 }

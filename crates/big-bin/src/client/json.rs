@@ -327,7 +327,9 @@ impl Answer {
             // `POST /repair`.
             ["repaired"] => repaired(&value),
             // `GET /cluster/topology`.
-            ["epoch", "leader", "schema_leader", "members", "ranges", "behind"] => topology(&value),
+            ["cluster_id", "epoch", "leader", "schema_leader", "members", "ranges", "behind"] => {
+                topology(&value)
+            }
             // Everything else the server writes is a flat object of scalars: a count, a sum, a
             // value, an id, a probe. Rendered as one row of its own keys, which is the reading
             // that needs no per-route knowledge and cannot be wrong about a shape it has not
@@ -560,6 +562,11 @@ fn topology(v: &Value) -> Result<Answer, String> {
     let mut notes = Vec::new();
     // `null` is a cell, and the cell it is is the empty string - so the check is emptiness
     // rather than absence.
+    // The cluster's name first, because it is what somebody reading this to add a node needs
+    // and the one field they cannot work out from the rows.
+    if let Some(id) = v.get("cluster_id").and_then(Value::cell).filter(|s| !s.is_empty()) {
+        notes.push(format!("cluster `{id}`"));
+    }
     match v.get("leader").and_then(Value::cell) {
         Some(leader) if !leader.is_empty() => notes.push(format!(
             "leader `{leader}`, schema leader `{}`, epoch {}",

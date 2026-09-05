@@ -486,8 +486,9 @@ pub fn topology(t: &Topology) -> String {
         None => "null".to_string(),
     };
     format!(
-        "{{\"epoch\":{},\"leader\":{},\"schema_leader\":{},\"members\":[{}],\"ranges\":[{}],\
-         \"behind\":[{}]}}",
+        "{{\"cluster_id\":{},\"epoch\":{},\"leader\":{},\"schema_leader\":{},\"members\":[{}],\
+         \"ranges\":[{}],\"behind\":[{}]}}",
+        string(&t.cluster_id),
         t.epoch,
         leader,
         string(&t.schema_leader),

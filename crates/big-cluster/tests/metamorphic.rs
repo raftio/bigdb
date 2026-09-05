@@ -110,7 +110,7 @@ fn db() -> &'static Cluster<MemPager> {
             )
             .unwrap();
         }
-        Cluster::solo(api)
+        Cluster::solo(api, "127.0.0.1:7654")
     })
 }
 

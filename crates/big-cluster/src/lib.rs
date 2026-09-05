@@ -200,6 +200,9 @@ pub mod path {
     /// Raise the agreement's ceiling on record ids for a table. Asked of the agreement's
     /// leader by a schema leader that is not it.
     pub const RESERVE: &str = "/internal/reserve";
+    /// Who is in the cluster, asked by a node starting with `--join` and no cluster file. The
+    /// only peer request made before this node has a cluster to be part of.
+    pub const JOIN: &str = "/internal/join";
 }
 
 /// One node, playing whichever of the three roles a given request needs.
@@ -266,8 +269,15 @@ impl<P: PagerMut + Sync> Cluster<P> {
     ///
     /// Infallible where [`Cluster::new`] is not, and provably: a cluster of one is not
     /// replicated, so no agreement is started and no state file is read.
-    pub fn solo(api: Api<P>) -> Self {
-        Self::new(api, ClusterConfig::solo("127.0.0.1:7654"), None, Box::new(raft::Forgetful))
+    ///
+    /// **`addr` is a parameter rather than a default, and it is not decoration.** No peer is
+    /// ever dialled here - the one node owns every range and is itself - but this is the
+    /// address `GET /cluster/topology` reports, which is what an operator reads to know which
+    /// node they are looking at. A hardcoded default answered with the port the daemon was
+    /// *not* on the moment anybody ran it anywhere else, and behind a proxy holding several
+    /// upstreams that is precisely the question being asked.
+    pub fn solo(api: Api<P>, addr: &str) -> Self {
+        Self::new(api, ClusterConfig::solo(addr), None, Box::new(raft::Forgetful))
             .expect("a cluster of one starts no agreement, so nothing can fail to load")
     }
 

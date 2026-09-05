@@ -167,6 +167,13 @@ pub enum ConfigError {
     Unplaced {
         addr: String,
     },
+    /// `--join` reached the cluster, and the cluster has never heard of this node.
+    ///
+    /// A separate failure from [`ConfigError::UnknownNode`], which is about a file this daemon
+    /// read: here the file is the agreement, and the fix is a command run somewhere else.
+    NotAMember {
+        name: String,
+    },
 }
 
 impl core::fmt::Display for ConfigError {
@@ -255,6 +262,11 @@ impl core::fmt::Display for ConfigError {
                 "this daemon binds {addr}, which no node in the file claims; pass --node <name> \
                  to say which one it is"
             ),
+            Self::NotAMember { name } => write!(
+                f,
+                "the cluster has no node named `{name}`; run `bigctl cluster add-node {name} \
+                 <addr>` against a node that is already in it, then start this one"
+            ),
         }
     }
 }
@@ -286,6 +298,20 @@ struct Draft {
     addr: String,
     shards: Option<ShardRange>,
     replica: Option<String>,
+}
+
+/// The stamp a named cluster answers to, from the name alone.
+///
+/// Split out because a node starting with `--join` has to send this header on the very request
+/// that fetches the membership - so it needs the number before it has a configuration to ask
+/// for one. Two ways of computing it would be two numbers the day one of them changed.
+pub fn fingerprint_of(cluster_id: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in cluster_id.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100_0000_01b3);
+    }
+    h
 }
 
 impl ClusterFile {
@@ -608,6 +634,63 @@ impl ClusterConfig {
         }
     }
 
+    /// The configuration a node builds when it was given an address instead of a file.
+    ///
+    /// **A seed, and deliberately a thin one.** It carries the two things startup cannot do
+    /// without - the id that makes this node's peer requests recognisable, and an address for
+    /// every peer so the agreement can be reached - and nothing else. Ownership is not among
+    /// them: this node is a replica of the first peer, which is the shape that parses without
+    /// overlapping anybody and claims no shard for a node that has not been given one. The
+    /// agreement replaces both the membership and the map on first contact, exactly as it
+    /// replaces what a file said.
+    ///
+    /// Ranges are not reconstructed here on purpose. A node that has taken part in a split
+    /// owns two ranges and the file format gives a node one, so a faithful rendering is not
+    /// always possible - and a seed that *looks* like the truth and is not would be worse than
+    /// one that is visibly a placeholder.
+    ///
+    /// `members` is what the dialled node's agreement holds, in its own order. Being absent
+    /// from it is [`ConfigError::NotAMember`], which is the common startup mistake and names
+    /// the command that fixes it.
+    pub fn joining(
+        cluster_id: &str,
+        members: &[(String, String)],
+        me: &str,
+    ) -> Result<Self, ConfigError> {
+        let this = members
+            .iter()
+            .position(|(name, _)| name == me)
+            .ok_or_else(|| ConfigError::NotAMember { name: me.to_string() })?;
+        // The first peer is the sole primary of the whole space, and everybody else - this node
+        // included - mirrors it. One range, so the seed is total and disjoint by construction.
+        let nodes = members
+            .iter()
+            .enumerate()
+            .map(|(i, (name, addr))| Node {
+                name: name.clone(),
+                addr: addr.clone(),
+                shards: ShardRange::ALL,
+                replica_of: (i != 0).then_some(0),
+            })
+            .collect();
+        Ok(Self {
+            nodes,
+            primary_count: 1,
+            groups: vec![(0..members.len()).collect()],
+            leader: 0,
+            this,
+            peer_ca_file: None,
+            cluster_id: Some(cluster_id.to_string()),
+        })
+    }
+
+    /// What names this cluster, for the answer a joining node is given. Empty when the
+    /// operator never named it - a cluster identified by the shape of its file cannot admit a
+    /// node whose file is a different shape, so there is nothing useful to hand over.
+    pub fn cluster_id(&self) -> &str {
+        self.cluster_id.as_deref().unwrap_or_default()
+    }
+
     /// A number every node of the same cluster computes alike.
     ///
     /// **What it is for has narrowed, because the file has.** It used to close the one failure
@@ -624,15 +707,10 @@ impl ClusterConfig {
     /// **A node that joins must be given the id**, or it cannot be admitted: its own file
     /// describes a different set of nodes and would hash differently.
     pub fn fingerprint(&self) -> u64 {
-        if let Some(id) = &self.cluster_id {
-            let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-            for b in id.as_bytes() {
-                h ^= *b as u64;
-                h = h.wrapping_mul(0x100_0000_01b3);
-            }
-            return h;
+        match &self.cluster_id {
+            Some(id) => fingerprint_of(id),
+            None => self.shape_fingerprint(),
         }
-        self.shape_fingerprint()
     }
 
     /// The old fingerprint: the shape of the file itself.

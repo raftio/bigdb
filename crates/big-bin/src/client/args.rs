@@ -123,6 +123,11 @@ pub enum Command {
         name: String,
         addr: String,
     },
+    /// `cluster join <name> <addr>` - `add-node`, then the command to run on the new machine.
+    ClusterJoin {
+        name: String,
+        addr: String,
+    },
     /// `cluster admit|drain|remove <name>` - the three one-node changes.
     ClusterMember {
         verb: &'static str,
@@ -224,6 +229,18 @@ Operations:
   verify                      do the copies of every range still agree
   repair                      catch up every copy that is behind
   health | ready | metrics    the three probes
+
+Cluster:
+  cluster topology            who is in it, what each holds, and who leads
+  cluster join <name> <addr>  add a node and print the command that starts it. Two steps on
+                              two machines, in an order that only works one way round, so this
+                              does the half that belongs here
+  cluster add-node <n> <a>    the first half on its own, when the second is scripted elsewhere
+  cluster admit|drain|remove <name>
+  cluster split <shard> [to <node>] | cluster merge <range>
+  cluster move <range> to <node>
+  cluster rebalance           one step, against facts gathered afresh
+  cluster schema-leader <node>
 
 Options:
   --addr <host:port>          default 127.0.0.1:7654, or $BIG_ADDR
@@ -545,6 +562,10 @@ fn command(positional: &[String], scoped: Vec<(String, String)>) -> Result<Comma
         ["cluster", "add-node", name, addr] => {
             only(&scoped, "cluster add-node", &[])?;
             Command::ClusterAddNode { name: (*name).to_string(), addr: (*addr).to_string() }
+        }
+        ["cluster", "join", name, addr] => {
+            only(&scoped, "cluster join", &[])?;
+            Command::ClusterJoin { name: (*name).to_string(), addr: (*addr).to_string() }
         }
         ["cluster", "admit", name] => {
             only(&scoped, "cluster admit", &[])?;
