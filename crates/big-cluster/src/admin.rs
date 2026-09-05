@@ -652,7 +652,7 @@ impl<P: PagerMut + Sync> Cluster<P> {
         self.await_reserved(table, upto)
     }
 
-    /// The agreement leader's half of [`Cluster::reserve_ids`]: commits the ceiling.
+    /// The agreement leader's half of `Cluster::reserve_ids`: commits the ceiling.
     ///
     /// Public because the peer route calls it. Answers the epoch it landed at.
     pub fn reserve_here(&self, table: &str, upto: RecordId) -> Result<u64> {

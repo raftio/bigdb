@@ -77,7 +77,7 @@ use big_page::{
 };
 use chainio::{chain_pgnos, chain_pgnos_checked, load_chain};
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex, MutexGuard, RwLock};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock};
 
 /// Test-only failpoint. Compiled out unless the `crash-injection` feature is on, so production
 /// builds cannot be aborted by an environment variable.
@@ -283,11 +283,54 @@ pub struct Store<P: Pager> {
     /// written once per commit and read by whoever is curious, and neither should wait on the
     /// other.
     last_commit: Mutex<metrics::CommitBreakdown>,
+    /// Notified after every commit, for [`Store::wait_for_txn`].
+    ///
+    /// **Its own mutex rather than the state lock.** A waiter has to hold something while it
+    /// waits, and holding `state` would block the very commit it is waiting for. The mutex
+    /// guards nothing at all — the transaction id it wakes to read lives in `state.meta` — so
+    /// it is a `()`, and every waiter re-reads the real answer after each wake.
+    committed: (Mutex<()>, Condvar),
 }
 
 impl<P: Pager> Store<P> {
     pub fn pager(&self) -> &P {
         &self.pager
+    }
+
+    /// The transaction the file is at right now.
+    pub fn txn_id(&self) -> TxnId {
+        self.state.read().unwrap().meta.txn_id
+    }
+
+    /// Waits until this store has committed `txn` or later, and says whether it did.
+    ///
+    /// **Bounded, always.** A caller naming a transaction this store will never reach - one
+    /// from a different node, or one that was never committed here - must get an answer rather
+    /// than a thread that never comes back, so the deadline is the caller's and there is no
+    /// form of this without one.
+    ///
+    /// The condvar is only a hint that *something* committed: the loop re-reads the meta each
+    /// time it wakes, so a spurious wake or a commit of some other transaction costs a read and
+    /// nothing else.
+    pub fn wait_for_txn(&self, txn: TxnId, deadline: std::time::Instant) -> bool {
+        if self.txn_id() >= txn {
+            return true;
+        }
+        let mut guard = self.committed.0.lock().unwrap_or_else(|p| p.into_inner());
+        loop {
+            if self.txn_id() >= txn {
+                return true;
+            }
+            let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) else {
+                return false;
+            };
+            let (next, timed_out) =
+                self.committed.1.wait_timeout(guard, left).unwrap_or_else(|p| p.into_inner());
+            guard = next;
+            if timed_out.timed_out() {
+                return self.txn_id() >= txn;
+            }
+        }
     }
 
     /// What a commit currently promises.
@@ -372,6 +415,7 @@ impl<P: Pager> Store<P> {
             write_lock: Mutex::new(()),
             durability: std::sync::atomic::AtomicU8::new(Durability::default().as_u8()),
             last_commit: Mutex::new(metrics::CommitBreakdown::default()),
+            committed: (Mutex::new(()), Condvar::new()),
         })
     }
 
@@ -898,6 +942,9 @@ impl<P: PagerMut> Store<P> {
         st.freelist = freelist;
         drop(st);
         *self.last_commit.lock().unwrap() = tally;
+        // After the state is published, so anybody woken here reads the new meta rather than
+        // the one this commit replaced.
+        self.committed.1.notify_all();
         Ok(txn_id)
     }
 

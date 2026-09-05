@@ -265,6 +265,34 @@ write the durable way instead: backpressure aimed at whoever filled the buffer, 
 lost and no new error. `refuse` answers `503` with code `server_busy` — the same code the
 connection shedder uses, so a client that already backs off on one backs off on the other.
 
+## Read your own write
+
+Every write answers with a header saying where this node's history got to:
+
+```
+X-Big-Txn: local/41
+```
+
+Send it back on a read to be caught up first:
+
+```
+POST /sql?min_txn=local/41        # answered once this node is at 41 or later
+POST /sql?min_txn=local/41&wait=250   # ...or 504 not_caught_up after 250ms
+```
+
+- **The node name is half the value.** A transaction id is monotonic within one file and means
+  nothing outside it. Sending node `a`'s number to node `b` is `409 wrong_node` in one round
+  trip, rather than a wait for something that cannot arrive.
+- **Through `bigproxy` it is not useful**, because the client does not choose which node
+  answers. This is for a client talking to a node directly.
+- **You rarely need it.** A `?ack=commit` write is already durable and visible when it returns;
+  this exists for the client that wrote to one node and reads from another, and for the one that
+  wants to overlap a write with the read that follows it rather than serialising them.
+- **`?ack=queued` writes get no header**, because there is no transaction yet to name. Answering
+  early and reading your own write back are the two halves of a trade: pick one per request.
+
+`wait` defaults to 1000ms and is capped at 60s.
+
 ## Check the file for rot
 
 ```sh

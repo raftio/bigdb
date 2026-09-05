@@ -777,3 +777,72 @@ fn a_node_that_answers_only_durably_publishes_an_empty_queue() {
     assert!(r.body.contains("big_write_queue_oldest_seconds 0.000"), "{}", r.body);
     assert!(r.body.contains("big_write_queue_refused_total 0"), "{}", r.body);
 }
+
+/// A write says where this node's history got to, and a read can be told to wait for it.
+#[test]
+fn a_write_says_which_transaction_and_a_read_can_wait_for_it() {
+    let addr = spawn(2, config());
+
+    let wrote = send(addr, "POST", "/table/tx/import", "amount 100 1\n");
+    assert_eq!(wrote.status, 200, "{}", wrote.body);
+    let txn = wrote
+        .headers
+        .lines()
+        .find_map(|l| l.strip_prefix("X-Big-Txn: "))
+        .expect("a write says which transaction carried it")
+        .trim()
+        .to_string();
+    // `<node>/<transaction>`. The name is half the value: a bare number could be sent to a node
+    // it means nothing on.
+    let (node, number) = txn.split_once('/').expect("node/transaction");
+    assert_eq!(node, "local", "a server with no cluster file is one node called `local`");
+    assert!(number.parse::<u64>().is_ok(), "{txn}");
+
+    // Asking to be caught up to a transaction this node has already passed is free.
+    let caught = send(addr, "POST", &format!("/sql?min_txn={txn}"), "SELECT count(*) FROM tx");
+    assert_eq!(caught.status, 200, "{}", caught.body);
+    assert!(caught.body.contains("33"), "the write is visible: {}", caught.body);
+}
+
+/// A transaction id from another node names a history this one does not have. Refused in one
+/// round trip rather than waited out and reported as a timeout.
+#[test]
+fn a_transaction_from_another_node_is_refused_rather_than_waited_for() {
+    let addr = spawn(1, config());
+
+    let r = send(addr, "POST", "/sql?min_txn=somewhere-else/9", "SELECT count(*) FROM tx");
+    assert_eq!(r.status, 409, "{}", r.body);
+    assert!(r.body.contains("wrong_node"), "{}", r.body);
+    assert!(r.body.contains("somewhere-else"), "and names both nodes: {}", r.body);
+    assert!(r.body.contains("local"), "{}", r.body);
+}
+
+/// A transaction this node will never reach times out, with a deadline the caller chose.
+#[test]
+fn waiting_for_a_transaction_that_never_comes_is_a_timeout_not_a_hang() {
+    let addr = spawn(1, config());
+
+    let started = std::time::Instant::now();
+    let r = send(addr, "POST", "/sql?min_txn=local/999999&wait=50", "SELECT count(*) FROM tx");
+    assert_eq!(r.status, 504, "{}", r.body);
+    assert!(r.body.contains("not_caught_up"), "{}", r.body);
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "it waited far past the 50ms it was given: {:?}",
+        started.elapsed()
+    );
+}
+
+/// A `min_txn` that is not one is a refusal that says what the shape is.
+#[test]
+fn a_min_txn_that_is_not_one_says_what_the_shape_is() {
+    let addr = spawn(2, config());
+
+    let bare = send(addr, "POST", "/sql?min_txn=12", "SELECT count(*) FROM tx");
+    assert_eq!(bare.status, 422, "{}", bare.body);
+    assert!(bare.body.contains("X-Big-Txn"), "it names where to get one: {}", bare.body);
+
+    let nonsense = send(addr, "POST", "/sql?min_txn=local/soon", "SELECT count(*) FROM tx");
+    assert_eq!(nonsense.status, 422, "{}", nonsense.body);
+    assert!(nonsense.body.contains("soon"), "{}", nonsense.body);
+}

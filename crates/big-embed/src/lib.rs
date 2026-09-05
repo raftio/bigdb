@@ -1551,6 +1551,24 @@ impl<P: PagerMut + Sync> Api<P> {
         Ok(self.db.reclaim()?)
     }
 
+    /// The transaction this database is at.
+    ///
+    /// Monotonic within one file and **meaningless outside it**: a number from another node
+    /// names a different history, so it is only ever comparable against the node that issued
+    /// it. Whoever hands it to a client is responsible for saying which node that was.
+    pub fn txn_id(&self) -> big_pager::TxnId {
+        self.db.store().txn_id()
+    }
+
+    /// Waits until this database has committed `txn` or later, and says whether it did.
+    ///
+    /// What makes a write answered early readable on purpose: a caller that was handed a
+    /// transaction id can ask to be caught up to it before its next read, instead of guessing
+    /// with a sleep. Bounded by `deadline`, always — see [`big_pager::Store::wait_for_txn`].
+    pub fn wait_for_txn(&self, txn: big_pager::TxnId, deadline: std::time::Instant) -> bool {
+        self.db.store().wait_for_txn(txn, deadline)
+    }
+
     /// What the row-key dictionary costs this process. See [`Db::key_stats`].
     pub fn key_stats(&self) -> KeyStats {
         self.db.key_stats()

@@ -141,6 +141,13 @@ Listing:
   GET /table/{t}/records?after=<id>&limit=<n>   records in order, a page at a time
                               `next` in the response is the id to send back as `after`
 
+Reading your own write:
+  every write answers with X-Big-Txn: <node>/<transaction>
+  ?min_txn=<node>/<transaction>   do not answer until this node is at least there
+  ?wait=<ms>                      how long that may take, default 1000, capped at 60000
+                              a transaction from another node is 409, not a wait: an id
+                              means nothing outside the file that issued it
+
 Replication:
   GET  /verify   do the copies of every range still hold the same facts
                  a scan, not a probe; needs OPERATE on *.*

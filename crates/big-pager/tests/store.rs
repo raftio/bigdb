@@ -14,6 +14,7 @@
 
 use big_page::{FragmentKey, LeafBuilder, Page};
 use big_pager::*;
+use std::sync::Arc;
 
 fn key(field: u32, shard: u64) -> FragmentKey {
     FragmentKey::new(1, field, 0, shard)
@@ -500,4 +501,56 @@ fn one_damaged_meta_slot_is_still_recoverable() {
 
     let store = Store::load(pager).unwrap();
     assert_eq!(store.meta().txn_id, good);
+}
+
+/// A waiter is woken by the commit it was waiting for, rather than by a timer expiring.
+///
+/// The assertion is on the *answer*, not on the timing: a condvar may wake spuriously and a
+/// scheduler may be slow, so "it returned true well before its deadline" is the honest claim.
+/// Without the notify in `commit_txn` this would still pass — after waiting out the full five
+/// seconds — which is what the elapsed check is for.
+#[test]
+fn a_waiter_is_woken_by_the_commit_it_asked_for() {
+    let store = Arc::new(Store::init(MemPager::new()).unwrap());
+    let at = store.txn_id();
+
+    let waiter = {
+        let store = Arc::clone(&store);
+        std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let started = std::time::Instant::now();
+            (store.wait_for_txn(at + 1, deadline), started.elapsed())
+        })
+    };
+
+    // Long enough that the waiter is parked rather than racing the check at the top.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    put_fragment(&store, key(1, 0));
+
+    let (caught_up, took) = waiter.join().unwrap();
+    assert!(caught_up, "the commit happened and the waiter was told");
+    assert!(took < std::time::Duration::from_secs(4), "it waited out its deadline: {took:?}");
+}
+
+/// A transaction that never arrives is a deadline, not a hang.
+#[test]
+fn waiting_for_a_transaction_that_never_comes_gives_up_on_time() {
+    let store = Store::init(MemPager::new()).unwrap();
+    let started = std::time::Instant::now();
+    let deadline = started + std::time::Duration::from_millis(50);
+
+    assert!(!store.wait_for_txn(store.txn_id() + 100, deadline));
+    assert!(started.elapsed() < std::time::Duration::from_secs(2), "{:?}", started.elapsed());
+}
+
+/// A transaction already behind us costs nothing at all - no lock, no wait.
+#[test]
+fn waiting_for_something_already_committed_returns_at_once() {
+    let store = Store::init(MemPager::new()).unwrap();
+    put_fragment(&store, key(1, 0));
+    let at = store.txn_id();
+
+    // A deadline in the past, so anything that actually waited would report failure.
+    let past = std::time::Instant::now() - std::time::Duration::from_secs(1);
+    assert!(store.wait_for_txn(at, past));
 }
