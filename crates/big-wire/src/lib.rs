@@ -42,7 +42,7 @@ pub mod request;
 pub mod response;
 
 pub use request::{Basic, Request, RequestError};
-pub use response::{reason_for, Response};
+pub use response::{reason_for, Chunked, Response, Streaming, LAST_CHUNK};
 
 /// Largest request body accepted, so a single client cannot ask the process to allocate
 /// without bound.

@@ -215,3 +215,73 @@ fn durability_is_announced_on_every_start_not_only_when_it_is_relaxed() {
     until("the default daemon to announce itself", || default.log().contains("durability"));
     assert!(default.log().contains("durability full"), "{}", default.log());
 }
+
+#[test]
+fn write_coalescing_is_announced_both_ways_and_actually_writes() {
+    // Both ways for the same reason durability is: what a commit cost is the first thing an
+    // operator reaches for when write latency is the question.
+    let on = Daemon::with(&["--write-coalesce"]);
+    until("the coalescing daemon to announce itself", || on.log().contains("coalescing writes"));
+    assert!(on.log().contains("per commit"), "{}", on.log());
+
+    // And it is a working database, not just a flag that parses.
+    on.bigctl(&["create", "table", "tx"]).expect(0);
+    on.bigctl(&["create", "field", "tx", "amount", "--kind", "int", "--bit-depth", "20"]).expect(0);
+    on.bigctl_stdin(&["import", "tx", "-"], "amount 1 100\namount 2 250\n").expect(0);
+    let answer = on.bigctl(&["sql", "SELECT sum(amount) FROM tx"]).expect(0);
+    assert!(answer.out.contains("350"), "{}", answer.out);
+
+    let off = Daemon::start();
+    until("the default daemon to announce itself", || off.log().contains("--write-coalesce"));
+    assert!(off.log().contains("every write is its own commit"), "{}", off.log());
+}
+
+#[test]
+fn the_group_ceilings_are_rejected_when_they_are_not_numbers() {
+    let refused =
+        run("big", &["serve", "/tmp/nothing.big", "--write-group-jobs", "lots"]).expect(2);
+    assert!(refused.said("--write-group-jobs"), "and says which flag: {}", refused.err);
+}
+
+#[test]
+fn early_answers_are_announced_both_ways_and_need_coalescing() {
+    // The flag that changes what a write *promises* has to be visible in the log both ways:
+    // after a crash, "could anything have been acknowledged and lost" is the first question.
+    let on = Daemon::with(&["--write-coalesce", "--write-async", "--write-linger", "50"]);
+    until("the daemon to announce itself", || on.log().contains("ack=queued"));
+    assert!(on.log().contains("for at most 50ms"), "{}", on.log());
+
+    let off = Daemon::start();
+    until("the default daemon to announce itself", || off.log().contains("--write-async"));
+    assert!(off.log().contains("only once it is durable"), "{}", off.log());
+}
+
+#[test]
+fn asking_for_early_answers_without_coalescing_is_refused() {
+    // Not silently ignored: an operator who passed the flag and got durable answers would see
+    // the latency and no reason for it.
+    let refused = run("big", &["serve", "/tmp/nothing.big", "--write-async"]).expect(2);
+    assert!(refused.said("--write-async needs --write-coalesce"), "{}", refused.err);
+}
+
+#[test]
+fn a_when_full_policy_that_is_not_one_of_the_two_is_refused_with_both() {
+    let refused =
+        run("big", &["serve", "/tmp/nothing.big", "--write-when-full", "panic"]).expect(2);
+    assert!(refused.said("block or refuse"), "lists what it takes: {}", refused.err);
+    assert!(refused.said("panic"), "and repeats what it got: {}", refused.err);
+}
+
+#[test]
+fn watching_is_announced_both_ways_with_the_number_that_matters() {
+    // The number is announced next to the pool because a subscriber holds a worker: an operator
+    // sizing --workers needs to see both, not infer one from the other.
+    let on = Daemon::with(&["--watch-max", "8"]);
+    until("the daemon to announce itself", || on.log().contains("/watch"));
+    assert!(on.log().contains("at most 8 subscriptions"), "{}", on.log());
+    assert!(on.log().contains("workers"), "and says what it is competing with: {}", on.log());
+
+    let off = Daemon::start();
+    until("the default daemon to announce itself", || off.log().contains("--watch-max"));
+    assert!(off.log().contains("not configured"), "{}", off.log());
+}

@@ -194,6 +194,144 @@ inside the file are reused by the next allocation, so a file does not grow witho
 it does not shrink on its own either. A table that was large once keeps its high-water mark
 until someone runs this.
 
+## Share a commit between writers
+
+```sh
+big serve /var/lib/big/data.big --write-coalesce
+```
+
+A commit costs two fsyncs, a full catalog clone on the way in and a full catalog encode on the
+way out, and **none of that is per fact**. The store allows one writer, so ten producers
+importing at the same moment are serialised whatever you do; without this they are serialised
+into ten commits and twenty fsyncs. With it they share one.
+
+- **It costs an idle server nothing.** The group is collected in the window the first writer
+  spends waiting for the write lock — the window it was blocked in anyway. There is no timer, so
+  a write with no company waits for none, and a node with no write contention behaves exactly as
+  it did.
+- **A batch this database refuses still fails alone.** A failed group is rolled back — nothing
+  reached the disk — and re-run by halves until the offender is by itself. The other batches in
+  it succeed, and each caller gets its own error rather than somebody else's.
+- **`200` still means durable.** The call returns after the commit that carried it was flushed.
+  This changes what a commit costs, never what it promises.
+- **What to watch:** `big_write_commit_jobs_total / big_write_commits_total` is the average
+  group size and therefore the win. It sits at `1.00` on a node with no write contention, which
+  is the correct reading rather than a disappointing one — there was nothing to share.
+- **When it may not pay.** Under `--durability none` there are no fsyncs to amortise, and the
+  batch is copied into the queue rather than borrowed from the request. Measure before leaving it
+  on there.
+
+`--write-group-jobs` and `--write-group-facts` bound one commit. The second is the one to reach
+for: it is what stops a one-fact request inheriting the wait of a million-fact request it
+happened to arrive behind. A batch larger than the ceiling still goes on its own.
+
+## Answer a write before it is durable
+
+```sh
+big serve /var/lib/big/data.big --write-coalesce --write-async
+```
+
+Then a client may ask for it, per request:
+
+```
+POST /table/tx/import?ack=queued   ->  {"imported":2,"durable":false}
+```
+
+**This is a different promise, not a faster one.** Read the whole of this section before turning
+it on.
+
+- **What you gain.** The call returns as soon as the facts are held, so a producer's latency
+  stops being one fsync and becomes one memcpy. A commit still happens — carried by the next
+  writer along, or by this node's writer thread within `--write-linger`.
+- **What you lose, first.** Anything acknowledged and not yet committed is **gone** if the
+  process dies. `--write-queue-bytes` is the ceiling on how much that can be, and
+  `big_write_queue_bytes` is how much it is right now.
+- **What you lose, second, and it is the one people do not expect.** A batch this database turns
+  out to refuse — a value too wide, a key too long — has **nobody left to tell**. The caller was
+  answered a moment ago. It is counted in `big_write_acknowledged_lost_total` and nowhere else.
+  **Alert on that counter being anything but zero.**
+- **An orderly shutdown loses nothing.** `SIGTERM` stops the listener, joins the workers, and
+  only then drains what is held; the count is logged. A `SIGKILL` is a different thing and
+  loses whatever was waiting.
+- **Single node only, for now.** A node with peers refuses `?ack=queued` with `422
+  ack_not_available`. In a cluster a write is answered when every copy has taken it, and a node
+  acking before it has written would turn the coordinator's report from a statement about
+  *reachability* into a claim about *durability* that is not true.
+- **`?ack=commit` is the default and is unchanged.** A client that asks for nothing gets the
+  same bytes it always got — no `durable` field, no new behaviour.
+
+`--write-when-full` decides what happens at the ceiling. The default, `block`, answers that
+write the durable way instead: backpressure aimed at whoever filled the buffer, with nothing
+lost and no new error. `refuse` answers `503` with code `server_busy` — the same code the
+connection shedder uses, so a client that already backs off on one backs off on the other.
+
+## Read your own write
+
+Every write answers with a header saying where this node's history got to:
+
+```
+X-Big-Txn: local/41
+```
+
+Send it back on a read to be caught up first:
+
+```
+POST /sql?min_txn=local/41        # answered once this node is at 41 or later
+POST /sql?min_txn=local/41&wait=250   # ...or 504 not_caught_up after 250ms
+```
+
+- **The node name is half the value.** A transaction id is monotonic within one file and means
+  nothing outside it. Sending node `a`'s number to node `b` is `409 wrong_node` in one round
+  trip, rather than a wait for something that cannot arrive.
+- **Through `bigproxy` it is not useful**, because the client does not choose which node
+  answers. This is for a client talking to a node directly.
+- **You rarely need it.** A `?ack=commit` write is already durable and visible when it returns;
+  this exists for the client that wrote to one node and reads from another, and for the one that
+  wants to overlap a write with the read that follows it rather than serialising them.
+- **`?ack=queued` writes get no header**, because there is no transaction yet to name. Answering
+  early and reading your own write back are the two halves of a trade: pick one per request.
+
+`wait` defaults to 1000ms and is capped at 60s.
+
+## Push an answer instead of being asked for it
+
+```sh
+big serve /var/lib/big/data.big --watch-max 32
+```
+
+```
+GET /watch?sql=SELECT%20count(*)%20FROM%20tx&interval=1000
+Accept: text/event-stream
+
+event: answer
+id: local/41
+data: {"columns":["count"],"rows":[[41820]]}
+```
+
+A client registers one `SELECT` and is pushed the answer again **whenever it changes**. The
+`id` is the same `<node>/<transaction>` `X-Big-Txn` uses.
+
+- **A live query, not a change feed.** This engine keeps no log of logical changes —
+  copy-on-write preserves old *pages*, which says nothing about which facts moved. What it has
+  instead is answers that are *numbers*, so it re-runs the statement and pushes the result when
+  it differs. If you need to know which rows changed, this is not that and will not become it.
+- **Each subscriber holds a worker for as long as it stays connected.** That is the real cost.
+  Keep `--watch-max` well under `--workers`, or subscriptions will starve ordinary requests.
+  Past the cap the route answers `503 server_busy` with `Retry-After`.
+- **How soon a push follows a write depends on the shape of the deployment.** On a node writing
+  alone it follows the commit immediately, because it waits on the same signal `?min_txn=` does.
+  On a node with peers a commit elsewhere signals nothing here, so `?interval=` is the whole
+  trigger — that is a real difference and not a tuning knob.
+- **The grant is re-checked on every push**, so a `REVOKE` ends the stream rather than being
+  noticed the next time the client reconnects.
+- **Not available through `bigproxy`.** Subscribe to a node directly; see
+  [docs/proxy.md](docs/proxy.md) for why.
+- **Nothing is replayed.** Reconnecting gets you the current answer, not what you missed. The
+  `id` tells you where the node's history had got to, which is enough to know *that* you missed
+  something.
+
+`interval` is clamped to between 50ms and 5 minutes.
+
 ## Check the file for rot
 
 ```sh
@@ -297,6 +435,14 @@ Everything `big serve` takes:
 | `--read-timeout <s>` | `30` | How long a client may take to send a request |
 | `--query-timeout <s>` | none | Wall-clock budget for one query. `0` means none |
 | `--durability <level>` | `full` | What a commit promises. See below |
+| `--write-coalesce` | off | Let concurrent writes share a commit. See below |
+| `--write-group-jobs <n>` | `64` | Batches one shared commit may carry |
+| `--write-group-facts <n>` | `1048576` | Facts one shared commit may carry |
+| `--write-async` | off | Offer `?ack=queued`: answered before it is durable. See below |
+| `--write-linger <ms>` | `200` | The longest an acknowledged write waits to be committed |
+| `--write-queue-bytes <size>` | `64M` | Acknowledged, uncommitted writes this node may hold |
+| `--write-when-full <policy>` | `block` | `block` answers durably instead; `refuse` answers `503` |
+| `--watch-max <n>` | `0` (off) | Subscriptions `GET /watch` may hold at once. Each holds a worker |
 | `BIG_LOG` | `info` | `off`, `error`, `warn`, `info`, `debug` |
 
 **`big serve` refuses to bind anywhere but loopback without `--users`, and refuses again
@@ -831,6 +977,14 @@ catalog as a new record kind, which is additive and needs no format version bump
 | Metric | It means |
 |---|---|
 | `big_free_pages_reusable` | Free pages the next allocation may take |
+| `big_write_commits_total` | Write transactions that reached the disk |
+| `big_write_commit_jobs_total` | Batches those transactions carried. Divided by the above: the average group size |
+| `big_write_isolations_total` | Groups that failed and had to be split to find the batch at fault |
+| `big_write_isolation_attempts_total` | Transactions opened while splitting. Against the above, what one bad batch costs everyone else |
+| `big_write_queue_bytes` | Acknowledged and not yet committed. What is lost if this node dies now |
+| `big_write_queue_oldest_seconds` | How long the oldest acknowledged write has waited. The durability lag |
+| `big_write_queue_refused_total` | Writes turned away because the buffer was full |
+| `big_write_acknowledged_lost_total` | Accepted data that did not land, and nobody was told. **Alert on any value** |
 | `big_pages_pending_reclaim_reader` | Free but pinned by a live reader |
 | `big_pages_pending_reclaim_retention` | Free but pinned by a snapshot |
 | `big_page_count` | Pages in the file |
@@ -877,6 +1031,18 @@ big_pages_pending_reclaim_reader > 10000
 
 # The pool is the limit, not the engine. Raise --workers, or find what is slow.
 rate(big_http_connections_rejected_total[5m]) > 0
+
+# A client is sending batches this database refuses, and everybody else is paying for the
+# splitting that finds them. Look for the 4xx in the log and go and tell whoever is sending it.
+rate(big_write_isolation_attempts_total[5m]) / rate(big_write_isolations_total[5m]) > 4
+
+# Data this node said it had and then could not write. Nobody was told, because the caller had
+# already been answered. This is the alert that justifies --write-async having a flag at all.
+increase(big_write_acknowledged_lost_total[15m]) > 0
+
+# Acknowledged writes are not being committed. --write-linger says how long that should take,
+# so anything far past it means the writer thread is stuck or every commit is failing.
+big_write_queue_oldest_seconds > 5
 
 # The engine is failing, not the callers. Every one of these has a line in the log.
 rate(big_http_responses_total{class="5xx"}[5m]) > 0

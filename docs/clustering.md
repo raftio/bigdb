@@ -559,6 +559,14 @@ The most important section on this page.
   starts one by itself is a system that starts one at the worst possible moment. Backup is still
   per node and [`Db::copy_to`](../crates/big-db/src/db.rs#L69) is still the whole story: an
   online walk under a read transaction, producing an ordinary database file.
+- **No cluster-wide read-your-writes, and no early acknowledgement.** A write answers with
+  `X-Big-Txn: <node>/<transaction>` and a read may send it back as `?min_txn=`, but a
+  transaction id is monotonic within one file and means nothing outside it — so the pair works
+  against the node that issued it and is refused with `409 wrong_node` anywhere else. Doing it
+  across a cluster needs a vector rather than a number, and nothing here keeps one. For the same
+  family of reasons `?ack=queued` is refused on a node with peers: a write here is answered when
+  every copy has taken it, and acking before writing would turn `missed` from a statement about
+  *reachability* into a claim about *durability* that is not true.
 - **No quorum reads or writes.** A read goes to one copy and a write goes to all of them. What
   a quorum would buy - a write surviving the loss of a minority - is bought instead by letting
   the write stand and marking the copy behind, which costs one entry in a log that is already

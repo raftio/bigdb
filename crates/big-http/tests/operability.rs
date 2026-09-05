@@ -49,6 +49,59 @@ fn spawn(requests: usize, config: ServerConfig) -> SocketAddr {
     addr
 }
 
+/// The same, with group commit switched on before the server takes the database.
+fn spawn_coalescing(requests: usize, jobs: usize) -> SocketAddr {
+    let api = Api::in_memory().unwrap();
+    api.create_table("tx").unwrap();
+    api.create_field("tx", "amount", big_db::catalog::FieldKind::Int, 32).unwrap();
+    api.configure_group_commit(big_embed::GroupConfig {
+        enabled: true,
+        max_jobs: jobs,
+        ..big_embed::GroupConfig::default()
+    });
+
+    let server = Server::bind_with(api, "127.0.0.1:0", config()).unwrap();
+    let addr = server.local_addr().unwrap();
+    std::thread::spawn(move || {
+        let _ = server.serve_n(requests);
+    });
+    addr
+}
+
+/// The same, offering `?ack=queued`.
+fn spawn_early(requests: usize) -> SocketAddr {
+    let api = Api::in_memory().unwrap();
+    api.create_table("tx").unwrap();
+    api.create_field("tx", "amount", big_db::catalog::FieldKind::Int, 32).unwrap();
+    api.configure_group_commit(big_embed::GroupConfig {
+        enabled: true,
+        async_writes: true,
+        ..big_embed::GroupConfig::default()
+    });
+
+    let server = Server::bind_with(api, "127.0.0.1:0", config()).unwrap();
+    let addr = server.local_addr().unwrap();
+    std::thread::spawn(move || {
+        let _ = server.serve_n(requests);
+    });
+    addr
+}
+
+/// The same, with `GET /watch` configured.
+fn spawn_watching(requests: usize) -> SocketAddr {
+    let api = Api::in_memory().unwrap();
+    api.create_table("tx").unwrap();
+    api.create_field("tx", "amount", big_db::catalog::FieldKind::Int, 32).unwrap();
+
+    let server =
+        Server::bind_with(api, "127.0.0.1:0", ServerConfig { watch_max: 4, ..config() }).unwrap();
+    let addr = server.local_addr().unwrap();
+    std::thread::spawn(move || {
+        let _ = server.serve_n(requests);
+    });
+    addr
+}
+
 /// The same, on the real worker pool rather than the inline path, for the tests that are
 /// about the pool itself.
 fn spawn_pooled(config: ServerConfig) -> SocketAddr {
@@ -565,4 +618,353 @@ fn a_read_token_cannot_take_a_backup() {
     );
     let r = send_with(addr, "POST", "/admin/backup?name=x.big", "", Some("scraper"));
     assert_eq!(r.status, 403, "{}", r.body);
+}
+
+/// The group-commit series are always there, so a dashboard built before anybody passed the
+/// flag keeps evaluating after somebody does.
+///
+/// Deliberately **not** a claim that writes were grouped: this server answers requests one at a
+/// time, so there is nothing to group and `jobs == commits` is the right answer. What is
+/// asserted is that a write went through the coalescer at all, and that it was counted.
+#[test]
+fn a_node_that_coalesces_writes_counts_what_its_commits_carried() {
+    let addr = spawn_coalescing(3, 64);
+
+    let wrote = send(addr, "POST", "/table/tx/import", "amount 1 100\namount 2 200\n");
+    assert_eq!(wrote.status, 200, "{}", wrote.body);
+    assert_eq!(wrote.body, r#"{"imported":2}"#);
+
+    let r = send(addr, "GET", "/metrics", "");
+    assert_eq!(r.status, 200);
+    assert!(r.body.contains("# TYPE big_write_commits_total counter"), "{}", r.body);
+    assert!(r.body.contains("big_write_commits_total 1"), "{}", r.body);
+    assert!(r.body.contains("big_write_commit_jobs_total 1"), "{}", r.body);
+    assert!(r.body.contains("big_write_isolations_total 0"), "{}", r.body);
+}
+
+/// The off half, and the half that matters more: a node nobody configured must not have gone
+/// anywhere near the queue, and must still publish the series as zeroes.
+#[test]
+fn a_node_that_does_not_coalesce_still_publishes_the_series() {
+    let addr = spawn(2, config());
+
+    let wrote = send(addr, "POST", "/table/tx/import", "amount 40 400\n");
+    assert_eq!(wrote.status, 200, "{}", wrote.body);
+
+    let r = send(addr, "GET", "/metrics", "");
+    assert!(r.body.contains("# TYPE big_write_commits_total counter"), "{}", r.body);
+    assert!(
+        r.body.contains("big_write_commits_total 0"),
+        "a write that never went through the coalescer must not be counted by it: {}",
+        r.body
+    );
+    assert!(r.body.contains("big_write_commit_jobs_total 0"), "{}", r.body);
+}
+
+/// A batch the engine refuses is refused the same way, and with the same words, when it went
+/// through the coalescer.
+#[test]
+fn a_refused_batch_reads_the_same_whether_or_not_writes_are_coalesced() {
+    let coalescing = spawn_coalescing(1, 64);
+    let plain = spawn(1, config());
+
+    let a = send(coalescing, "POST", "/table/tx/import", "nosuchfield 1 100\n");
+    let b = send(plain, "POST", "/table/tx/import", "nosuchfield 1 100\n");
+
+    assert_eq!(a.status, b.status, "{} vs {}", a.body, b.body);
+    assert_eq!(a.body, b.body);
+    assert!(a.body.contains("nosuchfield"), "{}", a.body);
+}
+
+/// `?ack=queued` says what it is: a count, and a flag saying it is not durable yet.
+#[test]
+fn an_early_acknowledgement_says_it_is_not_durable() {
+    let addr = spawn_early(3);
+
+    let queued = send(addr, "POST", "/table/tx/import?ack=queued", "amount 1 100\namount 2 200\n");
+    assert_eq!(queued.status, 200, "{}", queued.body);
+    assert_eq!(queued.body, r#"{"imported":2,"durable":false}"#);
+
+    // The buffer says what is at risk.
+    let r = send(addr, "GET", "/metrics", "");
+    assert!(r.body.contains("# TYPE big_write_queue_bytes gauge"), "{}", r.body);
+    assert!(
+        !r.body.contains("big_write_queue_bytes 0\n"),
+        "two facts were acknowledged and nothing is held: {}",
+        r.body
+    );
+    assert!(r.body.contains("big_write_acknowledged_lost_total 0"), "{}", r.body);
+}
+
+/// The default answer is unchanged, byte for byte. This is the regression that matters most.
+#[test]
+fn a_write_that_does_not_ask_is_answered_exactly_as_before() {
+    let addr = spawn_early(2);
+
+    let durable = send(addr, "POST", "/table/tx/import", "amount 1 100\n");
+    assert_eq!(durable.body, r#"{"imported":1}"#, "no new field on a write that did not ask");
+
+    let explicit = send(addr, "POST", "/table/tx/import?ack=commit", "amount 2 200\n");
+    assert_eq!(explicit.body, r#"{"imported":1}"#);
+}
+
+/// Asking for it where it is not offered is refused by name, never quietly downgraded.
+#[test]
+fn asking_to_be_answered_early_where_it_is_off_names_the_flag() {
+    let addr = spawn_coalescing(1, 64);
+
+    let r = send(addr, "POST", "/table/tx/import?ack=queued", "amount 1 100\n");
+    assert_eq!(r.status, 422, "{}", r.body);
+    assert!(r.body.contains("ack_not_available"), "{}", r.body);
+    assert!(r.body.contains("--write-async"), "and says which flag: {}", r.body);
+}
+
+/// A value the parameter does not take is a refusal that lists what it does take.
+#[test]
+fn an_ack_that_is_not_one_of_the_two_is_refused_with_both() {
+    let addr = spawn_early(1);
+
+    let r = send(addr, "POST", "/table/tx/import?ack=whenever", "amount 1 100\n");
+    assert_eq!(r.status, 422, "{}", r.body);
+    assert!(r.body.contains("commit or queued"), "{}", r.body);
+    assert!(r.body.contains("whenever"), "and repeats what it got: {}", r.body);
+}
+
+/// **The reason the writer thread exists.** An acknowledged write on a node that then goes
+/// quiet still becomes durable, without another request arriving to carry it.
+///
+/// A wait rather than an assertion, like the reclaim test: the thread runs on `--write-linger`,
+/// which is its own clock and not this test's.
+#[test]
+fn an_early_acknowledgement_is_committed_even_if_nothing_else_arrives() {
+    let api = Api::in_memory().unwrap();
+    api.create_table("tx").unwrap();
+    api.create_field("tx", "amount", big_db::catalog::FieldKind::Int, 32).unwrap();
+    api.configure_group_commit(big_embed::GroupConfig {
+        enabled: true,
+        async_writes: true,
+        linger: Duration::from_millis(20),
+        ..big_embed::GroupConfig::default()
+    });
+
+    let server = Server::bind_with(api, "127.0.0.1:0", config()).unwrap();
+    let addr = server.local_addr().unwrap();
+    let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let flag = std::sync::Arc::clone(&running);
+    let done = std::thread::spawn(move || {
+        let _ = server.serve_while(&flag);
+    });
+
+    let queued = send(addr, "POST", "/table/tx/import?ack=queued", "amount 7 700\n");
+    assert_eq!(queued.status, 200, "{}", queued.body);
+
+    // Nothing else is sent from here on. The only thing that can commit it is the writer.
+    let started = std::time::Instant::now();
+    loop {
+        let body = send(addr, "GET", "/metrics", "").body;
+        if body.contains("big_write_commits_total 1") {
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "nothing ever committed the acknowledged write: {body}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // And it is readable, which is the claim that actually matters.
+    let answer = send(addr, "POST", "/sql", "SELECT sum(amount) FROM tx");
+    assert!(answer.body.contains("700"), "{}", answer.body);
+
+    let held = send(addr, "GET", "/metrics", "").body;
+    assert!(held.contains("big_write_queue_bytes 0"), "and nothing is still at risk: {held}");
+
+    running.store(false, std::sync::atomic::Ordering::Relaxed);
+    let _ = done.join();
+}
+
+/// A node that offers no early answers starts no writer thread, and nothing about it changes.
+#[test]
+fn a_node_that_answers_only_durably_publishes_an_empty_queue() {
+    let addr = spawn_coalescing(1, 64);
+    let r = send(addr, "GET", "/metrics", "");
+    assert!(r.body.contains("big_write_queue_bytes 0"), "{}", r.body);
+    assert!(r.body.contains("big_write_queue_oldest_seconds 0.000"), "{}", r.body);
+    assert!(r.body.contains("big_write_queue_refused_total 0"), "{}", r.body);
+}
+
+/// A write says where this node's history got to, and a read can be told to wait for it.
+#[test]
+fn a_write_says_which_transaction_and_a_read_can_wait_for_it() {
+    let addr = spawn(2, config());
+
+    let wrote = send(addr, "POST", "/table/tx/import", "amount 100 1\n");
+    assert_eq!(wrote.status, 200, "{}", wrote.body);
+    let txn = wrote
+        .headers
+        .lines()
+        .find_map(|l| l.strip_prefix("X-Big-Txn: "))
+        .expect("a write says which transaction carried it")
+        .trim()
+        .to_string();
+    // `<node>/<transaction>`. The name is half the value: a bare number could be sent to a node
+    // it means nothing on.
+    let (node, number) = txn.split_once('/').expect("node/transaction");
+    assert_eq!(node, "local", "a server with no cluster file is one node called `local`");
+    assert!(number.parse::<u64>().is_ok(), "{txn}");
+
+    // Asking to be caught up to a transaction this node has already passed is free.
+    let caught = send(addr, "POST", &format!("/sql?min_txn={txn}"), "SELECT count(*) FROM tx");
+    assert_eq!(caught.status, 200, "{}", caught.body);
+    assert!(caught.body.contains("33"), "the write is visible: {}", caught.body);
+}
+
+/// A transaction id from another node names a history this one does not have. Refused in one
+/// round trip rather than waited out and reported as a timeout.
+#[test]
+fn a_transaction_from_another_node_is_refused_rather_than_waited_for() {
+    let addr = spawn(1, config());
+
+    let r = send(addr, "POST", "/sql?min_txn=somewhere-else/9", "SELECT count(*) FROM tx");
+    assert_eq!(r.status, 409, "{}", r.body);
+    assert!(r.body.contains("wrong_node"), "{}", r.body);
+    assert!(r.body.contains("somewhere-else"), "and names both nodes: {}", r.body);
+    assert!(r.body.contains("local"), "{}", r.body);
+}
+
+/// A transaction this node will never reach times out, with a deadline the caller chose.
+#[test]
+fn waiting_for_a_transaction_that_never_comes_is_a_timeout_not_a_hang() {
+    let addr = spawn(1, config());
+
+    let started = std::time::Instant::now();
+    let r = send(addr, "POST", "/sql?min_txn=local/999999&wait=50", "SELECT count(*) FROM tx");
+    assert_eq!(r.status, 504, "{}", r.body);
+    assert!(r.body.contains("not_caught_up"), "{}", r.body);
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "it waited far past the 50ms it was given: {:?}",
+        started.elapsed()
+    );
+}
+
+/// A `min_txn` that is not one is a refusal that says what the shape is.
+#[test]
+fn a_min_txn_that_is_not_one_says_what_the_shape_is() {
+    let addr = spawn(2, config());
+
+    let bare = send(addr, "POST", "/sql?min_txn=12", "SELECT count(*) FROM tx");
+    assert_eq!(bare.status, 422, "{}", bare.body);
+    assert!(bare.body.contains("X-Big-Txn"), "it names where to get one: {}", bare.body);
+
+    let nonsense = send(addr, "POST", "/sql?min_txn=local/soon", "SELECT count(*) FROM tx");
+    assert_eq!(nonsense.status, 422, "{}", nonsense.body);
+    assert!(nonsense.body.contains("soon"), "{}", nonsense.body);
+}
+
+/// **The claim `GET /watch` has to earn**: subscribe, write from somewhere else, and the new
+/// answer arrives without asking for it.
+#[test]
+fn a_subscriber_is_pushed_the_new_answer_when_it_changes() {
+    use std::io::{BufRead, BufReader, Write};
+
+    let api = Api::in_memory().unwrap();
+    api.create_table("tx").unwrap();
+    api.create_field("tx", "amount", big_db::catalog::FieldKind::Int, 32).unwrap();
+
+    let server = Server::bind_with(
+        api,
+        "127.0.0.1:0",
+        ServerConfig { watch_max: 4, ..config() },
+    )
+    .unwrap();
+    let addr = server.local_addr().unwrap();
+    let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let flag = std::sync::Arc::clone(&running);
+    let done = std::thread::spawn(move || {
+        let _ = server.serve_while(&flag);
+    });
+
+    // Subscribe on a connection of its own and leave it open.
+    let mut sub = std::net::TcpStream::connect(addr).unwrap();
+    sub.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+    write!(
+        sub,
+        "GET /watch?sql=SELECT%20count(*)%20FROM%20tx&interval=50 HTTP/1.1\r\nHost: x\r\n\r\n"
+    )
+    .unwrap();
+    let mut reader = BufReader::new(sub.try_clone().unwrap());
+
+    // The head says it is a stream rather than a body.
+    let mut head = String::new();
+    loop {
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        if line == "\r\n" {
+            break;
+        }
+        head.push_str(&line);
+    }
+    assert!(head.contains("200"), "{head}");
+    assert!(head.contains("Transfer-Encoding: chunked"), "{head}");
+    assert!(head.contains("text/event-stream"), "{head}");
+
+    // The first answer, pushed without being asked for.
+    let first = read_event(&mut reader);
+    assert!(first.contains(r#""rows":[[0]]"#), "the table is empty: {first}");
+
+    // Somebody else writes.
+    let wrote = send(addr, "POST", "/table/tx/import", "amount 1 100\n");
+    assert_eq!(wrote.status, 200, "{}", wrote.body);
+
+    // And the subscriber is told, without having asked again.
+    let second = read_event(&mut reader);
+    assert!(second.contains(r#""rows":[[1]]"#), "{second}");
+    assert!(second.contains("event: answer"), "{second}");
+    assert!(second.contains("id: local/"), "the id is where this node's history got to: {second}");
+
+    drop(reader);
+    running.store(false, std::sync::atomic::Ordering::Relaxed);
+    let _ = done.join();
+}
+
+/// Reads one server-sent event out of a chunked stream, skipping the chunk framing.
+fn read_event(reader: &mut std::io::BufReader<std::net::TcpStream>) -> String {
+    use std::io::BufRead;
+    let mut event = String::new();
+    loop {
+        let mut line = String::new();
+        let n = reader.read_line(&mut line).unwrap();
+        assert!(n > 0, "the stream ended before an event arrived: {event}");
+        let trimmed = line.trim_end();
+        // Chunk sizes are bare hex on a line of their own; a blank line ends an event.
+        if trimmed.is_empty() {
+            if !event.is_empty() {
+                return event;
+            }
+            continue;
+        }
+        if u64::from_str_radix(trimmed, 16).is_ok() && !trimmed.contains(':') {
+            continue;
+        }
+        event.push_str(&line);
+    }
+}
+
+/// Off by default, and it says which flag turns it on rather than pretending the route is gone.
+#[test]
+fn watching_is_refused_when_it_was_never_configured() {
+    let addr = spawn(1, config());
+    let r = send(addr, "GET", "/watch?sql=SELECT%20count(*)%20FROM%20tx", "");
+    assert_eq!(r.status, 503, "{}", r.body);
+    assert!(r.body.contains("--watch-max"), "{}", r.body);
+}
+
+/// A statement that writes is refused at subscribe, not once per push.
+#[test]
+fn watching_something_that_is_not_a_select_is_refused_at_subscribe() {
+    let addr = spawn_watching(1);
+    let r = send(addr, "GET", "/watch?sql=CREATE%20TABLE%20nope", "");
+    assert_eq!(r.status, 422, "{}", r.body);
+    assert!(r.body.contains("not_a_query"), "{}", r.body);
 }

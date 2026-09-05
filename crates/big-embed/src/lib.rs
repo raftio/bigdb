@@ -32,12 +32,14 @@
 pub mod error;
 pub mod explain;
 pub mod fact;
+mod group;
 pub mod introspect;
 pub mod result;
 pub mod schema;
 pub mod views;
 
 pub use error::{ApiError, Result};
+pub use group::{Accepted, Ack, GroupConfig, GroupStats, WhenFull};
 pub use result::{
     date_text, fixed, literal_of, one_cell, result_set, timestamp_text, Datum, ResultSet, Row,
 };
@@ -545,12 +547,15 @@ pub struct KeyAssignment<'a> {
 /// ```
 pub struct Api<P: PagerMut> {
     db: Db<P>,
+    /// Off until [`Api::configure_group_commit`] turns it on, so an `Api` that nobody
+    /// configured writes down the path it always did.
+    group: group::Group,
 }
 
 impl Api<MemPager> {
     /// A database with no file behind it. Nothing is durable and nothing is locked.
     pub fn in_memory() -> Result<Self> {
-        Ok(Self { db: Db::in_memory()? })
+        Ok(Self { db: Db::in_memory()?, group: group::Group::default() })
     }
 }
 
@@ -559,7 +564,7 @@ impl Api<MmapPager> {
     /// One process per file: the engine takes an exclusive lock, so a second `Api` on the same
     /// path fails here rather than corrupting anything later.
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self> {
-        Ok(Self { db: Db::open_path(path)? })
+        Ok(Self { db: Db::open_path(path)?, group: group::Group::default() })
     }
 
     /// The same, with the address-space reservation named rather than defaulted.
@@ -567,7 +572,7 @@ impl Api<MmapPager> {
     /// See [`Db::open_path_sized`]: the reservation is the file's ceiling for the life of the
     /// process, so it belongs to whoever is deciding how many databases this machine runs.
     pub fn open_sized(path: impl AsRef<std::path::Path>, mapsize: u64) -> Result<Self> {
-        Ok(Self { db: Db::open_path_sized(path, mapsize)? })
+        Ok(Self { db: Db::open_path_sized(path, mapsize)?, group: group::Group::default() })
     }
 }
 
@@ -652,11 +657,30 @@ impl<P: PagerMut + Sync> Api<P> {
     ///
     /// The batch is the unit on purpose. Per-fact transactions would pay the commit cost -
     /// two fsyncs and a full metadata rewrite - once per fact.
+    ///
+    /// With group commit configured, the batch may travel *in company*: several callers'
+    /// batches in one transaction. What is promised here does not change - this batch still
+    /// lands entirely or not at all, and this call still returns only once it is durable.
     pub fn import(&self, table: &str, facts: &[Fact<'_>]) -> Result<()> {
+        self.import_acked(table, facts, Ack::Sync).map(|_| ())
+    }
+
+    /// [`Api::import`], saying when it should be answered.
+    ///
+    /// [`Ack::Sync`] is what `import` does and what every caller should want by default.
+    /// [`Ack::Async`] answers before the commit and is refused unless
+    /// [`GroupConfig::async_writes`] is on; read what it costs on [`Ack::Async`] before
+    /// reaching for it.
+    pub fn import_acked(&self, table: &str, facts: &[Fact<'_>], ack: Ack) -> Result<Accepted> {
+        if self.group.enabled() {
+            let work =
+                group::Work::Import { table: table.to_string(), batch: group::Batch::own(facts) };
+            return self.group.submit(&self.db, work, ack);
+        }
         let mut w = self.db.write();
         apply(&mut w, table, facts)?;
-        w.commit()?;
-        Ok(())
+        let txn = w.commit()?;
+        Ok(Accepted { count: facts.len() as u64, txn: Some(txn) })
     }
 
     /// Assigns a row id to each key, in one transaction, and hands the ids back.
@@ -692,13 +716,32 @@ impl<P: PagerMut + Sync> Api<P> {
         keys: &[KeyAssignment<'_>],
         facts: &[Fact<'_>],
     ) -> Result<()> {
+        self.import_with_keys_acked(table, keys, facts, Ack::Sync).map(|_| ())
+    }
+
+    /// [`Api::import_with_keys`], saying when it should be answered.
+    pub fn import_with_keys_acked(
+        &self,
+        table: &str,
+        keys: &[KeyAssignment<'_>],
+        facts: &[Fact<'_>],
+        ack: Ack,
+    ) -> Result<Accepted> {
+        if self.group.enabled() {
+            let work = group::Work::ImportWithKeys {
+                table: table.to_string(),
+                keys: keys.iter().map(group::OwnedKey::own).collect(),
+                batch: group::Batch::own(facts),
+            };
+            return self.group.submit(&self.db, work, ack);
+        }
         let mut w = self.db.write();
         for k in keys {
             w.assign_key(table, k.field, k.key, k.row)?;
         }
         apply(&mut w, table, facts)?;
-        w.commit()?;
-        Ok(())
+        let txn = w.commit()?;
+        Ok(Accepted { count: facts.len() as u64, txn: Some(txn) })
     }
 
     /// Removes records from every field of a table, in one transaction.
@@ -706,10 +749,82 @@ impl<P: PagerMut + Sync> Api<P> {
     /// Returns how many of them existed. Deleting a record that was never written is not an
     /// error - it is a request that was already satisfied - so a retried delete is safe.
     pub fn delete(&self, table: &str, records: &[RecordId]) -> Result<u64> {
+        self.delete_acked(table, records, Ack::Sync).map(|a| a.count)
+    }
+
+    /// [`Api::delete`], saying when it should be answered.
+    ///
+    /// Under [`Ack::Async`] the count is what was *asked for* rather than what existed: nothing
+    /// has been read yet. That is the honest number to hand back before a transaction has run,
+    /// and it is another reason an early answer is a different promise.
+    pub fn delete_acked(&self, table: &str, records: &[RecordId], ack: Ack) -> Result<Accepted> {
+        if self.group.enabled() {
+            let work = group::Work::Delete { table: table.to_string(), records: records.to_vec() };
+            return self.group.submit(&self.db, work, ack);
+        }
         let mut w = self.db.write();
         let n = w.delete(table, records)?;
-        w.commit()?;
-        Ok(n)
+        let txn = w.commit()?;
+        Ok(Accepted { count: n, txn: Some(txn) })
+    }
+
+    /// Turns group commit on or off, and sets its ceilings.
+    ///
+    /// Off by default. On, concurrent writers share one transaction and therefore one pair of
+    /// fsyncs; the group is collected in the window the first of them spends waiting for the
+    /// store's write lock, so an uncontended write is not made to wait for company that is not
+    /// coming. See [`GroupConfig`].
+    pub fn configure_group_commit(&self, config: GroupConfig) {
+        self.group.configure(config);
+    }
+
+    /// What group commit has done so far. `jobs / commits` is the average group size.
+    pub fn group_stats(&self) -> GroupStats {
+        self.group.stats()
+    }
+
+    /// Whether this database will answer a write before committing it.
+    ///
+    /// Asked by the layer above so it can refuse [`Ack::Async`] by name rather than quietly
+    /// downgrading it: a client that asked to be answered early and was made to wait sees
+    /// unexplained latency and nothing else.
+    pub fn takes_async_writes(&self) -> bool {
+        self.group.takes_async()
+    }
+
+    /// Commits whatever has been acknowledged and is still waiting, and says how many.
+    ///
+    /// **This crate spawns no threads.** A library that started one behind its caller's back
+    /// would be a surprise in every process that embeds it, so the clock belongs to whoever
+    /// owns the process - see `big_http`'s writer thread. This is the thing that clock calls.
+    ///
+    /// Does nothing when another writer is already mid-commit: a commit drains the whole queue,
+    /// so work waiting now is work that commit will carry.
+    pub fn flush_pending(&self) -> u64 {
+        self.group.flush(&self.db)
+    }
+
+    /// Waits until there is acknowledged work to commit, or `timeout` passes.
+    ///
+    /// Returns whether there is something to do. A flusher on an idle database is not woken at
+    /// all, rather than woken on a timer to find nothing.
+    pub fn await_pending(&self, timeout: std::time::Duration) -> bool {
+        self.group.await_work(timeout)
+    }
+
+    /// The longest an acknowledged write may wait before a flusher should commit it.
+    pub fn write_linger(&self) -> std::time::Duration {
+        self.group.linger()
+    }
+
+    /// Refuses new writes and commits everything held, returning how many jobs it carried.
+    ///
+    /// For shutdown, and it must be called **after** whatever submits writes has stopped, or it
+    /// races the very thing it exists to drain. A write that was acknowledged and then lost to
+    /// an orderly shutdown is a bug rather than a trade-off, so a caller that cannot report the
+    /// result of this should not be calling it.
+    pub fn stop_writer(&self) -> u64 {
+        self.group.stop(&self.db)
     }
 
     /// Creates a database, or returns `false` if it was already there.
@@ -1434,6 +1549,24 @@ impl<P: PagerMut + Sync> Api<P> {
     /// try again when the node is between requests.
     pub fn reclaim(&self) -> Result<u64> {
         Ok(self.db.reclaim()?)
+    }
+
+    /// The transaction this database is at.
+    ///
+    /// Monotonic within one file and **meaningless outside it**: a number from another node
+    /// names a different history, so it is only ever comparable against the node that issued
+    /// it. Whoever hands it to a client is responsible for saying which node that was.
+    pub fn txn_id(&self) -> big_pager::TxnId {
+        self.db.store().txn_id()
+    }
+
+    /// Waits until this database has committed `txn` or later, and says whether it did.
+    ///
+    /// What makes a write answered early readable on purpose: a caller that was handed a
+    /// transaction id can ask to be caught up to it before its next read, instead of guessing
+    /// with a sleep. Bounded by `deadline`, always — see [`big_pager::Store::wait_for_txn`].
+    pub fn wait_for_txn(&self, txn: big_pager::TxnId, deadline: std::time::Instant) -> bool {
+        self.db.store().wait_for_txn(txn, deadline)
     }
 
     /// What the row-key dictionary costs this process. See [`Db::key_stats`].

@@ -26,6 +26,15 @@ have nowhere to put it. This is the other answer.
 
 ## What it deliberately does not do
 
+**It does not carry `GET /watch`.** That route answers with a chunked stream that stays open for
+as long as a subscriber wants it, and everything here is built the other way: a request is read
+whole, forwarded whole, and answered whole, against a budget written down per route in
+`allowlist.rs`. A connection that lives for hours has no budget to check it against, and a proxy
+that forwarded one would be holding an upstream connection per subscriber with no way to shed
+it. So `/watch` is simply not in `ROUTES`, the proxy refuses it with the mechanism it already
+has, and a client that wants a subscription opens it against a node.
+
+
 **It does not route by key.** Which node serves a range is a value the nodes agree on, and it
 moves without a byte of data moving with it. A proxy that computed the same answer would be a
 second copy of `big-cluster/src/ownership.rs` — one that is wrong for as long as it takes a moved

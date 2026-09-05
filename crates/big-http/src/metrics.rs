@@ -469,6 +469,70 @@ pub fn render_keys(out: &mut String, k: &big_embed::KeyStats) {
     );
 }
 
+/// What group commit has done, if it is on.
+///
+/// **`big_write_commit_jobs_total / big_write_commits_total` is the whole story**: it is the
+/// average number of batches one transaction carried, and therefore how many pairs of fsyncs
+/// this node did not perform. It sits at `1.00` on a node with no write contention however the
+/// flag is set, which is the correct reading rather than a disappointing one - there was
+/// nothing to share.
+///
+/// Rendered even when the feature is off, and rendered as zeroes. The alternative - absent
+/// until somebody passes the flag - breaks every dashboard built before the flag was passed,
+/// and a rate over a counter that is always zero is a flat line rather than a gap.
+pub fn render_group(out: &mut String, g: &big_embed::GroupStats) {
+    counter(out, "big_write_commits_total", "Write transactions that reached the disk.", g.commits);
+    counter(
+        out,
+        "big_write_commit_jobs_total",
+        "Batches those transactions carried. Divided by big_write_commits_total, the average \
+         group size.",
+        g.jobs,
+    );
+    counter(
+        out,
+        "big_write_isolations_total",
+        "Groups that failed and had to be split to find the batch at fault. Rises when a \
+         client is sending batches this database refuses.",
+        g.isolations,
+    );
+    counter(
+        out,
+        "big_write_isolation_attempts_total",
+        "Transactions opened while splitting, the failed ones included. Against \
+         big_write_isolations_total, what one bad batch costs everybody else.",
+        g.isolation_attempts,
+    );
+    gauge(
+        out,
+        "big_write_queue_bytes",
+        "Writes this node has acknowledged and not yet committed. What is lost if it dies now.",
+        g.async_held_bytes,
+    );
+    // Seconds as a gauge, rounded to milliseconds. Prometheus takes a float and this is a
+    // duration, so the alternative is a counter that is not one.
+    gauge_f(
+        out,
+        "big_write_queue_oldest_seconds",
+        "How long the oldest acknowledged, uncommitted write has been waiting. The durability \
+         lag, and the number to alert on when writes are answered early.",
+        g.async_oldest_seconds,
+    );
+    counter(
+        out,
+        "big_write_queue_refused_total",
+        "Writes turned away because the buffer was full. Backpressure reaching the client.",
+        g.async_refused,
+    );
+    counter(
+        out,
+        "big_write_acknowledged_lost_total",
+        "Writes this node acknowledged and then could not commit. Nobody was told: the caller \
+         had already been answered. Any value above zero is accepted data that did not land.",
+        g.async_failed,
+    );
+}
+
 /// What this node can say about the cluster it is part of.
 ///
 /// A second entry point rather than more fields on `ServerMetrics`, because none of this is
@@ -609,6 +673,15 @@ pub fn render_cluster(out: &mut String, c: &big_cluster::counters::Snapshot, bal
 
 fn counter(out: &mut String, name: &str, help: &str, value: u64) {
     sample(out, name, "counter", help, value);
+}
+
+/// A gauge whose value is not a whole number.
+///
+/// Three decimals: this exists for durations, and a millisecond is as fine as any lag graph
+/// here is meaningful to.
+fn gauge_f(out: &mut String, name: &str, help: &str, value: f64) {
+    let help: String = help.chars().map(|c| if c == '\n' { ' ' } else { c }).collect();
+    out.push_str(&format!("# HELP {name} {help}\n# TYPE {name} gauge\n{name} {value:.3}\n"));
 }
 
 fn gauge(out: &mut String, name: &str, help: &str, value: u64) {

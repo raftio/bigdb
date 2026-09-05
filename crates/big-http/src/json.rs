@@ -399,6 +399,16 @@ pub fn verify(ranges: &[RangeVerdict]) -> String {
     format!("{{\"agree\":{agree},\"ranges\":[{}]}}", items.join(","))
 }
 
+/// What an early answer says, and the one field that separates it from a durable one.
+///
+/// `"durable":false` is emitted **only** here, so a caller that never asks to be answered early
+/// sees byte for byte what it saw before. A client that ignores the field gets the count it
+/// always got; a client that reads it knows this number is a promise about what was accepted
+/// rather than a report of what landed.
+pub fn queued(name: &str, count: u64) -> String {
+    format!("{{\"{name}\":{count},\"durable\":false}}")
+}
+
 /// What a write managed, and what it did not.
 ///
 /// `missed` is absent when everything landed, which is the shape every existing client already

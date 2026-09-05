@@ -22,6 +22,9 @@ use super::*;
 use std::collections::HashMap;
 
 pub(super) fn query<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request, table: &str) -> Response {
+    if let Err((status, code, why)) = caught_up(ctx, req) {
+        return Response::failure(status, code, &why);
+    }
     let page = match page(req) {
         Ok(p) => p,
         Err(why) => return Response::failure(422, "bad_parameter", &why),
@@ -71,6 +74,9 @@ pub(super) fn sql<P: PagerMut + Sync>(
     req: &Request,
     principal: &crate::auth::Principal,
 ) -> Response {
+    if let Err((status, code, why)) = caught_up(ctx, req) {
+        return Response::failure(status, code, &why);
+    }
     let text = match req.text() {
         Ok(t) => t.trim(),
         Err(e) => return e.into_response(),
@@ -121,9 +127,97 @@ pub(super) fn sql<P: PagerMut + Sync>(
         // The statement's `FORMAT` decides both the bytes and the type they are declared as: a
         // client that asked for TSV and was told `application/json` was answered twice, once
         // wrongly.
-        Ok((set, format)) => Response::text(format.content_type(), json::result_set(format, &set)),
+        Ok((set, format)) => {
+            stamp(ctx, Response::text(format.content_type(), json::result_set(format, &set)))
+        }
         Err(e) => from_cluster(&e),
     }
+}
+
+/// `X-Big-Txn: <node>/<transaction>` — where this node's history had got to when it answered.
+///
+/// **Read after the write rather than carried out of it**, and that is a deliberate
+/// over-approximation. A commit that landed between this write and this read makes the number
+/// larger than the one that actually carried the facts, which can only make a later
+/// `?min_txn=` wait for something *further on* — never for something earlier. Threading a
+/// transaction id back out through `WriteOutcome` and the peer wire would buy exactness that
+/// read-your-writes has no use for.
+///
+/// **The node name is half the value.** A transaction id is monotonic within one file and means
+/// nothing outside it, so a bare number would be a number a client could send to the wrong node
+/// and be quietly misled by.
+fn stamp<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, r: Response) -> Response {
+    let node = &ctx.cluster.config().this().name;
+    r.with_header("X-Big-Txn", format!("{node}/{}", ctx.api().txn_id()))
+}
+
+/// How long a `?min_txn=` may wait to be caught up, before it is a timeout.
+const DEFAULT_WAIT_MS: u64 = 1_000;
+
+/// The ceiling on that, whatever the request asks for. A read that waits longer than this is a
+/// read that should have been sent to the node that did the write.
+const MAX_WAIT_MS: u64 = 60_000;
+
+/// `?min_txn=<node>/<transaction>` — do not answer until this node is at least there.
+///
+/// Send back exactly what `X-Big-Txn` gave you. What it buys is read-your-writes without a
+/// sleep: a client that wrote and wants to see its own write asks to be caught up rather than
+/// guessing how long that takes.
+///
+/// **Refused when the node does not match**, rather than waited out and reported as a timeout.
+/// A transaction id from another node names a history this one does not have, so waiting for it
+/// would be waiting for something that cannot arrive - a `409` says that in one round trip.
+/// Through `bigproxy` the client does not choose which node answers, so this parameter is for a
+/// client talking to a node directly.
+fn caught_up<P: PagerMut + Sync>(
+    ctx: &Ctx<'_, P>,
+    req: &Request,
+) -> core::result::Result<(), (u16, &'static str, String)> {
+    let Some(asked) = req.param("min_txn") else { return Ok(()) };
+    let Some((node, txn)) = asked.split_once('/') else {
+        return Err((
+            422,
+            "bad_parameter",
+            "min_txn is the value of an X-Big-Txn header, `<node>/<transaction>`".to_string(),
+        ));
+    };
+    let Ok(txn) = txn.parse::<big_pager::TxnId>() else {
+        return Err((422, "bad_parameter", format!("min_txn names no transaction: `{txn}`")));
+    };
+    let here = &ctx.cluster.config().this().name;
+    if node != here {
+        return Err((
+            409,
+            "wrong_node",
+            format!(
+                "min_txn is node `{node}`'s transaction and this is node `{here}`; a transaction \
+                 id means nothing on another node"
+            ),
+        ));
+    }
+
+    let wait = match req.param("wait") {
+        None => DEFAULT_WAIT_MS,
+        Some(ms) => match ms.parse::<u64>() {
+            Ok(ms) => ms.min(MAX_WAIT_MS),
+            Err(_) => {
+                return Err((
+                    422,
+                    "bad_parameter",
+                    format!("wait is a number of milliseconds, got `{ms}`"),
+                ))
+            }
+        },
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(wait);
+    if ctx.api().wait_for_txn(txn, deadline) {
+        return Ok(());
+    }
+    Err((
+        504,
+        "not_caught_up",
+        format!("this node is at transaction {} and was asked for {txn}", ctx.api().txn_id()),
+    ))
 }
 
 /// The table a request names, with `?database=` folded in.
@@ -159,6 +253,9 @@ pub(super) fn records<P: PagerMut + Sync>(
     req: &Request,
     table: &str,
 ) -> Response {
+    if let Err((status, code, why)) = caught_up(ctx, req) {
+        return Response::failure(status, code, &why);
+    }
     let page = match page(req) {
         Ok(p) => p,
         Err(why) => return Response::failure(422, "bad_parameter", &why),
@@ -170,6 +267,45 @@ pub(super) fn records<P: PagerMut + Sync>(
     match ctx.cluster.records(&scoped(req, table), page.after, limit) {
         Ok(ids) => Response::ok(json::records(&ids, limit)),
         Err(e) => from_cluster(&e),
+    }
+}
+
+/// `?ack=commit|queued` - whether the caller waits for the commit that carries its facts.
+///
+/// **Refused by name where it is not offered, never quietly downgraded.** A client that asked
+/// to be answered early and was made to wait instead sees latency it cannot explain and has no
+/// way to find out why; a `422` naming the flag is something an operator can act on.
+///
+/// In a cluster it is refused outright. `WriteOutcome::missed` is only knowable once every copy
+/// has answered, so a node acking before it has written would turn the coordinator's report
+/// from a statement about reachability into a claim about durability that is not true.
+/// The code and the sentence, for the caller to shape - the way `page` hands back a reason
+/// rather than a whole `Response`.
+type Refusal = (&'static str, String);
+
+fn ack_of<P: PagerMut + Sync>(
+    ctx: &Ctx<'_, P>,
+    req: &Request,
+) -> core::result::Result<Ack, Refusal> {
+    match req.param("ack").as_deref() {
+        None | Some("commit") => Ok(Ack::Sync),
+        Some("queued") => {
+            if !ctx.cluster.writes_alone() {
+                return Err((
+                    "ack_not_available",
+                    "this node has peers; a write is answered when every copy has taken it"
+                        .to_string(),
+                ));
+            }
+            if !ctx.api().takes_async_writes() {
+                return Err((
+                    "ack_not_available",
+                    "this server was not started with --write-async".to_string(),
+                ));
+            }
+            Ok(Ack::Async)
+        }
+        Some(other) => Err(("bad_parameter", format!("ack takes commit or queued, got `{other}`"))),
     }
 }
 
@@ -190,6 +326,11 @@ pub(super) fn import<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request, table:
     // is written - a batch that turns out to be malformed must not land halfway. In a cluster
     // it is resolved against this node's schema, which is every node's: a schema change is
     // applied everywhere or reported as half applied.
+    let ack = match ack_of(ctx, req) {
+        Ok(ack) => ack,
+        Err((code, why)) => return Response::failure(422, code, &why),
+    };
+
     let name = scoped(req, table);
     let target = big_db::TableRef::parse(&name);
     let schema = ctx.cluster.schema();
@@ -219,13 +360,24 @@ pub(super) fn import<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request, table:
     // back. A node with peers still pays, because a batch that has to be shipped needs to own
     // what it ships.
     let outcome = if ctx.cluster.writes_alone() {
+        // Answering early is a single-node path, so it forks here rather than inside the
+        // cluster: `import_borrowed` is the one that already knows it is writing alone.
+        if ack == Ack::Async {
+            // No `X-Big-Txn` on an early answer, and that is the honest shape: there is no
+            // transaction yet to name. A client that needs to read its own write back has to
+            // ask for `?ack=commit`, which is the trade it made.
+            return match ctx.api().import_acked(&name, &facts, ack) {
+                Ok(a) => Response::ok(json::queued("imported", a.count)),
+                Err(e) => crate::status::response_for(&e),
+            };
+        }
         ctx.cluster.import_borrowed(&name, &facts)
     } else {
         let owned: Vec<OwnedFact> = facts.iter().map(OwnedFact::from_fact).collect();
         ctx.cluster.import(&name, &owned)
     };
     match outcome {
-        Ok(outcome) => Response::ok(json::wrote("imported", &outcome)),
+        Ok(outcome) => stamp(ctx, Response::ok(json::wrote("imported", &outcome))),
         Err(e) => from_cluster(&e),
     }
 }
@@ -473,6 +625,10 @@ fn three(line: &str) -> Option<(&str, &str, &str)> {
 
 /// One record id per line. Same shape as `/import`, so the same client code writes both.
 pub(super) fn delete<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request, table: &str) -> Response {
+    let ack = match ack_of(ctx, req) {
+        Ok(ack) => ack,
+        Err((code, why)) => return Response::failure(422, code, &why),
+    };
     let body = match req.text() {
         Ok(t) => t,
         Err(e) => return e.into_response(),
@@ -495,8 +651,15 @@ pub(super) fn delete<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request, table:
         records.push(record);
     }
 
-    match ctx.cluster.delete(&scoped(req, table), &records) {
-        Ok(outcome) => Response::ok(json::wrote("deleted", &outcome)),
+    let name = scoped(req, table);
+    if ack == Ack::Async {
+        return match ctx.api().delete_acked(&name, &records, ack) {
+            Ok(a) => Response::ok(json::queued("deleted", a.count)),
+            Err(e) => crate::status::response_for(&e),
+        };
+    }
+    match ctx.cluster.delete(&name, &records) {
+        Ok(outcome) => stamp(ctx, Response::ok(json::wrote("deleted", &outcome))),
         Err(e) => from_cluster(&e),
     }
 }

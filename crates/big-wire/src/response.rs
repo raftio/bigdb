@@ -170,3 +170,94 @@ pub fn reason_for(status: u16) -> &'static str {
         _ => "Error",
     }
 }
+
+/// A response whose body is written as it is produced.
+///
+/// **A second shape rather than a variant of [`Response`].** Everything that already exists —
+/// `bigctl`, `clients/go`, `clients/python`, `bigproxy` — reads a `Content-Length` and says so
+/// in its own source; three of them refuse a response without one. So the shape they read is
+/// left exactly as it was, and this is a separate thing that only a route written for it can
+/// produce. No existing route changes, and a client that never asks for one never meets one.
+///
+/// **`Connection: close`, always.** A chunked body ends when the sender says it does, and the
+/// routes that need this are the ones that stay open until somebody goes away. Keeping the
+/// connection alive afterwards would mean agreeing with the client about where the body ended,
+/// which is exactly the negotiation this shape exists to avoid.
+pub struct Streaming {
+    status: u16,
+    content_type: String,
+    headers: Vec<(String, String)>,
+}
+
+/// The bytes that end a chunked body. Nothing follows it.
+pub const LAST_CHUNK: &[u8] = b"0\r\n\r\n";
+
+impl Streaming {
+    /// A `200` of this content type.
+    pub fn ok(content_type: &str) -> Self {
+        Self { status: 200, content_type: content_type.to_string(), headers: Vec::new() }
+    }
+
+    /// Adds one header, chainably. Sanitised exactly as [`Response::encode`] sanitises its own.
+    pub fn with_header(mut self, name: &str, value: impl core::fmt::Display) -> Self {
+        self.headers.push((name.to_string(), value.to_string()));
+        self
+    }
+
+    /// The head, to be written before the first chunk.
+    pub fn head(&self) -> Vec<u8> {
+        let Self { status, content_type, headers } = self;
+        let mut head = format!(
+            "HTTP/1.1 {status} {}\r\n\
+             Content-Type: {content_type}\r\n\
+             Transfer-Encoding: chunked\r\n\
+             Cache-Control: no-cache\r\n\
+             Connection: close\r\n",
+            reason_for(*status)
+        );
+        for (name, value) in headers {
+            let value: String = value.chars().filter(|c| *c != '\r' && *c != '\n').collect();
+            head.push_str(&format!("{name}: {value}\r\n"));
+        }
+        head.push_str("\r\n");
+        head.into_bytes()
+    }
+}
+
+/// Wraps a socket and frames whatever is written to it as chunks.
+///
+/// **An empty write is dropped rather than framed.** A zero-length chunk is how a chunked body
+/// says it has ended, so writing one by accident would truncate the response at that point and
+/// leave the rest of it as garbage after the terminator.
+pub struct Chunked<'w> {
+    inner: &'w mut dyn std::io::Write,
+    written: u64,
+}
+
+impl<'w> Chunked<'w> {
+    pub fn new(inner: &'w mut dyn std::io::Write) -> Self {
+        Self { inner, written: 0 }
+    }
+
+    /// Body bytes actually sent, not counting the framing. What the log and the histogram want.
+    pub fn written(&self) -> u64 {
+        self.written
+    }
+}
+
+impl std::io::Write for Chunked<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        self.inner.write_all(format!("{:x}\r\n", buf.len()).as_bytes())?;
+        self.inner.write_all(buf)?;
+        self.inner.write_all(b"\r\n")?;
+        self.written += buf.len() as u64;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
