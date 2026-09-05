@@ -130,6 +130,16 @@ usage: big serve <file> [addr] [options]
                               carries it along
   --write-queue-bytes <size>  acknowledged writes this may hold, default 64M. Past it, see
                               --write-when-full. Suffixes K, M, G
+  --watch-max <n>             subscriptions GET /watch may hold at once, default 0 (off).
+                              A client subscribes with a SELECT and is pushed the answer
+                              again whenever it changes - a live query, not a change feed:
+                              the engine keeps no log of logical changes, and an answer here
+                              is a number rather than a row. **Each subscriber holds a worker
+                              for as long as it stays connected**, so this is the one route
+                              that can take the pool away from everything else; keep it well
+                              under --workers. On a node writing alone a push follows a commit
+                              at once; with peers it follows ?interval= instead, because a
+                              commit elsewhere notifies nothing here
   --write-when-full block|refuse
                               what a full buffer does, default block. block answers the write
                               the durable way instead, which is backpressure aimed at whoever
@@ -416,6 +426,7 @@ fn serving(auth: Auth, tls: Option<TlsConfig>, opts: &Options) -> ServerConfig {
         auth,
         tls,
         backup_dir: opts.backup_dir.clone(),
+        watch_max: opts.watch_max,
         query_timeout: opts.query_timeout,
         workers: opts.workers.unwrap_or(base.workers),
         queue_depth: opts.queue.unwrap_or(base.queue_depth),
@@ -539,6 +550,17 @@ fn announce(server: &Server<big_embed::MmapPager>, bound: std::net::SocketAddr, 
     } else {
         eprintln!("big: no --write-async; a write is answered only once it is durable");
     }
+    // Both ways, and the number matters: a subscriber holds a worker, so an operator sizing a
+    // pool needs to see this next to --workers rather than infer it.
+    if opts.watch_max > 0 {
+        eprintln!(
+            "big: GET /watch holding at most {} subscriptions, of {} workers",
+            opts.watch_max,
+            server.config().workers
+        );
+    } else {
+        eprintln!("big: no --watch-max; GET /watch is not configured");
+    }
     // Printed both ways for the reason the balancer is, and with the consequence spelled out:
     // an automatic handover can burn row ids the dead leader promised to writes that never
     // landed, which is not something to find out from a doc after the fact.
@@ -604,6 +626,8 @@ struct Options {
     write_queue_bytes: usize,
     /// What a full buffer does.
     write_when_full: big_embed::WhenFull,
+    /// Subscriptions `GET /watch` may hold at once. `0` turns the route off.
+    watch_max: usize,
     durability: Option<big_db::Durability>,
     cluster: Option<String>,
     node: Option<String>,
@@ -641,6 +665,7 @@ impl Default for Options {
             write_linger: big_embed::GroupConfig::default().linger,
             write_queue_bytes: big_embed::GroupConfig::default().max_async_bytes,
             write_when_full: big_embed::GroupConfig::default().when_full,
+            watch_max: 0,
             durability: None,
             cluster: None,
             node: None,
@@ -743,6 +768,10 @@ impl Options {
                 }
                 "--write-group-facts" => {
                     out.write_group_facts = parse_num(&value()?, arg)?.max(1);
+                    i += 2;
+                }
+                "--watch-max" => {
+                    out.watch_max = parse_num(&value()?, arg)?;
                     i += 2;
                 }
                 "--write-async" => {

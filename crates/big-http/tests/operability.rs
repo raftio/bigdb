@@ -87,6 +87,21 @@ fn spawn_early(requests: usize) -> SocketAddr {
     addr
 }
 
+/// The same, with `GET /watch` configured.
+fn spawn_watching(requests: usize) -> SocketAddr {
+    let api = Api::in_memory().unwrap();
+    api.create_table("tx").unwrap();
+    api.create_field("tx", "amount", big_db::catalog::FieldKind::Int, 32).unwrap();
+
+    let server =
+        Server::bind_with(api, "127.0.0.1:0", ServerConfig { watch_max: 4, ..config() }).unwrap();
+    let addr = server.local_addr().unwrap();
+    std::thread::spawn(move || {
+        let _ = server.serve_n(requests);
+    });
+    addr
+}
+
 /// The same, on the real worker pool rather than the inline path, for the tests that are
 /// about the pool itself.
 fn spawn_pooled(config: ServerConfig) -> SocketAddr {
@@ -845,4 +860,111 @@ fn a_min_txn_that_is_not_one_says_what_the_shape_is() {
     let nonsense = send(addr, "POST", "/sql?min_txn=local/soon", "SELECT count(*) FROM tx");
     assert_eq!(nonsense.status, 422, "{}", nonsense.body);
     assert!(nonsense.body.contains("soon"), "{}", nonsense.body);
+}
+
+/// **The claim `GET /watch` has to earn**: subscribe, write from somewhere else, and the new
+/// answer arrives without asking for it.
+#[test]
+fn a_subscriber_is_pushed_the_new_answer_when_it_changes() {
+    use std::io::{BufRead, BufReader, Write};
+
+    let api = Api::in_memory().unwrap();
+    api.create_table("tx").unwrap();
+    api.create_field("tx", "amount", big_db::catalog::FieldKind::Int, 32).unwrap();
+
+    let server = Server::bind_with(
+        api,
+        "127.0.0.1:0",
+        ServerConfig { watch_max: 4, ..config() },
+    )
+    .unwrap();
+    let addr = server.local_addr().unwrap();
+    let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let flag = std::sync::Arc::clone(&running);
+    let done = std::thread::spawn(move || {
+        let _ = server.serve_while(&flag);
+    });
+
+    // Subscribe on a connection of its own and leave it open.
+    let mut sub = std::net::TcpStream::connect(addr).unwrap();
+    sub.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+    write!(
+        sub,
+        "GET /watch?sql=SELECT%20count(*)%20FROM%20tx&interval=50 HTTP/1.1\r\nHost: x\r\n\r\n"
+    )
+    .unwrap();
+    let mut reader = BufReader::new(sub.try_clone().unwrap());
+
+    // The head says it is a stream rather than a body.
+    let mut head = String::new();
+    loop {
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        if line == "\r\n" {
+            break;
+        }
+        head.push_str(&line);
+    }
+    assert!(head.contains("200"), "{head}");
+    assert!(head.contains("Transfer-Encoding: chunked"), "{head}");
+    assert!(head.contains("text/event-stream"), "{head}");
+
+    // The first answer, pushed without being asked for.
+    let first = read_event(&mut reader);
+    assert!(first.contains(r#""rows":[[0]]"#), "the table is empty: {first}");
+
+    // Somebody else writes.
+    let wrote = send(addr, "POST", "/table/tx/import", "amount 1 100\n");
+    assert_eq!(wrote.status, 200, "{}", wrote.body);
+
+    // And the subscriber is told, without having asked again.
+    let second = read_event(&mut reader);
+    assert!(second.contains(r#""rows":[[1]]"#), "{second}");
+    assert!(second.contains("event: answer"), "{second}");
+    assert!(second.contains("id: local/"), "the id is where this node's history got to: {second}");
+
+    drop(reader);
+    running.store(false, std::sync::atomic::Ordering::Relaxed);
+    let _ = done.join();
+}
+
+/// Reads one server-sent event out of a chunked stream, skipping the chunk framing.
+fn read_event(reader: &mut std::io::BufReader<std::net::TcpStream>) -> String {
+    use std::io::BufRead;
+    let mut event = String::new();
+    loop {
+        let mut line = String::new();
+        let n = reader.read_line(&mut line).unwrap();
+        assert!(n > 0, "the stream ended before an event arrived: {event}");
+        let trimmed = line.trim_end();
+        // Chunk sizes are bare hex on a line of their own; a blank line ends an event.
+        if trimmed.is_empty() {
+            if !event.is_empty() {
+                return event;
+            }
+            continue;
+        }
+        if u64::from_str_radix(trimmed, 16).is_ok() && !trimmed.contains(':') {
+            continue;
+        }
+        event.push_str(&line);
+    }
+}
+
+/// Off by default, and it says which flag turns it on rather than pretending the route is gone.
+#[test]
+fn watching_is_refused_when_it_was_never_configured() {
+    let addr = spawn(1, config());
+    let r = send(addr, "GET", "/watch?sql=SELECT%20count(*)%20FROM%20tx", "");
+    assert_eq!(r.status, 503, "{}", r.body);
+    assert!(r.body.contains("--watch-max"), "{}", r.body);
+}
+
+/// A statement that writes is refused at subscribe, not once per push.
+#[test]
+fn watching_something_that_is_not_a_select_is_refused_at_subscribe() {
+    let addr = spawn_watching(1);
+    let r = send(addr, "GET", "/watch?sql=CREATE%20TABLE%20nope", "");
+    assert_eq!(r.status, 422, "{}", r.body);
+    assert!(r.body.contains("not_a_query"), "{}", r.body);
 }

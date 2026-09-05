@@ -132,6 +132,10 @@ pub struct ServerConfig {
     /// is power over the rest of the filesystem, and that is a much larger thing to hand to
     /// whoever holds a token.
     pub backup_dir: Option<String>,
+    /// How many `GET /watch` subscriptions to hold at once. `0`, the default, turns the route
+    /// off: a subscriber holds a worker for as long as it stays connected, so an uncapped
+    /// version of this route is a way to take the pool away from every other request.
+    pub watch_max: usize,
 }
 
 impl Default for ServerConfig {
@@ -158,6 +162,8 @@ impl Default for ServerConfig {
             // Off. A daemon that backed itself up somewhere by default would be a daemon
             // filling a disk nobody chose.
             backup_dir: None,
+            // Off, like everything that lets a client hold something open.
+            watch_max: 0,
         }
     }
 }
@@ -176,6 +182,8 @@ struct State<P: PagerMut> {
     /// while sending nothing at all, and the server stops answering anyone - which is a worse
     /// failure than the reconnect keep-alive was avoiding.
     kept_alive: std::sync::atomic::AtomicUsize,
+    /// Live `GET /watch` subscriptions, against `config.watch_max`.
+    watching: std::sync::atomic::AtomicUsize,
     /// Whether a backup is walking this node's file right now.
     ///
     /// One at a time: two walks would each pin the reclaim horizon for their whole run while
@@ -249,6 +257,7 @@ impl<P: PagerMut + Sync + Send + 'static> Server<P> {
                 metrics: ServerMetrics::new(),
                 config,
                 kept_alive: std::sync::atomic::AtomicUsize::new(0),
+                watching: std::sync::atomic::AtomicUsize::new(0),
                 backing_up: AtomicBool::new(false),
                 stopping: AtomicBool::new(false),
             }),
@@ -653,6 +662,9 @@ fn serve_one<P: PagerMut + Sync>(
     // Who the request turned out to be, filled in once the route has decided. Declared out here
     // so that the log line below can reach it whether or not a handler ever ran.
     let mut who: Option<(&'static str, String)> = None;
+    // Set when the answer turns out to be a stream. Declared out here for the same reason
+    // `who` is: the match below borrows the request, and this outlives it.
+    let mut stream: Option<routes::Watch> = None;
     // When the request was actually in hand. **Not `started`**, which begins before
     // `Request::read` and therefore runs while a worker sits blocked waiting for a client to
     // send anything - on a pooled connection that idle wait can be seconds, and reporting it as
@@ -686,10 +698,49 @@ fn serve_one<P: PagerMut + Sync>(
                 r.into()
             });
             who = answered.who;
+            stream = answered.stream;
             (answered.response, method, path, bytes_in, keep)
         }
         Err(e) => (e.into_response(), "-".to_string(), "-".to_string(), 0, false),
     };
+
+    // **A subscription is answered here rather than by a handler**, because it is the only
+    // answer that needs the socket: it writes its head, then keeps writing until the reader
+    // leaves. Everything below this point that talks about a body is skipped, and the
+    // connection ends with the stream - a chunked body ends where the sender says it does, and
+    // agreeing with the client about that afterwards is the negotiation this shape avoids.
+    if let Some(watch) = stream {
+        let head = watch.head.head();
+        if wire.write_all(&head).and_then(|()| wire.flush()).is_err() {
+            return Ok(false);
+        }
+        let sent = {
+            let mut chunked = big_wire::Chunked::new(wire);
+            routes::watch::run(state, &watch, &mut chunked);
+            chunked.written()
+        };
+        let _ = wire.write_all(big_wire::LAST_CHUNK).and_then(|()| wire.flush());
+
+        let elapsed = started.elapsed();
+        state.metrics.request(200, elapsed, bytes_in, sent as usize);
+        let mut fields = vec![
+            ("id", log::F::S(&id)),
+            ("method", log::F::S(&method)),
+            ("path", log::F::S(&path)),
+            ("status", log::F::N(200)),
+            ("duration_us", log::F::N(elapsed.as_micros().min(u64::MAX as u128) as u64)),
+            ("bytes_in", log::F::N(bytes_in as u64)),
+            ("bytes_out", log::F::N(sent)),
+        ];
+        if let Some(peer) = peer {
+            fields.push(("peer", log::F::S(peer)));
+        }
+        if let Some((kind, name)) = &who {
+            fields.push((kind, log::F::S(name)));
+        }
+        log::emit(log::Level::Info, "subscription", &fields);
+        return Ok(false);
+    }
 
     // A request this server could not make sense of, or could not complete, takes the
     // connection with it. Reading the next request means trusting that this one ended where
@@ -830,6 +881,8 @@ fn answer<P: PagerMut + Sync>(state: &State<P>, req: &Request, wire: &Wire) -> r
         cancel: None,
         backup_dir: state.config.backup_dir.as_deref(),
         backup_running: &state.backing_up,
+        watch_max: state.config.watch_max,
+        watching: &state.watching,
         balance: state.config.balance,
     };
 

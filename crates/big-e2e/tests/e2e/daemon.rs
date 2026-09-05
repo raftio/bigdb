@@ -271,3 +271,17 @@ fn a_when_full_policy_that_is_not_one_of_the_two_is_refused_with_both() {
     assert!(refused.said("block or refuse"), "lists what it takes: {}", refused.err);
     assert!(refused.said("panic"), "and repeats what it got: {}", refused.err);
 }
+
+#[test]
+fn watching_is_announced_both_ways_with_the_number_that_matters() {
+    // The number is announced next to the pool because a subscriber holds a worker: an operator
+    // sizing --workers needs to see both, not infer one from the other.
+    let on = Daemon::with(&["--watch-max", "8"]);
+    until("the daemon to announce itself", || on.log().contains("/watch"));
+    assert!(on.log().contains("at most 8 subscriptions"), "{}", on.log());
+    assert!(on.log().contains("workers"), "and says what it is competing with: {}", on.log());
+
+    let off = Daemon::start();
+    until("the default daemon to announce itself", || off.log().contains("--watch-max"));
+    assert!(off.log().contains("not configured"), "{}", off.log());
+}

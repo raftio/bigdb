@@ -23,6 +23,7 @@
 //! POST   /repair                   catch up every copy that is behind     admin
 //! POST   /table/{t}/query          body: one PQL call                    read
 //! POST   /sql                      one SELECT, or CREATE TABLE            read *
+//! GET    /watch?sql=&interval=      a SELECT, re-answered when it changes  read *
 //! POST   /table/{t}/import         body: one fact per line               write
 //! POST   /table/{t}/delete         body: one record id per line          write
 //! POST   /table/{t}?engine=bitmap|bitmap+columnar|columnar             admin
@@ -50,6 +51,12 @@
 //! schema routes gained a fan-out behind them, and a client cannot tell: a coordinator with no
 //! peers is what a single node now is, so the request that worked yesterday takes the same
 //! path as the one that reaches four machines.
+//!
+//! **`/watch` is the only route that answers with a stream**, and the only one that holds a
+//! worker for as long as a client cares to stay. It is off unless `--watch-max` says otherwise,
+//! and it is deliberately absent from `bigproxy`'s allowlist: that proxy is buffered
+//! request/response with a per-route budget, and a connection that lives for hours has no
+//! budget. A client subscribes to a node directly. See `watch`.
 //!
 //! \* `CREATE TABLE` over `/sql` needs `admin`. The role check runs before any body is decoded,
 //! so a route's role is a *floor*: the statement raises it once it has been classified, which is
@@ -113,6 +120,7 @@ mod backup;
 mod ops;
 mod peer;
 mod query;
+pub(crate) mod watch;
 
 // Glob rather than a list, because the list would be the route table written a fourth time -
 // after the doc comment above, `Target`, and `dispatch` - and the one that drifts is the one
@@ -164,6 +172,13 @@ pub struct Ctx<'a, P: PagerMut> {
     /// somewhere to put one. A directory rather than a path per request, because a request
     /// that chose its own path could write anywhere this process can.
     pub backup_dir: Option<&'a str>,
+    /// How many `GET /watch` subscriptions this server will hold at once. `0` is the default
+    /// and turns the route off: every subscriber holds a worker for the life of its connection,
+    /// so this is the one route that can take the pool away from everything else.
+    pub watch_max: usize,
+    /// How many it is holding. Shared with the server for the reason `backup_running` is: it
+    /// has to outlive the request that took a slot.
+    pub watching: &'a std::sync::atomic::AtomicUsize,
     /// Whether a backup is already walking this node's file. Shared with the server rather
     /// than owned here, because a `Ctx` lives for one request and the flag has to outlive it.
     pub backup_running: &'a AtomicBool,
@@ -220,6 +235,7 @@ enum Target<'a> {
     Verify,
     Query(&'a str),
     Sql,
+    Watch,
     Records(&'a str),
     Import(&'a str),
     DeleteRecords(&'a str),
@@ -346,6 +362,9 @@ impl<'a> Target<'a> {
             // The statement says what it needs - see `Sql::demands` - and it cannot be known
             // before the body is read. This is the floor, and the floor is "somebody".
             Self::Sql => Guard::Authenticated,
+            // The floor is the same as `/sql`'s and for the same reason: the statement says
+            // what it needs, and it is re-asked on every push rather than only at subscribe.
+            Self::Watch => Guard::Authenticated,
             // A listing of names, which is what every JDBC driver opens with. Filtering it down
             // to what the reader may query is a feature this surface does not have yet; when it
             // does, it belongs beside `Sql::demands` rather than here.
@@ -424,6 +443,7 @@ fn resolve<'a>(method: &str, segments: &[&'a str]) -> Option<Target<'a>> {
         ("GET", ["table", t, "records"]) => Target::Records(t),
         ("POST", ["table", t, "query"]) => Target::Query(t),
         ("POST", ["sql"]) => Target::Sql,
+        ("GET", ["watch"]) => Target::Watch,
         ("POST", ["table", t, "import"]) => Target::Import(t),
         ("POST", ["table", t, "delete"]) => Target::DeleteRecords(t),
         ("POST", ["table", t]) => Target::CreateTable(t),
@@ -499,6 +519,10 @@ pub fn may_run_long(req: &Request) -> bool {
 pub struct Answered {
     /// What to send back.
     pub response: Response,
+    /// Set when the answer is a stream rather than a body: the head to write, and what to keep
+    /// pushing down it. Owned data rather than a closure, so nothing here grows a lifetime and
+    /// the work itself stays a plain function the server calls with the socket in hand.
+    pub stream: Option<Watch>,
     /// What to put in the log: the field name - `"user"` or `"node"` - and the name itself.
     ///
     /// The kind is carried rather than guessed from the name. An earlier draft inferred it from
@@ -507,9 +531,28 @@ pub struct Answered {
     pub who: Option<(&'static str, String)>,
 }
 
+/// A registered live query: what to re-run, how often to look, and as whom.
+///
+/// **As whom matters on every push, not just at subscribe.** A `REVOKE` while a stream is open
+/// has to cut it off, so the identity is carried here and the grant is checked again each time
+/// round rather than once at the top.
+pub struct Watch {
+    /// The `SELECT` to re-run.
+    pub sql: String,
+    /// Which database an unqualified name in it means.
+    pub database: Option<String>,
+    /// The longest to go without looking. On a node with peers this is the whole trigger; on a
+    /// node writing alone a commit wakes it sooner.
+    pub interval: std::time::Duration,
+    /// The identity to check the grant against, every push.
+    pub who: big_rbac::Who,
+    /// The head to write before the first chunk.
+    pub head: big_wire::Streaming,
+}
+
 impl From<Response> for Answered {
     fn from(response: Response) -> Self {
-        Self { response, who: None }
+        Self { response, who: None, stream: None }
     }
 }
 
@@ -539,8 +582,18 @@ pub fn dispatch<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request) -> Answered
     // Both are cheap to check and impossible to notice afterwards.
     if target.is_internal() {
         if let Some(refusal) = mismatched(ctx, req) {
-            return Answered { response: refusal, who };
+            return Answered { response: refusal, who, stream: None };
         }
+    }
+
+    // A subscription is not a body, so it leaves before the arm below that builds one. It is
+    // also the one route whose answer is decided here and *produced* by the server, with the
+    // socket in hand - see `watch::run`.
+    if matches!(target, Target::Watch) {
+        return match watch::subscribe(ctx, req, &principal) {
+            Ok((response, stream)) => Answered { response, who, stream: Some(stream) },
+            Err(refusal) => Answered { response: *refusal, who, stream: None },
+        };
     }
 
     let response = match target {
@@ -564,6 +617,8 @@ pub fn dispatch<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request) -> Answered
         Target::Verify => Response::ok(json::verify(&ctx.cluster.verify())),
         Target::Query(t) => query(ctx, req, t),
         Target::Sql => sql(ctx, req, &principal),
+        // Handled above: it answers with a stream rather than a body.
+        Target::Watch => unreachable!("a subscription leaves before this match"),
         Target::Records(t) => records(ctx, req, t),
         Target::Import(t) => import(ctx, req, t),
         Target::DeleteRecords(t) => delete(ctx, req, t),
@@ -623,7 +678,7 @@ pub fn dispatch<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request) -> Answered
         Target::ClusterSchemaLeader => cluster_schema_leader(ctx, req),
         Target::Backup => backup(ctx, req),
     };
-    Answered { response, who }
+    Answered { response, who, stream: None }
 }
 
 /// Who this request is, or the response explaining why it is nobody.

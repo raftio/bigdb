@@ -293,6 +293,45 @@ POST /sql?min_txn=local/41&wait=250   # ...or 504 not_caught_up after 250ms
 
 `wait` defaults to 1000ms and is capped at 60s.
 
+## Push an answer instead of being asked for it
+
+```sh
+big serve /var/lib/big/data.big --watch-max 32
+```
+
+```
+GET /watch?sql=SELECT%20count(*)%20FROM%20tx&interval=1000
+Accept: text/event-stream
+
+event: answer
+id: local/41
+data: {"columns":["count"],"rows":[[41820]]}
+```
+
+A client registers one `SELECT` and is pushed the answer again **whenever it changes**. The
+`id` is the same `<node>/<transaction>` `X-Big-Txn` uses.
+
+- **A live query, not a change feed.** This engine keeps no log of logical changes —
+  copy-on-write preserves old *pages*, which says nothing about which facts moved. What it has
+  instead is answers that are *numbers*, so it re-runs the statement and pushes the result when
+  it differs. If you need to know which rows changed, this is not that and will not become it.
+- **Each subscriber holds a worker for as long as it stays connected.** That is the real cost.
+  Keep `--watch-max` well under `--workers`, or subscriptions will starve ordinary requests.
+  Past the cap the route answers `503 server_busy` with `Retry-After`.
+- **How soon a push follows a write depends on the shape of the deployment.** On a node writing
+  alone it follows the commit immediately, because it waits on the same signal `?min_txn=` does.
+  On a node with peers a commit elsewhere signals nothing here, so `?interval=` is the whole
+  trigger — that is a real difference and not a tuning knob.
+- **The grant is re-checked on every push**, so a `REVOKE` ends the stream rather than being
+  noticed the next time the client reconnects.
+- **Not available through `bigproxy`.** Subscribe to a node directly; see
+  [docs/proxy.md](docs/proxy.md) for why.
+- **Nothing is replayed.** Reconnecting gets you the current answer, not what you missed. The
+  `id` tells you where the node's history had got to, which is enough to know *that* you missed
+  something.
+
+`interval` is clamped to between 50ms and 5 minutes.
+
 ## Check the file for rot
 
 ```sh
@@ -403,6 +442,7 @@ Everything `big serve` takes:
 | `--write-linger <ms>` | `200` | The longest an acknowledged write waits to be committed |
 | `--write-queue-bytes <size>` | `64M` | Acknowledged, uncommitted writes this node may hold |
 | `--write-when-full <policy>` | `block` | `block` answers durably instead; `refuse` answers `503` |
+| `--watch-max <n>` | `0` (off) | Subscriptions `GET /watch` may hold at once. Each holds a worker |
 | `BIG_LOG` | `info` | `off`, `error`, `warn`, `info`, `debug` |
 
 **`big serve` refuses to bind anywhere but loopback without `--users`, and refuses again
