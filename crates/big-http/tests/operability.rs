@@ -872,12 +872,8 @@ fn a_subscriber_is_pushed_the_new_answer_when_it_changes() {
     api.create_table("tx").unwrap();
     api.create_field("tx", "amount", big_db::catalog::FieldKind::Int, 32).unwrap();
 
-    let server = Server::bind_with(
-        api,
-        "127.0.0.1:0",
-        ServerConfig { watch_max: 4, ..config() },
-    )
-    .unwrap();
+    let server =
+        Server::bind_with(api, "127.0.0.1:0", ServerConfig { watch_max: 4, ..config() }).unwrap();
     let addr = server.local_addr().unwrap();
     let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
     let flag = std::sync::Arc::clone(&running);
