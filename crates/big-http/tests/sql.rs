@@ -1264,6 +1264,28 @@ fn the_catalog_answers_in_sql_what_the_schema_route_answers_in_json() {
     assert!(body.contains(r#""code":"unknown_table""#), "{body}");
 }
 
+/// **A database that holds nothing is still in `SHOW DATABASES`.** The listing was derived
+/// from the tables once, so a `CREATE DATABASE` answered `200` and then left no trace in the
+/// one statement a client checks it with - which is what a console shows an operator right
+/// after they run it, before there is any table to put in it.
+#[test]
+fn a_database_with_no_tables_is_still_listed_over_sql() {
+    let addr = spawn(4);
+
+    let (status, body) = send(addr, "POST", "/sql", "CREATE DATABASE sales");
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body, r#"{"columns":["database"],"rows":[[1]]}"#);
+
+    let (status, body) = send(addr, "POST", "/sql", "SHOW DATABASES");
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body, r#"{"columns":["name","tables"],"rows":[["default",0],["sales",0]]}"#);
+
+    // And the count is the tables it holds, once it holds one.
+    assert_eq!(send(addr, "POST", "/sql", "CREATE TABLE sales.orders (n INT)").0, 200);
+    let (_, body) = send(addr, "POST", "/sql", "SHOW DATABASES");
+    assert_eq!(body, r#"{"columns":["name","tables"],"rows":[["default",0],["sales",1]]}"#);
+}
+
 /// **`SHOW CREATE TABLE` answers with a statement that creates the same table.**
 ///
 /// Not "a statement that looks right": it is posted back to a fresh server and the two schemas

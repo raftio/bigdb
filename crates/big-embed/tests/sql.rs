@@ -392,6 +392,26 @@ fn an_unqualified_name_still_means_the_default_database() {
     assert!(set.rows.iter().any(|r| r[0] == Datum::Text("tx".to_string())), "{set:?}");
 }
 
+/// A database that holds nothing is still in `SHOW DATABASES`. It was derived from the tables
+/// once, which made a freshly created database invisible until something was put in it - the
+/// one moment an operator is asking the question in order to confirm the `CREATE` landed.
+#[test]
+fn an_empty_database_is_still_listed() {
+    let api = Api::in_memory().unwrap();
+    api.create_database("sales").unwrap();
+
+    let set = api.databases();
+    let named = |n: &str| set.rows.iter().find(|r| r[0] == Datum::Text(n.to_string()));
+    assert_eq!(named("sales").map(|r| &r[1]), Some(&Datum::Int(0)), "{set:?}");
+    assert_eq!(named("default").map(|r| &r[1]), Some(&Datum::Int(0)), "{set:?}");
+
+    // And the count is the tables it holds, once it holds one.
+    api.create_table("sales.orders").unwrap();
+    let set = api.databases();
+    let sales = set.rows.iter().find(|r| r[0] == Datum::Text("sales".to_string()));
+    assert_eq!(sales.map(|r| &r[1]), Some(&Datum::Int(1)), "{set:?}");
+}
+
 /// `DROP DATABASE` refuses while the database still holds tables, and `CASCADE` is the word
 /// that takes them with it. The default is `RESTRICT` because this is one word away from being
 /// the most expensive statement on this surface.
