@@ -39,6 +39,12 @@ class FakeServer:
         self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._sock.bind(("127.0.0.1", 0))
         self._sock.listen(8)
+        # **A timeout, so `close` can actually stop it.** The accept loop below blocks in
+        # `accept()`; closing the socket from another thread does not reliably wake a thread
+        # already parked there, so without this the listener can outlive `close()` and accept a
+        # connection on its way out - which is a client getting a reset where it was promised a
+        # refusal.
+        self._sock.settimeout(0.05)
         self.port = self._sock.getsockname()[1]
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._serve, daemon=True)
@@ -54,6 +60,9 @@ class FakeServer:
                 return
             try:
                 conn, _ = self._sock.accept()
+            except TimeoutError:
+                # Nothing arrived in this slice. Round again and re-read `_stop`.
+                continue
             except OSError:
                 return
             self.connections += 1
@@ -83,7 +92,15 @@ class FakeServer:
                     return
 
     def close(self) -> None:
+        """Stops listening, and does not return until that is true.
+
+        The join is the point. `close` used to set the flag and shut the socket, leaving the
+        accept thread parked in `accept()`; a client connecting in that window was accepted by
+        a server that was supposed to be gone, read in full, and dropped - which reads to the
+        client as `Unknown` rather than the `NotSent` a closed port owes it.
+        """
         self._stop.set()
+        self._thread.join(timeout=2.0)
         with contextlib.suppress(OSError):
             self._sock.close()
 

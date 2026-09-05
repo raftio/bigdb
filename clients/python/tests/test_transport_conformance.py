@@ -8,6 +8,7 @@ in design - so the parametrisation is over the transport itself, not two copies 
 from __future__ import annotations
 
 import asyncio
+import socket
 import time
 
 import pytest
@@ -179,10 +180,15 @@ def test_a_connection_dropped_before_the_status_line_is_an_unknown_outcome(kind)
 
 @BOTH
 def test_a_refused_connection_provably_never_arrived(kind):
-    # Bound then closed, so the port is almost certainly nobody's.
-    server = FakeServer([])
-    addr = Address.parse(server.addr)
-    server.close()
+    # **A socket that never listened**, rather than a `FakeServer` that was closed. A listener
+    # on its way out can still accept - which is a connection that reaches somebody, reads the
+    # request in full and drops it, and that is `Unknown` rather than the `NotSent` this test
+    # is about. Nothing can ever be accepted on a socket that was never listening.
+    probe = socket.socket()
+    probe.bind(("127.0.0.1", 0))
+    port = probe.getsockname()[1]
+    probe.close()
+    addr = Address.parse(f"127.0.0.1:{port}")
     t = drive(kind, addr)
     with pytest.raises(NotSent):
         t.roundtrip("GET", "/health")
