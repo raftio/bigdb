@@ -11,6 +11,61 @@ intersection and a count is a population count rather than a scan.
 It ships as two binaries: `big`, the daemon and the offline file tools, and `bigctl`, the client
 that talks to a running daemon over HTTP.
 
+## Use cases
+
+Questions whose answer is a number over a great many records, asked again and again with a
+different filter each time.
+
+- **The numbers behind a dashboard.** A BI panel is the same handful of aggregates re-asked with
+  whatever the reader clicked: `count`, `sum`, `avg`, a `GROUP BY`, a top ten. `EXPLAIN` says
+  what a statement will do before it does any of it, `--query-timeout` puts a wall-clock ceiling
+  on it, and `--format table|tsv|json` decides how the answer comes back.
+- **Segments and audiences.** `country = 'GB' AND plan = 'pro' AND NOT churned` is three bitmaps
+  intersected and one population count. A condition added is another intersection, not another
+  pass over the records, so what a filter costs follows the containers it touches rather than
+  the number of records the table holds.
+- **Event and product analytics.** A time quantum field writes a per-day index beside the fact,
+  so `WHERE visit = 'home' AND visit BETWEEN 1767225600 AND 1769904000` reads the days it needs
+  and no others. Retention is `big drop-days`, which drops those days from the index and leaves
+  the records where they are.
+- **A counting engine beside a system of record.** The database that owns the rows keeps owning
+  them; this one answers *how many*. A record id is the address a bit is written at rather than
+  a key this side invented, so it can be the id the source already has, and the same import run
+  twice writes what it wrote once.
+- **Realtime, from a program that is running.** [`contrib/big-message`](contrib/big-message/)
+  takes events as they are produced — no file to point at, and no ids of its own to invent — and
+  a commit publishes its roots and its catalog together, so a fact is answerable by the next
+  query rather than by the next batch. There is no index to rebuild and nothing to replay after
+  a crash. [`examples/producer/`](examples/producer/) runs it in one command.
+- **A serving layer downstream of a stream or a warehouse.** Loads are chunked, resumable and
+  safe to re-run, which is what makes a replay from upstream converge rather than double-count.
+  Past one machine, each node owns a range of shards and any node plans the whole query, so a
+  table wider than a host still answers with one number.
+
+**What it is not for.** Reading rows back one at a time: a record is bits spread across fields,
+not a row sitting somewhere. Atomicity across nodes: there is none, by decision —
+[docs/clustering.md](docs/clustering.md) says why, for that and for every other thing a cluster
+here does not give you. There is no Postgres or MySQL wire protocol either, so a BI tool reaches
+it over HTTP or through the `database/sql` driver in [`clients/go`](clients/go/), not through an
+ODBC driver it already ships. `UPDATE`, `DELETE FROM` and joins beyond a single equi-join are
+refused by name, before anything runs, with a sentence saying what exists instead.
+
+## Features
+
+| | |
+|---|---|
+| **Storage** | A b-tree of roaring containers over 8 KB pages, pure copy-on-write. **No WAL, no checkpoint, nothing to replay after a crash** — a commit writes pages, fsyncs, flips the meta page, and fsyncs again. |
+| **Reads** | One writer and many readers, each on the transaction it opened. The read path borrows straight out of the mapped file and takes no lock. |
+| **Fields** | `set`, `mutex`, `bool`, `int` at a chosen bit depth, signed `int`, `decimal`, `float32`, `float64`, `date`, `datetime`, `timequantum`. Everything but a set is bit-sliced, so a `sum` or a `min` is a walk over planes rather than over records. |
+| **SQL** | `SELECT` with `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`, `UNION ALL`, one equi-join on a keyed column, plus views, `INSERT`, DDL, `SHOW`, `GRANT`/`REVOKE` and `EXPLAIN`. `count`, `count(distinct)`, `sum`, `min`, `max`, `avg`, `median`/`quantile`, and the usual scalar functions. |
+| **PQL** | `Count`, `Sum`, `Min`, `Max`, `Distinct`, `TopN`, `GroupBy`. The SQL surface lowers into exactly these, through the same planner, so neither can express what the other cannot. |
+| **Cluster** | Ranges of shards over many nodes, every node a coordinator. A replicated range fails over on its own in about a second; `--balance` lets the cluster move ranges as nodes join, fill and drain. CP, deliberately. |
+| **Front door** | `bigproxy` puts one address in front of a cluster, sends each request to the least busy node that reports ready, and carries nothing outside a list of routes written down in advance. See [docs/proxy.md](docs/proxy.md). |
+| **Durability** | `--durability full`, `barrier` or `none`. A checksum on every page it can reach and `big scrub` to walk them, `big backup` and `POST /admin/backup` while serving, `big compact` offline and `--reclaim` online to give space back to the filesystem. |
+| **Access control** | argon2id passwords over TLS, roles that are sets of grants rather than ranks, and certificates rather than shared secrets between nodes. See [docs/access-control.md](docs/access-control.md). |
+| **Operations** | `/health`, `/ready`, Prometheus `/metrics`, `GET /verify` and `POST /repair` for replication, per-query and per-connection timeouts, a ceiling on row keys. |
+| **Clients** | Go, including a `database/sql` driver, and Python in progress — [`clients/`](clients/readme.md). [`crates/big-embed`](crates/big-embed/) is the same engine as a library, with no server in the way. |
+
 ## Requirements
 
 Rust 1.88 or newer, stable toolchain. No nightly (except for fuzzing).
