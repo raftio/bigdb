@@ -1170,3 +1170,71 @@ fn a_handover_that_has_not_finished_is_not_restarted() {
         "the node it names is this one, and it is answering; there is nothing to decide"
     );
 }
+
+// -------------------------------------------------------------------------------------------
+// Knowing that you are behind
+// -------------------------------------------------------------------------------------------
+
+/// **A node whose log is short knows it is short, and says so before the log is repaired.**
+///
+/// `commit` cannot answer this: a follower sets its own to `min(what the leader said, what this
+/// log holds)`, so a node missing half the log records a commit at the end of what it has and
+/// looks entirely caught up. What the leader *said* is the only thing that says otherwise, and
+/// it has to be recorded even when the append that carried it is rejected - which is every
+/// append until the log is filled in.
+#[test]
+fn a_node_missing_entries_knows_it_before_they_arrive() {
+    let mut node = Raft::new(1, voters(3), Timing::default(), 0);
+    assert!(!node.behind(), "a node that has heard from nobody is not behind, it is new");
+
+    // A leader with five committed entries, appending at a position this node cannot match.
+    node.deliver(
+        Message::Append {
+            term: 1,
+            leader: 0,
+            prev_index: 4,
+            prev_term: 1,
+            entries: vec![big_cluster::raft::Entry { term: 1, decision: Decision::Noop }],
+            commit: 5,
+        },
+        0,
+    );
+
+    assert!(node.behind(), "the append was rejected and the number in it was still true");
+    assert_eq!(node.commit_index(), 0, "and nothing was committed on the strength of it");
+}
+
+/// Once the log is filled in, the node stops saying it. The refusal this drives is a wait, not
+/// a failure, so a condition that never cleared would be a node that never served again.
+#[test]
+fn catching_up_clears_it() {
+    let mut node = Raft::new(1, voters(3), Timing::default(), 0);
+    node.deliver(
+        Message::Append {
+            term: 1,
+            leader: 0,
+            prev_index: 4,
+            prev_term: 1,
+            entries: vec![],
+            commit: 5,
+        },
+        0,
+    );
+    assert!(node.behind());
+
+    let filled: Vec<_> =
+        (0..5).map(|_| big_cluster::raft::Entry { term: 1, decision: Decision::Noop }).collect();
+    node.deliver(
+        Message::Append {
+            term: 1,
+            leader: 0,
+            prev_index: 0,
+            prev_term: 0,
+            entries: filled,
+            commit: 5,
+        },
+        0,
+    );
+
+    assert!(!node.behind(), "everything the leader said it had committed is here");
+}

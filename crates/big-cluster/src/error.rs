@@ -77,6 +77,14 @@ pub enum ClusterError {
     /// It cannot know it has not been replaced, so it stops - `NotServing`, for the one role
     /// that is not a range. A write introducing a new key waits; everything else is untouched.
     SchemaLeaseLost { node: String },
+    /// The schema leader is in touch with the agreement but has not caught up with it.
+    ///
+    /// **The window a restart opens.** A lease says this node heard from the agreement's
+    /// leader; it does not say this node has received what the leader has committed. A node in
+    /// that window holds a map from before it stopped - which knows nothing of the ids the
+    /// leader before it promised - so assigning from it would re-issue them. Retryable: it
+    /// closes as soon as the log catches up, which is one round trip.
+    SchemaCatchingUp { node: String },
     /// The namespace has just moved and its new holder has not finished taking it over.
     ///
     /// Nobody interns in this window - the old leader has been deposed, the new one does not
@@ -133,6 +141,7 @@ impl ClusterError {
             | Self::NotServing { .. }
             | Self::NotSchemaLeader { .. }
             | Self::SchemaLeaseLost { .. }
+            | Self::SchemaCatchingUp { .. }
             | Self::SchemaHandover { .. }
             | Self::StaleRoute { .. }
             | Self::RangeMoving { .. } => 503,
@@ -192,6 +201,7 @@ impl ClusterError {
             Self::NotServing { .. } => "not_serving",
             Self::NotSchemaLeader { .. } => "not_schema_leader",
             Self::SchemaLeaseLost { .. } => "schema_lease_lost",
+            Self::SchemaCatchingUp { .. } => "schema_catching_up",
             Self::SchemaHandover { .. } => "schema_handover",
             Self::Refused(_) => "refused",
             Self::StaleRoute { .. } => "stale_route",
@@ -236,6 +246,12 @@ impl core::fmt::Display for ClusterError {
                 f,
                 "`{node}` leads the schema and has lost touch with the agreement, so it cannot \
                  know it still does; a key it has never assigned a row id waits until it can"
+            ),
+            Self::SchemaCatchingUp { node } => write!(
+                f,
+                "`{node}` holds the schema and has not caught up with the agreement, so it \
+                 cannot yet know which row ids were promised before it restarted; a key it has \
+                 never assigned one waits until it has"
             ),
             Self::SchemaHandover { node } => write!(
                 f,

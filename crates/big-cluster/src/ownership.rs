@@ -126,6 +126,15 @@ impl<P: PagerMut + Sync> Cluster<P> {
         if !self.controller.as_ref().is_none_or(|c| c.may_lead_schema()) {
             return Err(ClusterError::SchemaLeaseLost { node });
         }
+        // **Heard from is not caught up.** The lease above says the agreement's leader is
+        // speaking to this node; it says nothing about whether what that leader committed has
+        // arrived. A node restarted into that window holds the map it had before it stopped,
+        // which knows nothing of the block its predecessor reserved - so it would assign from
+        // the highest record anybody holds and re-issue every id that was promised and never
+        // landed. One round trip closes it.
+        if self.controller.as_ref().is_some_and(|c| c.behind_agreement()) {
+            return Err(ClusterError::SchemaCatchingUp { node });
+        }
         Ok(())
     }
 

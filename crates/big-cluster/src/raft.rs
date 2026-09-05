@@ -834,6 +834,15 @@ pub struct Raft {
     members: Vec<Member>,
     /// The subset of `members` whose agreement counts. A learner replicates and does not vote.
     voters: Vec<NodeId>,
+    /// The commit index the current leader last said it had.
+    ///
+    /// **Kept because `commit` cannot answer "am I behind".** A follower sets its own commit to
+    /// `min(what the leader said, what this log holds)`, so a node missing half the log records
+    /// a commit at the end of what it has and looks, locally, entirely caught up. The number
+    /// before that clamp is the only thing that says otherwise. Not persisted: it is a fact
+    /// about the leader that is speaking now, and a node that has heard from nobody is already
+    /// refused by the lease.
+    leader_commit: Index,
     timing: Timing,
 
     // --- persistent: none of this may be lost in a restart ---
@@ -880,6 +889,7 @@ impl Raft {
             seed: members.clone(),
             members,
             voters,
+            leader_commit: 0,
             timing,
             term: 0,
             voted_for: None,
@@ -1094,6 +1104,20 @@ impl Raft {
 
     pub fn log(&self) -> &[Entry] {
         &self.log
+    }
+
+    /// Whether this node knows it has not received everything the agreement has committed.
+    ///
+    /// `false` on a node that has heard from nobody, which is correct here and covered
+    /// elsewhere: not having heard is what the schema lease refuses, and this answers the
+    /// narrower question of whether what *was* heard has arrived.
+    /// One past the last entry whose decision has been handed to the caller.
+    pub fn applied_index(&self) -> Index {
+        self.applied
+    }
+
+    pub fn behind(&self) -> bool {
+        self.leader_commit > self.commit
     }
 
     pub fn commit_index(&self) -> Index {
@@ -1426,6 +1450,16 @@ impl Raft {
 
             Message::Append { term, leader, prev_index, prev_term, entries, commit } => {
                 self.heard.insert(leader, now);
+                // **Recorded here, beside the lease, and not where the commit is applied
+                // below.** The two have to be learned at the same moment or the gap between
+                // them is a lie: an append that does not match this log is rejected several
+                // lines down, and a node whose log is short rejects every one until it has been
+                // filled in - so a node that recorded the number only on the path that succeeds
+                // would renew its lease for that whole stretch while still reporting that it
+                // had everything.
+                if term >= self.term {
+                    self.leader_commit = self.leader_commit.max(commit);
+                }
                 self.observe(term, &mut out);
                 if term < self.term {
                     out.to(
