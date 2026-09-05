@@ -32,12 +32,14 @@
 pub mod error;
 pub mod explain;
 pub mod fact;
+mod group;
 pub mod introspect;
 pub mod result;
 pub mod schema;
 pub mod views;
 
 pub use error::{ApiError, Result};
+pub use group::{Accepted, GroupConfig, GroupStats};
 pub use result::{
     date_text, fixed, literal_of, one_cell, result_set, timestamp_text, Datum, ResultSet, Row,
 };
@@ -545,12 +547,15 @@ pub struct KeyAssignment<'a> {
 /// ```
 pub struct Api<P: PagerMut> {
     db: Db<P>,
+    /// Off until [`Api::configure_group_commit`] turns it on, so an `Api` that nobody
+    /// configured writes down the path it always did.
+    group: group::Group,
 }
 
 impl Api<MemPager> {
     /// A database with no file behind it. Nothing is durable and nothing is locked.
     pub fn in_memory() -> Result<Self> {
-        Ok(Self { db: Db::in_memory()? })
+        Ok(Self { db: Db::in_memory()?, group: group::Group::default() })
     }
 }
 
@@ -559,7 +564,7 @@ impl Api<MmapPager> {
     /// One process per file: the engine takes an exclusive lock, so a second `Api` on the same
     /// path fails here rather than corrupting anything later.
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self> {
-        Ok(Self { db: Db::open_path(path)? })
+        Ok(Self { db: Db::open_path(path)?, group: group::Group::default() })
     }
 
     /// The same, with the address-space reservation named rather than defaulted.
@@ -567,7 +572,7 @@ impl Api<MmapPager> {
     /// See [`Db::open_path_sized`]: the reservation is the file's ceiling for the life of the
     /// process, so it belongs to whoever is deciding how many databases this machine runs.
     pub fn open_sized(path: impl AsRef<std::path::Path>, mapsize: u64) -> Result<Self> {
-        Ok(Self { db: Db::open_path_sized(path, mapsize)? })
+        Ok(Self { db: Db::open_path_sized(path, mapsize)?, group: group::Group::default() })
     }
 }
 
@@ -652,7 +657,16 @@ impl<P: PagerMut + Sync> Api<P> {
     ///
     /// The batch is the unit on purpose. Per-fact transactions would pay the commit cost -
     /// two fsyncs and a full metadata rewrite - once per fact.
+    ///
+    /// With group commit configured, the batch may travel *in company*: several callers'
+    /// batches in one transaction. What is promised here does not change - this batch still
+    /// lands entirely or not at all, and this call still returns only once it is durable.
     pub fn import(&self, table: &str, facts: &[Fact<'_>]) -> Result<()> {
+        if self.group.enabled() {
+            let work =
+                group::Work::Import { table: table.to_string(), batch: group::Batch::own(facts) };
+            return self.group.submit(&self.db, work).map(|_| ());
+        }
         let mut w = self.db.write();
         apply(&mut w, table, facts)?;
         w.commit()?;
@@ -692,6 +706,14 @@ impl<P: PagerMut + Sync> Api<P> {
         keys: &[KeyAssignment<'_>],
         facts: &[Fact<'_>],
     ) -> Result<()> {
+        if self.group.enabled() {
+            let work = group::Work::ImportWithKeys {
+                table: table.to_string(),
+                keys: keys.iter().map(group::OwnedKey::own).collect(),
+                batch: group::Batch::own(facts),
+            };
+            return self.group.submit(&self.db, work).map(|_| ());
+        }
         let mut w = self.db.write();
         for k in keys {
             w.assign_key(table, k.field, k.key, k.row)?;
@@ -706,10 +728,29 @@ impl<P: PagerMut + Sync> Api<P> {
     /// Returns how many of them existed. Deleting a record that was never written is not an
     /// error - it is a request that was already satisfied - so a retried delete is safe.
     pub fn delete(&self, table: &str, records: &[RecordId]) -> Result<u64> {
+        if self.group.enabled() {
+            let work = group::Work::Delete { table: table.to_string(), records: records.to_vec() };
+            return self.group.submit(&self.db, work).map(|a| a.count);
+        }
         let mut w = self.db.write();
         let n = w.delete(table, records)?;
         w.commit()?;
         Ok(n)
+    }
+
+    /// Turns group commit on or off, and sets its ceilings.
+    ///
+    /// Off by default. On, concurrent writers share one transaction and therefore one pair of
+    /// fsyncs; the group is collected in the window the first of them spends waiting for the
+    /// store's write lock, so an uncontended write is not made to wait for company that is not
+    /// coming. See [`GroupConfig`].
+    pub fn configure_group_commit(&self, config: GroupConfig) {
+        self.group.configure(config);
+    }
+
+    /// What group commit has done so far. `jobs / commits` is the average group size.
+    pub fn group_stats(&self) -> GroupStats {
+        self.group.stats()
     }
 
     /// Creates a database, or returns `false` if it was already there.

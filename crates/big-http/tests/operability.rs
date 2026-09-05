@@ -49,6 +49,25 @@ fn spawn(requests: usize, config: ServerConfig) -> SocketAddr {
     addr
 }
 
+/// The same, with group commit switched on before the server takes the database.
+fn spawn_coalescing(requests: usize, jobs: usize) -> SocketAddr {
+    let api = Api::in_memory().unwrap();
+    api.create_table("tx").unwrap();
+    api.create_field("tx", "amount", big_db::catalog::FieldKind::Int, 32).unwrap();
+    api.configure_group_commit(big_embed::GroupConfig {
+        enabled: true,
+        max_jobs: jobs,
+        ..big_embed::GroupConfig::default()
+    });
+
+    let server = Server::bind_with(api, "127.0.0.1:0", config()).unwrap();
+    let addr = server.local_addr().unwrap();
+    std::thread::spawn(move || {
+        let _ = server.serve_n(requests);
+    });
+    addr
+}
+
 /// The same, on the real worker pool rather than the inline path, for the tests that are
 /// about the pool itself.
 fn spawn_pooled(config: ServerConfig) -> SocketAddr {
@@ -565,4 +584,60 @@ fn a_read_token_cannot_take_a_backup() {
     );
     let r = send_with(addr, "POST", "/admin/backup?name=x.big", "", Some("scraper"));
     assert_eq!(r.status, 403, "{}", r.body);
+}
+
+/// The group-commit series are always there, so a dashboard built before anybody passed the
+/// flag keeps evaluating after somebody does.
+///
+/// Deliberately **not** a claim that writes were grouped: this server answers requests one at a
+/// time, so there is nothing to group and `jobs == commits` is the right answer. What is
+/// asserted is that a write went through the coalescer at all, and that it was counted.
+#[test]
+fn a_node_that_coalesces_writes_counts_what_its_commits_carried() {
+    let addr = spawn_coalescing(3, 64);
+
+    let wrote = send(addr, "POST", "/table/tx/import", "amount 1 100\namount 2 200\n");
+    assert_eq!(wrote.status, 200, "{}", wrote.body);
+    assert_eq!(wrote.body, r#"{"imported":2}"#);
+
+    let r = send(addr, "GET", "/metrics", "");
+    assert_eq!(r.status, 200);
+    assert!(r.body.contains("# TYPE big_write_commits_total counter"), "{}", r.body);
+    assert!(r.body.contains("big_write_commits_total 1"), "{}", r.body);
+    assert!(r.body.contains("big_write_commit_jobs_total 1"), "{}", r.body);
+    assert!(r.body.contains("big_write_isolations_total 0"), "{}", r.body);
+}
+
+/// The off half, and the half that matters more: a node nobody configured must not have gone
+/// anywhere near the queue, and must still publish the series as zeroes.
+#[test]
+fn a_node_that_does_not_coalesce_still_publishes_the_series() {
+    let addr = spawn(2, config());
+
+    let wrote = send(addr, "POST", "/table/tx/import", "amount 40 400\n");
+    assert_eq!(wrote.status, 200, "{}", wrote.body);
+
+    let r = send(addr, "GET", "/metrics", "");
+    assert!(r.body.contains("# TYPE big_write_commits_total counter"), "{}", r.body);
+    assert!(
+        r.body.contains("big_write_commits_total 0"),
+        "a write that never went through the coalescer must not be counted by it: {}",
+        r.body
+    );
+    assert!(r.body.contains("big_write_commit_jobs_total 0"), "{}", r.body);
+}
+
+/// A batch the engine refuses is refused the same way, and with the same words, when it went
+/// through the coalescer.
+#[test]
+fn a_refused_batch_reads_the_same_whether_or_not_writes_are_coalesced() {
+    let coalescing = spawn_coalescing(1, 64);
+    let plain = spawn(1, config());
+
+    let a = send(coalescing, "POST", "/table/tx/import", "nosuchfield 1 100\n");
+    let b = send(plain, "POST", "/table/tx/import", "nosuchfield 1 100\n");
+
+    assert_eq!(a.status, b.status, "{} vs {}", a.body, b.body);
+    assert_eq!(a.body, b.body);
+    assert!(a.body.contains("nosuchfield"), "{}", a.body);
 }

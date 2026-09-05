@@ -215,3 +215,30 @@ fn durability_is_announced_on_every_start_not_only_when_it_is_relaxed() {
     until("the default daemon to announce itself", || default.log().contains("durability"));
     assert!(default.log().contains("durability full"), "{}", default.log());
 }
+
+#[test]
+fn write_coalescing_is_announced_both_ways_and_actually_writes() {
+    // Both ways for the same reason durability is: what a commit cost is the first thing an
+    // operator reaches for when write latency is the question.
+    let on = Daemon::with(&["--write-coalesce"]);
+    until("the coalescing daemon to announce itself", || on.log().contains("coalescing writes"));
+    assert!(on.log().contains("per commit"), "{}", on.log());
+
+    // And it is a working database, not just a flag that parses.
+    on.bigctl(&["create", "table", "tx"]).expect(0);
+    on.bigctl(&["create", "field", "tx", "amount", "--kind", "int", "--bit-depth", "20"]).expect(0);
+    on.bigctl_stdin(&["import", "tx", "-"], "amount 1 100\namount 2 250\n").expect(0);
+    let answer = on.bigctl(&["sql", "SELECT sum(amount) FROM tx"]).expect(0);
+    assert!(answer.out.contains("350"), "{}", answer.out);
+
+    let off = Daemon::start();
+    until("the default daemon to announce itself", || off.log().contains("--write-coalesce"));
+    assert!(off.log().contains("every write is its own commit"), "{}", off.log());
+}
+
+#[test]
+fn the_group_ceilings_are_rejected_when_they_are_not_numbers() {
+    let refused =
+        run("big", &["serve", "/tmp/nothing.big", "--write-group-jobs", "lots"]).expect(2);
+    assert!(refused.said("--write-group-jobs"), "and says which flag: {}", refused.err);
+}

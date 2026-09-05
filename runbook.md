@@ -194,6 +194,37 @@ inside the file are reused by the next allocation, so a file does not grow witho
 it does not shrink on its own either. A table that was large once keeps its high-water mark
 until someone runs this.
 
+## Share a commit between writers
+
+```sh
+big serve /var/lib/big/data.big --write-coalesce
+```
+
+A commit costs two fsyncs, a full catalog clone on the way in and a full catalog encode on the
+way out, and **none of that is per fact**. The store allows one writer, so ten producers
+importing at the same moment are serialised whatever you do; without this they are serialised
+into ten commits and twenty fsyncs. With it they share one.
+
+- **It costs an idle server nothing.** The group is collected in the window the first writer
+  spends waiting for the write lock — the window it was blocked in anyway. There is no timer, so
+  a write with no company waits for none, and a node with no write contention behaves exactly as
+  it did.
+- **A batch this database refuses still fails alone.** A failed group is rolled back — nothing
+  reached the disk — and re-run by halves until the offender is by itself. The other batches in
+  it succeed, and each caller gets its own error rather than somebody else's.
+- **`200` still means durable.** The call returns after the commit that carried it was flushed.
+  This changes what a commit costs, never what it promises.
+- **What to watch:** `big_write_commit_jobs_total / big_write_commits_total` is the average
+  group size and therefore the win. It sits at `1.00` on a node with no write contention, which
+  is the correct reading rather than a disappointing one — there was nothing to share.
+- **When it may not pay.** Under `--durability none` there are no fsyncs to amortise, and the
+  batch is copied into the queue rather than borrowed from the request. Measure before leaving it
+  on there.
+
+`--write-group-jobs` and `--write-group-facts` bound one commit. The second is the one to reach
+for: it is what stops a one-fact request inheriting the wait of a million-fact request it
+happened to arrive behind. A batch larger than the ceiling still goes on its own.
+
 ## Check the file for rot
 
 ```sh
@@ -297,6 +328,9 @@ Everything `big serve` takes:
 | `--read-timeout <s>` | `30` | How long a client may take to send a request |
 | `--query-timeout <s>` | none | Wall-clock budget for one query. `0` means none |
 | `--durability <level>` | `full` | What a commit promises. See below |
+| `--write-coalesce` | off | Let concurrent writes share a commit. See below |
+| `--write-group-jobs <n>` | `64` | Batches one shared commit may carry |
+| `--write-group-facts <n>` | `1048576` | Facts one shared commit may carry |
 | `BIG_LOG` | `info` | `off`, `error`, `warn`, `info`, `debug` |
 
 **`big serve` refuses to bind anywhere but loopback without `--users`, and refuses again
@@ -831,6 +865,10 @@ catalog as a new record kind, which is additive and needs no format version bump
 | Metric | It means |
 |---|---|
 | `big_free_pages_reusable` | Free pages the next allocation may take |
+| `big_write_commits_total` | Write transactions that reached the disk |
+| `big_write_commit_jobs_total` | Batches those transactions carried. Divided by the above: the average group size |
+| `big_write_isolations_total` | Groups that failed and had to be split to find the batch at fault |
+| `big_write_isolation_attempts_total` | Transactions opened while splitting. Against the above, what one bad batch costs everyone else |
 | `big_pages_pending_reclaim_reader` | Free but pinned by a live reader |
 | `big_pages_pending_reclaim_retention` | Free but pinned by a snapshot |
 | `big_page_count` | Pages in the file |
@@ -877,6 +915,10 @@ big_pages_pending_reclaim_reader > 10000
 
 # The pool is the limit, not the engine. Raise --workers, or find what is slow.
 rate(big_http_connections_rejected_total[5m]) > 0
+
+# A client is sending batches this database refuses, and everybody else is paying for the
+# splitting that finds them. Look for the 4xx in the log and go and tell whoever is sending it.
+rate(big_write_isolation_attempts_total[5m]) / rate(big_write_isolations_total[5m]) > 4
 
 # The engine is failing, not the callers. Every one of these has a line in the log.
 rate(big_http_responses_total{class="5xx"}[5m]) > 0

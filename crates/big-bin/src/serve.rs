@@ -105,6 +105,18 @@ usage: big serve <file> [addr] [options]
                               full    survives power loss
                               barrier survives the OS dying, not the drive's cache
                               none    survives this process dying, nothing more
+  --write-coalesce            let concurrent writes share a commit. The store allows one
+                              writer, so writes arriving together are serialised anyway;
+                              this makes them share one transaction and therefore one pair
+                              of fsyncs instead of one pair each. The group is collected
+                              while the first writer waits for the write lock, so a write
+                              with no company waits for none. A batch the engine refuses
+                              still fails alone. Off unless passed; watch
+                              big_write_commit_jobs_total / big_write_commits_total
+  --write-group-jobs <n>      batches one commit may carry, default 64
+  --write-group-facts <n>     facts one commit may carry, default 1048576. Bounds the wait
+                              a small batch inherits from a large one it arrived behind;
+                              a batch larger than this still goes on its own
 
   BIG_LOG=off|error|warn|info|debug   log level, default info
 
@@ -174,6 +186,11 @@ pub fn main(args: &[String]) -> std::io::Result<()> {
             .set_durability(d)
             .map_err(|e| std::io::Error::other(format!("could not set durability: {e}")))?;
     }
+    cluster.local().configure_group_commit(big_embed::GroupConfig {
+        enabled: opts.write_coalesce,
+        max_jobs: opts.write_group_jobs,
+        max_facts: opts.write_group_facts,
+    });
 
     let server = Server::bind_cluster(cluster, opts.addr.as_str(), serving(auth, tls, &opts))?;
     let bound = server.local_addr()?;
@@ -471,6 +488,17 @@ fn announce(server: &Server<big_embed::MmapPager>, bound: std::net::SocketAddr, 
     } else {
         eprintln!("big: no --reclaim; the file gives space back only to an offline `big compact`");
     }
+    // Both ways again. What a commit costs is the first thing an operator reaches for when
+    // write latency is the question, and a line that appears only when the flag was passed is
+    // one they have to remember the absence of.
+    if opts.write_coalesce {
+        eprintln!(
+            "big: coalescing writes, at most {} batches or {} facts per commit",
+            opts.write_group_jobs, opts.write_group_facts
+        );
+    } else {
+        eprintln!("big: no --write-coalesce; every write is its own commit and its own fsyncs");
+    }
     // Printed both ways for the reason the balancer is, and with the consequence spelled out:
     // an automatic handover can burn row ids the dead leader promised to writes that never
     // landed, which is not something to find out from a doc after the fact.
@@ -521,6 +549,13 @@ struct Options {
     elect_schema_leader: bool,
     /// Whether this node may hand trailing free pages back to the filesystem while serving.
     reclaim: bool,
+    /// Whether concurrent writers may share one commit.
+    write_coalesce: bool,
+    /// Batches one commit may carry. Not `Option`: the default belongs to the engine, and
+    /// `big_embed::GroupConfig` is where it is written down.
+    write_group_jobs: usize,
+    /// Facts one commit may carry, across every batch in it.
+    write_group_facts: usize,
     durability: Option<big_db::Durability>,
     cluster: Option<String>,
     node: Option<String>,
@@ -551,6 +586,9 @@ impl Default for Options {
             balance: false,
             elect_schema_leader: false,
             reclaim: false,
+            write_coalesce: big_embed::GroupConfig::default().enabled,
+            write_group_jobs: big_embed::GroupConfig::default().max_jobs,
+            write_group_facts: big_embed::GroupConfig::default().max_facts,
             durability: None,
             cluster: None,
             node: None,
@@ -642,6 +680,18 @@ impl Options {
                 "--reclaim" => {
                     out.reclaim = true;
                     i += 1;
+                }
+                "--write-coalesce" => {
+                    out.write_coalesce = true;
+                    i += 1;
+                }
+                "--write-group-jobs" => {
+                    out.write_group_jobs = parse_num(&value()?, arg)?.max(1);
+                    i += 2;
+                }
+                "--write-group-facts" => {
+                    out.write_group_facts = parse_num(&value()?, arg)?.max(1);
+                    i += 2;
                 }
                 "--durability" => {
                     let v = value()?;

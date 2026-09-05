@@ -469,6 +469,42 @@ pub fn render_keys(out: &mut String, k: &big_embed::KeyStats) {
     );
 }
 
+/// What group commit has done, if it is on.
+///
+/// **`big_write_commit_jobs_total / big_write_commits_total` is the whole story**: it is the
+/// average number of batches one transaction carried, and therefore how many pairs of fsyncs
+/// this node did not perform. It sits at `1.00` on a node with no write contention however the
+/// flag is set, which is the correct reading rather than a disappointing one - there was
+/// nothing to share.
+///
+/// Rendered even when the feature is off, and rendered as zeroes. The alternative - absent
+/// until somebody passes the flag - breaks every dashboard built before the flag was passed,
+/// and a rate over a counter that is always zero is a flat line rather than a gap.
+pub fn render_group(out: &mut String, g: &big_embed::GroupStats) {
+    counter(out, "big_write_commits_total", "Write transactions that reached the disk.", g.commits);
+    counter(
+        out,
+        "big_write_commit_jobs_total",
+        "Batches those transactions carried. Divided by big_write_commits_total, the average \
+         group size.",
+        g.jobs,
+    );
+    counter(
+        out,
+        "big_write_isolations_total",
+        "Groups that failed and had to be split to find the batch at fault. Rises when a \
+         client is sending batches this database refuses.",
+        g.isolations,
+    );
+    counter(
+        out,
+        "big_write_isolation_attempts_total",
+        "Transactions opened while splitting, the failed ones included. Against \
+         big_write_isolations_total, what one bad batch costs everybody else.",
+        g.isolation_attempts,
+    );
+}
+
 /// What this node can say about the cluster it is part of.
 ///
 /// A second entry point rather than more fields on `ServerMetrics`, because none of this is

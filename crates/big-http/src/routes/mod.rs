@@ -549,6 +549,7 @@ pub fn dispatch<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request) -> Answered
         Target::Metrics => {
             let mut text = ctx.metrics.render(&ctx.api().metrics());
             crate::metrics::render_keys(&mut text, &ctx.api().key_stats());
+            crate::metrics::render_group(&mut text, &ctx.api().group_stats());
             crate::metrics::render_cluster(&mut text, &ctx.cluster.counters(), ctx.balance.enabled);
             let (verifications, hits, throttled) = ctx.auth.counters();
             crate::metrics::render_auth(&mut text, verifications, hits, throttled);
