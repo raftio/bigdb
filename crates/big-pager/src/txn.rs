@@ -249,7 +249,8 @@ impl<'db, P: PagerMut> WriteTxn<'db, P> {
 
     pub fn free(&mut self, pgno: Pgno) {
         // A page from beyond the tail floor was allocated by this transaction, so it cannot be
-        // in any committed tree and no reader can be looking at it.
+        // in any committed tree and no reader can be looking at it. It goes to `scratch`, which
+        // `alloc` empties first and `commit` gives back - see `Freelist::absorb_scratch`.
         if pgno as u64 >= self.tail_floor {
             self.dirty.remove(&pgno);
             self.scratch.push(pgno);
@@ -338,6 +339,15 @@ impl<'db, P: PagerMut> WriteTxn<'db, P> {
     }
 
     pub fn commit(mut self) -> Result<TxnId> {
+        // **Before anything below allocates.** Nothing in `commit_txn` knows `scratch` exists,
+        // which is exactly how a transaction whose tree shrank used to lose its own churn into
+        // `page_count`. It has to happen here rather than deeper in: lowering `next_pgno` after
+        // a chain page had been taken from the tail would hand that page's number out twice.
+        self.next_pgno = self.freelist.absorb_scratch(
+            core::mem::take(&mut self.scratch),
+            self.next_pgno,
+            self.txn_id,
+        );
         let txn_id = self.store.commit_txn(
             self.txn_id,
             self.base,

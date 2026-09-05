@@ -66,6 +66,22 @@ pub enum ClusterError {
     /// would say so, which is the one failure a client could never see - so a node that cannot
     /// prove it is still the primary stops being one.
     NotServing { node: String, shards: String },
+    /// A request to intern or allocate reached a node that does not lead the schema.
+    ///
+    /// Either the sender holds an older map, or this node has stood down for a move that has
+    /// not landed yet. Retryable, against the leader the answer names: two nodes interning at
+    /// once hand one string two row ids, and this refusal is what keeps it to one.
+    NotSchemaLeader { node: String, leader: String, epoch: u64 },
+    /// The map names this node as the schema leader and it has lost touch with the agreement.
+    ///
+    /// It cannot know it has not been replaced, so it stops - `NotServing`, for the one role
+    /// that is not a range. A write introducing a new key waits; everything else is untouched.
+    SchemaLeaseLost { node: String },
+    /// The namespace has just moved and its new holder has not finished taking it over.
+    ///
+    /// Nobody interns in this window - the old leader has been deposed, the new one does not
+    /// yet hold every row key - and a write with a new key waits for it to close. Retryable.
+    SchemaHandover { node: String },
     /// An operator asked for something the cluster will not do, and the message says why.
     ///
     /// A string rather than a variant per cause: these are read by a person at a terminal, they
@@ -115,6 +131,9 @@ impl ClusterError {
             Self::Unreachable { .. }
             | Self::LeaderUnreachable { .. }
             | Self::NotServing { .. }
+            | Self::NotSchemaLeader { .. }
+            | Self::SchemaLeaseLost { .. }
+            | Self::SchemaHandover { .. }
             | Self::StaleRoute { .. }
             | Self::RangeMoving { .. } => 503,
             Self::Peer { status, .. } => *status,
@@ -150,6 +169,7 @@ impl ClusterError {
             self,
             Self::Unreachable { .. }
                 | Self::NotServing { .. }
+                | Self::SchemaLeaseLost { .. }
                 | Self::StaleRoute { .. }
                 | Self::RangeMoving { .. }
                 | Self::Timeout
@@ -170,6 +190,9 @@ impl ClusterError {
             Self::Overflow => "sum_overflow",
             Self::Timeout => "query_timeout",
             Self::NotServing { .. } => "not_serving",
+            Self::NotSchemaLeader { .. } => "not_schema_leader",
+            Self::SchemaLeaseLost { .. } => "schema_lease_lost",
+            Self::SchemaHandover { .. } => "schema_handover",
             Self::Refused(_) => "refused",
             Self::StaleRoute { .. } => "stale_route",
             Self::RangeMoving { .. } => "range_moving",
@@ -204,6 +227,21 @@ impl core::fmt::Display for ClusterError {
             }
             Self::Overflow => write!(f, "the totals from two nodes do not fit in one number"),
             Self::Timeout => write!(f, "the request ran out of time"),
+            Self::NotSchemaLeader { node, leader, epoch } => write!(
+                f,
+                "`{node}` does not lead the schema; as of epoch {epoch} that is {leader}. Ask \
+                 there instead"
+            ),
+            Self::SchemaLeaseLost { node } => write!(
+                f,
+                "`{node}` leads the schema and has lost touch with the agreement, so it cannot \
+                 know it still does; a key it has never assigned a row id waits until it can"
+            ),
+            Self::SchemaHandover { node } => write!(
+                f,
+                "`{node}` was just given the schema and has not finished taking it over; a key \
+                 nobody has assigned a row id waits until it has"
+            ),
             Self::NotServing { node, shards } => write!(
                 f,
                 "`{node}` holds shards {shards} and has lost touch with the agreement, so it \

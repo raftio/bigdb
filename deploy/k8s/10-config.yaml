@@ -1,0 +1,206 @@
+# Three lists, and they follow three different rules. Getting them confused is the whole
+# difficulty of running this on Kubernetes, so they are in one file with the difference written
+# down.
+#
+# **`seed.toml` is the membership, and it must be exact.** A node with no log seeds its agreement
+# from this file and counts a majority out of it, so naming a node that is not running is naming
+# a vote that never arrives: three entries with two pods up is a cluster that cannot elect
+# anybody. It names the *founding* nodes and is not edited when the cluster grows - growth is a
+# committed decision, and `bigctl cluster topology` is where the current membership is.
+#
+# **`upstreams.toml` is an address space, and it may name nodes that do not exist.** The proxy
+# does not vote; a name it cannot reach is one it polls, marks unreachable and leaves out of
+# rotation. So it is written out to the ceiling once, and a node that appears later is picked up
+# within a health interval with no restart and no edit. Raise the ceiling here and in
+# `secrets.sh` - those two lists are the same list.
+#
+# **`join.sh` writes the third one**, per pod, at startup: the file *that* node begins with. See
+# the script.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: big-seed
+data:
+  seed.toml: |
+    # The cluster as it is founded, and only that. `kubectl scale` does not edit this file; a
+    # node that joins afterwards is registered with `cluster add-node` and given a range by the
+    # balancer, and the agreement is what says who is in the cluster from then on.
+    #
+    # Three nodes and not two, because two is the size at which nothing works: a majority of two
+    # is two, so a cluster of two can neither fail a range over nor hand the schema-key
+    # namespace on - both are decisions a majority has to commit while one node is the one that
+    # went away. `deploy/cluster` runs two because compose runs on one machine and the second
+    # node is there to show the shape. This is not that.
+    cluster_id      = "big-k8s"
+
+    schema_leader   = "big-0"
+    peer_ca_file    = "/run/big/peer-ca.pem"
+
+    # The names are the pods'; the addresses are the headless Service's. They differ, and the
+    # daemon is built for them differing: a certificate is issued to a *name*, and
+    # `ClientWire::connect` is handed `peer.name` as the TLS server name rather than the host it
+    # dialled. So a node keeps its identity wherever it is reached.
+    [[node]]
+    name   = "big-0"
+    addr   = "big-0.nodes:7654"
+    shards = "0..64"
+
+    [[node]]
+    name   = "big-1"
+    addr   = "big-1.nodes:7654"
+    shards = "64..128"
+
+    [[node]]
+    name   = "big-2"
+    addr   = "big-2.nodes:7654"
+    shards = "128.."
+
+  upstreams.toml: |
+    # What the proxy may forward to. It reads `name` and `addr` and discards the rest - it does
+    # not route by key - so there are no ranges here and no ceiling on how wrong they could be.
+    #
+    # **Eight names for three nodes, on purpose.** A name whose pod does not exist is polled,
+    # found unreachable and left out of rotation; a name that appears is in rotation within a
+    # health interval. That is what makes `kubectl scale big --replicas=5` reach the client
+    # without a proxy restart. Nothing here grants anything: a certificate is what a node
+    # authenticates with, and the roster that accepts one follows the agreement.
+    cluster_id = "big-k8s"
+
+    [[node]]
+    name = "big-0"
+    addr = "big-0.nodes:7654"
+    [[node]]
+    name = "big-1"
+    addr = "big-1.nodes:7654"
+    [[node]]
+    name = "big-2"
+    addr = "big-2.nodes:7654"
+    [[node]]
+    name = "big-3"
+    addr = "big-3.nodes:7654"
+    [[node]]
+    name = "big-4"
+    addr = "big-4.nodes:7654"
+    [[node]]
+    name = "big-5"
+    addr = "big-5.nodes:7654"
+    [[node]]
+    name = "big-6"
+    addr = "big-6.nodes:7654"
+    [[node]]
+    name = "big-7"
+    addr = "big-7.nodes:7654"
+---
+# What each pod runs before its daemon starts: it writes the cluster file *that* node begins
+# with, and registers the node with the cluster it is joining.
+#
+# **Both halves exist because of one rule in the daemon**: a node's listener accepts a peer whose
+# certificate names somebody on its roster, and the roster it starts with comes from its own
+# file. A node whose file names only itself refuses every peer that dials it, has none of its own
+# to dial, and sits there healthy and alone. Once it is in touch the roster follows the
+# agreement - `Controller::follow_roster` - so this is only about the first second.
+#
+# **It is a shell script and not an operator**, and the ceiling on what it will do is: write a
+# file, and make one call. It does not choose ranges, does not admit anybody and does not scale
+# anything. The balancer does those, on the leader, from facts it gathers itself.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: big-join
+data:
+  join.sh: |
+    #!/bin/sh
+    # Runs as an initContainer. Never fails the pod: a cluster that cannot be reached yet is
+    # what a bootstrap looks like, and the daemon behind this is what makes it reachable.
+    set -eu
+
+    me=${POD_NAME:?POD_NAME is not set}
+    svc=${PEER_SERVICE:?PEER_SERVICE is not set}
+    seed=/etc/big/seed/seed.toml
+    gen=/etc/big/gen/cluster.toml
+    ca=/etc/big/secrets/peer-ca.pem
+    cred=/etc/big/join/credentials
+
+    # The `name = "..."` of every [[node]], in file order. Anchored past leading space so a
+    # commented-out entry is not read as one.
+    names() { sed -n 's/^[[:space:]]*name[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$1"; }
+    has() { names "$2" | grep -qx "$1"; }
+
+    cp "$seed" "$gen"
+
+    if has "$me" "$gen"; then
+        echo "join: $me is a founding node; starting from the seed unchanged"
+    else
+        # **Every name up to this pod's own ordinal, as a replica of the first.**
+        #
+        # Not just this node: the peer that dials a joining node is the agreement's *leader*,
+        # and by the time a cluster has grown the leader may be a node the seed never mentioned.
+        # A roster that named only the founders and this pod would refuse it and the join would
+        # hang for no visible reason.
+        #
+        # `replica` and not `shards` because it is the shape that parses without claiming a
+        # range anybody else owns - and a claim would be a lie this node might act on if it were
+        # ever alone. The agreement overwrites all of it within the second. Names of pods that
+        # do not exist, or that were removed, cost nothing: a roster is a list of names a
+        # certificate may claim, not a list of votes.
+        first=$(names "$gen" | head -1)
+        ord=${me##*-}
+        stem=${me%-*}
+        i=0
+        while [ "$i" -le "$ord" ]; do
+            n="$stem-$i"
+            i=$((i + 1))
+            if has "$n" "$gen"; then continue; fi
+            printf '\n[[node]]\nname    = "%s"\naddr    = "%s.%s:7654"\nreplica = "%s"\n' \
+                "$n" "$n" "$svc" "$first" >> "$gen"
+        done
+        echo "join: wrote a cluster file naming $(names "$gen" | tr '\n' ' ')"
+    fi
+
+    # A founding node is in the seed membership already; there is nobody to ask and nothing to
+    # add.
+    if has "$me" "$seed"; then
+        exit 0
+    fi
+
+    # **Registering is a separate act from being reachable, and it is meant to be.** A node that
+    # dials in is not thereby a member: `add-node` is a decision an existing cluster commits,
+    # and the credential below is what says somebody authorised it. Without one this pod still
+    # starts - it just sits outside the cluster until an operator runs the command printed here.
+    if [ ! -r "$cred" ]; then
+        echo "join: no credential mounted, so $me will not register itself. Run:" >&2
+        echo "join:   bigctl cluster add-node $me $me.$svc:7654" >&2
+        exit 0
+    fi
+
+    # `bigctl` holds a credentials file to the same rule the daemon holds a users file to, and a
+    # Secret cannot be both readable here and mode 600 - see the readme. A private copy can.
+    install -m 600 "$cred" /run/join/credentials
+
+    # **Before the daemon, not after**, which is the ordering that matters: a node that starts
+    # while the cluster has never heard of it is a voter in a cluster of its own imagining, and
+    # it will stand for election once per timeout until somebody tells it otherwise. Registered
+    # first, the leader reaches it as a learner - which does not vote and does not stand.
+    #
+    # Only the leader can commit this, and it does not forward, so this asks each node in turn.
+    for peer in $(names "$gen"); do
+        if [ "$peer" = "$me" ]; then continue; fi
+        if out=$(bigctl --addr "https://$peer.$svc:7654" --ca-file "$ca" \
+                     --credentials-file /run/join/credentials \
+                     cluster add-node "$me" "$me.$svc:7654" 2>&1); then
+            echo "join: $peer took the registration"
+            exit 0
+        fi
+        # Already a member: a pod that restarted, or a second pass. Nothing to do and not a
+        # failure.
+        case $out in
+            *"already in this cluster"*)
+                echo "join: $me is already a member"
+                exit 0
+                ;;
+        esac
+    done
+
+    echo "join: nobody took the registration; starting anyway. The cluster may still be" >&2
+    echo "join: bootstrapping - 'bigctl cluster topology' says where it stands." >&2
+    exit 0

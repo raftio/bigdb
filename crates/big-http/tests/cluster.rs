@@ -87,6 +87,14 @@ fn a_replicated_group() -> (SocketAddr, SocketAddr, SocketAddr) {
          [[node]]\nname = \"a-third\"\naddr = \"{third}\"\nreplica = \"a\"\n"
     );
     start(&file, &[("a", a), ("a-spare", spare), ("a-third", third)]);
+    // **Wait for the agreement before asking anything of it.** Every node here holds a
+    // replicated range, so every one of them is fenced: until it has heard from the agreement
+    // it cannot know it has not already been replaced, and it refuses rather than risk being
+    // the second node answering for one range. On the shipped clocks that is an election, and
+    // an election is what a replicated cluster needs before it can serve at all.
+    waiting("an elected leader", std::time::Duration::from_secs(15), || {
+        ready(a).contains(r#""leader":""#)
+    });
     (a, spare, third)
 }
 
@@ -757,6 +765,9 @@ fn a_write_that_misses_a_copy_stands_and_says_so() {
     // `a-third` is configured and never started, so a majority is still two of three and the
     // agreement works - it is one copy that is missing, not the quorum.
     start(&file, &[("a", a), ("a-spare", spare)]);
+    waiting("an elected leader", std::time::Duration::from_secs(15), || {
+        ready(a).contains(r#""leader":""#)
+    });
 
     // A schema change reaches the copies it can and names the one it cannot.
     let (status, body) = send(a, "POST", "/table/tx", "");
@@ -859,6 +870,7 @@ fn brisk() -> (Timing, Leases) {
         Leases {
             serve_for: std::time::Duration::from_millis(300),
             promote_after: std::time::Duration::from_millis(900),
+            ..Leases::default()
         },
     )
 }
@@ -874,6 +886,17 @@ fn a_group_of_three() -> (String, Vec<SocketAddr>) {
         ports[0], ports[1], ports[2]
     );
     (file, ports)
+}
+
+/// The same as `brisk`, and the agreement is also allowed to move the row-key namespace.
+///
+/// Fifteen seconds in a deployment, a quarter of a second here, and for the same reason the
+/// other clocks are shortened: what these tests are about is the rule, and the rule does not
+/// depend on the number. The ordering does, and it is kept - the namespace still waits longer
+/// than a range does.
+fn brisk_electing() -> (Timing, Leases) {
+    let (timing, leases) = brisk();
+    (timing, Leases { move_schema_after: Some(leases.promote_after * 3), ..leases })
 }
 
 /// A node a test can take away.
@@ -931,6 +954,32 @@ fn start_with(
     leases: Leases,
     state: Option<std::path::PathBuf>,
 ) -> Node {
+    start_configured(file, name, addr, timing, leases, state, ServerConfig::default())
+}
+
+/// On the brisk clocks, with the balancer switched on - the one thing the steward acts on.
+fn start_balancing(file: &str, name: &str, addr: SocketAddr) -> Node {
+    let (timing, leases) = brisk();
+    let config = ServerConfig {
+        balance: big_cluster::balance::Policy {
+            enabled: true,
+            ..big_cluster::balance::Policy::default()
+        },
+        ..ServerConfig::default()
+    };
+    start_configured(file, name, addr, timing, leases, None, config)
+}
+
+/// The same, with the server's configuration spelled out as well.
+fn start_configured(
+    file: &str,
+    name: &str,
+    addr: SocketAddr,
+    timing: Timing,
+    leases: Leases,
+    state: Option<std::path::PathBuf>,
+    server: ServerConfig,
+) -> Node {
     let config = ClusterFile::parse(file).unwrap().for_node(Some(name), "").unwrap();
     let store: Box<dyn big_cluster::raft::Store> = match state {
         Some(path) => Box::new(big_cluster::raft::FileStore::new(path)),
@@ -939,8 +988,7 @@ fn start_with(
     let cluster =
         Cluster::with_timing(Api::in_memory().unwrap(), config, None, store, timing, leases)
             .unwrap();
-    let server =
-        Server::bind_cluster(cluster, addr, ServerConfig::default()).expect("the port was free");
+    let server = Server::bind_cluster(cluster, addr, server).expect("the port was free");
     let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
     let flag = std::sync::Arc::clone(&running);
     let done = std::thread::spawn(move || {
@@ -1006,6 +1054,49 @@ fn a_range_fails_over_when_its_primary_dies() {
         [ports[1], ports[2]]
             .iter()
             .all(|p| send(*p, "POST", "/table/tx/query", "Count(All())").1 == r#"{"count":2}"#)
+    });
+}
+
+/// **A range still fails over after the leader has compacted its log.**
+///
+/// The guard in front of a promotion compared the commit index with the length of the vector
+/// holding the log's suffix, and the two could never agree again once anything had been
+/// compacted away - so every promotion after the first compaction was refused, silently, on a
+/// cluster reporting itself healthy. The rule is proven against a simulated agreement in
+/// `big-cluster/tests/raft.rs`; this is the one test that runs it inside the real driver
+/// thread, against a log the real leader compacted on its own.
+#[test]
+fn a_range_fails_over_after_the_log_has_been_compacted() {
+    let (file, ports) = a_group_of_three();
+    // **The copies elect a leader before the primary arrives.** Only the leader compacts its
+    // log - a follower's base moves only when it is handed a snapshot - so the node that dies
+    // must not be the one that decides, or its successor would decide from an uncompacted log
+    // and this test would pass with the bug in place. `a` is the primary by the file; the
+    // agreement's leader has to be one of the other two.
+    let _b = start_agreeing(&file, "b", ports[1]);
+    let _c = start_agreeing(&file, "c", ports[2]);
+    until("a leader among the copies", || ready(ports[1]).contains(r#""leader":""#));
+    let mut a = start_agreeing(&file, "a", ports[0]);
+    until("the primary to join", || ready(ports[0]).contains(r#""leader":""#));
+    let leader = leader_of(&ports);
+    assert_ne!(leader, ports[0], "the primary joined a settled agreement; it must not lead it");
+
+    ok(ports[0], "POST", "/table/tx", "");
+    ok(ports[0], "POST", "/table/tx/field/amount?kind=int&bit_depth=32", "");
+    ok(ports[0], "POST", "/table/tx/import", "amount 1 5\namount 2 5\n");
+
+    // Enough committed decisions that the leader compacts. Every split and every merge is one
+    // entry, and with every voter up the leader drops whatever is more than `KEEP_ENTRIES`
+    // behind - so more than that many, with room, is a log that has certainly been cut.
+    for _ in 0..(big_cluster::raft::Raft::KEEP_ENTRIES / 2 + 8) {
+        ok(leader, "POST", "/admin/cluster/split?at=900", "");
+        ok(leader, "POST", "/admin/cluster/merge?range=0", "");
+    }
+
+    a.close();
+    until("the range to move after a compaction", || {
+        let (status, body) = send(ports[1], "POST", "/table/tx/query", "Count(All())");
+        status == 200 && body == r#"{"count":2}"#
     });
 }
 
@@ -1193,6 +1284,8 @@ fn a_second_batch_of_keys_does_not_collide_with_the_first() {
     let mut a_spare = start_agreeing(&file, "a-spare", spare);
     start_agreeing(&file, "a", a).forget();
     start_agreeing(&file, "b", b).forget();
+    // `a` holds a replicated range, so it is fenced until it has heard from the agreement.
+    until("an elected leader", || ready(a).contains(r#""leader":""#));
 
     ok(a, "POST", "/table/tx", "");
     ok(a, "POST", "/table/tx/field/amount?kind=int&bit_depth=32", "");
@@ -1371,7 +1464,7 @@ fn a_node_that_restarts_keeps_what_it_agreed() {
 
     // The file was read rather than started fresh: the state on disk says so.
     let written = std::fs::read(dir.path().join("c.raft")).unwrap();
-    assert!(written.starts_with(b"BIGRAFT2"), "the agreement wrote no state for `c`");
+    assert!(written.starts_with(b"BIGRAFT3"), "the agreement wrote no state for `c`");
 
     // Reads never stopped: the copy serving the range was never the one taken away.
     assert_eq!(ok(ports[0], "POST", "/table/tx/query", "Count(All())"), r#"{"count":1}"#);
@@ -1415,6 +1508,7 @@ fn a_serving_node_that_comes_back_empty_is_only_found_by_verify() {
     let leases = Leases {
         serve_for: std::time::Duration::from_secs(5),
         promote_after: std::time::Duration::from_secs(30),
+        ..Leases::default()
     };
     let mut a = start_with(&file, "a", ports[0], timing, leases, None);
     let _b = start_with(&file, "b", ports[1], timing, leases, None);
@@ -1726,6 +1820,37 @@ fn a_node_joins_as_a_learner_and_is_promoted_when_it_has_something_to_serve() {
     });
 }
 
+/// **A node that joined is admitted by the steward**, once it is answering for data and holds
+/// the log - and by nothing else. The test above promotes by hand; this one starts the fourth
+/// node for real, with a file that names the whole cluster and itself, and waits for the
+/// agreement's leader to decide it counts.
+#[test]
+fn a_learner_that_has_caught_up_is_admitted_by_the_steward() {
+    let (a, b, spare, d) = (free_port(), free_port(), free_port(), free_port());
+    // Named, so that a node whose file describes four nodes is recognised by three whose files
+    // describe three: without a `cluster_id` the shape of the file is what nodes check.
+    let file = format!("cluster_id = \"grows\"\n{}", three(a, b, spare));
+    let _a = start_balancing(&file, "a", a);
+    let _b = start_balancing(&file, "b", b);
+    let _spare = start_balancing(&file, "a-spare", spare);
+    until("an elected leader", || ready(a).contains(r#""leader":""#));
+
+    let leader = leader_of(&[a, b, spare]);
+    ok(leader, "POST", &format!("/admin/cluster/node?name=d&addr={d}"), "");
+
+    // The node itself, seeded as a copy of `a` - the shape that parses without overlapping
+    // anybody's range, and one the agreement overwrites the moment it is heard from.
+    let grown = format!("{file}[[node]]\nname = \"d\"\naddr = \"{d}\"\nreplica = \"a\"\n");
+    let _d = start_balancing(&grown, "d", d);
+
+    until("the steward to admit it", || {
+        let seen = ok(a, "GET", "/cluster/topology", "");
+        seen.contains(r#""name":"d","addr""#) && !seen.contains(r#""state":"learner""#)
+    });
+    let metrics = ok(leader, "GET", "/metrics", "");
+    assert!(metrics.contains("big_cluster_balance_admits_total 1"), "{metrics}");
+}
+
 /// **A node that still holds a range is not removed**, because removing it removes the only
 /// copy of what it holds and leaves the map naming a node nobody talks to.
 #[test]
@@ -1945,6 +2070,55 @@ fn a_cancelled_move_leaves_the_range_where_it_was() {
     assert!(after.contains(r#""shards":"64..","primary":"b""#), "{after}");
 }
 
+/// **Switched on, the balancer needs no operator.** The same step the test below asks for by
+/// hand, taken by the steward on the agreement's leader - and only there - because the policy
+/// says it may. Draining `b` is the only instruction anybody gives.
+#[test]
+fn the_balancer_runs_by_itself_when_switched_on() {
+    let (a, b, spare) = (free_port(), free_port(), free_port());
+    let file = three(a, b, spare);
+    let _a = start_balancing(&file, "a", a);
+    let _b = start_balancing(&file, "b", b);
+    let _spare = start_balancing(&file, "a-spare", spare);
+    until("an elected leader", || ready(a).contains(r#""leader":""#));
+
+    ok(a, "POST", "/table/tx", "");
+    ok(a, "POST", "/table/tx/field/amount?kind=int&bit_depth=32", "");
+    ok(a, "POST", "/table/tx/import", &format!("amount {} 5\n", 70 * (1 << 20)));
+
+    let leader = leader_of(&[a, b, spare]);
+    ok(leader, "POST", "/admin/cluster/drain?name=b", "");
+    until("the steward to move the range off the draining node", || {
+        !ok(a, "GET", "/cluster/topology", "").contains(r#""shards":"64..","primary":"b""#)
+    });
+    // The records came with it.
+    assert_eq!(ok(a, "POST", "/table/tx/query", "Count(All())"), r#"{"count":1}"#);
+
+    // **And it stops.** `b` holds nothing, so the next pass finds nothing to do, and a
+    // draining node is never a destination - which is exactly the state in which it can be
+    // removed for good. A removal refused is one the move has not finished landing.
+    until("the move to be over and `b` removable", || {
+        send(leader, "DELETE", "/admin/cluster/node?name=b", "").0 == 200
+    });
+}
+
+/// The steward is stopped the way the workers are, and no slower. A node asked to stand down
+/// comes back within a wake of the steward's sleep, not a whole period of it.
+#[test]
+fn a_node_stands_down_promptly_with_its_steward() {
+    let (file, ports) = a_group_of_three();
+    let mut a = start_balancing(&file, "a", ports[0]);
+    until("the node to answer", || send(ports[0], "GET", "/ready", "").0 == 200);
+
+    let started = std::time::Instant::now();
+    a.close();
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(1),
+        "stood down in {:?}",
+        started.elapsed()
+    );
+}
+
 /// **The balancer, over real nodes.** It decides from what the nodes actually weigh, and one
 /// call does one thing - so a cluster that needs several steps takes several calls, each
 /// against facts gathered afresh.
@@ -1985,9 +2159,41 @@ fn rebalancing_takes_a_range_off_a_draining_node_and_then_stops() {
     let again = ok(leader, "POST", "/admin/cluster/rebalance?force=true", "");
     assert_eq!(again, r#"{"did":null}"#);
 
+    // The step was counted where an operator scrapes, and the move is over rather than
+    // lingering as a range marked moving - the state that silences every step after it.
+    let metrics = ok(leader, "GET", "/metrics", "");
+    assert!(metrics.contains("big_cluster_balance_moves_total 1"), "{metrics}");
+    assert!(metrics.contains("big_cluster_ranges_moving 0"), "{metrics}");
+    assert!(metrics.contains("big_cluster_balance_drops_failed_total 0"), "{metrics}");
+
     // Which is exactly the state in which it can be removed for good.
     let (status, said) = send(leader, "DELETE", "/admin/cluster/node?name=b", "");
     assert_eq!(status, 200, "{said}");
+}
+
+/// **A peer that does not say what it weighs is counted, not just skipped.** To the balancer
+/// that node is neither a source nor a destination, so a cluster with one silent member is a
+/// cluster that quietly stops reshaping - and the only way an operator tells that apart from a
+/// cluster with nothing to do is this number.
+#[test]
+fn a_peer_that_does_not_answer_the_balancer_is_counted() {
+    let (a, b, spare) = (free_port(), free_port(), free_port());
+    let file = three(a, b, spare);
+    let mut nodes = [
+        start_agreeing(&file, "a", a),
+        start_agreeing(&file, "b", b),
+        start_agreeing(&file, "a-spare", spare),
+    ];
+    until("an elected leader", || ready(a).contains(r#""leader":""#));
+    let leader = leader_of(&[a, b, spare]);
+
+    // Take away a node that is not deciding, so the one that is keeps deciding.
+    let silent = [a, b, spare].into_iter().position(|p| p != leader).expect("two others");
+    nodes[silent].close();
+
+    ok(leader, "POST", "/admin/cluster/rebalance?force=true", "");
+    let metrics = ok(leader, "GET", "/metrics", "");
+    assert!(metrics.contains("big_cluster_peer_load_unanswered_total 1"), "{metrics}");
 }
 
 /// Off unless asked. A cluster that reshapes itself unasked is one whose shape an operator
@@ -2007,6 +2213,182 @@ fn the_balancer_does_nothing_until_it_is_switched_on() {
 
     let leader = leader_of(&[a, b, spare]);
     assert_eq!(ok(leader, "POST", "/admin/cluster/rebalance", ""), r#"{"did":null}"#);
+}
+
+/// **The agreement gives the row-key namespace away when its holder dies, and nothing is
+/// handed the same meaning twice.**
+///
+/// Four claims, and the middle two are what make the first one safe. The namespace moves. In
+/// the gap before the successor holds every key, a write with a *new* key is refused rather
+/// than given an id somebody else might also be giving out. Once it is ready, a key that
+/// already had a row id has the *same* one - which is the proof that the keys came across from
+/// the survivors rather than being invented again. And no record id is reused across the whole
+/// thing.
+#[test]
+fn the_agreement_moves_the_namespace_when_its_holder_dies() {
+    let (a, b, spare) = (free_port(), free_port(), free_port());
+    let file = three(a, b, spare);
+    let (timing, leases) = brisk_electing();
+    let mut a_node = start_with(&file, "a", a, timing, leases, None);
+    let _b = start_with(&file, "b", b, timing, leases, None);
+    let _spare = start_with(&file, "a-spare", spare, timing, leases, None);
+    until("an elected leader", || ready(b).contains(r#""leader":""#));
+
+    ok(a, "POST", "/table/tx", "");
+    ok(a, "POST", "/table/tx/field/amount?kind=int&bit_depth=32", "");
+    ok(a, "POST", "/table/tx/field/country?kind=set", "");
+    ok(a, "POST", "/sql", "INSERT INTO tx (amount, country) VALUES (5, 'GB')");
+    ok(a, "POST", "/sql", "INSERT INTO tx (amount, country) VALUES (7, 'FR')");
+
+    // What `GB` means before the handover. It has to mean the same afterwards: a successor
+    // that invented a second row id for it would answer a `GroupBy` with two groups that are
+    // one group, and nothing downstream could tell.
+    let before = ok(b, "POST", "/table/tx/query", "GroupBy(All(), field=\"country\")");
+    assert!(before.contains("GB") && before.contains("FR"), "{before}");
+
+    // The schema leader dies. Nobody is told; nothing is edited.
+    a_node.close();
+
+    // 1. It moves, and to a node that is answering.
+    until("the namespace to move", || {
+        let seen = ok(b, "GET", "/cluster/topology", "");
+        seen.contains(r#""schema_leader":"b""#) || seen.contains(r#""schema_leader":"a-spare""#)
+    });
+
+    // 2. Once the successor holds the keys, an existing key resolves to the id it always had.
+    until("the successor to finish taking it over", || {
+        send(b, "POST", "/sql", "INSERT INTO tx (amount, country) VALUES (9, 'GB')").0 == 200
+    });
+    let after = ok(b, "POST", "/table/tx/query", "GroupBy(All(), field=\"country\")");
+    assert_eq!(
+        after.matches("GB").count(),
+        1,
+        "one group for `GB`, not two - the keys came across: {after}"
+    );
+
+    // 3. A key nobody has ever seen works too, now that somebody holds the namespace.
+    ok(b, "POST", "/sql", "INSERT INTO tx (amount, country) VALUES (11, 'DE')");
+
+    // 4. No record id was handed out twice: four inserts, four records.
+    until("both survivors to agree on the count", || {
+        [b, spare]
+            .iter()
+            .all(|p| send(*p, "POST", "/table/tx/query", "Count(All())").1 == r#"{"count":4}"#)
+    });
+
+    // And the node that was deposed is marked behind: it may hold row ids it interned for
+    // writes that never landed anywhere, so it must be repaired before it is trusted again.
+    assert!(ready(b).contains(r#""behind":["a"]"#), "{}", ready(b));
+}
+
+/// **A record id promised by a leader that died is never promised again.**
+///
+/// The floor a leader allocates from lives in its memory, and a successor - here the same node,
+/// restarted with an empty database - would start from what is on disk and hand out ids the
+/// old leader had already given to writes that may not have landed. So the leader commits a
+/// ceiling through the agreement before it hands out anything under it, in blocks, and a
+/// fresh leader starts at the ceiling. The tell is the id: it jumps to the block boundary
+/// rather than continuing from the highest record anybody holds.
+#[test]
+fn a_restarted_schema_leader_starts_above_everything_it_may_have_promised() {
+    let dir = tempfile::tempdir().unwrap();
+    let (file, ports) = a_group_of_three();
+    let state = |name: &str| Some(dir.path().join(format!("{name}.raft")));
+    let (timing, leases) = brisk();
+
+    let mut a = start_with(&file, "a", ports[0], timing, leases, state("a"));
+    let _b = start_with(&file, "b", ports[1], timing, leases, state("b"));
+    let _c = start_with(&file, "c", ports[2], timing, leases, state("c"));
+    until("an elected leader", || ready(ports[1]).contains(r#""leader":""#));
+
+    ok(ports[1], "POST", "/table/tx", "");
+    ok(ports[1], "POST", "/table/tx/field/amount?kind=int&bit_depth=32", "");
+    ok(ports[1], "POST", "/sql", "INSERT INTO tx (amount) VALUES (5)");
+    ok(ports[1], "POST", "/sql", "INSERT INTO tx (amount) VALUES (7)");
+    assert_eq!(
+        ok(ports[1], "GET", "/table/tx/records?limit=5", ""),
+        r#"{"records":[0,1],"next":null}"#,
+        "two ids, from zero, as always"
+    );
+
+    // The schema leader goes away and comes back with its agreement state and nothing else -
+    // a replaced disk. Its floor was in memory; the ceiling it committed was not.
+    a.close();
+    until("the copy that went away to be marked behind", || {
+        ready(ports[1]).contains(r#""behind":["a"]"#)
+    });
+    let _a_again = start_with(&file, "a", ports[0], timing, leases, state("a"));
+    until("the restarted node to answer", || send(ports[0], "GET", "/ready", "").0 == 200);
+    // Caught up first: it is still a copy of the range every write goes to, and a copy with
+    // no table in it refuses the write. That is the repair's job, not this test's subject.
+    until("the restarted copy to be repaired", || {
+        send(ports[1], "POST", "/repair", "").1.contains(r#""outcome":"caught up""#)
+    });
+    until("the leader to allocate again", || {
+        send(ports[1], "POST", "/sql", "INSERT INTO tx (amount) VALUES (9)").0 == 200
+    });
+
+    // Not 2. The highest record anybody holds is 1, and a leader starting from there would be
+    // free to re-issue whatever the old one promised in between.
+    let ids = ok(ports[1], "GET", "/table/tx/records?after=1&limit=5", "");
+    assert!(ids.contains("65536"), "the next id starts at the committed block: {ids}");
+}
+
+/// **A schema leader that loses the agreement stops assigning row ids**, even when the range
+/// it holds is not fenced. A range with no copy is never fenced because nothing could take it;
+/// the namespace can always be given to somebody else, so the node that holds it acts only
+/// while it can prove it still does. What it costs is exactly one thing: a write with a key
+/// nobody has seen waits. A write whose keys are known lands as it always did.
+#[test]
+fn the_schema_leader_stops_interning_when_it_loses_the_agreement() {
+    let (a, b, spare) = (free_port(), free_port(), free_port());
+    // `a` leads the schema and holds a range of one copy; the copy that makes the agreement
+    // run at all is of `b`'s range. So when `b` and its copy go, `a` keeps serving its own
+    // range - and cannot know whether the namespace is still its.
+    let file = format!(
+        "schema_leader = \"a\"\n\
+         [[node]]\nname = \"a\"\naddr = \"{a}\"\nshards = \"0..64\"\n\
+         [[node]]\nname = \"b\"\naddr = \"{b}\"\nshards = \"64..\"\n\
+         [[node]]\nname = \"b-spare\"\naddr = \"{spare}\"\nreplica = \"b\"\n"
+    );
+    let _a = start_agreeing(&file, "a", a);
+    let mut b_node = start_agreeing(&file, "b", b);
+    let mut spare_node = start_agreeing(&file, "b-spare", spare);
+    until("an elected leader", || ready(a).contains(r#""leader":""#));
+
+    ok(a, "POST", "/table/tx", "");
+    ok(a, "POST", "/table/tx/field/amount?kind=int&bit_depth=32", "");
+    ok(a, "POST", "/table/tx/field/country?kind=set", "");
+    ok(a, "POST", "/table/tx/import", "amount 1 5\ncountry 1 GB\n");
+
+    b_node.close();
+    spare_node.close();
+
+    // A key nobody has seen needs the leader, and `a` can no longer prove it is one. Whether
+    // `a` led the agreement or followed it makes no difference: a leader's lease is renewed
+    // by a majority it no longer has, a follower's by a leader it no longer hears.
+    //
+    // A fresh key every time. The lease outlives the closes by a moment, and a key interned
+    // in that moment is a key this node knows from then on - a second attempt with the same
+    // one would need no leader and prove nothing.
+    let mut attempt = 100u64;
+    until("the schema lease to run out", || {
+        attempt += 1;
+        let body = format!("amount {attempt} 7\ncountry {attempt} K{attempt}\n");
+        let (status, body) = send(a, "POST", "/table/tx/import", &body);
+        status == 503 && body.contains(r#""code":"schema_lease_lost""#)
+    });
+
+    // Still serving its own range: that range has no copy, so nothing could have taken it,
+    // and the lease it lost is the namespace's and not the range's.
+    assert!(ready(a).contains(r#""serving":true"#), "{}", ready(a));
+
+    // A key it already knows needs nobody. The range is its own, and the write lands. (A
+    // count over the whole table would fan out to `b`'s range, which is the part of the
+    // cluster that is actually gone - so the import's own answer is the evidence.)
+    let (status, body) = send(a, "POST", "/table/tx/import", "amount 3 9\ncountry 3 GB\n");
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains(r#""imported":2"#), "{body}");
 }
 
 /// **The row-key namespace moves, and nothing is handed the same id twice.**
@@ -2059,4 +2441,37 @@ fn the_schema_leader_moves_without_reissuing_anything() {
     );
     let after = ok(b, "POST", "/table/tx/query", "GroupBy(All(), field=\"country\")");
     assert!(after.contains("US"), "a key invented after the handover works too: {after}");
+
+    // **And the old leader refuses to intern**, rather than answering a coordinator that still
+    // holds the map from before the move. Two nodes interning at once is the one failure that
+    // hands one string two row ids, and this refusal is what keeps it to one: it used to be
+    // assumed rather than checked, because the leader was a name in a file.
+    let fingerprint =
+        ClusterFile::parse(&file).unwrap().for_node(Some("a"), "").unwrap().fingerprint();
+    let stale = |leader: usize| {
+        big_cluster::wire::InternRequest {
+            table: "tx".to_string(),
+            field: "country".to_string(),
+            keys: vec!["DE".to_string()],
+            led: Some(big_cluster::wire::Led { epoch: 1, leader }),
+        }
+        .encode()
+    };
+    // Sent to `a`, which by its own map no longer leads.
+    let (status, body) = send_bytes(a, "/internal/intern", &stale(0), fingerprint);
+    assert_eq!(status, 503, "{}", String::from_utf8_lossy(&body));
+    assert!(
+        String::from_utf8_lossy(&body).contains("not_schema_leader"),
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    // Sent to `b`, which leads - by a sender that believes `a` does. Refused too: the answer
+    // names who leads so the sender can ask the right node on purpose rather than by luck.
+    let (status, body) = send_bytes(b, "/internal/intern", &stale(0), fingerprint);
+    assert_eq!(status, 503, "{}", String::from_utf8_lossy(&body));
+    assert!(
+        String::from_utf8_lossy(&body).contains("not_schema_leader"),
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
 }

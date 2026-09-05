@@ -24,6 +24,7 @@
 //! never lead the same term, and a committed decision is never taken back.** Everything else
 //! is a way of stressing that.
 
+use big_cluster::controller::{Controller, Leases};
 use big_cluster::raft::{
     Decision, Member, MemberState, Message, NodeId, Raft, Range, RangeMap, Role, State, Store,
     Timing,
@@ -172,7 +173,14 @@ fn map_of(primary: &[NodeId], stale: &[NodeId]) -> RangeMap {
             moving: None,
         })
         .collect();
-    RangeMap { epoch: 1, ranges, stale: stale.to_vec(), schema_leader: 0 }
+    RangeMap {
+        epoch: 1,
+        ranges,
+        stale: stale.to_vec(),
+        schema_leader: 0,
+        reserved: Vec::new(),
+        schema_ready: true,
+    }
 }
 
 /// A node alone in its config file leads immediately: a majority of one is one.
@@ -537,11 +545,18 @@ fn a_restart_keeps_the_term_the_vote_and_the_log() {
             ]),
         },
     ];
-    let state = State { term: 4, voted_for: Some(2), commit: 3, base: 0, log: log.clone() };
+    let state = State {
+        term: 4,
+        voted_for: Some(2),
+        commit: 3,
+        base: 0,
+        log: log.clone(),
+        seed: voters(3),
+    };
     store.save(&state).unwrap();
 
     let back = store.load().unwrap().expect("just written");
-    assert_eq!(back, state);
+    assert_eq!(back, state, "the seed included: a snapshot replaces it, so it has to be kept");
 
     // **The commit point is part of the state.** A node that forgot it would replay its whole
     // log into the state machine on the way up, applying a map no majority ever agreed to.
@@ -549,7 +564,9 @@ fn a_restart_keeps_the_term_the_vote_and_the_log() {
 
     // A node with no vote is a different state from a node that voted for node zero, and the
     // two must not encode alike.
-    store.save(&State { term: 9, voted_for: None, commit: 1, base: 0, log }).unwrap();
+    store
+        .save(&State { term: 9, voted_for: None, commit: 1, base: 0, log, seed: Vec::new() })
+        .unwrap();
     assert_eq!(store.load().unwrap().unwrap().voted_for, None);
 }
 
@@ -562,7 +579,9 @@ fn a_restarted_node_still_refuses_a_stale_candidate() {
         big_cluster::raft::Entry { term: 0, decision: Decision::Noop },
         big_cluster::raft::Entry { term: 7, decision: owning(&[1, 0]) },
     ];
-    store.save(&State { term: 7, voted_for: Some(1), commit: 1, base: 0, log }).unwrap();
+    store
+        .save(&State { term: 7, voted_for: Some(1), commit: 1, base: 0, log, seed: Vec::new() })
+        .unwrap();
 
     let state = store.load().unwrap().unwrap();
     let mut node = Raft::new(0, voters(3), Timing::default(), 0);
@@ -591,6 +610,7 @@ fn a_damaged_state_file_is_refused() {
             commit: 0,
             base: 0,
             log: vec![big_cluster::raft::Entry { term: 0, decision: Decision::Noop }],
+            seed: Vec::new(),
         })
         .unwrap();
 
@@ -769,7 +789,7 @@ fn a_restarted_node_comes_back_with_the_cluster_as_the_log_left_it() {
     // Started from a file that knows three nodes, restored from a log that knows four.
     let mut node = Raft::new(0, voters(3), Timing::default(), 0);
     assert_eq!(node.members(), 3);
-    node.restore(State { term: 5, voted_for: Some(0), commit: 1, base: 0, log });
+    node.restore(State { term: 5, voted_for: Some(0), commit: 1, base: 0, log, seed: Vec::new() });
 
     assert_eq!(node.members(), 4, "the log is what says who is in the cluster");
     assert_eq!(node.voters(), &[0, 1, 2], "and the fourth is still catching up");
@@ -887,12 +907,17 @@ fn a_follower_that_falls_behind_the_base_is_caught_up_by_a_snapshot() {
 fn a_compacted_log_survives_a_restart() {
     let dir = tempfile::tempdir().unwrap();
     let store = big_cluster::raft::FileStore::new(dir.path().join("state.raft"));
+    // With a reservation in it: the ceiling on record ids is the one thing in the map that a
+    // successor cannot rebuild from anywhere else, so it had better survive a restart.
+    let mut kept = map_of(&[1, 0], &[]);
+    kept.reserve("tx", 1 << 16);
+    kept.schema_ready = false;
     let log = vec![
         // The sentinel is the state as of the base, not an empty entry.
-        big_cluster::raft::Entry { term: 3, decision: Decision::Ranges(map_of(&[1, 0], &[])) },
+        big_cluster::raft::Entry { term: 3, decision: Decision::Ranges(kept) },
         big_cluster::raft::Entry { term: 4, decision: Decision::Noop },
     ];
-    let state = State { term: 4, voted_for: Some(1), commit: 41, base: 40, log };
+    let state = State { term: 4, voted_for: Some(1), commit: 41, base: 40, log, seed: voters(3) };
     store.save(&state).unwrap();
     assert_eq!(store.load().unwrap().unwrap(), state, "the base is part of what is written down");
 
@@ -901,4 +926,247 @@ fn a_compacted_log_survives_a_restart() {
     assert_eq!(node.base(), 40);
     assert_eq!(node.last_index(), 41, "indices are log positions, not vector positions");
     assert_eq!(node.commit_index(), 41);
+}
+
+/// **A restart lands on the seed the snapshot handed over**, not on the file's.
+///
+/// A follower that fell behind the base is given the state whole, members included, and takes
+/// those members as its seed. Until the seed was written down, a restart forgot that and went
+/// back to the file - which, once anybody had joined or left, named a cluster that was gone.
+#[test]
+fn a_restored_seed_is_the_membership_when_the_log_says_nothing() {
+    let mut grown = voters(3);
+    grown.push(learner("joined"));
+    let log = vec![big_cluster::raft::Entry { term: 3, decision: Decision::Noop }];
+
+    let mut node = Raft::new(0, voters(3), Timing::default(), 0);
+    node.restore(State { term: 3, voted_for: None, commit: 40, base: 40, log, seed: grown });
+    assert_eq!(node.members(), 4, "the seed that was written down is the one that counts");
+    assert_eq!(node.voters(), &[0, 1, 2], "and the fourth is a learner, as the seed said");
+}
+
+/// A state file from before the seed was recorded still loads, and reads as "the file's".
+#[test]
+fn a_state_file_from_before_the_seed_was_recorded_still_loads() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.raft");
+    // `BIGRAFT2`, by hand: magic, term, vote, commit, base, then a log of one `Noop`.
+    let mut bytes = b"BIGRAFT2".to_vec();
+    for v in [7u64, u64::MAX, 0, 0, 1, 0] {
+        bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    bytes.push(0);
+    std::fs::write(&path, &bytes).unwrap();
+
+    let state = big_cluster::raft::FileStore::new(&path)
+        .load()
+        .unwrap()
+        .expect("a file from the previous format is still a file");
+    assert_eq!(state.term, 7);
+    assert_eq!(state.voted_for, None);
+    assert_eq!(state.log.len(), 1);
+    assert!(state.seed.is_empty(), "nothing was written, so nothing is claimed");
+}
+
+/// **Compaction keeps the newest map and the newest membership**, whatever else it drops.
+///
+/// The follower's snapshot path folds the state into `log[0]`; the leader's own compaction did
+/// not, so a leader that compacted past its last decision and then restarted came back with the
+/// file's map and the file's members - a cluster that, once anything had moved or joined, no
+/// longer existed.
+#[test]
+fn a_compacted_log_still_holds_the_map_and_the_membership() {
+    let mut sim = Sim::new(4);
+    sim.run(3_000);
+    let leader = sim.leader();
+    // The fourth node steps back to learning: still replicated to, no longer voting.
+    let mut shrunk = voters(4);
+    shrunk[3].state = MemberState::Learner;
+
+    assert!(sim.propose(leader, owning(&[1, 2, 0])));
+    sim.run(500);
+    assert!(sim.propose(leader, Decision::Members(shrunk)));
+    sim.run(500);
+    for _ in 0..(Raft::KEEP_ENTRIES + 8) {
+        assert!(sim.propose(leader, Decision::Noop));
+        sim.run(100);
+    }
+    sim.nodes[leader].compact(0);
+    assert!(sim.nodes[leader].base() > 0, "there was something to compact");
+
+    let log = sim.nodes[leader].log();
+    assert!(
+        log.iter().any(|e| matches!(e.decision, Decision::Ranges(_))),
+        "the newest map is still in the log"
+    );
+    assert!(
+        log.iter().any(|e| matches!(e.decision, Decision::Members(_))),
+        "and so is the newest membership"
+    );
+
+    // And a restart from that log lands on both, whatever the file says.
+    let mut back = Raft::new(leader, voters(4), Timing::default(), 0);
+    back.restore(sim.nodes[leader].state());
+    assert_eq!(back.members(), 4);
+    assert_eq!(back.voters(), &[0, 1, 2], "the membership survived the compaction and the restart");
+}
+
+/// **A compacted leader still fails a range over.**
+///
+/// The guard in front of a promotion compared the commit index - a log position - with the
+/// length of the vector holding the log's suffix. Once anything had been compacted away the
+/// two could never agree again, and every promotion after the first compaction was silently
+/// refused on a cluster reporting itself healthy.
+#[test]
+fn a_compacted_leader_still_fails_a_range_over() {
+    let mut sim = Sim::new(3);
+    sim.run(3_000);
+    let leader = sim.leader();
+    for i in 0..8 {
+        assert!(sim.propose(leader, owning(&[i % 3, (i + 1) % 3])));
+        sim.run(200);
+    }
+    sim.nodes[leader].compact(0);
+    assert!(sim.nodes[leader].base() > 0, "the log was compacted");
+
+    // One copy of a replicated range goes quiet for longer than the lease allows.
+    let dead = (leader + 1) % 3;
+    sim.down.insert(dead);
+    let leases = Leases::default();
+    sim.run(leases.promote_after.as_millis() as u64 * 3);
+    assert_eq!(sim.leader(), leader, "two of three are still a majority");
+
+    let mut current = map_of(&[dead], &[]);
+    current.ranges[0].group = vec![dead, leader];
+    let next = Controller::promotion_for(&leases, &sim.nodes[leader], &current, sim.now)
+        .expect("a range whose primary went quiet is given to the copy that is answering");
+    assert_eq!(next.ranges[0].primary, leader);
+    assert!(next.is_stale(dead), "and the one that went quiet is marked behind");
+}
+
+// -------------------------------------------------------------------------------------------
+// The row-key namespace, moved by the agreement
+//
+// The most expensive decision the agreement makes: it copies every row key of every table to
+// the successor. So it waits far longer than a range failover, it happens only when an operator
+// has said it may, and the node it takes the namespace from is marked behind whether or not it
+// holds a copy of anything - it may have interned row ids nobody else ever saw.
+// -------------------------------------------------------------------------------------------
+
+/// A cluster of `n` in which the range is served by the agreement's leader, so that nothing
+/// about the *ranges* moves and what is left to observe is the namespace alone.
+fn quiet_schema_leader(n: usize) -> (Sim, NodeId, NodeId) {
+    let mut sim = Sim::new(n);
+    sim.run(3_000);
+    let leader = sim.leader();
+    let holder = (leader + 1) % n;
+    sim.down.insert(holder);
+    (sim, leader, holder)
+}
+
+fn schema_after(ms: u64) -> Leases {
+    Leases { move_schema_after: Some(std::time::Duration::from_millis(ms)), ..Leases::default() }
+}
+
+/// **Silence long enough for a range is not long enough for the namespace.** Moving it copies
+/// every row key of every table, so it waits until the ranges have already failed over and the
+/// map has settled - and on a blip it does nothing at all.
+#[test]
+fn the_namespace_waits_far_longer_than_a_range_does() {
+    let (mut sim, leader, holder) = quiet_schema_leader(3);
+    let leases = schema_after(15_000);
+    let mut current = map_of(&[leader], &[]);
+    current.schema_leader = holder;
+
+    // Past `promote_after`, nowhere near the namespace's own wait.
+    sim.run(6_000);
+    assert!(
+        Controller::promotion_for(&leases, &sim.nodes[leader], &current, sim.now).is_none(),
+        "a range would have moved by now; the namespace has not"
+    );
+
+    sim.run(12_000);
+    let next = Controller::promotion_for(&leases, &sim.nodes[leader], &current, sim.now)
+        .expect("silence for the whole of the longer wait moves it");
+    assert_eq!(next.schema_leader, leader);
+    assert!(!next.schema_ready, "the successor holds no row keys yet, and says so");
+    assert!(next.is_stale(holder), "the deposed node is marked behind, holding a copy or not");
+}
+
+/// **Off unless an operator turned it on.** The namespace stays where the file put it, however
+/// long its holder has been gone - which is what every deployment before this did.
+#[test]
+fn the_namespace_is_never_moved_unless_a_lease_says_it_may() {
+    let (mut sim, leader, holder) = quiet_schema_leader(3);
+    let mut current = map_of(&[leader], &[]);
+    current.schema_leader = holder;
+    sim.run(60_000);
+    assert_eq!(
+        Controller::promotion_for(&Leases::default(), &sim.nodes[leader], &current, sim.now),
+        None
+    );
+}
+
+/// The successor is a voter that is answering and has not missed a write - the same three
+/// conditions a range's replacement has to meet, for the same reasons.
+#[test]
+fn a_learner_a_draining_node_and_a_copy_that_is_behind_are_all_passed_over() {
+    let mut sim =
+        Sim::with_timing(4, Timing { election_min: 1_000, election_spread: 1_000, heartbeat: 200 });
+    sim.run(3_000);
+    let leader = sim.leader();
+    // Everybody but the leader is unfit in some way: one is a learner, one is behind, and the
+    // fourth is the node being deposed.
+    let holder = (leader + 1) % 4;
+    let learner_at = (leader + 2) % 4;
+    let behind_at = (leader + 3) % 4;
+    let mut members = voters(4);
+    members[learner_at].state = MemberState::Learner;
+    assert!(sim.propose(leader, Decision::Members(members)));
+    sim.run(500);
+
+    sim.down.insert(holder);
+    sim.run(20_000);
+
+    let mut current = map_of(&[leader], &[behind_at]);
+    current.schema_leader = holder;
+    let next =
+        Controller::promotion_for(&schema_after(15_000), &sim.nodes[leader], &current, sim.now)
+            .expect("there is one node left that is fit to hold it");
+    assert_eq!(next.schema_leader, leader, "not the learner, not the one marked behind");
+}
+
+/// Two leaders elected in sequence decide the same thing from the same facts, which is what
+/// keeps the namespace from moving twice.
+#[test]
+fn the_same_facts_always_choose_the_same_successor() {
+    let (mut sim, leader, holder) = quiet_schema_leader(3);
+    sim.run(20_000);
+    let mut current = map_of(&[leader], &[]);
+    current.schema_leader = holder;
+    let leases = schema_after(15_000);
+
+    let once = Controller::promotion_for(&leases, &sim.nodes[leader], &current, sim.now);
+    for _ in 0..20 {
+        assert_eq!(Controller::promotion_for(&leases, &sim.nodes[leader], &current, sim.now), once);
+    }
+    assert!(once.is_some());
+}
+
+/// Nothing is decided while the namespace is still being handed over: the successor has not
+/// finished taking it, and choosing another one would throw away the keys it already holds.
+#[test]
+fn a_handover_that_has_not_finished_is_not_restarted() {
+    let (mut sim, leader, holder) = quiet_schema_leader(3);
+    sim.run(20_000);
+    // Already deposed, already waiting on its successor.
+    let mut current = map_of(&[leader], &[holder]);
+    current.schema_leader = leader;
+    current.schema_ready = false;
+
+    assert_eq!(
+        Controller::promotion_for(&schema_after(15_000), &sim.nodes[leader], &current, sim.now),
+        None,
+        "the node it names is this one, and it is answering; there is nothing to decide"
+    );
 }

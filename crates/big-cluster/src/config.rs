@@ -661,7 +661,14 @@ impl ClusterConfig {
             text(&node.shards.to_string(), &mut h);
             eat(&node.replica_of.map_or(u64::MAX, |r| r as u64).to_le_bytes(), &mut h);
         }
-        text(&self.nodes[self.leader].name.clone(), &mut h);
+        // **The schema leader is deliberately not folded in.** It used to be, and it was right
+        // while the leader was a name read once from a file: two files naming different ones
+        // described two different clusters. It is a field in the map now, moved by an operator
+        // and - once a lease allows it - by the agreement itself. Two nodes whose files were
+        // updated at different moments after a *correct* failover would stop being able to
+        // talk to each other, which is a successful failover causing a partition: the worst
+        // failure available. The map overrides the file within a heartbeat anyway, so folding
+        // it in protected nothing.
         h
     }
 
@@ -746,7 +753,15 @@ impl ClusterConfig {
             .collect();
         // Nothing is behind before anything has happened, which is exactly what the file
         // asserts by naming a primary for every range.
-        crate::raft::RangeMap { epoch: 0, ranges, stale: Vec::new(), schema_leader: self.leader }
+        crate::raft::RangeMap {
+            epoch: 0,
+            ranges,
+            stale: Vec::new(),
+            schema_leader: self.leader,
+            reserved: Vec::new(),
+            // The file's leader has nothing to take over: it starts holding the namespace.
+            schema_ready: true,
+        }
     }
 
     /// The members the cluster starts from, in the file's order.

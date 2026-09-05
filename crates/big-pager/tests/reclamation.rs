@@ -205,6 +205,129 @@ fn truncate_tail_refuses_while_a_reader_is_alive() {
     assert!(store.truncate_tail().is_ok());
 }
 
+/// **The lowest reusable page is the one handed out**, which is what lets a file that has
+/// churned ever get smaller.
+///
+/// Ordering the freelist by generation first was correct and hopeless for the tail: writes went
+/// on landing at the end of the file while holes near the front stayed holes, so nothing was
+/// ever flush against EOF for `truncate_tail` to release. The reclaim rule is untouched - a run
+/// newer than the horizon is still skipped - and only the choice among reusable pages changed.
+/// Against the freelist itself rather than through a commit, and for the reason this file's
+/// header gives about every other assertion here: a commit takes pages for its own root,
+/// catalog and freelist chains before the caller's `alloc` ever sees the list, so a page number
+/// observed through one says as much about the machinery as about the rule. The rule is a
+/// property of this data structure, and this is where it is exact.
+#[test]
+fn the_lowest_reusable_page_is_allocated_first() {
+    let mut f = Freelist::default();
+    // Freed newest-page-first, so the *oldest* generation holds the *highest* page - which is
+    // what the old ordering, by generation, would have handed out first.
+    f.push(30, 1);
+    f.push(20, 2);
+    f.push(10, 3);
+    f.compact();
+
+    assert_eq!(f.alloc(9), Some(10), "the lowest hole, not the oldest one");
+    assert_eq!(f.alloc(9), Some(20));
+    assert_eq!(f.alloc(9), Some(30));
+    assert_eq!(f.alloc(9), None);
+}
+
+/// And the horizon still decides *whether* a page may be reused, not just which one. A run
+/// newer than the horizon is skipped however low it sits.
+#[test]
+fn a_page_too_new_to_reuse_is_skipped_however_low_it_is() {
+    let mut f = Freelist::default();
+    f.push(10, 7); // low, but freed by a transaction a reader can still see
+    f.push(30, 1);
+    f.compact();
+
+    assert_eq!(f.alloc(3), Some(30), "the low page is not reusable yet");
+    assert_eq!(f.alloc(3), None);
+    assert_eq!(f.alloc(7), Some(10), "and is once the horizon passes it");
+}
+
+/// And the point of that ordering: a file that churns comes back down instead of only ever
+/// growing. Written and dropped repeatedly, then trimmed - the tail is free by then, because
+/// every write went into a hole near the front rather than onto the end.
+#[test]
+fn a_file_that_churns_can_be_given_back_to_the_filesystem() {
+    let store = Store::init(MemPager::new()).unwrap();
+    for i in 0..16 {
+        put_fragment(&store, key(i, 0));
+    }
+    let high_water = store.metrics().page_count;
+
+    for i in 0..16 {
+        drop_fragment(&store, key(i, 0));
+    }
+    // A few more commits, which is what a live database is doing while this happens: each one
+    // takes its pages from the freelist, lowest first, and leaves the tail alone.
+    for i in 0..4 {
+        put_fragment(&store, key(100 + i, 0));
+    }
+
+    let released = store.truncate_tail().unwrap();
+    assert!(released > 0, "the tail was free and none of it was given back");
+    assert!(
+        store.metrics().page_count < high_water,
+        "the file did not shrink: {} vs {high_water}",
+        store.metrics().page_count
+    );
+}
+
+// -------------------------------------------------------------------------------------------
+// Pages a transaction allocated and then gave up on
+//
+// A page freed above the tail floor goes to the transaction's scratch list rather than the
+// freelist, so `alloc` can hand it straight back. What is left there at commit used to be lost:
+// counted in `page_count`, present in the file, and referenced by nothing. Against the freelist
+// directly, for the reason at the top of this file.
+// -------------------------------------------------------------------------------------------
+
+/// A page flush against the end is given back by not growing the file that far, which is
+/// better than recording it as free: there is nothing to record and nothing to reuse.
+#[test]
+fn scratch_against_the_tail_is_given_back_rather_than_freed() {
+    let mut f = Freelist::default();
+    assert_eq!(f.absorb_scratch(vec![10, 11], 12, 5), 10);
+    assert!(f.is_empty(), "the file simply never grew that far");
+}
+
+/// A page with something live above it cannot be given back that way, so it is recorded free.
+#[test]
+fn scratch_below_the_tail_goes_to_the_freelist() {
+    let mut f = Freelist::default();
+    assert_eq!(f.absorb_scratch(vec![10], 12, 5), 12, "page 11 is live, so 10 cannot be dropped");
+    assert_eq!(f.runs(), [FreeRun { freed_at: 5, first: 10, len: 1 }]);
+}
+
+/// The giveback stops at the first gap - everything below the gap is recorded instead.
+#[test]
+fn the_giveback_stops_at_the_first_gap() {
+    let mut f = Freelist::default();
+    assert_eq!(f.absorb_scratch(vec![100, 102], 103, 7), 102);
+    assert_eq!(f.runs(), [FreeRun { freed_at: 7, first: 100, len: 1 }]);
+}
+
+/// **Stamped with the committing transaction, so it is pending for the whole of that commit.**
+/// A lower stamp would make the page allocatable while the freelist's own pages are still being
+/// chosen, which is the loop whose termination argument assumes the entry count only falls.
+#[test]
+fn an_absorbed_page_is_not_reusable_inside_its_own_commit() {
+    let mut f = Freelist::default();
+    f.absorb_scratch(vec![10], 12, 5);
+    assert_eq!(f.alloc(4), None, "the horizon is below this transaction");
+    assert_eq!(f.alloc(5), Some(10), "and it is reusable once the horizon reaches it");
+}
+
+#[test]
+fn absorbing_nothing_changes_nothing() {
+    let mut f = Freelist::default();
+    assert_eq!(f.absorb_scratch(Vec::new(), 12, 5), 12);
+    assert!(f.is_empty());
+}
+
 #[test]
 fn readers_are_refcounted_not_flagged() {
     let store = Store::init(MemPager::new()).unwrap();

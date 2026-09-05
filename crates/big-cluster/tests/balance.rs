@@ -35,15 +35,87 @@ fn range(id: u64, start: u64, end: Option<u64>, primary: usize) -> Range {
 }
 
 fn map(ranges: Vec<Range>) -> RangeMap {
-    RangeMap { epoch: 1, ranges, stale: Vec::new(), schema_leader: 0 }
+    RangeMap {
+        epoch: 1,
+        ranges,
+        stale: Vec::new(),
+        schema_leader: 0,
+        reserved: Vec::new(),
+        schema_ready: true,
+    }
 }
 
+/// Every node that answered has also caught up on the log, which is the common case.
 fn load(pages: &[Option<u64>], frontier: u64) -> Vec<NodeLoad> {
-    pages.iter().map(|p| NodeLoad { pages: *p, frontier }).collect()
+    pages.iter().map(|p| NodeLoad { pages: *p, frontier, caught_up: p.is_some() }).collect()
+}
+
+/// The same, with node `n` still replaying what it missed.
+fn behind(mut loads: Vec<NodeLoad>, n: usize) -> Vec<NodeLoad> {
+    loads[n].caught_up = false;
+    loads
 }
 
 fn on() -> Policy {
     Policy { enabled: true, ..Policy::default() }
+}
+
+// -------------------------------------------------------------------------------------------
+// Admitting a node that joined
+// -------------------------------------------------------------------------------------------
+
+/// **A learner that is answering and has caught up is made a member, before anything else.**
+/// Until it is a voter the balancer cannot see it as a node with nothing, so admitting it has
+/// to come first - even ahead of a drain an operator asked for, which only needs somewhere to
+/// send the range and will have one more place the moment this lands.
+#[test]
+fn a_learner_that_answers_and_has_caught_up_is_admitted_before_anything_else() {
+    let m = map(vec![range(0, 0, Some(64), 0), range(1, 64, None, 1)]);
+    let mut members = voters(&["a", "b"]);
+    members.push(member("d", MemberState::Learner));
+    let l = load(&[Some(100_000), Some(100_000), Some(0)], 0);
+    assert_eq!(plan(&m, &members, &l, &on()), Some(Action::Admit { node: "d".to_string() }));
+
+    // Ahead of the drain: `b` wants to go, and it will have `d` to go to once `d` counts.
+    members[1].state = MemberState::Draining;
+    assert_eq!(
+        plan(&m, &members, &l, &on()),
+        Some(Action::Admit { node: "d".to_string() }),
+        "a member is worth more than a move, and the move comes right after"
+    );
+}
+
+/// A learner that did not say what it weighs is a learner that may not be up for data at all.
+/// Replicating the log to it proves nothing about whether it can serve a range.
+#[test]
+fn a_learner_that_did_not_answer_is_not_admitted() {
+    let m = map(vec![range(0, 0, Some(64), 0), range(1, 64, None, 1)]);
+    let mut members = voters(&["a", "b"]);
+    members.push(member("d", MemberState::Learner));
+    let l = load(&[Some(100_000), Some(100_000), None], 0);
+    assert_eq!(plan(&m, &members, &l, &on()), None);
+}
+
+/// A learner still replaying the log would raise the bar for every election while being able
+/// to help decide none - the exact reason a learner is not a voter in the first place.
+#[test]
+fn a_learner_still_catching_up_is_not_admitted() {
+    let m = map(vec![range(0, 0, Some(64), 0), range(1, 64, None, 1)]);
+    let mut members = voters(&["a", "b"]);
+    members.push(member("d", MemberState::Learner));
+    let l = behind(load(&[Some(100_000), Some(100_000), Some(0)], 0), 2);
+    assert_eq!(plan(&m, &members, &l, &on()), None);
+}
+
+/// Admitting is a change to the map's membership, and the one-at-a-time rule covers it too.
+#[test]
+fn nothing_is_admitted_while_something_is_moving() {
+    let mut m = map(vec![range(0, 0, Some(64), 0), range(1, 64, None, 1)]);
+    m.ranges[0].moving = Some(Move { target: 1, state: MoveState::Seeding });
+    let mut members = voters(&["a", "b"]);
+    members.push(member("d", MemberState::Learner));
+    let l = load(&[Some(100_000), Some(100_000), Some(0)], 0);
+    assert_eq!(plan(&m, &members, &l, &on()), None);
 }
 
 // -------------------------------------------------------------------------------------------
@@ -137,13 +209,13 @@ fn a_draining_node_is_not_given_anything() {
     assert_eq!(plan(&m, &members, &l, &on()), None, "`b` holds nothing and still gets nothing");
 }
 
-/// A learner is still catching up: it replicates and does not yet take ranges.
+/// A learner is still catching up: it replicates, is not yet admitted, and takes no range.
 #[test]
 fn a_learner_is_not_given_a_range_until_it_is_admitted() {
     let m = map(vec![range(0, 0, Some(64), 0), range(1, 64, None, 0)]);
     let mut members = voters(&["a", "b"]);
     members[1].state = MemberState::Learner;
-    let l = load(&[Some(100_000), Some(0)], 70 * (1 << 20));
+    let l = behind(load(&[Some(100_000), Some(0)], 70 * (1 << 20)), 1);
     assert_eq!(plan(&m, &members, &l, &on()), None);
 
     // Admitted, and now it is the obvious place for the tail.

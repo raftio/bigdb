@@ -1,0 +1,17 @@
+# One namespace, because every name in here is a DNS name the cluster depends on.
+#
+# `cluster.toml` says a node is reached at `a:7654`, and that short name resolves only from
+# inside the namespace the Service `a` lives in - the resolver's search path is
+# `<namespace>.svc.cluster.local` first. Two copies of this deployment in one namespace would be
+# two nodes called `a`; two namespaces is two clusters that cannot see each other, which is what
+# you want and is free.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: big
+  labels:
+    # The restricted profile is what these manifests are written against: no root, no added
+    # capabilities, seccomp on. The entrypoint is happy unprivileged - see the readme, "Why
+    # nothing here runs as root and the Secret is mode 0440".
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest

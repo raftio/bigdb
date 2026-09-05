@@ -266,6 +266,61 @@ fn backend_is_swappable() {
     }
 }
 
+/// **A transaction that gives its own pages back must leave the file the size it would have
+/// been.** Two stores, the same committed content; one of them additionally takes five pages
+/// from the tail and frees them all inside the same transaction. Those pages are in no tree, in
+/// no chain, and no reader ever saw them - a file that ends up larger for them has kept pages
+/// nothing will ever read and nothing will ever hand out again.
+///
+/// A difference test rather than an absolute one, so it stays true when the machinery around it
+/// changes how many pages a commit needs.
+#[test]
+fn a_transaction_that_abandons_its_own_pages_leaves_no_trace() {
+    let plain = Store::init(MemPager::new()).unwrap();
+    put_fragment(&plain, key(1, 0));
+
+    let churned = Store::init(MemPager::new()).unwrap();
+    put_fragment(&churned, key(1, 0));
+    let mut w = churned.begin_write();
+    let pages: Vec<u32> = (0..5).map(|_| w.alloc().unwrap()).collect();
+    for p in pages {
+        w.free(p);
+    }
+    w.commit().unwrap();
+    // The plain store commits too, so both have run the same number of transactions.
+    plain.begin_write().commit().unwrap();
+
+    assert_eq!(
+        churned.pager().page_count(),
+        plain.pager().page_count(),
+        "five pages allocated and freed in one transaction were kept"
+    );
+}
+
+/// The plateau below, but with a transaction that churns. **This is the one the leak broke:**
+/// an empty commit has nothing in its scratch list, so it plateaus either way.
+#[test]
+fn repeated_churning_commits_do_not_grow_the_file_without_bound() {
+    let store = Store::init(MemPager::new()).unwrap();
+    put_fragment(&store, key(1, 0));
+    let churn = || {
+        let mut w = store.begin_write();
+        let pages: Vec<u32> = (0..3).map(|_| w.alloc().unwrap()).collect();
+        for p in pages {
+            w.free(p);
+        }
+        w.commit().unwrap();
+    };
+    for _ in 0..50 {
+        churn();
+    }
+    let settled = store.pager().page_count();
+    for _ in 0..200 {
+        churn();
+    }
+    assert_eq!(store.pager().page_count(), settled, "page count must plateau under churn");
+}
+
 /// Freelist pages always come from the file tail, so a quiet loop of commits must still
 /// reach a steady state rather than growing the file forever.
 #[test]

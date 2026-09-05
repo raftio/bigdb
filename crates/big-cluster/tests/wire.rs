@@ -402,6 +402,22 @@ proptest! {
     }
 }
 
+/// A request to the schema leader carries who the sender thinks leads, so that the receiver can
+/// disagree - and a caller with no assumption says so rather than inventing one.
+#[test]
+fn a_request_to_the_schema_leader_carries_who_it_thinks_leads() {
+    let intern = wire::InternRequest {
+        table: "t".to_string(),
+        field: "f".to_string(),
+        keys: vec!["GB".to_string(), "FR".to_string()],
+        led: Some(wire::Led { epoch: 9, leader: 2 }),
+    };
+    assert_eq!(wire::InternRequest::decode(&intern.encode()).unwrap(), intern);
+
+    let allocate = wire::AllocateRequest { table: "t".to_string(), count: 4, led: None };
+    assert_eq!(wire::AllocateRequest::decode(&allocate.encode()).unwrap(), allocate);
+}
+
 /// A segment travels as what its records *hold*, not as encoded blocks.
 ///
 /// Shipping the encoded form would tie two nodes to the same codec choice for ever; shipping the

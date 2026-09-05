@@ -28,6 +28,14 @@ use super::*;
 /// node that did not propose it.
 const STALE_ROUTE_PAUSE_MS: u64 = 500;
 
+/// How many record ids the schema leader reserves with the agreement at a time.
+///
+/// A ceiling committed per statement would put an agreement round trip in front of every
+/// `INSERT`; a block this size puts one in front of every sixty-five thousand. What a block
+/// costs is that a leader replaced mid-block leaves a gap of unused ids behind it - and record
+/// ids are sixty-four bits wide and shard-mapped, so a gap costs nothing at all.
+const RESERVE_BLOCK: u64 = 65_536;
+
 impl<P: PagerMut + Sync> Cluster<P> {
     /// Writes a batch, splitting it by the owner of each record.
     ///
@@ -297,11 +305,13 @@ impl<P: PagerMut + Sync> Cluster<P> {
     ///
     /// Answers the first id of the run; the caller takes `count` consecutive ids from it.
     pub(super) fn allocate(&self, table: &str, count: u64) -> Result<RecordId> {
-        if self.leads_schema() {
+        let (leader, epoch) = self.schema_lead();
+        if leader == self.config.this_index() {
+            self.guard_schema()?;
             return self.allocate_here(table, count);
         }
-        let leader = self.schema_leader();
-        let body = wire::AllocateRequest { table: table.to_string(), count }.encode();
+        let led = Some(wire::Led { epoch, leader });
+        let body = wire::AllocateRequest { table: table.to_string(), count, led }.encode();
         let bytes = self.ask(leader, path::ALLOCATE, &body, None).map_err(|e| match e {
             ClusterError::Unreachable { node, why, .. } => {
                 ClusterError::LeaderUnreachable { node, why }
@@ -326,8 +336,21 @@ impl<P: PagerMut + Sync> Cluster<P> {
         // released before the floor was raised would be a lock that decided nothing.
         let mut floor = self.allocated.lock().unwrap_or_else(|e| e.into_inner());
         let anywhere = self.next_record(table)?;
-        let from = anywhere.max(floor.get(table).copied().unwrap_or(0));
-        floor.insert(table.to_string(), from.saturating_add(count));
+        let ceiling = self.map().reserved_for(table);
+        // A leader with no floor of its own for this table is a fresh one - just elected, or
+        // just restarted - and starts at the ceiling: everything below it may have been
+        // promised by whoever led before, to a write that has not landed, and the number that
+        // would have said so died with them.
+        let promised = floor.get(table).copied().unwrap_or(ceiling);
+        let from = anywhere.max(promised);
+        let end = from.saturating_add(count);
+        if end > ceiling {
+            // **Committed before it is handed out.** A block, not the run: one entry in the
+            // agreement per `RESERVE_BLOCK` ids rather than per statement, and a block a dead
+            // leader never finished is a gap in the ids, which cost nothing.
+            self.reserve_ids(table, from.saturating_add(count.max(RESERVE_BLOCK)))?;
+        }
+        floor.insert(table.to_string(), end);
         Ok(from)
     }
 
@@ -375,14 +398,19 @@ impl<P: PagerMut + Sync> Cluster<P> {
     /// Not queued, not assigned locally and reconciled later: two row ids for one string is a
     /// silently wrong answer, and a refusal is not.
     pub(super) fn intern(&self, table: &str, field: &str, keys: &[&str]) -> Result<Vec<RowId>> {
-        if self.leads_schema() {
+        let (leader, epoch) = self.schema_lead();
+        if leader == self.config.this_index() {
+            // Named by the map is not the same as allowed to act: a node that has stood down
+            // for a move, or has lost touch with the agreement, refuses here exactly as it
+            // would refuse a peer.
+            self.guard_schema()?;
             return Ok(self.api.intern_keys(table, field, keys)?);
         }
-        let leader = self.schema_leader();
         let body = wire::InternRequest {
             table: table.to_string(),
             field: field.to_string(),
             keys: keys.iter().map(|k| (*k).to_string()).collect(),
+            led: Some(wire::Led { epoch, leader }),
         }
         .encode();
         let bytes = self.ask(leader, path::INTERN, &body, None).map_err(|e| match e {

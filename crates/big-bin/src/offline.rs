@@ -33,6 +33,7 @@ pub fn main(args: &[String], usage: &str) {
         ["compact", file] => compact(file),
         ["verify", file] => verify(file),
         ["scrub", file] => scrub(file),
+        ["leaks", file] => leaks(file),
         ["drop-days", file, table, field, before] => drop_days(file, table, field, before),
         // Named rather than answered with the usage alone: an operator who typed a real
         // command with the wrong arguments has made a different mistake from one who typed a
@@ -62,7 +63,8 @@ pub fn main(args: &[String], usage: &str) {
 /// Every command word `big` answers to, for telling a typo from a misuse. `serve` is here
 /// because it is a real command of this binary, just not one this half handles - so
 /// `big serve` with no file reaches its own error rather than "no such command".
-const KNOWN: [&str; 7] = ["serve", "backup", "restore", "compact", "verify", "drop-days", "scrub"];
+const KNOWN: [&str; 8] =
+    ["serve", "backup", "restore", "compact", "verify", "drop-days", "scrub", "leaks"];
 
 fn backup(file: &str, dest: &str) -> Result<(), String> {
     let db = open(file)?;
@@ -144,6 +146,70 @@ fn scrub(file: &str) -> Result<(), String> {
         found.bitmaps,
         found.total()
     );
+    Ok(())
+}
+
+/// Accounts for every page in the file: reachable, free, or neither.
+///
+/// `verify` already prints `page_count` and the free counters, but nothing ties them to each
+/// other or to the size of the file. This does: it walks every tree the current roots and every
+/// snapshot can reach, adds the meta pages, the four chains and the freelist, and reports what
+/// is left over. **A page in neither set is one the database will never read and never hand out
+/// again**, and one of those at the end of the file is enough to stop `compact` giving anything
+/// back to the filesystem.
+///
+/// A separate subcommand for the same reason as `scrub`: it costs a full read of the live data,
+/// while `verify` costs almost nothing. It only reads - there is no repair here, and the counts
+/// it reports are exact as of the transaction it opened at rather than of any later one.
+///
+/// This is not a scrub. The walk parses pages without verifying their checksums, so run
+/// `big scrub <file>` first if the file is under suspicion.
+fn leaks(file: &str) -> Result<(), String> {
+    let db = open(file)?;
+    let r = db.audit_pages().map_err(|e| format!("{file} could not be audited: {e}"))?;
+
+    println!("{file}: txn {}, {} pages", r.txn_id, r.page_count);
+    println!(
+        "  {} reachable ({} meta, {} chain, {} tree, {} snapshot chain, {} snapshot tree)",
+        r.reachable,
+        r.by_class.meta,
+        r.by_class.chains,
+        r.by_class.trees,
+        r.by_class.snapshot_chains,
+        r.by_class.snapshot_trees
+    );
+    println!(
+        "  {} free ({} reusable now, {} still pending)",
+        r.free_total,
+        r.free_reusable,
+        r.free_total - r.free_reusable
+    );
+    println!("  {} unaccounted for", r.leaked);
+
+    if r.leaked > 0 {
+        println!(
+            "    highest is {}, of {} pages: {:?}",
+            r.highest_leaked.map_or("none".to_string(), |p| p.to_string()),
+            r.page_count,
+            r.leaked_sample
+        );
+        println!("    `big compact {file}` rewrites the file without them");
+    }
+    if r.file_pages != r.page_count {
+        println!(
+            "  {} pages past what the meta page records ({} on disk against {})",
+            r.beyond_meta, r.file_pages, r.page_count
+        );
+        println!("    a crash between a meta flip and a truncation leaves these; harmless, and `compact` clears them");
+    }
+
+    // Only these two are corruption rather than waste, and only these two fail the command.
+    if r.double_allocated > 0 || r.dangling > 0 {
+        return Err(format!(
+            "{file} is corrupt: {} page(s) handed out twice ({:?}), {} reference(s) past the end of the file",
+            r.double_allocated, r.double_allocated_sample, r.dangling
+        ));
+    }
     Ok(())
 }
 

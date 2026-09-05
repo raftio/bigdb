@@ -173,6 +173,14 @@ happen online is the *swap*: `read` hands back a page borrowed straight out of t
 replacing the file under a live mapping is exactly the dangling reference the pager's four mmap
 constraints exist to prevent. So the copy runs while serving and only the rename needs the stop.
 
+- **`--reclaim` gives the tail back without stopping anything.** A node started with it hands
+  trailing free pages to the filesystem while it serves, once a quarter of the file is
+  reclaimable and it finds a moment with no query in flight. It is not a substitute for
+  `compact`: only pages *flush against the end* are released, so one live page near the top
+  pins every free page below it. A file that churns comes down; a file that was emptied and
+  then left alone stays where it is. `big_pages_reclaimed_total` and
+  `big_reclaim_blocked_total` are the two numbers - the second climbing while the first stays
+  flat is a node that is never idle long enough.
 - **`compact` itself is offline.** It takes the exclusive lock, so stop `big serve` first. Running it against a served
   database fails with a lock error rather than doing anything behind the daemon's back.
 - Needs free space for a second copy of the *live data* alongside the original, briefly.
@@ -751,7 +759,7 @@ in the group already holds it.
 ### Containers
 
 Two compose files, in [deploy/](deploy/): [`single/`](deploy/single/) for one node and
-[`cluster/`](deploy/cluster/) for three. Same binary, same code path - `big serve` without
+[`cluster/`](deploy/cluster/) for two. Same binary, same code path - `big serve` without
 `--cluster` builds itself a cluster of one - so what differs is a config file and how many
 containers there are.
 
@@ -889,6 +897,29 @@ rate(big_storage_writes_total[15m]) / rate(big_txn_id[15m]) > 100
 # Configured for full durability but not flushing. The two disagreeing is a bug, not a setting.
 big_durability{level="none"} == 0 and rate(big_storage_syncs_total[15m]) == 0
   and rate(big_txn_id[15m]) > 0
+
+# A copy is behind. Redundancy the cluster has lost, and nothing gets it back but POST /repair.
+big_cluster_copies_behind > 0
+
+# A range has been moving for longer than a move takes. The balancer plans nothing, cluster-wide,
+# while anything is marked moving, and nothing clears the mark on its own: `bigctl cluster cancel`.
+big_cluster_ranges_moving > 0 for 10m
+
+# A peer keeps not saying what it weighs. To the balancer it is neither a source nor a
+# destination, so a cluster with one silent member quietly stops reshaping.
+rate(big_cluster_peer_load_unanswered_total[15m]) > 0
+
+# A move landed but its source could not let go of its copy. Space nobody reclaims until somebody
+# looks, and the loop that moved it will not say so twice.
+increase(big_cluster_balance_drops_failed_total[1h]) > 0
+
+# Nobody holds the row-key namespace. A write with a key nobody has seen is refused while this
+# is 0, so a handover that does not close in a minute is one that has stalled.
+big_cluster_schema_ready == 0 for 1m
+
+# **Page somebody.** Handing the namespace over found two surviving nodes disagreeing about what
+# a row id means. Nothing assigns row ids until this is resolved, and nothing clears it by itself.
+big_cluster_schema_handover_blocked > 0
 ```
 
 Do **not** alert on `4xx`. It is clients being wrong, which is normal traffic.

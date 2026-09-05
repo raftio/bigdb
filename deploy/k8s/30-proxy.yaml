@@ -1,0 +1,166 @@
+# The front door, and the only Service a client is given.
+#
+# It adds no routing - every node already plans a query and fans it out - so what it answers is
+# "which node is alive", and that is the answer Kubernetes cannot produce here. `/ready` on a
+# node is always `200`, with `serving` as a field in the body; an `httpGet` probe reads the
+# status line and nothing else. This process reads the body, every couple of seconds, and takes
+# a node that says `"serving":false` out of rotation without restarting anything. See
+# crates/big-proxy/src/health.rs, which is written around exactly those two facts.
+#
+# It also adds a route allowlist: `/internal/*` is unreachable through it and cannot be made
+# reachable, because it presents no client certificate either.
+apiVersion: v1
+kind: Service
+metadata:
+  name: big
+  labels:
+    app.kubernetes.io/name: big
+    app.kubernetes.io/component: proxy
+spec:
+  # **ClusterIP, and deliberately nothing else.** The compose file publishes to `127.0.0.1`
+  # because the hop below is in the clear; a ClusterIP is the same promise with the same
+  # boundary drawn around the cluster instead of the machine, and `kubectl port-forward` is the
+  # loopback hop. There is no Ingress and no LoadBalancer in this directory on purpose: adding
+  # one publishes a plaintext database port, and the fix is not an annotation but `--tls-cert`
+  # and `--tls-key` on this deployment and dropping `--insecure-no-tls` below.
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: big
+    app.kubernetes.io/component: proxy
+  ports:
+    # 7654 outside, 7650 inside: a client that moves from the compose deployment to this one
+    # changes the host and nothing else.
+    - name: big
+      port: 7654
+      targetPort: proxy
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: big-proxy
+  labels:
+    app.kubernetes.io/name: big
+    app.kubernetes.io/component: proxy
+spec:
+  # **Two, where compose has one.** A Deployment and not a StatefulSet because this is the one
+  # component here that genuinely is fungible: it opens no file, holds no lock, stores no
+  # credential and has no identity to keep. The compose file runs one of it because compose runs
+  # on one machine; a front door that is a single point of failure is the thing the front door
+  # was added to stop being.
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: big
+      app.kubernetes.io/component: proxy
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: big
+        app.kubernetes.io/component: proxy
+    spec:
+      terminationGracePeriodSeconds: 2
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: bigproxy
+          # A second image, and the separation is the point: this one has no engine, no SQL
+          # planner and no argon2 in it. See deploy/proxy/Dockerfile.
+          image: bigproxy:latest
+          imagePullPolicy: IfNotPresent
+          args:
+            - 0.0.0.0:7650
+            - --cluster
+            - /etc/bigproxy/cluster/upstreams.toml
+            # Trusting the CA is not being trusted by it: this verifies the nodes' certificates
+            # and presents none of its own, which is why `/internal/*` stays out of reach.
+            - --upstream-ca
+            - /run/bigproxy/peer-ca.pem
+            # The hop from a client to here is in the clear, and the ClusterIP above is what
+            # bounds it. Give this `--tls-cert` and `--tls-key` and drop this flag before
+            # anything outside the cluster reaches it.
+            - --insecure-no-tls
+          ports:
+            - name: proxy
+              containerPort: 7650
+          # Liveness: is this process answering. A proxy whose upstreams are all down is a
+          # healthy proxy - it is answering `503`, which is the correct answer - and restarting
+          # it would not bring a database back.
+          livenessProbe:
+            httpGet: { path: /health, port: proxy }
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          # Readiness: is there anywhere to send a request. `503` when nothing is in rotation,
+          # so this pod leaves the Service rather than accepting a request it can only refuse.
+          # It costs nothing to ask: the answer comes out of what the poller already knows, and
+          # the probe never touches a node.
+          readinessProbe:
+            httpGet: { path: /ready, port: proxy }
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 2
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: run
+              mountPath: /run/bigproxy
+            - name: cluster
+              mountPath: /etc/bigproxy/cluster
+              readOnly: true
+            - name: secrets
+              mountPath: /etc/bigproxy/secrets
+              readOnly: true
+      volumes:
+        - name: run
+          emptyDir: {}
+        # **Not the seed the nodes read**, and the difference is the point: this list names
+        # every address a node could ever have, including pods that do not exist yet. The proxy
+        # takes `name` and `addr` and ignores the rest - it does not route by key - so a name it
+        # cannot reach is simply out of rotation, and one that appears is in rotation within a
+        # health interval. That is what makes `kubectl scale` reach a client with no restart
+        # here. The seed cannot be written that way: a node counts a majority out of it.
+        - name: cluster
+          configMap:
+            name: big-seed
+            items:
+              - key: upstreams.toml
+                path: upstreams.toml
+        # **The CA and nothing else.** Not a users file: this process authenticates nobody, it
+        # forwards the credential the client sent to a node that does. Not a node key: a
+        # certificate signed by that CA would name a node and would reach `/internal/*`, and
+        # there is deliberately no flag here that loads one.
+        - name: secrets
+          secret:
+            secretName: big-proxy
+            defaultMode: 0440
+---
+# **The one budget worth writing, and the nodes deliberately have none.** Draining a machine may
+# take one of these two and must not take both - that is a real constraint an eviction can
+# respect, because a second proxy is as good as the first.
+#
+# A node's is not that shape. Each range lives on exactly one node here, so evicting either one
+# takes a range offline no matter what a budget says; `maxUnavailable: 0` would not protect the
+# data, it would hang `kubectl drain` forever and call it protection. What makes a node evictable
+# is a copy of its range, and that needs the third node docs/clustering.md describes.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: big-proxy
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: big
+      app.kubernetes.io/component: proxy

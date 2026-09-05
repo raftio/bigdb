@@ -75,9 +75,88 @@ impl<P: PagerMut + Sync> Cluster<P> {
         self.ranges.read().expect("no panic holds this lock").schema_leader
     }
 
-    /// Whether this node is the one that assigns row ids.
+    /// Whether the map names this node as the one that assigns row ids.
+    ///
+    /// The map's answer and nothing more. Whether this node may *act* on it is
+    /// [`Cluster::guard_schema`], which also asks whether it has stood down and whether it has
+    /// heard from the agreement recently enough to know it still leads.
     pub(super) fn leads_schema(&self) -> bool {
         self.schema_leader() == self.config.this_index()
+    }
+
+    /// Who leads the schema and at which epoch the map said so, read together so that a
+    /// request built from them carries one consistent assumption.
+    pub(super) fn schema_lead(&self) -> (usize, u64) {
+        let map = self.ranges.read().expect("no panic holds this lock");
+        (map.schema_leader, map.epoch)
+    }
+
+    /// The refusal this node owes a request to intern or allocate when it may not.
+    ///
+    /// Three ways to owe one. **The map names somebody else**: a coordinator holding an older
+    /// map sent this here, and the answer says where to send it instead. **This node was told
+    /// to stand down** by a move that has not committed yet, so by the map it still leads and
+    /// by the move it no longer does. **This node has lost touch with the agreement**, so it
+    /// cannot know that it has not been replaced - the same reason a range stops being served,
+    /// and here there is no unfenced case: the schema leader can always be replaced.
+    ///
+    /// Two nodes interning at once hand one string two row ids, which nothing downstream can
+    /// see. Every refusal here is worth that.
+    pub fn guard_schema(&self) -> Result<()> {
+        let (leader, epoch) = self.schema_lead();
+        let this = self.config.this_index();
+        let node = self.config.this().name.clone();
+        if leader != this {
+            return Err(ClusterError::NotSchemaLeader {
+                node,
+                leader: self.describe(leader),
+                epoch,
+            });
+        }
+        if self.stood_down_at.load(std::sync::atomic::Ordering::Relaxed) > epoch {
+            return Err(ClusterError::NotSchemaLeader {
+                node,
+                leader: "a node this one is handing the namespace to".to_string(),
+                epoch,
+            });
+        }
+        if !self.ranges.read().expect("no panic holds this lock").schema_ready {
+            return Err(ClusterError::SchemaHandover { node });
+        }
+        if !self.controller.as_ref().is_none_or(|c| c.may_lead_schema()) {
+            return Err(ClusterError::SchemaLeaseLost { node });
+        }
+        Ok(())
+    }
+
+    /// Refuses a request to the schema leader whose assumptions this node does not share.
+    ///
+    /// The one assumption a sender can state is who it thinks leads. A sender that names
+    /// another node reached this one by a map it has not yet applied - or by one this node has
+    /// not - and is told who leads *here*, so that it can ask the right node rather than have
+    /// this one answer a question that is no longer its to answer.
+    pub fn check_schema_lead(&self, led: Option<&wire::Led>) -> Result<()> {
+        if let Some(led) = led {
+            if led.leader != self.config.this_index() {
+                let (leader, epoch) = self.schema_lead();
+                return Err(ClusterError::NotSchemaLeader {
+                    node: self.config.this().name.clone(),
+                    leader: self.describe(leader),
+                    epoch,
+                });
+            }
+        }
+        self.guard_schema()
+    }
+
+    /// Stops this node interning until the map has moved past `epoch`.
+    ///
+    /// What a move of the namespace asks of its source before it reads the floor: after this
+    /// the floor is final rather than racing, and the window between here and the decision
+    /// landing is one in which nobody interns - which is allowed - rather than one in which
+    /// two nodes do.
+    pub fn stand_down_schema(&self, epoch: u64) {
+        self.stood_down_at.fetch_max(epoch.saturating_add(1), std::sync::atomic::Ordering::Relaxed);
     }
 
     /// A node's name, or `None` for an index the cluster file never had.

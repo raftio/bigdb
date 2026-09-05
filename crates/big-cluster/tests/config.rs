@@ -533,3 +533,29 @@ fn a_file_with_no_cluster_id_is_still_identified_by_its_shape() {
     assert_eq!(a.fingerprint(), b.fingerprint(), "which node this is does not change it");
     assert_ne!(a.fingerprint(), edited.fingerprint(), "a file somebody edited does");
 }
+
+/// **Two files that disagree about who leads the schema still describe one cluster.**
+///
+/// The leader used to be folded into the shape, and that was right while it was a name read
+/// once from a file. It moves at runtime now - by an operator, and by the agreement itself -
+/// so a deployment whose files were updated at different moments after a *correct* failover
+/// would have two nodes that could no longer talk: a successful failover causing a partition,
+/// which is the worst failure on offer. The map overrides the file within a heartbeat, so
+/// folding it in protected nothing.
+#[test]
+fn who_leads_the_schema_is_not_part_of_the_shape() {
+    let with = |leader: &str| {
+        format!(
+            "schema_leader = \"{leader}\"\n\
+             [[node]]\nname = \"a\"\naddr = \"10.0.0.1:7654\"\nshards = \"0..64\"\n\
+             [[node]]\nname = \"b\"\naddr = \"10.0.0.2:7654\"\nshards = \"64..\"\n"
+        )
+    };
+    let a = ClusterFile::parse(&with("a")).unwrap().for_node(Some("a"), "").unwrap();
+    let b = ClusterFile::parse(&with("b")).unwrap().for_node(Some("a"), "").unwrap();
+    assert_eq!(a.fingerprint(), b.fingerprint());
+
+    // The key is still required, and still has to name a node that could hold it: it seeds the
+    // map, and a fresh cluster has nothing else to start from.
+    assert!(matches!(ClusterFile::parse(&with("nobody")), Err(ConfigError::UnknownLeader { .. })));
+}

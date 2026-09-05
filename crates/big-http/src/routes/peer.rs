@@ -125,15 +125,20 @@ pub(super) fn peer_delete<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request) -
 
 /// The schema leader's one job.
 ///
-/// Answered by whichever node receives it, which is the leader because a coordinator sends it
-/// nowhere else. There is no check here that this node *is* the leader: the config is what
-/// decides that, every node reads the same file, and a check would turn a misconfiguration
-/// that startup already refuses into a runtime error somewhere less useful.
+/// **Checked, not assumed.** It used to be assumed: the leader was a name in the config, every
+/// node read the same file, and a request could only have been sent here on purpose. The
+/// leader is a field in the map now, and a coordinator holding a map one decision old sends
+/// this to whoever led *then* - which is how two nodes come to intern at once, the one failure
+/// that hands one string two row ids and that nothing downstream can see. So the request says
+/// who it thinks leads, and this node says whether it agrees before it assigns anything.
 pub(super) fn peer_intern<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request) -> Response {
     let request = match wire::InternRequest::decode(&req.body) {
         Ok(r) => r,
         Err(e) => return unreadable(&e),
     };
+    if let Err(e) = ctx.cluster.check_schema_lead(request.led.as_ref()) {
+        return super::from_cluster(&e);
+    }
     let keys: Vec<&str> = request.keys.iter().map(String::as_str).collect();
     match ctx.api().intern_keys(&request.table, &request.field, &keys) {
         Ok(rows) => {
@@ -154,10 +159,50 @@ pub(super) fn peer_allocate<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request)
         Ok(r) => r,
         Err(e) => return unreadable(&e),
     };
+    if let Err(e) = ctx.cluster.check_schema_lead(request.led.as_ref()) {
+        return super::from_cluster(&e);
+    }
     match ctx.cluster.allocate_here(&request.table, request.count) {
         Ok(from) => Response::binary(wire::put_u64_body(from)),
         Err(e) => super::from_cluster(&e),
     }
+}
+
+/// `POST /internal/reserve`: raise the agreement's ceiling on record ids for a table.
+///
+/// Asked of the agreement's leader by a schema leader that is not it, once per block of ids.
+/// The body is the same shape floors travel in - `(table, one past the highest)` - and the
+/// answer is the epoch the ceiling landed at.
+pub(super) fn peer_reserve<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request) -> Response {
+    let floors = match wire::get_floors(&req.body) {
+        Ok(f) => f,
+        Err(e) => return unreadable(&e),
+    };
+    let mut epoch = 0;
+    for (table, upto) in &floors {
+        match ctx.cluster.reserve_here(table, *upto) {
+            Ok(at) => epoch = at,
+            Err(e) => return super::from_cluster(&e),
+        }
+    }
+    Response::binary(wire::put_u64_body(epoch))
+}
+
+/// `POST /internal/schema/step-down`: stop interning, the namespace is being handed over.
+///
+/// The body is the map epoch the move read. This node refuses to intern or allocate until the
+/// map is past it - which, once the move lands, it is, and by then the map names somebody
+/// else. Answered with the epoch, so the caller knows which one was heard.
+pub(super) fn peer_schema_step_down<P: PagerMut + Sync>(
+    ctx: &Ctx<'_, P>,
+    req: &Request,
+) -> Response {
+    let epoch = match wire::get_u64_body(&req.body) {
+        Ok(e) => e,
+        Err(e) => return unreadable(&e),
+    };
+    ctx.cluster.stand_down_schema(epoch);
+    Response::binary(wire::put_u64_body(epoch))
 }
 
 /// One past the highest record id this node holds, which is its share of the answer the leader
@@ -387,7 +432,7 @@ pub(super) fn cluster_rebalance<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Requ
     }
     match ctx.cluster.rebalance(&policy) {
         Ok(None) => Response::ok("{\"did\":null}".to_string()),
-        Ok(Some(what)) => Response::ok(format!("{{\"did\":{}}}", json::string(&what))),
+        Ok(Some(what)) => Response::ok(format!("{{\"did\":{}}}", json::string(&what.describe()))),
         Err(e) => from_cluster(&e),
     }
 }

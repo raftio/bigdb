@@ -86,9 +86,10 @@ struct Echo {
 }
 
 impl Echo {
-    /// **The only `unsafe` in this crate**, and the whole of it is four `libc` calls around a
-    /// `termios` struct. The crate is `#![deny(unsafe_code)]`, so this says so out loud rather
-    /// than the deny being quietly relaxed at the top of the file where nobody would see it.
+    /// **One of the two `unsafe` blocks in this crate** - the other installs the stop signal in
+    /// `serve.rs` - and the whole of it is four `libc` calls around a `termios` struct. The
+    /// crate is `#![deny(unsafe_code)]`, so this says so out loud rather than the deny being
+    /// quietly relaxed at the top of the file where nobody would see it.
     #[allow(unsafe_code)]
     #[cfg(unix)]
     fn off() -> io::Result<Self> {

@@ -235,6 +235,8 @@ enum Target<'a> {
     PeerDelete,
     PeerIntern,
     PeerAllocate,
+    PeerSchemaStepDown,
+    PeerReserve,
     PeerNextRecord,
     PeerDdl,
     PeerDigest,
@@ -297,6 +299,8 @@ impl<'a> Target<'a> {
                 | Self::PeerDelete
                 | Self::PeerIntern
                 | Self::PeerAllocate
+                | Self::PeerSchemaStepDown
+                | Self::PeerReserve
                 | Self::PeerNextRecord
                 | Self::PeerDdl
                 | Self::PeerRaft
@@ -395,6 +399,8 @@ impl<'a> Target<'a> {
             | Self::PeerDelete
             | Self::PeerIntern
             | Self::PeerAllocate
+            | Self::PeerSchemaStepDown
+            | Self::PeerReserve
             | Self::PeerDdl
             | Self::PeerRaft
             | Self::PeerFragmentPut
@@ -432,6 +438,8 @@ fn resolve<'a>(method: &str, segments: &[&'a str]) -> Option<Target<'a>> {
         ("POST", ["internal", "delete"]) => Target::PeerDelete,
         ("POST", ["internal", "intern"]) => Target::PeerIntern,
         ("POST", ["internal", "allocate"]) => Target::PeerAllocate,
+        ("POST", ["internal", "schema", "step-down"]) => Target::PeerSchemaStepDown,
+        ("POST", ["internal", "reserve"]) => Target::PeerReserve,
         ("POST", ["internal", "next-record"]) => Target::PeerNextRecord,
         ("POST", ["internal", "ddl"]) => Target::PeerDdl,
         ("POST", ["internal", "digest"]) => Target::PeerDigest,
@@ -541,7 +549,7 @@ pub fn dispatch<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request) -> Answered
         Target::Metrics => {
             let mut text = ctx.metrics.render(&ctx.api().metrics());
             crate::metrics::render_keys(&mut text, &ctx.api().key_stats());
-            crate::metrics::render_cluster(&mut text, &ctx.cluster.counters());
+            crate::metrics::render_cluster(&mut text, &ctx.cluster.counters(), ctx.balance.enabled);
             let (verifications, hits, throttled) = ctx.auth.counters();
             crate::metrics::render_auth(&mut text, verifications, hits, throttled);
             Response::text(
@@ -570,6 +578,8 @@ pub fn dispatch<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request) -> Answered
         Target::PeerDelete => peer_delete(ctx, req),
         Target::PeerIntern => peer_intern(ctx, req),
         Target::PeerAllocate => peer_allocate(ctx, req),
+        Target::PeerSchemaStepDown => peer_schema_step_down(ctx, req),
+        Target::PeerReserve => peer_reserve(ctx, req),
         Target::PeerNextRecord => peer_next_record(ctx, req),
         Target::PeerDdl => peer_ddl(ctx, req),
         Target::PeerDigest => peer_digest(ctx, req),

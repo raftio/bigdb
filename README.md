@@ -143,7 +143,7 @@ crates/big-bin/    the `big` and `bigctl` binaries
 crates/big-http/   the server
 crates/big-embed/  the library API
 contrib/           written against the HTTP surface, as an outside user would
-deploy/            single-node and cluster deployments
+deploy/            single-node, compose cluster and Kubernetes deployments
 examples/          runnable docker compose stacks
 bench/             benchmarks; excluded from the workspace test run
 fuzz/              cargo-fuzz targets, nightly only

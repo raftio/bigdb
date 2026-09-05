@@ -163,6 +163,11 @@ fn metrics_render_in_the_prometheus_text_format() {
     assert!(r.body.contains("big_page_count "), "{}", r.body);
     // The request that came before this one was counted.
     assert!(r.body.contains(r#"big_http_responses_total{class="2xx"} 1"#), "{}", r.body);
+    // The balancer's numbers are there even on a cluster of one, so a dashboard built against
+    // a single node keeps working when the second node arrives. Off, and nothing moving.
+    assert!(r.body.contains("big_cluster_balancer_enabled 0"), "{}", r.body);
+    assert!(r.body.contains("# TYPE big_cluster_ranges_moving gauge"), "{}", r.body);
+    assert!(r.body.contains("big_cluster_peer_load_unanswered_total 0"), "{}", r.body);
 
     // This server is in memory, and `MemPager` counts no I/O because it does none. Absent
     // rather than zero: a block of zeroes would read as a database nobody is writing to.
@@ -206,6 +211,80 @@ fn metrics_report_what_the_storage_backend_did() {
     // No byte counter for reads on this backend, on purpose: the read that reaches the disk is
     // a page fault this process is never told about.
     assert!(!r.body.contains("big_storage_read_bytes_total"), "{}", r.body);
+}
+
+/// **A node started with `--reclaim` gives pages back while it is serving**, which nothing in
+/// this tree could do before: `big compact` wants the exclusive lock, so shrinking a database
+/// meant stopping the daemon.
+///
+/// The whole chain, over a real socket: the steward notices the file has enough free space to
+/// be worth it, `Api::reclaim` takes the write lock, the pager releases the runs that sit flush
+/// against the end of the file, and the counters say what happened.
+///
+/// **What this deliberately does not claim.** Only the *tail* is released - one live page near
+/// the top pins every free page below it - so a database that is emptied and left alone stays
+/// large, and the number here is small. Making the general case shrink means relocating the
+/// fragments that sit above the free space, which is not built; the rule that makes the tail
+/// drain at all is `the_lowest_reusable_page_is_allocated_first` in `big-pager`.
+#[test]
+#[cfg(unix)]
+fn a_node_with_reclaim_on_gives_pages_back_while_serving() {
+    let dir = tempfile::tempdir().unwrap();
+    let api = Api::open(dir.path().join("t.big")).unwrap();
+    api.create_table("tx").unwrap();
+    api.create_field("tx", "amount", big_db::catalog::FieldKind::Int, 32).unwrap();
+
+    // One record per shard rather than a pile in one: a bitmap holds a great many records in a
+    // handful of pages, and what fills a file is fragments. Enough of them to pass the floor
+    // the steward will not act below.
+    let records: Vec<u64> = (0..6_000u64).map(|i| i << 20).collect();
+    let facts: Vec<_> = records
+        .iter()
+        .map(|r| big_embed::Fact::Int { field: "amount", record: *r, value: r % 1_000 })
+        .collect();
+    api.import("tx", &facts).unwrap();
+    assert!(api.metrics().page_count > 4_096, "the fixture has to outgrow the reclaim floor");
+    api.delete("tx", &records).unwrap();
+    // One more commit. A transaction cannot reuse the pages it is itself freeing - they are
+    // not past the horizon until it has landed - so the delete's own bookkeeping went to the
+    // end of the file. The next write takes the lowest free page instead, which is what moves
+    // the live page off the tail and leaves something to give back.
+    api.import("tx", &[big_embed::Fact::Int { field: "amount", record: 1, value: 1 }]).unwrap();
+
+    let server =
+        Server::bind_with(api, "127.0.0.1:0", ServerConfig { reclaim: true, ..config() }).unwrap();
+    let addr = server.local_addr().unwrap();
+    let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let flag = std::sync::Arc::clone(&running);
+    let done = std::thread::spawn(move || {
+        let _ = server.serve_while(&flag);
+    });
+
+    // The steward runs on its own clock, so this is a wait rather than an assertion.
+    let started = std::time::Instant::now();
+    loop {
+        let body = send(addr, "GET", "/metrics", "").body;
+        assert!(body.contains("# TYPE big_pages_reclaimed_total counter"), "{body}");
+        if !body.contains("big_pages_reclaimed_total 0") {
+            break;
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "nothing was ever given back: {body}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    running.store(false, std::sync::atomic::Ordering::Relaxed);
+    let _ = done.join();
+}
+
+/// And off by default, which is the half that keeps every existing deployment as it was.
+#[test]
+fn a_node_without_reclaim_never_gives_a_page_back() {
+    let addr = spawn(1, config());
+    let body = send(addr, "GET", "/metrics", "").body;
+    assert!(body.contains("big_pages_reclaimed_total 0"), "{body}");
 }
 
 // ---------------------------------------------------------------------------

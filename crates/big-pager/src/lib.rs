@@ -27,6 +27,7 @@
 
 #![deny(unsafe_code)]
 
+pub mod audit;
 pub mod chainio;
 #[cfg(feature = "counting-pager")]
 pub mod counting;
@@ -44,6 +45,7 @@ pub mod txn;
 #[cfg(unix)]
 pub mod mmap;
 
+pub use audit::{AuditTally, LeakReport, PageSet};
 #[cfg(feature = "counting-pager")]
 pub use counting::{CountingPager, PagerCounts};
 pub use durability::Durability;
@@ -73,7 +75,7 @@ pub use big_page::{
 use big_page::{
     build_chain, chain_pages_needed as pages_needed, pick_meta, PageType, ROOT_RECORD_BYTES,
 };
-use chainio::{chain_pgnos, load_chain};
+use chainio::{chain_pgnos, chain_pgnos_checked, load_chain};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 
@@ -189,6 +191,82 @@ struct StoreState {
     snapshots: Arc<SnapshotRegistry>,
     catalog: Arc<Vec<Vec<u8>>>,
     freelist: Freelist,
+}
+
+/// An audit in progress: the file's own bookkeeping, captured at one instant, plus the reader
+/// that keeps it true while the caller walks the trees.
+///
+/// Everything reachable without leaving this crate is already marked. The caller marks the
+/// trees - `roots` and then `snapshot_roots`, both of which need `big-btree` - and calls
+/// [`Audit::finish`].
+pub struct Audit<'db, P: Pager> {
+    /// Held for the life of the audit. Dropping it early would let the horizon advance and a
+    /// page named in the capture be recycled while the walk is still reading it.
+    _read: ReadTxn<'db, P>,
+    /// Pages something points at. The caller adds the trees.
+    pub marks: PageSet,
+    /// Pages the freelist holds, pending runs included.
+    pub free: PageSet,
+    /// Roots of the current trees, for the caller to walk.
+    pub roots: Vec<Pgno>,
+    /// Roots reachable only from a snapshot's old roots chain. **The class every other walk in
+    /// this tree skips**, and the one an audit must not.
+    pub snapshot_roots: Vec<Pgno>,
+    /// Runs a writer could take right now. Anything both reachable and in one of these has
+    /// been handed out twice.
+    reusable: Vec<FreeRun>,
+    tally: AuditTally,
+    dangling: u64,
+    free_total: u64,
+    free_reusable: u64,
+    page_count: u64,
+    file_pages: u64,
+    txn_id: TxnId,
+}
+
+impl<P: Pager> Audit<'_, P> {
+    /// Marks a page the caller reached, counting it against a tree or a snapshot's tree.
+    pub fn mark_tree_page(&mut self, pgno: Pgno, from_snapshot: bool) {
+        if self.marks.insert(pgno) {
+            if from_snapshot {
+                self.tally.snapshot_trees += 1;
+            } else {
+                self.tally.trees += 1;
+            }
+        } else if pgno as u64 >= self.page_count {
+            self.dangling += 1;
+        }
+    }
+
+    /// The complement, once the caller has marked everything it can reach.
+    pub fn finish(self) -> LeakReport {
+        const SAMPLE: usize = 64;
+        let leaked: Vec<Pgno> = self.marks.absent_from_both(&self.free).take(SAMPLE).collect();
+        let mut reusable = PageSet::with_pages(self.page_count);
+        for run in &self.reusable {
+            for p in audit::run_pages(run, self.page_count) {
+                reusable.insert(p);
+            }
+        }
+        let doubled: Vec<Pgno> = self.marks.present_in_both(&reusable).take(SAMPLE).collect();
+
+        LeakReport {
+            txn_id: self.txn_id,
+            page_count: self.page_count,
+            file_pages: self.file_pages,
+            reachable: self.marks.count(),
+            free_total: self.free_total,
+            free_reusable: self.free_reusable,
+            leaked: self.marks.count_absent_from_both(&self.free),
+            highest_leaked: self.marks.absent_from_both(&self.free).next_back(),
+            leaked_sample: leaked,
+            beyond_meta: self.file_pages.saturating_sub(self.page_count),
+            dangling: self.dangling,
+            double_allocated: self.marks.present_in_both(&reusable).count() as u64,
+            double_allocated_sample: doubled,
+            by_class: self.tally,
+        }
+    }
 }
 
 /// Bound only by `Pager`/`PagerMut`, so swapping the backend touches nothing in here.
@@ -324,6 +402,137 @@ impl<P: Pager> Store<P> {
             ROOT_RECORD_BYTES,
         )?);
         Ok(ReadTxn::new(self, snap.txn_id, Arc::new(roots), catalog))
+    }
+
+    /// Opens an audit: a reader, plus everything about the file's own bookkeeping taken at the
+    /// same instant.
+    ///
+    /// **The capture has to happen here, under one lock.** A caller assembling the same facts
+    /// from `meta()`, `snapshots()` and the freelist would take three separate read guards, and
+    /// `commit_txn` publishes all of them under one write guard - so a mark set built from a
+    /// straddled state would be wrong in a way no test reliably catches.
+    ///
+    /// This marks everything it can reach without leaving this crate: the meta pages, the four
+    /// chains, and every chain a snapshot still names. What it cannot do is walk a b-tree -
+    /// `big-btree` depends on this crate, not the other way round - so it hands back the roots
+    /// and leaves that to the caller. See `Db::audit_pages`.
+    ///
+    /// The read transaction is held for the whole audit, which pins the reclaim horizon just as
+    /// a backup does: `truncate_tail` will refuse for the duration, and any page named in this
+    /// capture is safe from being recycled underneath the walk.
+    pub fn begin_audit(&self) -> Result<Audit<'_, P>> {
+        // One guard. The reader is registered before it is dropped, so nothing committed
+        // between the capture and the registration can move the horizon past us.
+        let (read, meta, freelist, snapshots, roots, horizon) = {
+            let st = self.state.read().unwrap();
+            let reader_h = self.oldest_reader().unwrap_or(st.meta.txn_id);
+            let snap_h = st.snapshots.oldest_txn_id().unwrap_or(st.meta.txn_id);
+            let read =
+                ReadTxn::new(self, st.meta.txn_id, Arc::clone(&st.roots), Arc::clone(&st.catalog));
+            (
+                read,
+                st.meta,
+                st.freelist.clone(),
+                Arc::clone(&st.snapshots),
+                Arc::clone(&st.roots),
+                reader_h.min(snap_h).min(st.meta.txn_id),
+            )
+        };
+
+        let pages = meta.page_count;
+        let mut marks = PageSet::with_pages(pages);
+        let mut free = PageSet::with_pages(pages);
+        let mut tally = AuditTally::default();
+        let mut dangling = 0u64;
+
+        // 1. Both meta slots. They are double-buffered - a commit writes only `txn_id % 2` -
+        // so the one this file is not currently governed by still holds the previous commit
+        // and is what `Store::load` falls back to.
+        for slot in 0..META_PAGES {
+            if marks.insert(slot as Pgno) {
+                tally.meta += 1;
+            }
+        }
+
+        // 2. The four chains' own pages.
+        for (head, ty, stride) in Self::chain_shapes(&meta) {
+            for p in chain_pgnos_checked(&self.pager, head, ty, stride)? {
+                if marks.insert(p) {
+                    tally.chains += 1;
+                } else {
+                    dangling += 1;
+                }
+            }
+        }
+
+        // 3. Every snapshot's *old* roots chain, and the roots on it. This is the class no
+        // other walk in the tree visits: those trees are unreachable from the current roots
+        // and entirely live. `0` is the absent marker, the same one `begin_read_at` uses.
+        let mut snapshot_roots = Vec::new();
+        for snap in snapshots.all() {
+            let head = (snap.root_records != 0).then_some(snap.root_records);
+            if head.is_none() {
+                continue;
+            }
+            for p in
+                chain_pgnos_checked(&self.pager, head, PageType::RootRecords, ROOT_RECORD_BYTES)?
+            {
+                if marks.insert(p) {
+                    tally.snapshot_chains += 1;
+                } else {
+                    dangling += 1;
+                }
+            }
+            let old = RootRecords::from_entries(&load_chain(
+                &self.pager,
+                head,
+                PageType::RootRecords,
+                ROOT_RECORD_BYTES,
+            )?);
+            snapshot_roots.extend(old.iter().map(|(_, p)| *p));
+        }
+
+        // 4. Everything the freelist holds, pending runs included: pending is not reusable,
+        // but it is certainly not unaccounted for.
+        let mut free_total = 0u64;
+        let mut reusable = Vec::new();
+        for run in freelist.runs() {
+            for p in audit::run_pages(run, pages) {
+                if free.insert(p) {
+                    free_total += 1;
+                }
+            }
+            if run.freed_at <= horizon {
+                reusable.push(*run);
+            }
+        }
+
+        Ok(Audit {
+            _read: read,
+            marks,
+            free,
+            roots: roots.iter().map(|(_, p)| *p).collect(),
+            snapshot_roots,
+            reusable,
+            tally,
+            dangling,
+            free_total,
+            free_reusable: freelist.reusable_pages(horizon),
+            page_count: pages,
+            file_pages: self.pager.page_count(),
+            txn_id: meta.txn_id,
+        })
+    }
+
+    /// The four chains, as `(head, type, stride)`. One list, so a caller cannot walk three of
+    /// them and forget the fourth.
+    fn chain_shapes(meta: &MetaPage) -> [(Option<Pgno>, PageType, usize); 4] {
+        [
+            (meta.root_records, PageType::RootRecords, ROOT_RECORD_BYTES),
+            (meta.freelist, PageType::Freelist, FREE_ENTRY_BYTES),
+            (meta.snapshots, PageType::Snapshots, SNAPSHOT_ENTRY_BYTES),
+            (meta.catalog, PageType::Catalog, CATALOG_ENTRY_BYTES),
+        ]
     }
 
     pub(crate) fn register_reader(&self, txn_id: TxnId) {
@@ -622,6 +831,14 @@ impl<P: PagerMut> Store<P> {
             txn_id,
         )?;
         let free_pgnos = alloc_freelist_pages(&mut freelist, horizon, next_pgno, cap)?;
+        // The freelist is about to be written down as the file's record of what is spare, so
+        // nothing in it may name a page beyond where the file ends. Guards the old invariant as
+        // much as `absorb_scratch`, which is the newest way to reach it.
+        debug_assert!(
+            freelist.runs().iter().all(|r| r.first as u64 + r.len as u64 <= *next_pgno),
+            "a free run runs past the end of the file: {:?} against {next_pgno}",
+            freelist.runs()
+        );
         let free_entries = freelist.encode();
 
         // 4. Collect every page that has to reach the disk. A kept chain contributes none.
