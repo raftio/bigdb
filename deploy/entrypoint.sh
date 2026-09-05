@@ -45,14 +45,21 @@ stage /etc/big/secrets/peer-ca.pem /run/big/peer-ca.pem
 # The name is already in the command line as `--node`, and a deployment that had to write it
 # twice is a deployment where the two can disagree - which would present as a node holding a
 # certificate for somebody else and being refused by every peer.
+#
+# **Both spellings.** The parser accepts `--node=a` as well as `--node a`, and a scanner that
+# knew only the second would silently stage somebody else's certificate rather than fail - the
+# one outcome this whole block exists to prevent.
 node=""
 want=""
 for arg do
     if [ -n "$want" ]; then
         node=$arg
         want=""
-    elif [ "$arg" = "--node" ]; then
-        want=1
+    else
+        case "$arg" in
+            --node) want=1 ;;
+            --node=*) node=${arg#--node=} ;;
+        esac
     fi
 done
 
