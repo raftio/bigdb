@@ -1,12 +1,20 @@
 # deploy
 
-Two deployments, because they are two different things and pretending otherwise is how a
+Three deployments, because they are three different things and pretending otherwise is how a
 single-node database ends up with a cluster's configuration and none of its guarantees.
 
 | | What it is | When |
 |---|---|---|
 | [`single/`](single/) | One node, every shard, no peers | Anything that fits on one machine |
 | [`cluster/`](cluster/) | Two ranges, one node each | More data than one machine holds |
+| [`k8s/`](k8s/) | Three nodes that grow with `kubectl scale` | A cluster whose shape changes |
+
+**`cluster/` and `k8s/` are not the same deployment in two syntaxes.** The compose one is a fixed
+shape being explained: two nodes, two ranges, and every flag that would redraw them turned off.
+The Kubernetes one is a shape that changes: `--balance` is on, so a pod that appears is admitted
+and given the tail of the shard space by the cluster's own leader, and a pod registers itself as
+it starts. What that costs is a third node - a majority of two is two, so a two-node cluster can
+commit neither a failover nor a schema-leader handover.
 
 **They are the same binary and the same code path.** `big serve` without `--cluster` builds itself a
 cluster of one and runs every request through the same coordinator a multi-machine deployment

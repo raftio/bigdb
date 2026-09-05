@@ -11,12 +11,19 @@
 set -eu
 cd "$(dirname "$0")"
 
-nodes="a b"
+# **The names, and where they are written**, both overridable so that a second deployment can
+# have a CA of its own without a second copy of this script. `deploy/k8s` uses both: its nodes
+# are a StatefulSet's pods, so they are called `big-0`, `big-1`, and it keeps its own `secrets/`
+# because two deployments sharing one CA is two deployments that can impersonate each other.
+#
+#   NODES="big-0 big-1 big-2" SECRETS=../k8s/secrets ./certs.sh
+nodes=${NODES:-"a b"}
+out=${SECRETS:-secrets}
 days=${DAYS:-365}
 
-mkdir -p secrets
-chmod 700 secrets
-cd secrets
+mkdir -p "$out"
+chmod 700 "$out"
+cd "$out"
 
 # **With a name, this issues one more certificate and leaves everything else alone.** A node that
 # joins a running cluster needs one, and the alternative - re-running the whole script - would

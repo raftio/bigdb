@@ -30,11 +30,15 @@ command -v "$big" >/dev/null || {
     exit 1
 }
 
-mkdir -p secrets
-chmod 700 secrets
+# Where to write it. `deploy/k8s` points this at its own directory, because a users file is a
+# deployment's, not a machine's - see certs.sh for the same override and the same reason.
+out=${SECRETS:-secrets}
 
-if [ -f secrets/users ]; then
-    echo "secrets/users already exists; delete it first if you mean to rotate" >&2
+mkdir -p "$out"
+chmod 700 "$out"
+
+if [ -f "$out/users" ]; then
+    echo "$out/users already exists; delete it first if you mean to rotate" >&2
     exit 1
 fi
 
@@ -44,15 +48,15 @@ reader=$(random)
 # Piped rather than typed: `big passwd` reads one line from standard input when it is not a
 # terminal, which is the only non-tty path and exists for exactly this. It is never a flag,
 # because an argument is visible in `ps`.
-printf '%s\n' "$admin"  | "$big" passwd secrets/users set ops       --role superuser
+printf '%s\n' "$admin"  | "$big" passwd "$out/users" set ops       --role superuser
 # **Named before it exists**, and that is the right order: a role is resolved by name on every
 # request, so creating `dashboard` in the catalog later makes this credential work without a
 # restart. What needs a restart is changing the *name* in this file - it is read once, at
 # startup - which is the trap worth knowing about and the reason the name is chosen now.
-printf '%s\n' "$reader" | "$big" passwd secrets/users set dashboard --role dashboard
+printf '%s\n' "$reader" | "$big" passwd "$out/users" set dashboard --role dashboard
 
 echo
-echo "wrote secrets/users (mode 600)"
+echo "wrote $out/users (mode 600)"
 echo "  ops:       $admin   (superuser)"
 echo "  dashboard: $reader   (role \`dashboard\`, which does not exist yet)"
 echo

@@ -1,0 +1,295 @@
+# The nodes: one StatefulSet, and `kubectl scale` is how it grows.
+#
+# **What makes that possible is not this file.** A node that appears has to be given a
+# certificate, a cluster file that names the cluster, a membership entry, and a range - four
+# things, and only the first two are Kubernetes's. The daemon does the other two by itself:
+# `add-node` registers the pod as a **learner**, which holds nothing and does not vote, and the
+# balancer on the agreement's leader admits it once it has caught up and then cuts the tail of
+# the shard space over to it - `Action::Admit` then `Action::SplitTail`, one decision per pass,
+# each one committed. That is `--balance` below, and it is why there is no YAML to write per
+# node.
+#
+# So the four become: a pre-issued certificate (`secrets.sh`, and names are cheap), a file the
+# initContainer writes (`join.sh`), and two decisions the cluster makes about itself.
+#
+# **Scaling in is not the mirror image**, and deliberately so. Deleting a pod that holds a range
+# takes that range offline, and `cluster remove` refuses a node that still holds one. Drain it
+# first - see the readme.
+apiVersion: v1
+kind: Service
+metadata:
+  name: nodes
+  labels:
+    app.kubernetes.io/name: big
+    app.kubernetes.io/component: node
+spec:
+  # Headless, so `big-3.nodes` is the pod itself: peer traffic goes straight to the daemon, and
+  # a StatefulSet's pod gets the stable name its certificate was issued for.
+  clusterIP: None
+  # **The one Kubernetes-specific decision here.** Endpoints are the ready ones by default, so a
+  # node that has not passed its probe would have no address - and a peer that cannot reach it
+  # cannot help it settle the election that would make it ready. This is the flag that is not
+  # that deadlock, and it is what a joining pod is dialled at before it is anything.
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: big
+    app.kubernetes.io/component: node
+  ports:
+    - name: big
+      port: 7654
+      targetPort: big
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: big
+  labels:
+    app.kubernetes.io/name: big
+    app.kubernetes.io/component: node
+spec:
+  serviceName: nodes
+  # **Three, and two would be worse than one.** A majority of two is two, so a two-node cluster
+  # can neither fail a range over nor hand the schema-key namespace on: both are decisions a
+  # majority has to commit at the moment one node is the one that went away. This is the
+  # smallest size at which the two flags below mean anything.
+  #
+  # `seed.toml` names exactly these three. Everything above three is a join, and joins are not
+  # in a file.
+  replicas: 3
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: big
+      app.kubernetes.io/component: node
+  # The default, written out because it looks like a trap and is not one: ordered start waits
+  # for each pod to be *ready*, and readiness here means "the listener answers" rather than "the
+  # range is being served". A bootstrap therefore does not deadlock waiting for a quorum that
+  # needs the next pod. See the readme on what a probe here can and cannot say.
+  podManagementPolicy: OrderedReady
+  # Deleting a StatefulSet must not be a way to delete a database.
+  persistentVolumeClaimRetentionPolicy:
+    whenDeleted: Retain
+    whenScaled: Retain
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: big
+        app.kubernetes.io/component: node
+    spec:
+      terminationGracePeriodSeconds: 2
+      affinity:
+        podAntiAffinity:
+          # Preferred and not required: on a one-machine cluster - kind, minikube, what this is
+          # first run on - `required` would leave two of the three Pending forever. What it buys
+          # on a real cluster is that one machine failing is one range down rather than three.
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: big
+                    app.kubernetes.io/component: node
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        # What makes the Secret's `0440` readable: its files are owned `root:<fsGroup>`. It is
+        # also what makes the volume writable without the image chowning anything.
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        # Writes the cluster file this pod starts with, and registers the pod if it is new.
+        # Never fails the pod: a cluster that cannot be reached yet is what a bootstrap looks
+        # like. See the `big-join` ConfigMap for the whole of it.
+        - name: join
+          image: big:latest
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "/etc/big/join-script/join.sh"]
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: PEER_SERVICE
+              value: nodes
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+            readOnlyRootFilesystem: true
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+          volumeMounts:
+            - name: gen
+              mountPath: /etc/big/gen
+            - name: seed
+              mountPath: /etc/big/seed
+              readOnly: true
+            - name: join-script
+              mountPath: /etc/big/join-script
+              readOnly: true
+            - name: secrets
+              mountPath: /etc/big/secrets
+              readOnly: true
+            - name: join-credential
+              mountPath: /etc/big/join
+              readOnly: true
+            - name: join-run
+              mountPath: /run/join
+      containers:
+        - name: big
+          image: big:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          args:
+            - /data/big.db
+            - 0.0.0.0:7654
+            # The file the initContainer wrote, not the ConfigMap. A founding node's copy is the
+            # seed unchanged; a joining node's names the cluster it is joining as well.
+            - --cluster
+            - /etc/big/gen/cluster.toml
+            # Which entry in that file this daemon is. Kubernetes expands `$(POD_NAME)` from the
+            # environment above, so the pod's ordinal is the node's name and the certificate
+            # issued to it is the one the entrypoint stages - it reads `--node` out of this list
+            # rather than out of a second variable that could disagree with it.
+            - --node
+            - $(POD_NAME)
+            - --users
+            - /run/big/users
+            - --peer-cert
+            - /run/big/peer.pem
+            - --peer-key
+            - /run/big/peer.key
+            - --tls-cert
+            - /run/big/peer.pem
+            - --tls-key
+            - /run/big/peer.key
+            - --query-timeout
+            - "30"
+            # **On here, where the compose demo has it off.** This is the flag that makes
+            # `kubectl scale` a scale: on the agreement's leader it admits a learner that has
+            # caught up, gives a node with nothing the tail of the shard space - a split that
+            # moves no bytes - and moves a range off a node an operator is draining. One
+            # decision per pass, each committed, and it does nothing at all on a node that is
+            # not the leader.
+            #
+            # `deploy/cluster` leaves it off because two nodes and two ranges are the thing that
+            # file is explaining, and a cluster that redraws them mid-demo is explaining
+            # something else. Here the shape is meant to change.
+            - --balance
+            # Hands the row-key namespace on after fifteen seconds of silence from whoever holds
+            # it. Inert with two nodes and real with three: handing it on is a decision the
+            # agreement has to commit, and the moment it is needed is the moment its holder is
+            # the node that went away.
+            - --elect-schema-leader
+            # Purely local: it asks no peer and proposes nothing. Gives the free run at the end
+            # of the file back to the filesystem while this node serves.
+            - --reclaim
+            - --backup-dir
+            - /data
+          ports:
+            - name: big
+              containerPort: 7654
+          # `scheme: HTTPS` with no certificate check, which is what is wanted: the kubelet
+          # dials the pod's IP and the certificate names `big-3`. The question is "can this
+          # process answer", not "is this the right process", and it never leaves the machine to
+          # ask it. The compose healthcheck passes `-k` for the same reason.
+          livenessProbe:
+            httpGet: { path: /health, port: big, scheme: HTTPS }
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          # **"Answering", not "serving", and it cannot be made to say more.** `/ready` is always
+          # `200` - `serving` is a field in the body - and an httpGet probe reads the status line
+          # only. The proxy is what reads the body. See 30-proxy.yaml.
+          readinessProbe:
+            httpGet: { path: /ready, port: big, scheme: HTTPS }
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          # A request, so the scheduler knows what it is placing. **No memory limit**: reads come
+          # out of the mapping, so most of what this process appears to use is page cache the
+          # kernel will give back, and a hard ceiling turns that into an OOM kill under load.
+          # Set one if you have measured your workload, not because a template had one.
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            # Where the entrypoint stages the credentials at mode 600. Must be writable, and
+            # must not outlive the pod: what is in it is a private copy of a private key.
+            - name: run
+              mountPath: /run/big
+            - name: gen
+              mountPath: /etc/big/gen
+              readOnly: true
+            - name: secrets
+              mountPath: /etc/big/secrets
+              readOnly: true
+      volumes:
+        - name: run
+          emptyDir: {}
+        - name: join-run
+          emptyDir: {}
+        # Written by the initContainer, read by the daemon.
+        - name: gen
+          emptyDir: {}
+        - name: seed
+          configMap:
+            name: big-seed
+            items:
+              - key: seed.toml
+                path: seed.toml
+        - name: join-script
+          configMap:
+            name: big-join
+        # **One Secret for every pod, and that is the price of one StatefulSet.** A pod stages
+        # only the certificate `--node` names, so no daemon presents anybody else's - but every
+        # pod could read every key, which per-node certificates were meant to avoid. Per-node
+        # Secrets need per-node workloads, which is the shape that cannot be scaled. If that
+        # trade is the wrong way round for you, issue per-pod certificates with cert-manager's
+        # CSI driver and mount that instead; nothing above changes.
+        #
+        # `0440` and not `0400`: the files are owned `root:<fsGroup>` and the daemon is not
+        # root, so `0400` would be unreadable and the entrypoint would stage nothing - which
+        # presents as `cannot read /run/big/users`, not as a permission error on the mount.
+        # `0440` is also why the staging is not optional: `big serve` refuses a users file or a
+        # key that is group-readable, and no `defaultMode` is both readable here and mode 600.
+        - name: secrets
+          secret:
+            secretName: big-nodes
+            defaultMode: 0440
+        # The credential the initContainer registers with, and the only optional volume here: a
+        # cluster with no `big-ops` Secret still starts, and prints the one `add-node` command an
+        # operator then runs by hand.
+        - name: join-credential
+          secret:
+            secretName: big-ops
+            defaultMode: 0440
+            optional: true
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        # One volume per pod, never one shared: one process holds one file, and the pager takes
+        # an exclusive lock.
+        accessModes: [ReadWriteOnce]
+        # No `storageClassName`, so the cluster's default is used. Name one here if the default
+        # is network storage and this should be local - a database's latency is its disk's.
+        resources:
+          requests:
+            storage: 10Gi
