@@ -894,6 +894,73 @@ fn send_bytes(addr: SocketAddr, target: &str, body: &[u8], fingerprint: u64) -> 
 }
 
 // -------------------------------------------------------------------------------------------
+// Giving a live range one more copy
+// -------------------------------------------------------------------------------------------
+
+/// **A range that was serving alone gains a copy, and nothing is refused while it does.**
+///
+/// The copy enters the group marked behind in one decision, so a promotion cannot reach it
+/// before a repair has proved it agrees - and writes reach it from that moment, so it stops
+/// falling further behind while it fills in.
+#[test]
+fn a_range_gains_a_copy_without_refusing_anything() {
+    let (a, spare, third) = a_named_replicated_group("big-copy");
+    // A second range, held by `a-third` alone, is what there is to give a copy to.
+    ok(a, "POST", "/table/tx", "");
+    ok(a, "POST", "/table/tx/field/amount?kind=int&bit_depth=32", "");
+    ok(a, "POST", "/admin/cluster/split?at=64&to=a-third", "");
+
+    let (status, body) = send(a, "POST", "/admin/cluster/replica?range=1&to=a-spare", "");
+    assert_eq!(status, 200, "{body}");
+
+    let seen = ok(a, "GET", "/cluster/topology", "");
+    assert!(
+        seen.contains(r#""holders":["a-third","a-spare"]"#),
+        "the copy is in the group, primary unchanged: {seen}"
+    );
+    let _ = (spare, third);
+}
+
+/// **A learner is refused, by all three verbs that hand out a range.**
+///
+/// A learner receives the agreement and holds nothing - that is the state's whole purpose, so
+/// that adding a node never raises the bar for an election before the node can help clear it.
+/// `split` and `move` accepted one, which produced a holder the agreement does not count: a
+/// range whose availability rests on a node with no vote.
+#[test]
+fn a_range_is_never_handed_to_a_node_that_does_not_vote() {
+    let (a, _, _) = a_named_replicated_group("big-learner");
+    let d = free_port();
+    ok(a, "POST", &format!("/admin/cluster/node?name=d&addr={d}"), "");
+
+    for (method, target) in [
+        ("POST", "/admin/cluster/split?at=64&to=d".to_string()),
+        ("POST", "/admin/cluster/replica?range=0&to=d".to_string()),
+        ("POST", "/admin/cluster/move?range=0&to=d".to_string()),
+    ] {
+        let (status, body) = send(a, method, &target, "");
+        // `refused`, the code every "the cluster will not do this" answer carries.
+        assert_eq!(status, 409, "{target}: {body}");
+        assert!(body.contains("admit"), "{target} names the step that fixes it: {body}");
+    }
+}
+
+/// A copy can be taken away again, and the node a read goes to is not one of them.
+#[test]
+fn a_copy_can_be_dropped_but_the_primary_cannot() {
+    let (a, _, _) = a_named_replicated_group("big-drop");
+
+    let (status, body) = send(a, "DELETE", "/admin/cluster/replica?range=0&from=a", "");
+    assert_ne!(status, 200, "the primary is not a copy: {body}");
+    assert!(body.contains("cluster move"), "it names the verb that is: {body}");
+
+    let (status, body) = send(a, "DELETE", "/admin/cluster/replica?range=0&from=a-third", "");
+    assert_eq!(status, 200, "{body}");
+    let seen = ok(a, "GET", "/cluster/topology", "");
+    assert!(!seen.contains("a-third\"]"), "it is out of the group: {seen}");
+}
+
+// -------------------------------------------------------------------------------------------
 // Joining without a file
 // -------------------------------------------------------------------------------------------
 

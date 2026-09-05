@@ -402,6 +402,46 @@ pub(super) fn cluster_move<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request) 
     }
 }
 
+/// `POST /admin/cluster/replica?range=<id>&to=<node>` - one more copy of a range.
+///
+/// Long-running like a move, and for the same reason: it copies. Unlike a move it refuses
+/// nothing while it runs - see [`big_cluster::Cluster::add_replica`].
+pub(super) fn cluster_add_replica<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request) -> Response {
+    let (Some(range), Some(to)) = (req.param("range"), req.param("to")) else {
+        return Response::failure(400, "bad_request", "a copy needs ?range=<id>&to=<node>");
+    };
+    let Ok(range) = range.parse::<u64>() else {
+        return Response::failure(400, "bad_request", "?range= takes a range id");
+    };
+    match ctx.cluster.add_replica(range, &to) {
+        Ok(report) => Response::ok(json::moved(&report)),
+        Err(e) => from_cluster(&e),
+    }
+}
+
+/// `DELETE /admin/cluster/replica?range=<id>&from=<node>` - one copy fewer.
+///
+/// The map stops naming it; nothing is deleted from the node itself.
+pub(super) fn cluster_drop_replica<P: PagerMut + Sync>(
+    ctx: &Ctx<'_, P>,
+    req: &Request,
+) -> Response {
+    let (Some(range), Some(from)) = (req.param("range"), req.param("from")) else {
+        return Response::failure(
+            400,
+            "bad_request",
+            "dropping a copy needs ?range=<id>&from=<node>",
+        );
+    };
+    let Ok(range) = range.parse::<u64>() else {
+        return Response::failure(400, "bad_request", "?range= takes a range id");
+    };
+    match ctx.cluster.drop_replica(range, &from) {
+        Ok(()) => Response::ok(format!("{{\"dropped\":{}}}", json::string(&from))),
+        Err(e) => from_cluster(&e),
+    }
+}
+
 /// `POST /admin/cluster/cancel?range=<id>` - abandon a move.
 ///
 /// Nothing is ever read from the target of a move that has not completed, so this loses only

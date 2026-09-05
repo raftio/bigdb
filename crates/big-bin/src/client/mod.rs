@@ -252,6 +252,16 @@ fn request(command: &Command, input: &mut dyn BufRead) -> Result<Request, String
             format!("/admin/cluster/move?range={range}&to={to}"),
             String::new(),
         ),
+        Command::ClusterReplica { add: true, range, node } => Request::new(
+            "POST",
+            format!("/admin/cluster/replica?range={range}&to={node}"),
+            String::new(),
+        ),
+        Command::ClusterReplica { add: false, range, node } => Request::new(
+            "DELETE",
+            format!("/admin/cluster/replica?range={range}&from={node}"),
+            String::new(),
+        ),
         Command::ClusterCancel { range } => {
             Request::new("POST", format!("/admin/cluster/cancel?range={range}"), String::new())
         }

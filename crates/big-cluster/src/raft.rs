@@ -189,12 +189,31 @@ pub enum MapError {
     SchemaLeaderIsALearner {
         node: NodeId,
     },
+    /// A copy was added to a range the node already holds.
+    AlreadyAHolder {
+        id: RangeId,
+        node: NodeId,
+    },
+    /// The node a read goes to was named as a copy to remove.
+    PrimaryNotDroppable {
+        id: RangeId,
+        primary: NodeId,
+    },
 }
 
 impl core::fmt::Display for MapError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Empty => write!(f, "a map with no ranges answers for no record id at all"),
+            Self::AlreadyAHolder { id, node } => {
+                write!(f, "node {node} already holds range {id}")
+            }
+            Self::PrimaryNotDroppable { id, primary } => write!(
+                f,
+                "node {primary} is the node reads of range {id} go to, not a copy of it. \
+                 Removing it is `cluster move {id} to <node>`, and removing the last holder of \
+                 a range is not a replication change at all"
+            ),
             Self::NotStartingAtZero { start } => {
                 write!(f, "the first range starts at {start}; shards 0..{start} have no owner")
             }
@@ -520,6 +539,42 @@ impl RangeMap {
     /// something this type can know, so a caller that assigns a populated range to a node that
     /// has not been seeded has moved the answer without moving the facts. That is what the
     /// move protocol is for; this is the primitive underneath it.
+    /// Adds a copy of a range, and marks it behind in the same mutation.
+    ///
+    /// **One mutation, and that is the whole safety argument.** A holder the agreement believes
+    /// is current, and is not, is a node a promotion could hand reads to - and it would answer a
+    /// smaller count with no symptom. Entering the group and being marked behind cannot be two
+    /// decisions, because between them the map would say exactly that.
+    ///
+    /// The primary does not move: this is a range gaining a copy, not changing hands.
+    pub fn add_holder(&mut self, id: RangeId, node: NodeId) -> core::result::Result<(), MapError> {
+        let Some(i) = self.position(id) else { return Err(MapError::NoSuchRange { id }) };
+        if self.ranges[i].group.contains(&node) {
+            return Err(MapError::AlreadyAHolder { id, node });
+        }
+        self.ranges[i].group.push(node);
+        if !self.stale.contains(&node) {
+            self.stale.push(node);
+        }
+        Ok(())
+    }
+
+    /// Removes a copy. The primary is not one, and neither is the only holder.
+    ///
+    /// The stale mark is deliberately **left alone**: it is a fact about a node, not about this
+    /// range, and a node that was behind on two ranges is still behind on the other.
+    pub fn drop_holder(&mut self, id: RangeId, node: NodeId) -> core::result::Result<(), MapError> {
+        let Some(i) = self.position(id) else { return Err(MapError::NoSuchRange { id }) };
+        if self.ranges[i].primary == node {
+            return Err(MapError::PrimaryNotDroppable { id, primary: node });
+        }
+        if !self.ranges[i].group.contains(&node) {
+            return Err(MapError::NoSuchRange { id });
+        }
+        self.ranges[i].group.retain(|n| *n != node);
+        Ok(())
+    }
+
     pub fn assign(
         &mut self,
         id: RangeId,

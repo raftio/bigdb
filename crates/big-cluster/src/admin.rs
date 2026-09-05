@@ -45,7 +45,7 @@ impl<P: PagerMut + Sync> Cluster<P> {
         let id = next.split(at).map_err(|e| ClusterError::Refused(e.to_string()))?;
 
         if let Some(name) = to {
-            let target = self.node_named(name)?;
+            let target = self.voter_named(name)?;
             let upper = next
                 .position(id)
                 .map(|i| next.ranges[i].shards)
@@ -179,7 +179,7 @@ impl<P: PagerMut + Sync> Cluster<P> {
     /// Synchronous, like `POST /repair`: it is a scan and a copy, and a caller that wants it in
     /// the background runs it in the background.
     pub fn move_range(&self, id: RangeId, to: &str) -> Result<MoveReport> {
-        let target = self.node_named(to)?;
+        let target = self.voter_named(to)?;
         let map = self.map();
         let Some(i) = map.position(id) else {
             return Err(ClusterError::Refused(format!("there is no range {id}")));
@@ -265,6 +265,111 @@ impl<P: PagerMut + Sync> Cluster<P> {
                 Err(e) => format!("moved, but the old copy could not be dropped: {e}"),
             },
         })
+    }
+
+    /// Gives a range that is already serving one more copy of itself.
+    ///
+    /// **The one thing `move` does that this must not: stop writes.** A move ends by dropping
+    /// the source, so the new holder has to be provably exact before the handover - hence the
+    /// cutover, which is the only window in which anything is refused. Nothing is dropped here.
+    /// Every existing holder keeps everything it had, so a new copy that is incomplete cannot
+    /// lose a record; it can only *be* behind, and a copy that is behind is a state this
+    /// coordinator already models and already refuses to read from.
+    ///
+    /// So the copy enters the group **and is marked behind in the same decision**, which is
+    /// what makes the window safe rather than merely short: from that moment writes fan out to
+    /// it, so it stops falling further behind, and nothing promotes it until a repair has
+    /// proved it agrees. Then the catch-up runs and the mark is lifted.
+    ///
+    /// A catch-up that fails leaves a copy that is in the group and behind. **That is the
+    /// correct resting state, not a half-finished change to unwind**: it is exactly what a
+    /// node that missed a write looks like, `/repair` is what finishes it, and `behind` names
+    /// it until then.
+    pub fn add_replica(&self, id: RangeId, to: &str) -> Result<MoveReport> {
+        let target = self.voter_named(to)?;
+        let map = self.map();
+        let Some(i) = map.position(id) else {
+            return Err(ClusterError::Refused(format!("there is no range {id}")));
+        };
+        let (primary, shards) = (map.ranges[i].primary, map.ranges[i].shards);
+        if map.ranges[i].moving.is_some() {
+            return Err(ClusterError::Refused(format!(
+                "range {id} is moving; wait for it or `cluster cancel {id}` first"
+            )));
+        }
+        // **The rule the cluster file has always been held to, applied at runtime.** A file
+        // with a replica and two nodes is refused because a majority of two is two, so the
+        // copy can never be used - and without this check, this verb would be the way to build
+        // that shape after startup instead.
+        let voters = self.members().iter().filter(|m| m.state == raft::MemberState::Voter).count();
+        if voters < 3 {
+            return Err(ClusterError::Refused(format!(
+                "this cluster has {voters} voters; failing over needs a majority to agree, a \
+                 majority of two is two, so a cluster of two can never use its copy. Add a \
+                 third node first"
+            )));
+        }
+
+        // One decision: in the group, and behind.
+        self.with_map(|m| m.add_holder(id, target).map_err(|e| e.to_string()))?;
+
+        let copied = self.catch_up_in(primary, target, Some(shards))?;
+        if !self.digests_agree(primary, target, shards)? {
+            return Err(ClusterError::Refused(format!(
+                "`{to}` copied shards {shards} and still disagrees with `{}`, so it stays \
+                 marked behind. Run /repair, or `cluster drop-replica {id} {to}` to undo it",
+                self.name_of(primary).unwrap_or_default()
+            )));
+        }
+        let cleared = self.clear_stale(target);
+        Ok(MoveReport {
+            range: id,
+            shards: shards.to_string(),
+            from: self.name_of(primary).unwrap_or_default(),
+            to: to.to_string(),
+            fragments: copied,
+            dropped: cleared,
+            outcome: match cleared {
+                true => "copied".to_string(),
+                false => "copied, but it is still marked behind; run /repair".to_string(),
+            },
+        })
+    }
+
+    /// Takes a copy away from a range. The primary is not a copy, and neither is the last one.
+    ///
+    /// **Nothing is deleted from the node.** The range stops being routed to it and stops being
+    /// written to it; what it holds is left where it is, exactly as a move that could not drop
+    /// its source leaves records nobody reads. Space, not correctness - and a `/repair` after
+    /// re-adding it costs less than a re-seed would.
+    pub fn drop_replica(&self, id: RangeId, from: &str) -> Result<()> {
+        let target = self.node_named(from)?;
+        self.with_map(|m| m.drop_holder(id, target).map_err(|e| e.to_string()))?;
+        Ok(())
+    }
+
+    /// A node by name that may hold a range: present, and a full member.
+    ///
+    /// **Separate from `node_named` because holding is not membership.** A learner receives the
+    /// agreement and holds nothing - that is what the state is *for*, so that adding a node
+    /// never raises the bar for an election before the node can help clear it. Giving one a
+    /// range makes a holder the agreement does not count, which is the state the balancer
+    /// avoids by ordering `Admit` first and which the manual verbs could reach.
+    fn voter_named(&self, name: &str) -> Result<usize> {
+        let i = self.node_named(name)?;
+        match self.members().get(i).map(|m| m.state) {
+            Some(raft::MemberState::Voter) => Ok(i),
+            Some(state) => Err(ClusterError::Refused(format!(
+                "`{name}` is a {} and holds no range. `cluster admit {name}` makes it a full \
+                 member first - a node that does not vote must not be the one a read depends on",
+                match state {
+                    raft::MemberState::Learner => "learner still catching up",
+                    raft::MemberState::Draining => "node on its way out",
+                    _ => "node that has left",
+                }
+            ))),
+            None => Err(ClusterError::Refused(format!("there is no node called `{name}`"))),
+        }
     }
 
     /// Ends a move that cannot be finished, and reports why.

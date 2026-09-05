@@ -288,6 +288,8 @@ enum Target<'a> {
     ClusterRemove,
     /// Hand a populated range to another node without stopping reads.
     ClusterMove,
+    ClusterAddReplica,
+    ClusterDropReplica,
     /// Abandon a move that is in flight.
     ClusterCancel,
     /// Take one balancing step, if the facts call for one.
@@ -386,6 +388,8 @@ impl<'a> Target<'a> {
             | Self::ClusterDrain
             | Self::ClusterRemove
             | Self::ClusterMove
+            | Self::ClusterAddReplica
+            | Self::ClusterDropReplica
             | Self::ClusterCancel
             | Self::ClusterRebalance
             | Self::ClusterSchemaLeader => Guard::Needs(Privilege::Operate, ObjectRef::Server),
@@ -488,6 +492,8 @@ fn resolve<'a>(method: &str, segments: &[&'a str]) -> Option<Target<'a>> {
         ("POST", ["admin", "cluster", "drain"]) => Target::ClusterDrain,
         ("DELETE", ["admin", "cluster", "node"]) => Target::ClusterRemove,
         ("POST", ["admin", "cluster", "move"]) => Target::ClusterMove,
+        ("POST", ["admin", "cluster", "replica"]) => Target::ClusterAddReplica,
+        ("DELETE", ["admin", "cluster", "replica"]) => Target::ClusterDropReplica,
         ("POST", ["admin", "cluster", "cancel"]) => Target::ClusterCancel,
         ("POST", ["admin", "cluster", "rebalance"]) => Target::ClusterRebalance,
         ("POST", ["admin", "cluster", "schema-leader"]) => Target::ClusterSchemaLeader,
@@ -703,6 +709,8 @@ pub fn dispatch<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request) -> Answered
         Target::ClusterDrain => cluster_member(ctx, req, Membership::Drain),
         Target::ClusterRemove => cluster_member(ctx, req, Membership::Remove),
         Target::ClusterMove => cluster_move(ctx, req),
+        Target::ClusterAddReplica => cluster_add_replica(ctx, req),
+        Target::ClusterDropReplica => cluster_drop_replica(ctx, req),
         Target::ClusterCancel => cluster_cancel(ctx, req),
         Target::ClusterRebalance => cluster_rebalance(ctx, req),
         Target::ClusterSchemaLeader => cluster_schema_leader(ctx, req),

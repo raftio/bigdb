@@ -464,3 +464,70 @@ fn a_cancelled_move_leaves_the_range_exactly_as_it_was() {
     assert_eq!(after.cancel_move(0), Err(MoveError::NotMoving { id: 0 }));
     assert_eq!(after.set_move_state(0, MoveState::Cutover), Err(MoveError::NotMoving { id: 0 }));
 }
+
+// -------------------------------------------------------------------------------------------
+// Adding a copy to a range that is already serving
+// -------------------------------------------------------------------------------------------
+
+/// The copy joins the group and is marked behind **in the same mutation**.
+///
+/// Two mutations would leave a window in which the new node is a holder the agreement believes
+/// is current, and a promotion in that window hands reads to a node missing records - which
+/// answers a smaller count with no symptom. One mutation, or the guarantee is not there.
+#[test]
+fn a_new_copy_is_a_holder_and_behind_at_the_same_moment() {
+    let mut m = map(vec![range(0, 0, None, 0)]);
+
+    m.add_holder(0, 3).unwrap();
+
+    assert_eq!(m.ranges[0].group, vec![0, 3], "it holds the range");
+    assert_eq!(m.ranges[0].primary, 0, "and the primary did not move");
+    assert!(m.is_stale(3), "and nothing will read from it until a repair says so");
+}
+
+/// A node already holding the range is a refusal, not a no-op: an operator naming the wrong one
+/// wants to hear so, the same rule `cancel_move` follows.
+#[test]
+fn adding_a_copy_twice_is_refused() {
+    let mut m = map(vec![range(0, 0, None, 0)]);
+    m.add_holder(0, 3).unwrap();
+
+    assert_eq!(m.add_holder(0, 3), Err(MapError::AlreadyAHolder { id: 0, node: 3 }));
+}
+
+#[test]
+fn adding_a_copy_to_a_range_that_does_not_exist_is_refused() {
+    let mut m = map(vec![range(0, 0, None, 0)]);
+    assert_eq!(m.add_holder(7, 3), Err(MapError::NoSuchRange { id: 7 }));
+}
+
+/// Removing a copy leaves the primary and the map whole.
+#[test]
+fn a_copy_can_be_taken_away_again() {
+    let mut m = map(vec![range(0, 0, None, 0)]);
+    m.add_holder(0, 3).unwrap();
+
+    m.drop_holder(0, 3).unwrap();
+
+    assert_eq!(m.ranges[0].group, vec![0]);
+    assert_eq!(m.ranges[0].primary, 0);
+}
+
+/// **The primary is not a copy to be dropped.** Taking the node a read goes to out of its own
+/// group is a move written as a deletion, and it would leave the range naming a primary that
+/// does not hold it. `move` is the verb for that, and saying so is better than doing something
+/// else quietly.
+#[test]
+fn the_primary_is_not_droppable() {
+    let mut m = map(vec![range(0, 0, None, 0)]);
+    m.add_holder(0, 3).unwrap();
+
+    assert_eq!(m.drop_holder(0, 0), Err(MapError::PrimaryNotDroppable { id: 0, primary: 0 }));
+}
+
+/// And the last copy is not a replication change at all - it is deleting the data.
+#[test]
+fn the_only_holder_is_not_droppable() {
+    let mut m = map(vec![range(0, 0, None, 0)]);
+    assert_eq!(m.drop_holder(0, 0), Err(MapError::PrimaryNotDroppable { id: 0, primary: 0 }));
+}
