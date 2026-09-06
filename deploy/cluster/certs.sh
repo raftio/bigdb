@@ -78,6 +78,35 @@ EXT
     chmod 644 "$node.pem"
 done
 
+# **An empty revocation list, written at bootstrap.** Not because anything is revoked, but
+# because a cluster that has never had one cannot start checking without a restart of every
+# node - and the moment somebody needs to revoke a key is the worst moment to discover that.
+# Wired up from the start, it costs a file; discovered during an incident, it costs the outage.
+#
+# `peer_crl_file` in cluster.toml points at this. To retire a node's certificate:
+#
+#   openssl ca -revoke b.pem -keyfile peer-ca.key -cert peer-ca.pem   # needs an openssl ca setup
+#
+# or, without the `openssl ca` database, reissue the list naming the serial. Either way the
+# nodes read it at startup, so a revocation lands on a rolling restart.
+if [ ! -f peer-ca.crl ]; then
+    # `openssl ca` wants an index and a serial file; this is the whole of the state it needs.
+    : > ca-index.txt
+    echo 01 > ca-crlnumber
+    openssl ca -gencrl -keyfile peer-ca.key -cert peer-ca.pem -out peer-ca.crl \
+        -config /dev/stdin 2>/dev/null <<CACONF || rm -f peer-ca.crl ca-index.txt ca-crlnumber
+[ ca ]
+default_ca = big
+
+[ big ]
+database   = ca-index.txt
+crlnumber  = ca-crlnumber
+default_md = default
+default_crl_days = 3650
+CACONF
+    [ -f peer-ca.crl ] && chmod 644 peer-ca.crl
+fi
+
 rm -f peer-ca.srl
 echo "wrote a certificate for each of: $nodes"
 echo "keys are mode 600; certificates are public and are not"

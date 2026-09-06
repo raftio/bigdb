@@ -284,6 +284,12 @@ pub struct ClusterFile {
     primary_count: usize,
     leader: usize,
     peer_ca_file: Option<String>,
+    /// The CA's revocation list, when the operator keeps one.
+    ///
+    /// Beside the CA because it is the CA's other half: one file says which certificates this
+    /// cluster trusts, the other says which of them it has taken back. Without it a leaked node
+    /// key is retired only by rotating the CA and reissuing every node's certificate at once.
+    peer_crl_file: Option<String>,
     /// `cluster_id = "..."`, when the operator named the cluster. See
     /// [`ClusterConfig::fingerprint`].
     cluster_id: Option<String>,
@@ -353,11 +359,13 @@ impl ClusterFile {
 
         let mut leader_name = None;
         let mut peer_ca_file = None;
+        let mut peer_crl_file = None;
         let mut cluster_id = None;
         for (key, value, line) in top {
             match key.as_str() {
                 "schema_leader" => leader_name = Some(value),
                 "peer_ca_file" => peer_ca_file = Some(value),
+                "peer_crl_file" => peer_crl_file = Some(value),
                 // What names this cluster, so that a node which joined at runtime - and whose
                 // own file therefore describes a different set of nodes - can still be
                 // recognised as one of us. See `ClusterConfig::fingerprint`.
@@ -405,13 +413,14 @@ impl ClusterFile {
             parsed.push(Draft { name, addr, shards, replica });
         }
 
-        Self::validated(parsed, leader_name, peer_ca_file, cluster_id)
+        Self::validated(parsed, leader_name, peer_ca_file, peer_crl_file, cluster_id)
     }
 
     fn validated(
         drafts: Vec<Draft>,
         leader_name: Option<String>,
         peer_ca_file: Option<String>,
+        peer_crl_file: Option<String>,
         cluster_id: Option<String>,
     ) -> Result<Self, ConfigError> {
         if drafts.is_empty() {
@@ -522,7 +531,7 @@ impl ClusterFile {
             return Err(ConfigError::LeaderIsReplica { name: leader_name });
         }
 
-        Ok(Self { nodes, primary_count, leader, peer_ca_file, cluster_id })
+        Ok(Self { nodes, primary_count, leader, peer_ca_file, peer_crl_file, cluster_id })
     }
 
     /// Says which of these nodes is doing the reading.
@@ -562,6 +571,7 @@ impl ClusterFile {
             leader: self.leader,
             this,
             peer_ca_file: self.peer_ca_file,
+            peer_crl_file: self.peer_crl_file,
             cluster_id: self.cluster_id,
         })
     }
@@ -577,6 +587,11 @@ impl ClusterFile {
     /// half that is the same everywhere.
     pub fn peer_ca_file(&self) -> Option<&str> {
         self.peer_ca_file.as_deref()
+    }
+
+    /// The CA's revocation list, when one was named. See [`ClusterFile::peer_ca_file`].
+    pub fn peer_crl_file(&self) -> Option<&str> {
+        self.peer_crl_file.as_deref()
     }
 
     /// Every node named in the file, before this daemon has worked out which one it is.
@@ -602,6 +617,8 @@ pub struct ClusterConfig {
     leader: usize,
     this: usize,
     peer_ca_file: Option<String>,
+    /// The CA's revocation list, carried alongside it. See [`ClusterFile::peer_crl_file`].
+    peer_crl_file: Option<String>,
     /// What names this cluster, when the operator has named it.
     ///
     /// **What lets a node join.** Two nodes of one cluster now legitimately hold different
@@ -630,6 +647,7 @@ impl ClusterConfig {
             leader: 0,
             this: 0,
             peer_ca_file: None,
+            peer_crl_file: None,
             cluster_id: None,
         }
     }
@@ -680,6 +698,7 @@ impl ClusterConfig {
             leader: 0,
             this,
             peer_ca_file: None,
+            peer_crl_file: None,
             cluster_id: Some(cluster_id.to_string()),
         })
     }
@@ -891,6 +910,11 @@ impl ClusterConfig {
 
     pub fn peer_ca_file(&self) -> Option<&str> {
         self.peer_ca_file.as_deref()
+    }
+
+    /// The CA's revocation list, when one was named. See [`ClusterConfig::peer_ca_file`].
+    pub fn peer_crl_file(&self) -> Option<&str> {
+        self.peer_crl_file.as_deref()
     }
 }
 

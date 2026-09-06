@@ -182,6 +182,8 @@ fn transport(opts: &Options, cluster: Option<&ClusterFile>) -> std::io::Result<O
             // meant to be a node, and letting it through as an anonymous client would hide a
             // renamed node behind a `401` nobody can explain.
             let peer_ca = cluster.and_then(ClusterFile::peer_ca_file);
+            // The CRL travels with the CA it belongs to, and only means anything beside one.
+            let peer_crl = cluster.and_then(ClusterFile::peer_crl_file);
             let roster: Vec<String> = cluster
                 .map(|c| c.nodes().iter().map(|n| n.name.clone()).collect())
                 .unwrap_or_default();
@@ -190,12 +192,18 @@ fn transport(opts: &Options, cluster: Option<&ClusterFile>) -> std::io::Result<O
                     "a peer CA is configured but the cluster file names no nodes",
                 ));
             }
-            let tls =
-                TlsConfig::load(Path::new(cert), Path::new(key), peer_ca.map(Path::new), roster)
-                    .map_err(|e| {
-                        std::io::Error::new(e.kind(), format!("could not load {cert}: {e}"))
-                    })?;
+            let tls = TlsConfig::load(
+                Path::new(cert),
+                Path::new(key),
+                peer_ca.map(Path::new),
+                peer_crl.map(Path::new),
+                roster,
+            )
+            .map_err(|e| std::io::Error::new(e.kind(), format!("could not load {cert}: {e}")))?;
             eprintln!("big: tls certificate from {cert}");
+            if let Some(crl) = peer_crl {
+                eprintln!("big: peer certificates checked against the revocation list in {crl}");
+            }
             if tls.checks_peers() {
                 eprintln!("big: peers are checked against the names in the cluster file");
             }
@@ -442,9 +450,10 @@ fn refuse_an_open_port(
         eprintln!(
             "big: refusing to serve {bound} with no authentication.\n\
              \n\
-             Anyone who can reach this port can read and delete everything in the database.\n\
+             Anyone who can reach this port can read and delete everything in the database.{}\n\
              Either pass --users <file>, or bind to loopback and put a reverse proxy in\n\
-             front of it, or pass --insecure-no-auth if the port really is private."
+             front of it, or pass --insecure-no-auth if the port really is private.",
+            peer_routes_warning(opts)
         );
         std::process::exit(2);
     }
@@ -464,6 +473,28 @@ fn refuse_an_open_port(
         );
         std::process::exit(2);
     }
+}
+
+/// The extra sentence a node in a cluster has earned, and a lone daemon has not.
+///
+/// **Because the two are not the same offer.** With no users file, `Guard::Node` is satisfied
+/// by anything - "auth off means allow all" is the contract, and it extends to the peer routes
+/// like it extends to everything else. On one daemon that is what the line above already says:
+/// the data is readable and deletable. On a node with peers it is more than that. `/internal/*`
+/// carries the agreement itself and the storage underneath it - raft messages, row-key
+/// assignments, whole fragments written byte for byte - none of which the SQL surface would
+/// have let through, and none of which "read and delete everything in the database" describes
+/// to somebody deciding whether their network is private enough.
+fn peer_routes_warning(opts: &Options) -> &'static str {
+    if opts.cluster.is_none() {
+        return "";
+    }
+    "\n\
+     This node has peers, so it also serves /internal/*: the agreement's own\n\
+     messages, row-key assignments, and whole fragments written straight to disk.\n\
+     Those are normally reachable only by a node holding a peer certificate. With\n\
+     no users file they are reachable by anyone who can reach the port, and they\n\
+     bypass every check the SQL surface makes.\n"
 }
 
 /// What a starting daemon says about itself.

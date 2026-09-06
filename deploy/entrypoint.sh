@@ -40,6 +40,11 @@ stage /etc/big/secrets/users /run/big/users
 # The CA is not a secret - it is what everybody checks against - but it is staged the same way so
 # that one rule covers the directory. The per-node key is a secret, and gets the same mode 600.
 stage /etc/big/secrets/peer-ca.pem /run/big/peer-ca.pem
+# The revocation list, when the CA has one. Optional so that a `secrets/` written by an older
+# `certs.sh` still starts - but `certs.sh` writes an empty one at bootstrap, because a cluster
+# that has never had a CRL cannot begin checking without restarting every node, and the moment
+# somebody needs to revoke a key is the worst moment to find that out.
+[ -f /etc/big/secrets/peer-ca.crl ] && stage /etc/big/secrets/peer-ca.crl /run/big/peer-ca.crl
 
 # Which node this is, read out of the arguments rather than out of a second environment variable.
 # The name is already in the command line as `--node`, and a deployment that had to write it

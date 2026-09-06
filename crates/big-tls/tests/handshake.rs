@@ -51,15 +51,54 @@ impl Ca {
     /// A leaf certificate valid for `names`, and its key. Both at the modes the loader demands:
     /// a certificate is public, a key is not.
     fn issue(&self, stem: &str, names: &[&str]) -> (PathBuf, PathBuf) {
+        self.issue_numbered(stem, names, 1).0
+    }
+
+    /// The same, with the serial pinned so a revocation list can name this certificate.
+    ///
+    /// A real CA keeps a register of what it has issued; here the test is the register.
+    fn issue_numbered(
+        &self,
+        stem: &str,
+        names: &[&str],
+        serial: u64,
+    ) -> ((PathBuf, PathBuf), rcgen::SerialNumber) {
         let key = rcgen::KeyPair::generate().unwrap();
-        let params =
+        let mut params =
             rcgen::CertificateParams::new(names.iter().map(|s| s.to_string()).collect::<Vec<_>>())
                 .unwrap();
+        let serial = rcgen::SerialNumber::from(serial);
+        params.serial_number = Some(serial.clone());
         let cert = params.signed_by(&key, &self.cert, &self.key).unwrap();
         (
-            self.write(&format!("{stem}.pem"), &cert.pem(), 0o644),
-            self.write(&format!("{stem}.key"), &key.serialize_pem(), 0o600),
+            (
+                self.write(&format!("{stem}.pem"), &cert.pem(), 0o644),
+                self.write(&format!("{stem}.key"), &key.serialize_pem(), 0o600),
+            ),
+            serial,
         )
+    }
+
+    /// A revocation list from this CA naming `revoked`, as a PEM file.
+    fn crl(&self, name: &str, revoked: &[rcgen::SerialNumber]) -> PathBuf {
+        let params = rcgen::CertificateRevocationListParams {
+            this_update: rcgen::date_time_ymd(2026, 1, 1),
+            next_update: rcgen::date_time_ymd(2100, 1, 1),
+            crl_number: rcgen::SerialNumber::from(1u64),
+            issuing_distribution_point: None,
+            revoked_certs: revoked
+                .iter()
+                .map(|serial| rcgen::RevokedCertParams {
+                    serial_number: serial.clone(),
+                    revocation_time: rcgen::date_time_ymd(2026, 1, 2),
+                    reason_code: Some(rcgen::RevocationReason::KeyCompromise),
+                    invalidity_date: None,
+                })
+                .collect(),
+            key_identifier_method: rcgen::KeyIdMethod::Sha256,
+        };
+        let crl = params.signed_by(&self.cert, &self.key).unwrap();
+        self.write(name, &crl.pem().unwrap(), 0o644)
     }
 
     fn write(&self, name: &str, body: &str, mode: u32) -> PathBuf {
@@ -149,7 +188,7 @@ fn a_handshake_completes_and_the_wire_carries_bytes() {
     let ca = Ca::new();
     let (cert, key) = ca.issue("server", &["localhost"]);
     let ca_pem = ca.pem();
-    let tls = TlsConfig::load(&cert, &key, None, Vec::new()).unwrap();
+    let tls = TlsConfig::load(&cert, &key, None, None, Vec::new()).unwrap();
 
     let (wire, _client) = exchange(&tls, move |sock| {
         let mut w = ClientWire::connect(sock, Some(&client_tls(&ca_pem, None)), "localhost")
@@ -178,7 +217,8 @@ fn a_client_with_no_certificate_is_anonymous_and_still_served() {
     let (cert, key) = ca.issue("server", &["localhost"]);
     let ca_pem = ca.pem();
     let peer_ca = ca.pem();
-    let tls = TlsConfig::load(&cert, &key, Some(&peer_ca), vec!["node-a".to_string()]).unwrap();
+    let tls =
+        TlsConfig::load(&cert, &key, Some(&peer_ca), None, vec!["node-a".to_string()]).unwrap();
 
     let (wire, _client) = exchange(&tls, move |sock| {
         let mut w = ClientWire::connect(sock, Some(&client_tls(&ca_pem, None)), "localhost")
@@ -199,7 +239,7 @@ fn a_peer_certificate_names_the_node_it_was_issued_for() {
     let ca_pem = ca.pem();
     let peer_ca = ca.pem();
     let roster = vec!["node-a".to_string(), "node-b".to_string()];
-    let tls = TlsConfig::load(&cert, &key, Some(&peer_ca), roster).unwrap();
+    let tls = TlsConfig::load(&cert, &key, Some(&peer_ca), None, roster).unwrap();
     assert!(tls.checks_peers());
 
     let (wire, _client) = exchange(&tls, move |sock| {
@@ -229,7 +269,8 @@ fn a_certificate_naming_no_node_on_the_roster_is_refused() {
     let (peer_cert, peer_key) = ca.issue("node-z", &["node-z"]);
     let ca_pem = ca.pem();
     let peer_ca = ca.pem();
-    let tls = TlsConfig::load(&cert, &key, Some(&peer_ca), vec!["node-a".to_string()]).unwrap();
+    let tls =
+        TlsConfig::load(&cert, &key, Some(&peer_ca), None, vec!["node-a".to_string()]).unwrap();
 
     let (refused, _client) = exchange(&tls, move |sock| {
         let identity = Some((peer_cert.as_path(), peer_key.as_path()));
@@ -257,7 +298,8 @@ fn a_certificate_from_another_ca_never_gets_that_far() {
     let (peer_cert, peer_key) = other.issue("node-a", &["node-a"]);
     let ca_pem = ca.pem();
     let peer_ca = ca.pem();
-    let tls = TlsConfig::load(&cert, &key, Some(&peer_ca), vec!["node-a".to_string()]).unwrap();
+    let tls =
+        TlsConfig::load(&cert, &key, Some(&peer_ca), None, vec!["node-a".to_string()]).unwrap();
 
     let (refused, _client) = exchange(&tls, move |sock| {
         let identity = Some((peer_cert.as_path(), peer_key.as_path()));
@@ -277,7 +319,7 @@ fn plaintext_on_a_tls_port_comes_back_with_its_socket() {
     // the client was actually speaking.
     let ca = Ca::new();
     let (cert, key) = ca.issue("server", &["localhost"]);
-    let tls = TlsConfig::load(&cert, &key, None, Vec::new()).unwrap();
+    let tls = TlsConfig::load(&cert, &key, None, None, Vec::new()).unwrap();
 
     let (refused, _client) = exchange(&tls, |mut sock| {
         // Written and then left. Reading for the answer here would block until the server drops
@@ -301,7 +343,7 @@ fn a_wire_notices_bytes_the_reader_has_not_taken() {
     let ca = Ca::new();
     let (cert, key) = ca.issue("server", &["localhost"]);
     let ca_pem = ca.pem();
-    let tls = TlsConfig::load(&cert, &key, None, Vec::new()).unwrap();
+    let tls = TlsConfig::load(&cert, &key, None, None, Vec::new()).unwrap();
 
     let (wire, _client) = exchange(&tls, move |sock| {
         let mut w = ClientWire::connect(sock, Some(&client_tls(&ca_pem, None)), "localhost")
@@ -327,7 +369,7 @@ fn a_key_file_anyone_can_read_is_refused_before_the_port_opens() {
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).unwrap();
-        let e = TlsConfig::load(&cert, &key, None, Vec::new()).unwrap_err();
+        let e = TlsConfig::load(&cert, &key, None, None, Vec::new()).unwrap_err();
         assert!(e.to_string().contains("chmod 600"), "{e}");
         assert!(e.to_string().contains("a private key"), "{e}");
     }
@@ -344,16 +386,16 @@ fn swapping_the_certificate_and_key_files_says_which_way_round_they_go() {
     // names the file too, so it is no worse an answer - it is a different correct one.
     let ca = Ca::new();
     let (cert, key) = ca.issue("server", &["localhost"]);
-    let e = TlsConfig::load(&key, &cert, None, Vec::new()).unwrap_err();
+    let e = TlsConfig::load(&key, &cert, None, None, Vec::new()).unwrap_err();
     assert!(e.to_string().contains("chmod 600"), "{e}");
     assert!(e.to_string().ends_with("server.pem`"), "the message names the swapped file: {e}");
 
     // With the mode rule satisfied, the labels are what is left to notice - both directions.
     let tight_cert = ca.write("copy-of-cert.pem", &std::fs::read_to_string(&cert).unwrap(), 0o600);
-    let e = TlsConfig::load(&cert, &tight_cert, None, Vec::new()).unwrap_err();
+    let e = TlsConfig::load(&cert, &tight_cert, None, None, Vec::new()).unwrap_err();
     assert!(e.to_string().contains("is this the certificate file?"), "{e}");
 
-    let e = TlsConfig::load(&key, &key, None, Vec::new()).unwrap_err();
+    let e = TlsConfig::load(&key, &key, None, None, Vec::new()).unwrap_err();
     assert!(e.to_string().contains("is this the key file?"), "{e}");
 }
 
@@ -365,7 +407,7 @@ fn a_fully_read_request_leaves_nothing_pending() {
     let ca = Ca::new();
     let (cert, key) = ca.issue("server", &["localhost"]);
     let ca_pem = ca.pem();
-    let tls = TlsConfig::load(&cert, &key, None, Vec::new()).unwrap();
+    let tls = TlsConfig::load(&cert, &key, None, None, Vec::new()).unwrap();
 
     let (wire, _client) = exchange(&tls, move |sock| {
         let mut w = ClientWire::connect(sock, Some(&client_tls(&ca_pem, None)), "localhost")
@@ -383,4 +425,95 @@ fn a_fully_read_request_leaves_nothing_pending() {
         !wire.has_pending_plaintext(),
         "everything sent has been read, so the connection is reusable"
     );
+}
+
+/// **A revoked node certificate stops being a node.**
+///
+/// Without a revocation list the only way to retire a leaked `--peer-key` is to rotate the CA
+/// and reissue every node's certificate on every machine at once - an operation nobody performs
+/// quickly, and the window until they do is a window in which a stolen key is still a peer with
+/// the run of `/internal/*`.
+#[test]
+fn a_revoked_peer_certificate_is_refused_at_the_handshake() {
+    let ca = Ca::new();
+    let (cert, key) = ca.issue("server", &["localhost"]);
+    let ((peer_cert, peer_key), serial) = ca.issue_numbered("node-a", &["node-a"], 4242);
+    let crl = ca.crl("revoked.crl", &[serial]);
+    let ca_pem = ca.pem();
+    let peer_ca = ca.pem();
+
+    let tls = TlsConfig::load(&cert, &key, Some(&peer_ca), Some(&crl), vec!["node-a".to_string()])
+        .expect("a CA and its revocation list load together");
+
+    let (wire, _client) = exchange(&tls, move |sock| {
+        let identity = Some((peer_cert.as_path(), peer_key.as_path()));
+        // The client offers the certificate happily; it is the server that refuses it.
+        if let Ok(mut w) =
+            ClientWire::connect(sock, Some(&client_tls(&ca_pem, identity)), "localhost")
+        {
+            let _ = w.write_all(b"ping");
+            let _ = w.flush();
+        }
+    });
+
+    assert!(
+        wire.is_err(),
+        "the CA took this certificate back, so presenting it must not make a peer"
+    );
+}
+
+/// The other half, or the control above would pass on a CRL that refused everything: a
+/// certificate the same list does *not* name still authenticates.
+#[test]
+fn a_certificate_the_revocation_list_does_not_name_still_makes_a_peer() {
+    let ca = Ca::new();
+    let (cert, key) = ca.issue("server", &["localhost"]);
+    let ((peer_cert, peer_key), _) = ca.issue_numbered("node-a", &["node-a"], 4242);
+    // A list that revokes some other certificate entirely.
+    let crl = ca.crl("revoked.crl", &[rcgen::SerialNumber::from(9999u64)]);
+    let ca_pem = ca.pem();
+    let peer_ca = ca.pem();
+
+    let tls = TlsConfig::load(&cert, &key, Some(&peer_ca), Some(&crl), vec!["node-a".to_string()])
+        .unwrap();
+
+    let (wire, _client) = exchange(&tls, move |sock| {
+        let identity = Some((peer_cert.as_path(), peer_key.as_path()));
+        let mut w = ClientWire::connect(sock, Some(&client_tls(&ca_pem, identity)), "localhost")
+            .expect("the peer handshake");
+        let _ = w.write_all(b"ping");
+        let _ = w.flush();
+    });
+
+    let wire = wire.expect("the server handshake");
+    assert_eq!(
+        wire.identity(),
+        &Identity::Node("node-a".to_string()),
+        "revoking one certificate must not refuse the rest"
+    );
+}
+
+/// A file with no `X509 CRL` block is the wrong file, and taking it as "nothing is revoked"
+/// would turn a typo into a security control that quietly does nothing.
+#[test]
+fn a_revocation_list_that_is_not_one_is_refused_at_startup() {
+    let ca = Ca::new();
+    let (cert, key) = ca.issue("server", &["localhost"]);
+    let peer_ca = ca.pem();
+    // The CA certificate is a PEM file, and it is not a revocation list.
+    let e = TlsConfig::load(&cert, &key, Some(&peer_ca), Some(&peer_ca), vec!["node-a".into()])
+        .expect_err("a CA certificate is not a revocation list");
+    assert!(e.to_string().contains("X509 CRL"), "{e}");
+}
+
+#[test]
+fn the_shipped_bootstrap_revocation_list_loads() {
+    // A CRL as `deploy/cluster/certs.sh` writes it: signed by the peer CA, revoking nothing.
+    // An empty list must load, or a cluster could not turn revocation on before it needed it.
+    let ca = Ca::new();
+    let (cert, key) = ca.issue("server", &["localhost"]);
+    let peer_ca = ca.pem();
+    let empty = ca.crl("bootstrap.crl", &[]);
+    TlsConfig::load(&cert, &key, Some(&peer_ca), Some(&empty), vec!["node-a".to_string()])
+        .expect("an empty revocation list is what a cluster starts with");
 }

@@ -60,7 +60,7 @@ impl Certs {
     }
 
     fn server(&self) -> TlsConfig {
-        TlsConfig::load(&self.cert, &self.key, None, Vec::new()).unwrap()
+        TlsConfig::load(&self.cert, &self.key, None, None, Vec::new()).unwrap()
     }
 
     /// A client that trusts this certificate and nothing else.

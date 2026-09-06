@@ -36,6 +36,13 @@ schema_leader   = "a"
 # every other. A certificate says which node is speaking; a shared string could not.
 peer_ca_file = "/run/big/peer-ca.pem"
 
+# **And what that CA has taken back.** `certs.sh` writes an empty list at bootstrap and the
+# entrypoint stages it, so revocation is wired up before anybody needs it - a cluster that has
+# never had a CRL cannot start checking one without restarting every node, and the moment a key
+# leaks is the worst moment to discover that. Reissue the list naming a serial to retire one
+# node's certificate; the nodes read it at startup, so it lands on a rolling restart.
+peer_crl_file = "/run/big/peer-ca.crl"
+
 [[node]]
 name   = "a"
 addr   = "a:7654"

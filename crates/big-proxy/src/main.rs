@@ -352,6 +352,9 @@ fn run(o: Options) -> Result<(), String> {
             big_tls::TlsConfig::load(
                 std::path::Path::new(cert),
                 std::path::Path::new(key),
+                // No peer CA here, so no revocation list either: this listener never asks for
+                // a client certificate, and there is nothing for a CRL to be about.
+                None,
                 None,
                 Vec::new(),
             )
