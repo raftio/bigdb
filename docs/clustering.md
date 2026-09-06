@@ -467,6 +467,14 @@ however privileged they are, and a node certificate grants no role on the public
 `--peer-cert` and `--peer-key` a node presents are `big serve` flags rather than entries here,
 because one shared file cannot name node `a`'s private key without also naming node `b`'s.
 
+**And a certificate can be taken back.** `peer_crl_file`, beside `peer_ca_file`, names the CA's
+revocation list; a leaf it names is refused at the handshake. Without one the only way to retire
+a leaked node key is to rotate the CA and reissue every certificate at once, which is an
+operation slow enough that the stolen key stays a peer for the length of it. It fails closed in
+both directions on purpose: a file that is not a revocation list is refused at startup, and a
+certificate whose status the list cannot determine is refused at the handshake - a control that
+passed what it could not check would be worse than not having one.
+
 A cluster with no peer CA anywhere is allowed and runs unauthenticated between its nodes, and
 `big serve` says so on the way up - refusing it here would refuse it only for clusters. A cluster
 that names a peer CA and gives a node no certificate is refused outright, because that node could
