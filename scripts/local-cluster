@@ -36,6 +36,12 @@ PROXY_PORT=7650
 PROXY_ADMIN=7651
 SEED=127.0.0.1:7655
 
+# Subscriptions each node will hold for GET /watch. On by default here because a demo cluster
+# is where you want to see a live query at all, and 8 of the default worker pool is small
+# enough that subscribers cannot starve ordinary requests. The proxy does not carry /watch, so
+# a subscriber talks to a node port directly.
+WATCH_MAX=${WATCH_MAX:-8}
+
 say() { printf '\033[1m%s\033[0m\n' "$*"; }
 die() { printf 'local-cluster: %s\n' "$*" >&2; exit 1; }
 
@@ -98,7 +104,8 @@ up() {
     fi
     say "starting $name on 127.0.0.1:$port"
     nohup "$BIG" serve "$DIR/$file.big" "127.0.0.1:$port" \
-      --cluster "$CONF" --node "$name" >"$DIR/$file.log" 2>&1 &
+      --cluster "$CONF" --node "$name" --watch-max "$WATCH_MAX" \
+      >"$DIR/$file.log" 2>&1 &
     waiting "$name to answer" 100 curl -fsS -m 1 "http://127.0.0.1:$port/health"
   done
 
@@ -200,7 +207,8 @@ join() {
 
   say "starting $name on $addr with no cluster file"
   nohup "$BIG" serve "$DIR/$name.big" "$addr" \
-    --join "$leader_addr" --cluster-id big-local --node "$name" >"$DIR/$name.log" 2>&1 &
+    --join "$leader_addr" --cluster-id big-local --node "$name" \
+    --watch-max "$WATCH_MAX" >"$DIR/$name.log" 2>&1 &
   waiting "$name to answer" 100 curl -fsS -m 1 "http://127.0.0.1:$port/health"
   echo
   echo "  it is a learner until it has caught up. Give it work with:"
