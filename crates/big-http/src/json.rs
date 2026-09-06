@@ -486,12 +486,13 @@ pub fn topology(t: &Topology) -> String {
         None => "null".to_string(),
     };
     format!(
-        "{{\"cluster_id\":{},\"epoch\":{},\"leader\":{},\"schema_leader\":{},\"members\":[{}],\
-         \"ranges\":[{}],\"behind\":[{}]}}",
+        "{{\"cluster_id\":{},\"epoch\":{},\"leader\":{},\"schema_leader\":{},\"settled\":{},\
+         \"members\":[{}],\"ranges\":[{}],\"behind\":[{}]}}",
         string(&t.cluster_id),
         t.epoch,
         leader,
         string(&t.schema_leader),
+        t.settled,
         members.join(","),
         ranges.join(","),
         behind.join(",")
