@@ -132,6 +132,182 @@ row whose ordering value the cut cannot tell apart from the last one kept.
 `CSVWithNames`. `JSON` and `JSONCompact` produce the same bytes here; the second is an accepted
 spelling rather than a second encoding.
 
+## Changing and expiring records
+
+```sql
+UPDATE t SET amount = 0 WHERE country = 'GB'
+ALTER TABLE t DROP DAYS BEFORE '2026-01-01' ON ts
+KILL QUERY '<node>/<n>'
+SHOW PROCESSLIST
+```
+
+**`UPDATE` works where one record holds one value** — the integer, decimal and float columns,
+`MUTEX` and `BOOL` — because on those a write already *is* a replacement: `Bsi::set` emits the set
+and the clear in one pass, `MutexField::put` reads the old row and clears it. A `SET` column holds
+every value a record was ever given and a `TIMEQUANTUM` writes a copy per period, so a new value
+would join the old; both are refused (`sql_update_column`) rather than emulated by a delete and a
+rewrite, which is a different statement with a different failure mode. The columns are all judged
+before anything is written. Values are literals: `SET amount = amount + 1` is a read-modify-write
+per record and there is no plan for one. It demands `Insert` **and** `Delete`, because that is
+what it does.
+
+**Retention is a statement, not a `TTL` clause.** `TTL` is refused (`sql_declarative_ttl`): there
+is no scheduler here and the library under this starts no threads, so a stored `TTL` would be a
+promise nothing keeps — the same object a materialised view is refused for being. What exists runs
+when you run it, travels to every node the way a schema change does, and is honest about its
+effect: it drops the per-period **index** over those days, not the records. A window query stops
+finding them; `count(*)` does not change. Every granularity the column declared is trimmed, and a
+period the cutoff falls inside is kept whole.
+
+**`KILL QUERY` and `SHOW PROCESSLIST` are answered at the edge**, not by the cluster, because the
+cancellation flag is minted per connection there — `DbRead` has always checked one at every
+fragment, so what these add is an *address*, not a mechanism. Ids are `<node>/<n>`, the shape the
+write path already stamps on `X-Big-Txn`. Both are node-local and the listing says so with its own
+column: killing a coordinator's query stops it there, and its in-flight legs are stopped by their
+own sockets closing. Both demand `Operate`.
+
+## Deleting records
+
+```sql
+DELETE FROM t WHERE ts < '2026-01-01'
+```
+
+**A write whose first half is a read**, and the halves are bounded by different things because
+only one of them can be interrupted. The predicate is planned, fanned out and merged into one set
+across every owner *before a single bit is cleared* — a per-node share of the selection would
+clear a fraction of what the statement named on each node, which is a smaller deletion that looks
+exactly like a correct one. That selection runs under `max_execution_time` like any read. The
+clearing that follows is one transaction and nothing interrupts one, so it is bounded by a
+**count** instead: a popcount of the merged set, taken before anything goes, refused above
+`MAX_DELETE` (2²⁰) with `sql_delete_too_large`. `SETTINGS max_delete_records` lowers that and
+cannot raise it.
+
+The `WHERE` is the *same* `WHERE`: it lowers through the one function that turns a condition into
+a set operation, so a predicate cannot select one set when it is counted and another when it
+deletes. An `IN (SELECT ... FROM b)` inside it works and costs the extra round trip it costs in a
+query — and demands `SELECT` on `b`, because a read is a read.
+
+`DELETE FROM t` with no `WHERE` is refused (`sql_delete_all`) and pointed at `TRUNCATE TABLE`,
+which frees the fragments instead of clearing every record id by id. `ORDER BY` and `LIMIT` are
+refused by the same code for a different reason: a record id is an address rather than a position,
+so taking the first ten of a set would clear an arbitrary ten while reading as though it had
+chosen them.
+
+**There is no snapshot between selecting and clearing.** A record written after the merge
+survives; one deleted concurrently was never counted. That is the same non-atomicity
+`INSERT ... SELECT` lives with, and it is stated rather than papered over. `EXPLAIN DELETE`
+resolves the tree and runs none of it, which is the one chance to check a predicate before it
+clears records that do not come back.
+
+## Emptying a table
+
+```sql
+TRUNCATE TABLE [IF EXISTS] t
+```
+
+**A schema change, not a write**, and not a filing decision: the fragments are freed by key — it
+is `DROP TABLE`'s second half without its first — so it costs the number of *fragments* rather
+than the number of records, and it travels the leader-then-fan-out path every schema change takes.
+It demands `DROP` on the table, because what it destroys is the data.
+
+What survives is the declaration, the field ids, and — the part that is a correctness requirement
+across a cluster rather than a convenience — the **row keys**. Row ids are interned per
+`(table, field)` and the write path rests on them never being reused; a peer may still be holding
+a mapping it resolved earlier, and emptying a table must not be able to make a row id mean one
+string on one node and another on the next. That is also why this is one wire operation rather
+than a drop followed by a create.
+
+`TRUNCATE DATABASE` and `TRUNCATE VIEW` are refused (`sql_read_only`): there is one kind of object
+this empties. Postgres's `RESTART IDENTITY` and `CASCADE` are not read — there is no sequence to
+restart, because a record id is an address rather than a counter, and nothing references a table
+for a cascade to follow.
+
+## The catalog, under `system.`
+
+```sql
+SELECT * FROM system.tables
+SELECT name, kind FROM system.columns WHERE database = 'sales' AND table = 'orders'
+SELECT table, field, view, shard FROM system.parts WHERE table = 'orders'
+```
+
+Four views: `system.tables`, `system.columns`, `system.databases` and `system.parts`. They parse
+to a `Shown`, not a query — no plan produces them, the answer is in the catalog every node already
+holds, so they join the `SHOW` listings rather than becoming the first `Statement` with an empty
+`calls` list under a shape naming plans that do not exist.
+
+**`system.tables` is not `SHOW TABLES` under another name**, and that is why it is a separate
+variant: `SHOW TABLES` answers about the request's database, this answers about the server. The
+`database` column is what makes the difference visible.
+
+**`system.parts` is the one that repeats nothing.** A fragment is `(table, field, view, shard)`,
+and nothing else on this surface shows one — it is how "the query is slow" becomes a question with
+an answer. Two rows per field of a `bitmap+columnar` table is the answer being right rather than
+doubled: the `view` column says `_standard` for the bitmap and `_column` for the segment. It
+reports this node's fragments, and the `node` column says so.
+
+The one clause these take is `WHERE database = '…'` — and on `system.columns` and `system.parts`
+also `WHERE table = '…'`, joined by `AND` — because those two are already the parameters
+`SHOW TABLES FROM d` and `DESCRIBE t` pass underneath. A join, a grouping, an ordering, a limit or
+a `SETTINGS` budget is refused (`sql_system_clause`): the answer is rows from the catalog rather
+than a shape over plans, so filtering one would mean a second filter engine over rows. A name
+under `system.` this build has not got is `sql_system_table`, which lists the ones it has — and
+`CREATE DATABASE system` is refused by the same code, because a table in it could never be read.
+
+`system.query_log` and `system.processlist` are refused by name: a query log is a durable sink
+that does not exist, and a process list needs a registry of running queries that does not either.
+
+## What a statement may spend
+
+There is no `SET` here, because there is no session for it to leave a limit in — the same reason
+`USE` is refused. A limit is written on the statement it bounds:
+
+```sql
+SELECT count(*) FROM tx WHERE amount >= 500 SETTINGS max_execution_time = 30
+```
+
+Three keys, because three is what exists end to end: `max_execution_time` (seconds, the deadline
+`DbRead` checks at every fragment), `max_memory_usage` (bytes of bitmap held at once) and
+`max_result_rows` (records read back). `max_threads`, `max_block_size` and `join_algorithm` are
+refused (`sql_unknown_setting`) rather than accepted and ignored — there are no bind parameters
+in this dialect, so a key was typed, and a dropped `max_execution_tim = 30` is a statement running
+without the bound its author believes it has.
+
+**Every value only ever lowers what the operator configured.** Asking for more is not a mistake —
+the author of a query has no way to know what the server was started with — so it is clamped
+rather than refused, and `EXPLAIN` prints a `settings` line with the numbers that will actually be
+enforced. That line is what makes silent clamping defensible.
+
+The clause goes **after** `FORMAT`, and is read once for the whole statement, after the last
+`UNION ALL` branch. One position rather than two, so a statement cannot carry two of them; after
+the last branch because a union produces one answer, and a per-branch deadline would bound a part
+of it that nobody receives on its own. (ClickHouse writes it before `FORMAT`; this is the one
+place the two dialects differ on where it goes.)
+
+## Where the bitmap functions went
+
+Doris and ClickHouse expose a `BITMAP` value and a family of functions over it — `bitmap_and`,
+`bitmap_count`, `to_bitmap`, `bsi_sum`. **None of them exist here, and nothing is missing.** Those
+functions are how an engine that stores rows reaches a bitmap; this one has no other way to store
+anything, so the operations they name are the ordinary operators of the dialect. A `BITMAP` column
+would be a bitmap inside a bitmap.
+
+The mapping, which is what `sql_bitmap_function` says when one of those names is written:
+
+| Written elsewhere | Written here | Why it is the same thing |
+|---|---|---|
+| `bitmap_count(x)`, `bitmapCardinality(x)` | `count(DISTINCT x)` | the cardinality of a bitmap is a popcount, so it is **exact** |
+| `approx_count_distinct(x)`, `uniqHLL12(x)` | accepted as written | same popcount; answered exactly rather than refused |
+| `bsi_sum(x)` | `sum(x)` | a fold over the bit planes |
+| `bsi_range(x, a, b)` | `x BETWEEN a AND b` | a bit-sliced range, `O(bit_depth × container)` |
+| `bsi_topk(x)` | `topK(n)(x)` | the ranking a `TopN` already carries |
+| `bitmap_and(a, b)` | `a AND b` in the `WHERE` | intersection, container-wise |
+| `bitmap_or(a, b)` | `OR`, or `IN (a, b)` | union |
+| `bitmap_andnot(a, b)` | `NOT IN (SELECT _record_id FROM b …)` | difference |
+| `to_bitmap(x)`, `groupBitmapState(x)` | declare `x` a `SET` column | the bitmap was built when the fact was written |
+
+The one thing on that list with no local spelling is a bitmap held *in* a column and passed
+between calls, which is `sql_bitmap_type`.
+
 ## What it refuses
 
 Every one of these is refused by name, with a stable code, before anything runs. The list is the
@@ -159,9 +335,15 @@ condition selects a *set*, and `count(*) FILTER (WHERE …)` is how one statemen
 several. `CAST`, `toInt64` and `toString` convert between representations that do not convert: a
 keyed column is a string in a dictionary and an integer column is bit planes. `argMin`, `argMax`,
 `stddev`, `varPop` and `corr` need each record's value revisited against a running total, and
-this engine holds bits at `(row, record)` rather than values to revisit. A `FLOAT`, `DOUBLE`,
-`DATE`, `UUID`, `JSON` or `BLOB` column names nothing this engine stores
-(`sql_unknown_column_type`).
+this engine holds bits at `(row, record)` rather than values to revisit. A `UUID`, `JSON` or
+`BLOB` column names nothing this engine stores (`sql_unknown_column_type`).
+
+**The two type names it understands and declines**, which is why neither shares a code with the
+names above — those were not recognised, and these were. `Nullable(T)` (`sql_nullable_type`): a
+record either has the bit set for a value or it does not, and `SELECT *` reports absence by
+leaving the cell out, so the wrapper would add a second way to be absent that nothing below could
+tell from the first. It is the same decision `IS NULL` rests on (`sql_no_nulls`). `BITMAP`,
+`AggregateFunction(groupBitmap, …)` and `HLL` (`sql_bitmap_type`): see the mapping above.
 
 **The statements above a table, and the writes with no operation behind them** — a *session*
 (`sql_use_unsupported`: a database arrives with the request, so `USE` has nothing to leave

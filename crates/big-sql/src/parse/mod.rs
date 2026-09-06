@@ -15,9 +15,11 @@
 //! Tokens to [`Select`]. Recursive descent, with the refusals placed where the construct is.
 //!
 //! ```text
-//! statement := explain | create | alter | drop | insert | show
-//!            | [WITH literal AS ident (',' literal AS ident)*] select
+//! statement := explain | create | alter | drop | truncate | insert | delete | update
+//!            | kill | show
+//!            | [WITH literal AS ident (',' literal AS ident)*] select [settings]
 //! explain   := EXPLAIN [PLAN | SHAPE] statement   -- the inner one is not an EXPLAIN
+//! settings  := SETTINGS ident '=' n (',' ident '=' n)*   -- once, after the last UNION branch
 //! create    := CREATE TABLE [IF NOT EXISTS] ident
 //!              ['(' column (',' column)* ')'] [ENGINE '=' engine]
 //!            | CREATE [OR REPLACE] VIEW [IF NOT EXISTS] ident AS body
@@ -26,6 +28,10 @@
 //! alter     := ALTER TABLE ident change (',' change)*
 //! change    := ADD [COLUMN] column | DROP [COLUMN] ident
 //! drop      := DROP TABLE [IF EXISTS] ident | DROP VIEW [IF EXISTS] ident
+//! truncate  := TRUNCATE [TABLE] [IF EXISTS] ident
+//! delete    := DELETE FROM ident WHERE cond          -- the WHERE is required
+//! update    := UPDATE ident SET ident '=' literal (',' ident '=' literal)* WHERE cond
+//! kill      := KILL [QUERY] (str | WHERE 'query_id' '=' str)
 //! column    := ident type      -- see `Parser::column_type` for the type names
 //! insert    := INSERT [INTO] ident '(' ident (',' ident)* ')' VALUES tuple (',' tuple)*
 //! tuple     := '(' literal (',' literal)* ')'
@@ -84,6 +90,12 @@ pub enum Parsed {
     Insert(Insert),
     Show(Show),
     Ddl(crate::ddl::Ddl),
+    /// `DELETE FROM t WHERE ...`, still carrying its `Cond`.
+    Delete(crate::ast::Delete),
+    /// `UPDATE t SET c = v WHERE ...`, still carrying its `Cond`.
+    Update(crate::ast::Update),
+    /// `KILL QUERY '<id>'`: the id of the query to stop.
+    Kill(String),
     /// `GRANT`, `REVOKE`, `CREATE ROLE`, `DROP ROLE`: who may do what.
     ///
     /// Its own variant rather than a `Ddl`, because the two answer to different privileges and
@@ -100,6 +112,24 @@ pub enum Parsed {
         /// Which half was asked for. [`ExplainMode::All`] unless the statement named one.
         mode: ExplainMode,
         /// The statement being described, which is never itself an `EXPLAIN`.
+        inner: Box<Parsed>,
+    },
+    /// `<statement> SETTINGS max_execution_time = 30`: what this one statement may spend.
+    ///
+    /// **A wrapper for the reason [`Parsed::Explain`] is one**, and it sits *inside* an
+    /// `EXPLAIN` rather than outside: the clause is written on the statement being explained, so
+    /// `EXPLAIN SELECT ... SETTINGS ...` describes a bounded statement rather than being a
+    /// bounded description. That ordering is what lets the explain printer reach the settings
+    /// and print the numbers that will actually be enforced.
+    ///
+    /// Only ever wraps a query today. It is a `Parsed` rather than a field on [`Query`] because
+    /// a limit is not part of what the answer *is* - it is what the caller may spend getting it
+    /// - and `crate::lower::Statement` is the description of the answer.
+    Settings {
+        /// The limits the statement wrote, never empty: the parser leaves the wrapper off
+        /// entirely when no key was given, so a statement with no `SETTINGS` is unchanged.
+        settings: crate::settings::Settings,
+        /// The statement being bounded.
         inner: Box<Parsed>,
     },
 }
@@ -126,9 +156,25 @@ pub fn parse(input: &str) -> Result<Parsed> {
         end: input.len(),
         depth: 0,
         bound: Default::default(),
+        settings: Default::default(),
         now: now_seconds(),
     };
     statement(&mut p, true)
+}
+
+/// Wraps a statement in the `SETTINGS` its trailing clause wrote, if it wrote any.
+///
+/// Every place that builds a statement which may carry one calls this rather than constructing
+/// the variant, so that a `WITH`-bound query, a plain one and a delete cannot come to disagree
+/// about whether the clause applies to them.
+///
+/// **Nothing is wrapped when nothing was written**, which is what keeps every existing test that
+/// pins a parse tree pinning the same one.
+fn with_settings(p: &Parser<'_>, inner: Parsed) -> Parsed {
+    if p.settings.is_empty() {
+        return inner;
+    }
+    Parsed::Settings { settings: p.settings, inner: Box::new(inner) }
 }
 
 /// The leading keyword, and the statement it turned out to introduce.
@@ -179,10 +225,20 @@ fn statement(p: &mut Parser<'_>, explainable: bool) -> Result<Parsed> {
         }
         p.i += 1;
         let select = p.select()?;
-        return p.union(select).map(Parsed::Query);
+        let query = p.union(select)?;
+        return Ok(with_settings(p, Parsed::Query(query)));
     }
 
     match word.to_ascii_uppercase().as_str() {
+        // **The `FROM` decides what `*` means, so it is read before the select list.** Over a
+        // table `*` is the record id; over a system view it is every column, the way it is in
+        // every other dialect. One token, two readings, and nothing downstream could tell them
+        // apart after the fact - so the fork is here, on a lookahead that stops at the one
+        // `FROM` this dialect lets a statement have.
+        "SELECT" if p.names_system() => {
+            p.i += 1;
+            return p.system_select().map(Parsed::Show);
+        }
         "SELECT" => {}
         // Each of these rules on its second word, so that `CREATE DATABASE` and `CREATE VIEW`
         // get the sentence that is about them rather than the one about writes in general: a
@@ -237,11 +293,46 @@ fn statement(p: &mut Parser<'_>, explainable: bool) -> Result<Parsed> {
         // `DELETE FROM` has its own sentence: what it asks for exists, as record ids sent to
         // `POST /table/{t}/delete`, and the reason it is not a statement here is that a record
         // is not a row.
-        "DELETE" => return Err(p.refuse(Refused::DeleteRows)),
-        "USE" => return Err(p.refuse(Refused::SessionUse)),
-        "UPDATE" | "TRUNCATE" | "REPLACE" | "MERGE" | "UPSERT" => {
-            return Err(p.refuse(Refused::Write))
+        // `DELETE FROM t WHERE ...` clears the records a condition selects from every field.
+        // It used to be refused here; what changed is not the engine - `DbWrite::delete_where`
+        // was always there - but that the selection and the clearing are now one statement
+        // instead of a `SELECT *` a client had to post back.
+        "DELETE" => {
+            p.i += 1;
+            let delete = p.delete()?;
+            return Ok(with_settings(p, Parsed::Delete(delete)));
         }
+        // `KILL QUERY '<id>'`. The flag a query is stopped by has always existed - `DbRead`
+        // checks one at every fragment - so what this adds is an address for it, not a mechanism.
+        "KILL" => {
+            p.i += 1;
+            return p.kill().map(Parsed::Kill);
+        }
+        "USE" => return Err(p.refuse(Refused::SessionUse)),
+        // The same decision `USE` is refused by, reached from the other side. `SET` asks this
+        // surface to remember a limit between statements; `SETTINGS` writes it on the one
+        // statement it bounds. Refused at the keyword rather than left to fall off the end of
+        // the grammar, because `SET max_execution_time = 30` is perfectly good SQL somewhere
+        // and what its author needs is where to put it here.
+        "SET" => return Err(p.refuse(Refused::SessionSetting)),
+        // `TRUNCATE` has an operation behind it here - freeing a table's fragments by key,
+        // which is `DROP TABLE`'s second half without its first - so it left the refusal above
+        // and became a statement.
+        "TRUNCATE" => {
+            p.i += 1;
+            return p.truncate_table().map(Parsed::Ddl);
+        }
+
+        // `UPDATE` has an operation behind it on the columns where one record holds one value:
+        // writing the fact and clearing the old one is what `Bsi::set` and `MutexField::put`
+        // already do in a single pass. The columns where it does not are refused by name, where
+        // the schema is - see `Refused::UpdateColumn`.
+        "UPDATE" => {
+            p.i += 1;
+            let update = p.update()?;
+            return Ok(with_settings(p, Parsed::Update(update)));
+        }
+        "REPLACE" | "MERGE" | "UPSERT" => return Err(p.refuse(Refused::Write)),
         _ => {
             return Err(SqlError::Syntax {
                 at: p.at(),
@@ -253,7 +344,8 @@ fn statement(p: &mut Parser<'_>, explainable: bool) -> Result<Parsed> {
     p.i += 1;
 
     let select = p.select()?;
-    p.union(select).map(Parsed::Query)
+    let query = p.union(select)?;
+    Ok(with_settings(p, Parsed::Query(query)))
 }
 
 struct Parser<'a> {
@@ -271,6 +363,13 @@ struct Parser<'a> {
     depth: usize,
     /// Constants a `WITH` clause bound, by the name it gave them.
     bound: std::collections::BTreeMap<String, Literal>,
+    /// The limits the trailing `SETTINGS` clause wrote, if it wrote any.
+    ///
+    /// Held on the parser rather than returned, because the clause is read deep inside `union`
+    /// and the wrapper is built where the statement is: threading it back out through every
+    /// return would put a `Settings` in the signature of clauses that have nothing to do with
+    /// one.
+    settings: crate::settings::Settings,
     /// The instant this statement was read, in seconds since the epoch.
     ///
     /// **Read once, here, and shared by every `now()` in the statement.** A clock read per call
@@ -329,6 +428,11 @@ impl Parser<'_> {
             self.expect_word("SELECT", "SELECT after UNION ALL")?;
             branches.push(self.select()?);
         }
+        // After the last branch, because a budget is what the whole statement spends: a
+        // `UNION ALL` produces one answer, and a per-branch deadline would bound a part of it
+        // that nobody receives on its own. It is also the only position, so two of them cannot
+        // disagree.
+        self.settings = self.settings()?;
         if self.i < self.t.len() {
             if self.word_is("INTERSECT") || self.word_is("EXCEPT") {
                 return Err(self.refuse(Refused::Subquery));
@@ -605,13 +709,18 @@ mod acl;
 mod alter;
 mod cond;
 mod create;
+mod delete;
 /// The forward half of the decimal depth rule, for [`crate::render`] to invert.
 pub(crate) use create::decimal_bits;
 mod insert;
 mod item;
+mod kill;
 mod rounded;
 mod scalar;
 mod select;
 /// The shape-matcher a `GROUP BY` term and a select-list entry are compared through.
 pub(crate) use select::bucket_of;
+mod settings;
 mod show;
+mod system;
+mod update;

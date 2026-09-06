@@ -83,7 +83,7 @@ parse_error
 error
 EXPLAIN DELETE FROM t
 ----
-sql_read_only
+sql_delete_all
 
 error
 EXPLAIN SELECT * FROM t, u

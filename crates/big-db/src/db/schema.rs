@@ -251,6 +251,35 @@ impl<P: PagerMut> Db<P> {
         Ok(true)
     }
 
+    /// Empties a table, keeping the table and its fields.
+    ///
+    /// `Ok(None)` means there was no such table. The number is how many fragments went, which is
+    /// the only count this can answer cheaply: a record count would mean reading the existence
+    /// field of every shard before dropping it, and the caller asking to empty a table has not
+    /// asked what was in it.
+    ///
+    /// **What stays, and why each one matters.** The table's id and its fields' ids, so that
+    /// every name resolves to the same place it did before. Its **row keys**, because row ids
+    /// are interned per `(table, field)` and the write path rests on them never being reused -
+    /// see [`crate::catalog::Catalog::take_table_fragments`]. And its grants, because emptying a
+    /// table is not a statement about who may read it.
+    ///
+    /// Schema and data go in one transaction, as they do for a drop, so there is no window where
+    /// the fragments are unreachable but still allocated.
+    pub fn truncate_table<'a>(&self, name: impl Into<TableRef<'a>>) -> Result<Option<u64>> {
+        let name = name.into();
+        let mut w = self.write();
+        let database = w.catalog.database_of(name)?;
+        let Some(id) = w.catalog.table(database, name.table).map(|t| t.id) else {
+            return Ok(None);
+        };
+        let keys = w.catalog.take_table_fragments(id);
+        let dropped = keys.len() as u64;
+        w.discard(&keys)?;
+        w.commit()?;
+        Ok(Some(dropped))
+    }
+
     /// Removes one field of a table, its row keys, and the pages holding it.
     /// Drops every per-day view of a time quantum field older than `unix_seconds`, and returns
     /// how many fragments went.
@@ -266,8 +295,12 @@ impl<P: PagerMut> Db<P> {
     ///
     /// The standard view is untouched, so questions that carry no time still see every record.
     /// That is the honest shape of this operation and worth stating: it drops the *index by
-    /// day*, not the records. A query with a `BETWEEN` stops finding them; a `count(*)` does
-    /// not change. Deleting records is `DbWrite::delete_records`.
+    /// time*, not the records. A query with a `BETWEEN` stops finding them; a `count(*)` does
+    /// not change. Deleting records is `DELETE FROM t WHERE ...`.
+    ///
+    /// **Every granularity the field declared**, not only its days - see
+    /// [`crate::catalog::Catalog::drop_views_before`]. A view is dropped only when the whole
+    /// period it covers ends before the cutoff, so a month the cutoff falls inside stays.
     pub fn drop_days_before<'a>(
         &self,
         table: impl Into<TableRef<'a>>,
@@ -294,7 +327,7 @@ impl<P: PagerMut> Db<P> {
         }
         let field_id = def.id;
 
-        let keys = w.catalog.drop_days_before(table_id, field_id, &cutoff);
+        let keys = w.catalog.drop_views_before(table_id, field_id, &cutoff);
         let dropped = keys.len();
         w.discard(&keys)?;
         w.commit()?;

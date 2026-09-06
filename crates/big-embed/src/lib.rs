@@ -75,8 +75,9 @@ pub use big_sql::{
 };
 pub use big_sql::{
     Acl as SqlAcl, AclObject as SqlAclObject, Alter as SqlAlter, Column as SqlColumn,
-    ColumnKind as SqlColumnKind, Ddl as SqlDdl, ExplainMode, Insert as SqlInsert,
-    Query as SqlQuery, Select as SqlSelect, Show as SqlShow, Shown as SqlShown, Sql, SqlError,
+    ColumnKind as SqlColumnKind, Ddl as SqlDdl, Delete as SqlDelete, ExplainMode,
+    Insert as SqlInsert, Query as SqlQuery, Select as SqlSelect, Settings as SqlSettings,
+    Show as SqlShow, Shown as SqlShown, Sql, SqlError, SystemView, Update as SqlUpdate,
     RECORD_COLUMN,
 };
 
@@ -135,6 +136,42 @@ impl QueryOptions {
         self.shards = shards;
         self
     }
+
+    /// The same options, tightened by what a statement's `SETTINGS` clause asked for.
+    ///
+    /// **Every field only ever narrows.** What a client writes is a ceiling it accepts, not one
+    /// it is granted: the operator configured this server's limits, and a statement that could
+    /// raise them would make them advisory. So each is the minimum of the two, and `None` on
+    /// the request side means "whatever the storage layer defaults to" - which is a real number
+    /// ([`QueryLimits::default`]), so a statement asking for less than it gets that instead.
+    ///
+    /// Asking for more is **not** refused. The author of a query has no way to know what the
+    /// server was configured with, so a number above the ceiling is a preference rather than a
+    /// mistake - it is clamped, and `EXPLAIN` prints what will actually be enforced so nobody
+    /// has to guess which of the two won.
+    #[must_use]
+    pub fn narrowed_by(&self, settings: &big_sql::Settings) -> Self {
+        let mut out = self.clone();
+        if let Some(seconds) = settings.max_execution_time {
+            let asked = Duration::from_secs(seconds);
+            out.timeout = Some(out.timeout.map_or(asked, |have| have.min(asked)));
+        }
+        // Taken against the effective ceiling rather than against `None`, so that a statement
+        // writing a bigger number than the default does not quietly raise it by being the first
+        // to name one.
+        let mut limits = out.limits.unwrap_or_default();
+        if let Some(bytes) = settings.max_memory_usage {
+            limits.max_bytes = limits.max_bytes.min(usize::try_from(bytes).unwrap_or(usize::MAX));
+        }
+        if let Some(rows) = settings.max_result_rows {
+            limits.max_records =
+                limits.max_records.min(usize::try_from(rows).unwrap_or(usize::MAX));
+        }
+        if settings.max_memory_usage.is_some() || settings.max_result_rows.is_some() {
+            out.limits = Some(limits);
+        }
+        out
+    }
 }
 
 /// The options for the next plan of a statement, with the wall-clock already spent taken off.
@@ -166,6 +203,23 @@ pub fn remaining(opts: &QueryOptions, started: Instant) -> QueryOptions {
 /// equality costs one read per plane. A set of a few thousand is a query; a set of a few million
 /// is a scan wearing a `WHERE`, and it is refused with the number rather than answered slowly.
 pub const MAX_SET: u64 = 4_096;
+
+/// The most records one `DELETE` may clear before it is refused.
+///
+/// **A bound on the half that cannot be interrupted.** The `WHERE` is a read and runs under the
+/// statement's deadline; the clearing that follows is one transaction and neither a deadline nor
+/// a memory ceiling stops one. So the bound is a *count*, and it is taken from the merged set
+/// before a single bit is cleared - a popcount, known without materialising one id.
+///
+/// Much larger than [`MAX_SET`], and the difference is the marginal cost. A semi-join pays one
+/// bit-plane read *per id*, because the outer column is bit-sliced and `b_id IN (…)` is a union
+/// of one equality each. A delete pays one `clear_records` pass *per fragment*: the keys are
+/// collected once and the whole batch is cleared from each, so a record costs a container touch
+/// rather than a plane scan.
+///
+/// A caller may lower it with `SETTINGS max_delete_records`, and may not raise it - the same rule
+/// every other setting follows.
+pub const MAX_DELETE: u64 = 1 << 20;
 
 /// Whether a call has a semi-join anywhere under it.
 ///
@@ -1116,6 +1170,24 @@ impl<P: PagerMut + Sync> Api<P> {
         Ok(self.db.drop_table(table)?)
     }
 
+    /// Empties a table, keeping the table, its fields and its row keys.
+    ///
+    /// `Ok(None)` means there was no such table; the number is how many fragments went. See
+    /// [`big_db::Db::truncate_table`] for why the row keys stay - it is a correctness
+    /// requirement across a cluster, not a convenience.
+    pub fn truncate_table(&self, table: &str) -> Result<Option<u64>> {
+        Ok(self.db.truncate_table(table)?)
+    }
+
+    /// Drops a time-quantum field's index for every period wholly before an instant.
+    ///
+    /// **It drops the index, not the records**, and the difference is the whole reason this is
+    /// not called TTL: a `BETWEEN` stops finding them and `count(*)` does not change. See
+    /// [`big_db::Db::drop_days_before`].
+    pub fn drop_days_before(&self, table: &str, field: &str, unix_seconds: i64) -> Result<usize> {
+        Ok(self.db.drop_days_before(table, field, unix_seconds)?)
+    }
+
     /// Removes one field of a table and the pages behind it.
     pub fn drop_field(&self, table: &str, field: &str) -> Result<bool> {
         Ok(self.db.drop_field(table, field)?)
@@ -1160,11 +1232,24 @@ impl<P: PagerMut + Sync> Api<P> {
         // Taken from `opts` rather than from a second parameter because it belongs with the
         // other things that are true of the request and not of the text.
         let started = Instant::now();
+        // **The `SETTINGS` clause is unwrapped here, before the clock is read against anything.**
+        // This is the only layer holding a `QueryOptions`, so it is the only one that can apply
+        // a budget - everything below answers with plans and takes its limits from whoever runs
+        // them. Narrowing once, up here, is also what makes every `remaining(opts, started)`
+        // below already tightened rather than each of them having to remember.
+        let translated = self.translate_in(text, opts.database())?;
+        let (translated, narrowed) = match translated {
+            big_sql::Sql::Settings { settings, inner } => {
+                (*inner, Some(opts.narrowed_by(&settings)))
+            }
+            other => (other, None),
+        };
+        let opts = narrowed.as_ref().unwrap_or(opts);
         // **The semi-joins first, because a call that names another table cannot be planned
         // until that table has answered.** Each is one extra round trip, and it is the whole
         // cost of `IN (SELECT …)`: what comes back is a set of ids, and the outer call is
         // narrowed by the union they mean.
-        let (plans, probes, answer) = match self.translate_in(text, opts.database())? {
+        let (plans, probes, answer) = match translated {
             big_sql::Sql::Query(mut statement) => {
                 {
                     let catalog = self.db.catalog();
@@ -1227,7 +1312,19 @@ impl<P: PagerMut + Sync> Api<P> {
         // Through `Api::translate_in` and not `big_sql`'s, so a statement reading a view is
         // expanded here too. The un-clustered path and the coordinator's have to answer the
         // same question, and going straight to `big-sql` is how they would stop doing that.
-        match self.translate_in(text, database)? {
+        self.plan_translated(self.translate_in(text, database)?)
+    }
+
+    /// The half of [`Api::plan_sql_in`] after the translation.
+    ///
+    /// Split out for one caller: a `SETTINGS` clause is a wrapper, so the match has to be able
+    /// to run itself again on what it wraps - the same shape `parse::statement` uses for
+    /// `EXPLAIN`, and for the same reason.
+    fn plan_translated(
+        &self,
+        translated: big_sql::Sql,
+    ) -> Result<(Vec<Plan>, Vec<SqlProbe>, Answer)> {
+        match translated {
             big_sql::Sql::Query(s) => self.plan_statement(s),
             // The three statements that are not questions have no plan to resolve: a schema
             // change goes to the leader, an insert goes to the shard owners, and a listing is
@@ -1235,6 +1332,9 @@ impl<P: PagerMut + Sync> Api<P> {
             // coordinator classifies first - see `Api::translate`.
             big_sql::Sql::Ddl(_)
             | big_sql::Sql::Insert(_)
+            | big_sql::Sql::Delete(_)
+            | big_sql::Sql::Update(_)
+            | big_sql::Sql::Kill(_)
             | big_sql::Sql::Show(_)
             | big_sql::Sql::Acl(_) => Err(ApiError::Sql(big_sql::SqlError::Refused {
                 what: big_sql::Refused::Write,
@@ -1252,6 +1352,12 @@ impl<P: PagerMut + Sync> Api<P> {
                 what: big_sql::Refused::ExplainRows,
                 at: 0,
             })),
+            // Delegated, and the budget is *not* dropped on the floor here - it was applied
+            // before this was called. `Api::sql` unwraps the clause into its `QueryOptions`
+            // first, which is the only place that holds any; this function answers with plans,
+            // and a plan is not a budget. A caller reaching it directly gets the plans and
+            // supplies its own limits, which is what its signature already says.
+            big_sql::Sql::Settings { inner, .. } => self.plan_translated(*inner),
         }
     }
 

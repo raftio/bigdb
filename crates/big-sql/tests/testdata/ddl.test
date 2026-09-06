@@ -284,3 +284,53 @@ CREATE TABLE t (a SET) ENGINE = columnar
 CREATE TABLE t (
     a SET
 ) ENGINE = columnar
+
+## `TRUNCATE TABLE`: the records go, the table stays.
+#
+# It left `Refused::Write` and became a statement because there is an operation behind it - the
+# fragments are freed by key, which is `DROP TABLE`'s second half without its first. What it keeps
+# is the declaration, the field ids, and the row keys: those are interned per `(table, field)` and
+# the write path rests on them never being reused, so a peer's cached mapping must stay true.
+
+ddl
+TRUNCATE TABLE events
+----
+TruncateTable events
+
+# `TABLE` is optional, because Postgres requires it and MySQL does not, and the word decides
+# nothing here - there is one kind of object this empties.
+ddl
+TRUNCATE events
+----
+TruncateTable events
+
+ddl
+TRUNCATE TABLE IF EXISTS events
+----
+TruncateTable events if_exists
+
+ddl
+TRUNCATE TABLE sales.orders
+----
+TruncateTable sales.orders
+
+## Retention: `DROP DAYS BEFORE`, which is an `ALTER` because it changes what the table's index
+## holds without changing what the table stores.
+#
+# Imperative rather than a `TTL` clause, and that is a decision: nothing here would keep a
+# standing promise. It also drops the *index* over those periods rather than the records, which
+# is why it is not called TTL.
+
+ddl
+ALTER TABLE visits DROP DAYS BEFORE '2026-01-01' ON visit
+----
+AlterTable visits
+└── drop days before 2026-01-01 on visit
+
+# Beside other changes, validated with them against the same simulated post-statement schema.
+ddl
+ALTER TABLE visits ADD COLUMN region TEXT, DROP DAYS BEFORE '2026-01-01' ON visit
+----
+AlterTable visits
+├── add region set depth=32
+└── drop days before 2026-01-01 on visit

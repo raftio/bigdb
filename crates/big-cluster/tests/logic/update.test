@@ -1,0 +1,133 @@
+# `UPDATE t SET c = v WHERE ...` against real records.
+#
+# The parser corpus pins what the statement is; this pins what it does to the data. That split
+# matters here more than anywhere: an update on the kinds this accepts *is* a replacement only
+# because the engine below writes it as one, and nothing about the SQL would show it if it were
+# not.
+
+statement
+CREATE TABLE tx (amount UINT(32), price DECIMAL(10, 2), device MUTEX, country SET, active BOOL)
+
+statement
+INSERT INTO tx (_record_id, amount, price, device, country, active) VALUES
+  (1, 100, 1.50, 'ios', 'GB', true),
+  (2, 900, 12.25, 'android', 'US', false),
+  (3, 500, 3.00, 'ios', 'GB', true)
+
+## An integer column: the new value is there and the old one is not.
+
+exec
+UPDATE tx SET amount = 42 WHERE country = 'GB'
+----
+updated
+2
+
+query rowsort
+SELECT amount FROM tx
+----
+amount
+42
+42
+900
+
+query
+SELECT count(*) FROM tx WHERE amount = 100
+----
+count
+0
+
+## A decimal keeps its scale through the write, the same way an insert does.
+
+exec
+UPDATE tx SET price = 9.99 WHERE amount = 42
+----
+updated
+2
+
+query rowsort
+SELECT price FROM tx
+----
+price
+12.25
+9.99
+9.99
+
+## **The mutex case, which is the one worth having.** A mutex column keeps one value per record
+## by clearing the old row when a new one is set. If that shadow were not maintained, the record
+## would match both values - and `count(*)` would not show it.
+
+exec
+UPDATE tx SET device = 'web' WHERE device = 'ios'
+----
+updated
+2
+
+query
+SELECT count(*) FROM tx WHERE device = 'ios'
+----
+count
+0
+
+query
+SELECT count(*) FROM tx WHERE device = 'web'
+----
+count
+2
+
+query
+SELECT count(*) FROM tx
+----
+count
+3
+
+## A boolean, where the write is one bit on and the opposite off.
+
+exec
+UPDATE tx SET active = false WHERE active = true
+----
+updated
+2
+
+query
+SELECT count(*) FROM tx WHERE active = true
+----
+count
+0
+
+## A `SET` column holds every value a record was ever given, so a new one would join the old
+## rather than replace it - refused by name, with the two statements that do work.
+
+error
+UPDATE tx SET country = 'FR' WHERE amount = 42
+----
+error: sql_update_column
+
+## Several columns at once, and the check that no column is written when one of them is refused.
+
+error
+UPDATE tx SET amount = 7, country = 'FR' WHERE amount = 42
+----
+error: sql_update_column
+
+query rowsort
+SELECT amount FROM tx
+----
+amount
+42
+42
+900
+
+## Updating nothing is not an error.
+
+exec
+UPDATE tx SET amount = 1 WHERE country = 'DE'
+----
+updated
+0
+
+## A column the table has not got.
+
+error
+UPDATE tx SET nope = 1 WHERE amount = 42
+----
+error: unknown_field

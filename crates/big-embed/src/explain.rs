@@ -56,3 +56,29 @@ pub fn result_set(mode: ExplainMode, what: &Explained<'_>) -> ResultSet {
             .collect(),
     }
 }
+
+/// The `SETTINGS` line, carrying the numbers that will actually be enforced.
+///
+/// **Effective, not as written, and that is the whole point of printing it.** A statement may
+/// only lower what the operator configured, so what a client asked for and what it gets are two
+/// different numbers whenever it asked for more. Clamping silently is only defensible because
+/// this line exists: `EXPLAIN` is where somebody finds out which of the two won, without having
+/// to know what the server was started with.
+///
+/// Prepended rather than appended, because it is a fact about the whole statement and the tree
+/// below it is the answer to one. Every key is printed, including the ones the statement did not
+/// write - a limit it inherited bounds it exactly as much as one it chose, and leaving those out
+/// would make an inherited ceiling the one thing an explanation hides.
+pub fn with_settings(mut set: ResultSet, opts: &crate::QueryOptions) -> ResultSet {
+    let limits = opts.limits.unwrap_or_default();
+    // Printed exactly, including a zero. `SETTINGS max_execution_time = 0` is a statement that
+    // will be refused the moment it reaches a fragment, and rounding that up to `1s` here would
+    // make the one line whose job is to say what will be enforced the line that lies about it.
+    let seconds = opts.timeout.map_or_else(|| "none".to_string(), |t| format!("{}s", t.as_secs()));
+    let line = format!(
+        "settings max_execution_time={seconds} max_memory_usage={} max_result_rows={}",
+        limits.max_bytes, limits.max_records
+    );
+    set.rows.insert(0, vec![Datum::Text(line)]);
+    set
+}

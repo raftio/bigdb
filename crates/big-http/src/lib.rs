@@ -46,6 +46,7 @@ pub mod auth;
 pub mod json;
 pub mod metrics;
 pub mod routes;
+mod running;
 pub mod status;
 mod steward;
 mod watchdog;
@@ -174,6 +175,8 @@ struct State<P: PagerMut> {
     /// `Api` gets a cluster of one; nothing here can tell the difference, which is the point.
     cluster: Cluster<P>,
     metrics: ServerMetrics,
+    /// The queries running right now, so one of them can be named and stopped.
+    running: std::sync::Arc<running::Registry>,
     config: ServerConfig,
     /// Connections currently holding a worker on a kept-alive connection.
     ///
@@ -272,6 +275,7 @@ impl<P: PagerMut + Sync + Send + 'static> Server<P> {
             state: Arc::new(State {
                 cluster,
                 metrics: ServerMetrics::new(),
+                running: std::sync::Arc::default(),
                 config,
                 kept_alive: std::sync::atomic::AtomicUsize::new(0),
                 watching: std::sync::atomic::AtomicUsize::new(0),
@@ -894,6 +898,7 @@ fn answer<P: PagerMut + Sync>(state: &State<P>, req: &Request, wire: &Wire) -> r
         auth: &state.config.auth,
         identity: wire.identity(),
         metrics: &state.metrics,
+        running: &state.running,
         query_timeout: state.config.query_timeout,
         cancel: None,
         backup_dir: state.config.backup_dir.as_deref(),

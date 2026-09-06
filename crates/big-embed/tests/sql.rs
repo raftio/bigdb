@@ -578,3 +578,78 @@ fn now_is_one_instant_for_the_whole_statement() {
     let [Datum::Int(n)] = row[..] else { panic!("expected one count, got {row:?}") };
     assert_eq!(n, 0);
 }
+
+/// **A statement may lower what the operator configured and never raise it.**
+///
+/// The one property that makes clamping silently defensible instead of a hole: an operator sets
+/// a ceiling so that no client can hold a worker for longer than that, and a `SETTINGS` clause
+/// that could raise it would make every such ceiling advisory. Asserted over both directions of
+/// each key, because "takes the minimum" is only half a claim if nothing checks the half where
+/// the client asked for less.
+#[test]
+fn a_settings_clause_only_ever_narrows_what_the_operator_allowed() {
+    use std::time::Duration;
+
+    let configured = QueryOptions {
+        timeout: Some(Duration::from_secs(10)),
+        limits: Some(big_db::QueryLimits { max_bytes: 1_000, max_records: 100 }),
+        ..QueryOptions::default()
+    };
+
+    // Asking for more of each: every one is clamped back to the operator's number.
+    let more = configured.narrowed_by(&big_sql::Settings {
+        max_execution_time: Some(3_600),
+        max_memory_usage: Some(1_000_000),
+        max_result_rows: Some(1_000_000),
+        // Not narrowed by `QueryOptions` at all: it bounds a write, and `QueryOptions` carries
+        // nothing about writes. Set here so the struct stays exhaustive and a key added later
+        // has to be thought about rather than defaulted past.
+        max_delete_records: None,
+    });
+    assert_eq!(more.timeout, Some(Duration::from_secs(10)));
+    assert_eq!(more.limits.unwrap().max_bytes, 1_000);
+    assert_eq!(more.limits.unwrap().max_records, 100);
+
+    // Asking for less: the statement's own number wins, which is the point of the clause.
+    let less = configured.narrowed_by(&big_sql::Settings {
+        max_execution_time: Some(2),
+        max_memory_usage: Some(500),
+        max_result_rows: Some(5),
+        max_delete_records: None,
+    });
+    assert_eq!(less.timeout, Some(Duration::from_secs(2)));
+    assert_eq!(less.limits.unwrap().max_bytes, 500);
+    assert_eq!(less.limits.unwrap().max_records, 5);
+
+    // A key the statement did not write is left exactly as configured, rather than reset to a
+    // default by the act of writing a different key.
+    let one = configured.narrowed_by(&big_sql::Settings {
+        max_result_rows: Some(5),
+        ..big_sql::Settings::default()
+    });
+    assert_eq!(one.timeout, Some(Duration::from_secs(10)), "a deadline nobody named survived");
+    assert_eq!(one.limits.unwrap().max_bytes, 1_000, "a ceiling nobody named survived");
+
+    // With nothing configured, the storage layer's defaults are still the ceiling: being the
+    // first to name a number must not be a way to raise one.
+    let unconfigured = QueryOptions::default();
+    let asked = unconfigured.narrowed_by(&big_sql::Settings {
+        max_memory_usage: Some(u64::MAX),
+        max_result_rows: Some(u64::MAX),
+        ..big_sql::Settings::default()
+    });
+    let default = big_db::QueryLimits::default();
+    assert_eq!(asked.limits.unwrap().max_bytes, default.max_bytes);
+    assert_eq!(asked.limits.unwrap().max_records, default.max_records);
+    // ...but a deadline genuinely is unbounded until somebody names one, so this is the one
+    // field a statement can introduce rather than only tighten.
+    assert_eq!(
+        unconfigured
+            .narrowed_by(&big_sql::Settings {
+                max_execution_time: Some(30),
+                ..big_sql::Settings::default()
+            })
+            .timeout,
+        Some(Duration::from_secs(30))
+    );
+}

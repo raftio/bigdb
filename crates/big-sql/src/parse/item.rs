@@ -255,12 +255,18 @@ enum Which {
     Count,
     Avg,
     Agg(Agg),
-    /// `uniq` and its five approximate cousins.
+    /// `uniq` and its seven approximate cousins.
     ///
-    /// **All six map to the exact count**, because `Distinct` here walks each fragment once and
+    /// **All eight map to the exact count**, because `Distinct` here walks each fragment once and
     /// counts overlaps without building them - there is nothing an approximation would buy. A
     /// client porting from ClickHouse gets a different number where its sketch was wrong, which
     /// is worth saying out loud and is said in `olap-sql-surface-cheatsheet.md`.
+    ///
+    /// `approx_count_distinct` is on the list for the same reason the other seven are, and not
+    /// because Doris is owed a spelling: a name that promises an approximation is answered
+    /// exactly, which is a promise kept rather than broken. It is deliberately *not* on
+    /// `unsupported_call`'s bitmap list - that list is for names with no answer here, and this
+    /// one has the same answer as `uniq`.
     Uniq,
     TopKeys,
     /// A quantile, with the level a named spelling fixes - `median` is `quantile(0.5)`.
@@ -269,8 +275,16 @@ enum Which {
 
 impl Which {
     fn of(name: &str) -> Option<Self> {
-        const UNIQ: [&str; 6] =
-            ["uniq", "uniqExact", "uniqCombined", "uniqCombined64", "uniqHLL12", "uniqTheta"];
+        const UNIQ: [&str; 8] = [
+            "uniq",
+            "uniqExact",
+            "uniqCombined",
+            "uniqCombined64",
+            "uniqHLL12",
+            "uniqTheta",
+            "approx_count_distinct",
+            "approxCountDistinct",
+        ];
         Some(if name.eq_ignore_ascii_case("count") {
             Self::Count
         } else if name.eq_ignore_ascii_case("avg") {
@@ -318,7 +332,46 @@ pub(super) fn unsupported_call(name: &str) -> Refused {
         ["cast", "convert", "toInt64", "toUInt64", "toInt32", "toUInt32", "toString", "toDateTime"];
     /// Choosing between two values per record.
     const CHOICES: [&str; 5] = ["if", "multiIf", "coalesce", "nullIf", "ifNull"];
+    /// Bitmaps named as values, in both dialects that spell them.
+    ///
+    /// **The one list here whose members all have answers already.** The others name questions
+    /// this engine cannot fold; these name questions it folds under a different word, because
+    /// the bitmaps are the storage rather than a value to pass between calls. Listing both
+    /// spellings is the point: a query arrives here having been written against Doris or
+    /// ClickHouse, and what its author needs is the local word, not the news that bitmaps are
+    /// unsupported in a bitmap database.
+    const BITMAPS: [&str; 23] = [
+        "to_bitmap",
+        "groupBitmapState",
+        "groupBitmap",
+        "bitmap_and",
+        "bitmap_or",
+        "bitmap_xor",
+        "bitmap_andnot",
+        "bitmapAnd",
+        "bitmapOr",
+        "bitmapXor",
+        "bitmapAndnot",
+        "bitmap_count",
+        "bitmap_cardinality",
+        "bitmapCardinality",
+        "bitmap_contains",
+        "bitmap_union",
+        "bitmap_subset_in_range",
+        "bitmapSubsetInRange",
+        "intersect_count",
+        "orthogonal_bitmap_union_count",
+        "bsi_sum",
+        "bsi_range",
+        "bsi_topk",
+    ];
 
+    // Checked before the casts, because `to_bitmap` reads like a conversion and is not one:
+    // what it names is already how the fact was written, so the sentence it needs is the
+    // mapping rather than the one about representations that do not convert.
+    if BITMAPS.iter().any(|c| name.eq_ignore_ascii_case(c)) {
+        return Refused::BitmapFunction;
+    }
     if CASTS.iter().any(|c| name.eq_ignore_ascii_case(c)) {
         return Refused::Cast;
     }

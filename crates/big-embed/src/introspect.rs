@@ -317,3 +317,193 @@ fn find_view<'a>(views: &'a [ViewInfo], name: &str) -> Option<&'a ViewInfo> {
     let r = big_db::TableRef::parse(name);
     views.iter().find(|v| v.name == r.table && v.database == r.database)
 }
+
+// ------------------------------------------------------------------------------------------
+// `system.*`
+// ------------------------------------------------------------------------------------------
+
+/// Keeps only the columns a select list named, in the order it named them.
+///
+/// **A name the view does not have is dropped rather than refused**, which is the one place this
+/// module is lenient and it is deliberate: these views are a debugging surface, they gain columns
+/// between builds, and a script that names one this build has not got should come back with the
+/// rest rather than with nothing. `SELECT *` is the answer to "what is there", and it is one
+/// keystroke away.
+fn only(set: ResultSet, columns: Option<&[String]>) -> ResultSet {
+    let Some(wanted) = columns else { return set };
+    let keep: Vec<usize> = wanted
+        .iter()
+        .filter_map(|w| set.columns.iter().position(|c| c.eq_ignore_ascii_case(w)))
+        .collect();
+    ResultSet {
+        columns: keep.iter().map(|i| set.columns[*i].clone()).collect(),
+        rows: set
+            .rows
+            .into_iter()
+            .map(|row| keep.iter().map(|i| row[*i].clone()).collect())
+            .collect(),
+    }
+}
+
+/// `system.tables`: every table and view, in **every** database.
+///
+/// The difference from [`show_tables`] is the whole reason this is a separate function and a
+/// separate `Shown` variant: that one answers about the request's database, and this one answers
+/// about the server. A `database` column is therefore not decoration - without it the rows of two
+/// databases would be indistinguishable.
+pub fn system_tables(
+    tables: &[TableInfo],
+    views: &[ViewInfo],
+    database: Option<&str>,
+    columns: Option<&[String]>,
+) -> ResultSet {
+    let cols = ["database", "name", "type", "engine", "columns"].map(str::to_string).to_vec();
+    let mut rows: Vec<Vec<Datum>> = tables
+        .iter()
+        .filter(|t| database.is_none_or(|d| t.database == d))
+        .map(|t| {
+            vec![
+                Datum::Text(t.database.clone()),
+                Datum::Text(t.name.clone()),
+                Datum::Text("BASE TABLE".to_string()),
+                Datum::Text(t.engine.as_str().to_string()),
+                Datum::Int(t.fields.len() as i128),
+            ]
+        })
+        .collect();
+    rows.extend(views.iter().filter(|v| database.is_none_or(|d| v.database == d)).map(|v| {
+        // A body that no longer parses counts no columns rather than failing the listing, for
+        // the reason `show_tables` gives: a listing is how somebody finds the broken view.
+        let exposed = v.shape().map_or(0, |(_, c)| c.len());
+        vec![
+            Datum::Text(v.database.clone()),
+            Datum::Text(v.name.clone()),
+            Datum::Text("VIEW".to_string()),
+            Datum::Null,
+            Datum::Int(exposed as i128),
+        ]
+    }));
+    only(ResultSet { columns: cols, rows }, columns)
+}
+
+/// `system.columns`: every column of every table.
+///
+/// Views are deliberately absent. A view's columns are the base table's under other names, so
+/// listing them here would double-count every column a view exposes - and this is the view an
+/// operator counts with. `DESCRIBE v` still answers for one view.
+pub fn system_columns(
+    tables: &[TableInfo],
+    database: Option<&str>,
+    table: Option<&str>,
+    columns: Option<&[String]>,
+) -> ResultSet {
+    let cols = ["database", "table", "name", "kind", "bit_depth", "scale", "granularity"]
+        .map(str::to_string)
+        .to_vec();
+    let rows = tables
+        .iter()
+        .filter(|t| database.is_none_or(|d| t.database == d))
+        .filter(|t| table.is_none_or(|n| t.name == n))
+        .flat_map(|t| {
+            t.fields.iter().map(|f| {
+                let mut row = vec![Datum::Text(t.database.clone()), Datum::Text(t.name.clone())];
+                row.extend(field_row(f));
+                row
+            })
+        })
+        .collect();
+    only(ResultSet { columns: cols, rows }, columns)
+}
+
+/// `system.databases`: every database, with how many tables it holds.
+pub fn system_databases(
+    names: &[String],
+    tables: &[TableInfo],
+    database: Option<&str>,
+    columns: Option<&[String]>,
+) -> ResultSet {
+    let set = show_databases(names, tables);
+    let set = match database {
+        None => set,
+        // Filtered on the answer rather than inside `show_databases`, because the column it
+        // filters on is the first one and this is one comparison - not because filtering rows is
+        // something this module does in general.
+        Some(d) => ResultSet {
+            columns: set.columns,
+            rows: set
+                .rows
+                .into_iter()
+                .filter(|r| matches!(&r[0], Datum::Text(n) if n == d))
+                .collect(),
+        },
+    };
+    only(set, columns)
+}
+
+/// `system.parts`: every fragment this node holds.
+///
+/// **The one view here that repeats nothing.** `system.tables` says what `SHOW TABLES` says and
+/// `system.columns` what `DESCRIBE` says; a fragment - `(table, field, view, shard)` and how many
+/// bits are in it - has no other spelling on this surface at all. It is what turns "the query is
+/// slow" into a question with an answer: which shards a table actually occupies, whether a
+/// time-quantum field has the day views somebody expected, and where the data is not.
+///
+/// **This node's own**, and the `node` column says so. A coordinator holds the ranges it owns,
+/// so the honest answer is the local one under a name that admits it rather than a total that
+/// would be wrong on every node in a cluster.
+pub fn system_parts(
+    node: &str,
+    parts: &[(String, big_db::FragmentAddr, u64)],
+    database: Option<&str>,
+    table: Option<&str>,
+    columns: Option<&[String]>,
+) -> ResultSet {
+    let cols = ["node", "database", "table", "field", "view", "shard", "count"]
+        .map(str::to_string)
+        .to_vec();
+    let rows = parts
+        .iter()
+        .filter_map(|(qualified, addr, count)| {
+            let r = big_db::TableRef::parse(qualified);
+            if !database.is_none_or(|d| r.database == d) || !table.is_none_or(|n| r.table == n) {
+                return None;
+            }
+            Some(vec![
+                Datum::Text(node.to_string()),
+                Datum::Text(r.database.to_string()),
+                Datum::Text(r.table.to_string()),
+                // The reserved existence field has no name anybody wrote, and neither has the
+                // standard view. Reported as what they are rather than as an absence, because an
+                // operator counting fragments needs them counted.
+                addr.field.clone().map_or(Datum::Text("_exists".to_string()), Datum::Text),
+                Datum::Text(view_name(addr)),
+                Datum::Int(i128::from(addr.shard)),
+                Datum::Int(i128::from(*count)),
+            ])
+        })
+        .collect();
+    only(ResultSet { columns: cols, rows }, columns)
+}
+
+/// What to call the view a fragment is in.
+///
+/// **The reserved views have no name, and reporting them all as one would be worse than
+/// reporting none.** `FragmentAddr::view` is `None` for three different things - the standard
+/// view, the column segment and the mutex shadow - and which one it is lives in `view_id`. A
+/// listing that read only the `Option` would print two rows per field of a `bitmap+columnar`
+/// table under one name, which reads as a duplicate rather than as the two places the fact
+/// actually is. On a view whose whole purpose is finding out where the data is, that is the one
+/// mistake worth guarding by name.
+fn view_name(addr: &big_db::FragmentAddr) -> String {
+    if let Some(named) = &addr.view {
+        return named.clone();
+    }
+    match addr.view_id {
+        big_db::COLUMN_VIEW => "_column".to_string(),
+        big_db::MUTEX_SHADOW_VIEW => "_mutex_shadow".to_string(),
+        big_db::catalog::STANDARD_VIEW => "_standard".to_string(),
+        // A reserved id this build has no name for. Printed as the number rather than guessed
+        // at, so a fragment is never reported as being somewhere it is not.
+        other => format!("_view{other}"),
+    }
+}

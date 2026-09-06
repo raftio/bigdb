@@ -57,3 +57,10 @@ show
 SHOW CREATE TABLE events FORMAT TSVWithNames
 ----
 Create events format=tsv_with_names
+
+## The queries running on the node that answers. Node-local, and the answer says so.
+
+show
+SHOW PROCESSLIST
+----
+Processlist

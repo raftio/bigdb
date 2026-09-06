@@ -213,7 +213,7 @@ impl Parser<'_> {
 
     /// Whether the current word begins a clause rather than being an alias.
     pub(super) fn at_clause_keyword(&self) -> bool {
-        const KEYWORDS: [&str; 20] = [
+        const KEYWORDS: [&str; 21] = [
             "JOIN",
             "INNER",
             "LEFT",
@@ -234,6 +234,13 @@ impl Parser<'_> {
             "INTERSECT",
             "EXCEPT",
             "FORMAT",
+            // Both trailing clauses have to be here, not just the one that came first. Without
+            // it `FROM t SETTINGS max_result_rows = 5` reads `SETTINGS` as the table's alias and
+            // then fails on the key - and it fails *only* when nothing else follows the table,
+            // so `FORMAT TSV SETTINGS ...` would go on working and hide it. A table called
+            // `settings` now has to be quoted, which is what this list costs and what it costs
+            // for every other word on it.
+            "SETTINGS",
         ];
         KEYWORDS.iter().any(|k| self.word_is(k))
     }

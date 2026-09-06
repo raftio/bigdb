@@ -213,17 +213,12 @@ sql_quantile_level
 error
 UPDATE t SET amount = 1
 ----
-sql_read_only
+sql_delete_all
 
 error
 DELETE FROM t WHERE amount > 5
 ----
-sql_read_only
-
-error
-TRUNCATE TABLE t
-----
-sql_read_only
+accepted
 
 ## `INSERT ... SELECT` reads any answer whose cells are **values** - a projection, and a grouping
 ## just as much: a key is the string a keyed column was interned from, and a count is a number.
@@ -533,6 +528,59 @@ error
 CREATE TABLE t (a UUID)
 ----
 sql_unknown_column_type
+
+## The two type names this engine recognises and declines, which is why neither shares
+## `sql_unknown_column_type` with the names above: those were not understood, and these were.
+
+# Absence is already how a column answers - the bit is set or it is not - so a wrapper saying a
+# value may be missing would add a second way to be missing that nothing below tells from the
+# first. Refused at the word, so the nested form says the same sentence rather than a syntax
+# error about the inner bracket.
+error
+CREATE TABLE t (a Nullable(String))
+----
+sql_nullable_type
+
+error
+CREATE TABLE t (a Nullable(Decimal(10, 2)))
+----
+sql_nullable_type
+
+# A bitmap inside a bitmap. Every column here already is one, so the type has nothing to add and
+# the message says which column to declare instead.
+error
+CREATE TABLE t (a BITMAP)
+----
+sql_bitmap_type
+
+error
+CREATE TABLE t (a AggregateFunction(groupBitmap, UInt64))
+----
+sql_bitmap_type
+
+## Bitmaps named as values to pass between functions, in both dialects that spell them. Its own
+## code because nothing is missing: each one has an answer here under another word, and the
+## message is the mapping.
+
+error
+SELECT bitmap_count(bitmap_and(a, b)) FROM t
+----
+sql_bitmap_function
+
+error
+SELECT bitmapCardinality(uid) FROM t
+----
+sql_bitmap_function
+
+error
+SELECT bsi_sum(amount) FROM t
+----
+sql_bitmap_function
+
+error
+SELECT to_bitmap(country) FROM t
+----
+sql_bitmap_function
 
 ## A decimal's scale and a field's depth, both decided while the statement is parsed.
 
@@ -936,3 +984,48 @@ SELECT date_trunc('day', seen), count(*) FROM t GROUP BY date_trunc('month', see
 ----
 sql_unsupported
 
+
+## `TRUNCATE` of something that is not a table. `TRUNCATE TABLE` is a statement now; these are
+## still the writes with no operation behind them.
+
+error
+TRUNCATE DATABASE sales
+----
+sql_read_only
+
+error
+TRUNCATE VIEW v
+----
+sql_read_only
+
+## `TTL` is a standing promise, and there is nothing here to keep one: no scheduler, and a
+## library under it that starts no threads. The statement that does it when you run it is named
+## in the message.
+
+error
+CREATE TABLE t (ts TIMEQUANTUM) TTL ts + INTERVAL 90 DAY
+----
+sql_declarative_ttl
+
+error
+ALTER TABLE t MODIFY TTL ts + INTERVAL 30 DAY
+----
+sql_declarative_ttl
+
+## `KILL` names one running query by its id. A predicate over anything else kills a set nobody
+## named - and a different set each time it runs.
+
+error
+KILL QUERY WHERE user = 'analyst'
+----
+sql_kill_target
+
+error
+KILL MUTATION '1'
+----
+sql_kill_target
+
+error
+KILL QUERY
+----
+sql_kill_target

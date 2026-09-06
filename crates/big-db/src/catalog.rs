@@ -899,10 +899,28 @@ impl Catalog {
         // rewritten on every schema commit, and `SHOW GRANTS` would list an object that is gone.
         self.rbac.forget_table(id);
 
-        Some(self.take_fragments(
+        Some(self.take_table_fragments(id))
+    }
+
+    /// Takes every fragment of one table, leaving its definition and its fields alone.
+    ///
+    /// **This is `TRUNCATE`, and the difference from [`Catalog::drop_table`] is everything it
+    /// does *not* do.** The table keeps its id, its fields keep theirs, and - the part that is a
+    /// correctness requirement rather than a convenience - `keys.remove_table` is **not** called.
+    /// Row ids are interned per `(table, field)` and the whole write path rests on them being
+    /// immutable and never reused: a peer may be holding a mapping it resolved earlier, and
+    /// forgetting the keys here while that peer still caches them would make a row id mean one
+    /// string on one node and another string on the next. Emptying a table must not be able to
+    /// do that.
+    ///
+    /// Shared with `drop_table` so the two cannot come to disagree about where a table's key
+    /// range begins and ends - which they would, silently, the first time a reserved view id
+    /// moved.
+    pub fn take_table_fragments(&mut self, id: TableId) -> Vec<FragmentKey> {
+        self.take_fragments(
             FragmentKey { table: id, field: 0, view: 0, shard: 0 },
             FragmentKey { table: id, field: FieldId::MAX, view: ViewId::MAX, shard: u64::MAX },
-        ))
+        )
     }
 
     /// Removes one field of a table, with its row keys and its fragment metadata.
@@ -922,7 +940,16 @@ impl Catalog {
         ))
     }
 
-    /// Removes the fragments of one time quantum field for every day strictly before `cutoff`.
+    /// Removes the fragments of one time quantum field for every **view** wholly before `cutoff`.
+    ///
+    /// **Every granularity the field declared, not only the days**, which is what this used to
+    /// do and was wrong for any field declaring more than one: a field with `[Day, Month]` kept
+    /// its month views for ever, so the retention an operator asked for freed a fraction of what
+    /// they meant and the rest accumulated invisibly.
+    ///
+    /// The rule is `wholly_before` below, and it is a rule rather than a range because a coarser
+    /// view *contains* days on both sides of a cutoff: `202601` covers days after `20260115`, so
+    /// dropping it would lose data the cutoff said to keep.
     ///
     /// **What it does not touch.** The view *names* stay interned, because a view id is global
     /// across every table and field: `20260830` is one id that a dozen fields may be using, and
@@ -932,18 +959,17 @@ impl Catalog {
     ///
     /// Returns the keys, for the caller to free the trees behind them: this half is catalog
     /// bookkeeping and cannot reach a transaction.
-    pub fn drop_days_before(
+    pub fn drop_views_before(
         &mut self,
         table: TableId,
         field: FieldId,
         cutoff: &str,
     ) -> Vec<FragmentKey> {
-        // `day_views_between` is inclusive at both ends, and retention is not: an operator
-        // asking to keep everything from `cutoff` onwards has to still have `cutoff` itself.
         let doomed: Vec<ViewId> = self
-            .day_views_between(None, Some(cutoff))
-            .into_iter()
-            .filter(|v| self.view_name(*v) != Some(cutoff))
+            .view_ids
+            .iter()
+            .filter(|(name, _)| wholly_before(name, cutoff))
+            .map(|(_, id)| *id)
             .collect();
 
         let mut keys = Vec::new();
@@ -1352,5 +1378,68 @@ impl Catalog {
             *slot = (*slot).max(field + 1);
         }
         Ok(c)
+    }
+}
+
+/// Whether a time-quantum view's whole period ends before a cutoff day.
+///
+/// **A coarser view contains days on both sides of a cutoff, so this is a rule and not a range.**
+/// `202601` covers the whole of January; against a cutoff of `20260115` it holds days that are to
+/// be kept, so it stays. Only a period that is *wholly* before the cutoff may go.
+///
+/// View names are zero-padded and sort chronologically as strings at a fixed length - `YYYY`,
+/// `YYYYMM`, `YYYYMMDD`, `YYYYMMDDHH` - which is what makes the comparison a prefix comparison:
+/// truncate both to the coarser of the two lengths and the earlier period is the smaller string.
+/// An hour view is finer than a day, so it is compared at the day.
+///
+/// A name that is not one of those four shapes is not a time view at all and is never dropped:
+/// the reserved views carry no name here, and anything else would be a name this function has no
+/// business ruling on.
+fn wholly_before(name: &str, cutoff: &str) -> bool {
+    if !matches!(name.len(), 4 | 6 | 8 | 10) || !name.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    let k = name.len().min(cutoff.len());
+    name[..k] < cutoff[..k]
+}
+
+#[cfg(test)]
+mod retention_rule {
+    use super::wholly_before;
+
+    /// The rule the whole of retention rests on, at every granularity a field may declare.
+    ///
+    /// Written here rather than only against a database because it is arithmetic on strings and
+    /// the failure it guards against is silent: a month view wrongly dropped takes days the
+    /// operator asked to keep, and nothing afterwards reports that they are missing.
+    #[test]
+    fn only_a_period_wholly_before_the_cutoff_is_dropped() {
+        let cutoff = "20260115";
+
+        // Days: strictly before goes, the cutoff itself stays.
+        assert!(wholly_before("20260114", cutoff));
+        assert!(!wholly_before("20260115", cutoff));
+        assert!(!wholly_before("20260116", cutoff));
+
+        // Months: December is wholly before; January is the month the cutoff is in and holds
+        // days after it, so it stays. This is the case the day-only version got wrong by never
+        // considering it at all.
+        assert!(wholly_before("202512", cutoff));
+        assert!(!wholly_before("202601", cutoff));
+        assert!(!wholly_before("202602", cutoff));
+
+        // Years: the same, one level up.
+        assert!(wholly_before("2025", cutoff));
+        assert!(!wholly_before("2026", cutoff));
+
+        // Hours are finer than the cutoff, so they are judged by their day.
+        assert!(wholly_before("2026011423", cutoff));
+        assert!(!wholly_before("2026011500", cutoff));
+
+        // Not a time view. The reserved views carry no name here, and a name of another shape is
+        // not this rule's to judge.
+        assert!(!wholly_before("", cutoff));
+        assert!(!wholly_before("january", cutoff));
+        assert!(!wholly_before("2026011", cutoff));
     }
 }

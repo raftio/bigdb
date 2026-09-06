@@ -85,6 +85,97 @@ pub enum Shown {
         /// `SHOW CREATE x` means, and what makes the bare form useful for exploring.
         view: bool,
     },
+    /// `SHOW PROCESSLIST`: the queries running on the node that answers.
+    ///
+    /// **Node-local, and the answer says so with a `node` column.** A coordinator holds the
+    /// ranges it owns; a cluster-wide listing would be a fan-out, and one that showed peers'
+    /// *legs* of a fanned-out query as separate rows would be more confusing than useful. The
+    /// honest answer is the local one under a name that admits it.
+    Processlist,
+    /// `SELECT * FROM system.tables`: the catalog, asked about in the language everything else
+    /// is asked about in.
+    ///
+    /// **A `Shown` and not a query, even though it is written as one.** Every cell of a
+    /// [`crate::Shape`] names a plan by index, and no plan produces this: the answer is in the
+    /// catalog each node already holds. It joins the listings above rather than becoming the
+    /// first `Statement` with an empty `calls` list under a shape naming plans that do not
+    /// exist.
+    ///
+    /// It is a *separate variant* from [`Shown::Tables`] rather than a second spelling of it,
+    /// and the reason is [`Shown::fill_database`]: a bare `SHOW TABLES` means the request's
+    /// database, and `system.tables` means every database. Reusing the variant would make the
+    /// question quietly narrower than it reads, which is the kind of wrong answer nobody checks.
+    System {
+        view: SystemView,
+        /// `WHERE database = '<name>'`, the one filter these views take.
+        database: Option<String>,
+        /// `WHERE table = '<name>'`, accepted on [`SystemView::Columns`] only.
+        table: Option<String>,
+        /// The columns the select list named, or `None` for `*`.
+        ///
+        /// `*` here means *every column*, which is the opposite of what it means over a real
+        /// table - there it is the record id. That is why the parser decides which kind of
+        /// statement this is from the `FROM` before it reads the select list at all.
+        columns: Option<Vec<String>>,
+    },
+}
+
+/// The database name this build's own views live under.
+///
+/// A constant rather than a literal in three files, because it is read in two places that must
+/// agree: the parser forks on it before the select list, and `CREATE DATABASE` refuses it.
+pub const SYSTEM_DATABASE: &str = "system";
+
+/// Which view under `system.` was named.
+///
+/// A closed enum rather than a string, so that a name this build does not have is refused at the
+/// name - by [`crate::Refused::SystemTable`], which lists the ones that exist - instead of
+/// reaching a layer that would have to answer "no such thing" in some other vocabulary.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SystemView {
+    /// Every table and view, in every database.
+    Tables,
+    /// Every column of every table.
+    Columns,
+    /// Every database.
+    Databases,
+    /// **Every fragment**, which is the one thing here no other statement can show.
+    ///
+    /// `system.tables` repeats `SHOW TABLES`; this does not repeat anything. A fragment is
+    /// `(table, field, view, shard)`, and being able to list them is what turns "the query is
+    /// slow" into a question with an answer.
+    Parts,
+}
+
+impl SystemView {
+    /// The name written after `system.`, for the message that lists them.
+    ///
+    /// Here rather than spelled out in `Refused::why` so that a view added to the enum and not
+    /// to the sentence is a change in one file rather than a sentence that goes quietly stale.
+    pub const NAMES: [&'static str; 4] = ["tables", "columns", "databases", "parts"];
+
+    /// The view a name after `system.` refers to, if it is one.
+    #[must_use]
+    pub fn of(name: &str) -> Option<Self> {
+        Some(match name.to_ascii_lowercase().as_str() {
+            "tables" => Self::Tables,
+            "columns" => Self::Columns,
+            "databases" => Self::Databases,
+            "parts" => Self::Parts,
+            _ => return None,
+        })
+    }
+
+    /// The name it was written under.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Tables => "tables",
+            Self::Columns => "columns",
+            Self::Databases => "databases",
+            Self::Parts => "parts",
+        }
+    }
 }
 
 impl Shown {
@@ -103,7 +194,13 @@ impl Shown {
             }
             // Neither is about one database: a role is server-wide, which is what lets one
             // grant reach across two of them.
-            Self::Databases | Self::Roles | Self::Grants { .. } => {}
+            Self::Databases | Self::Roles | Self::Grants { .. } | Self::Processlist => {}
+            // **Deliberately untouched, and this is the whole reason it is its own variant.** A
+            // system view is a question about the server, not about the request's database, so
+            // filling one in would silently turn `SELECT * FROM system.tables` into a listing of
+            // one database - an answer that looks complete and is not. The `database` field here
+            // is a *filter somebody wrote*, never one inherited.
+            Self::System { .. } => {}
         }
     }
 }

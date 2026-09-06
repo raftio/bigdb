@@ -180,6 +180,30 @@ impl<P: PagerMut + Sync> Cluster<P> {
         self.ddl(&Ddl::DropTable { table: table.to_string() }).map(|n| n == 1)
     }
 
+    /// `TRUNCATE TABLE`: empties a table everywhere, keeping it declared.
+    ///
+    /// Travels the same leader-then-fan-out path a drop takes, and for the sharper version of
+    /// the same reason: a node that missed it still holds the records, and unlike a drop there
+    /// is no name missing afterwards to make that visible. What comes back is the leader's
+    /// count of fragments, which is what every other schema change answers with.
+    pub fn truncate_table(&self, table: &str) -> Result<u64> {
+        self.ddl(&Ddl::TruncateTable { table: table.to_string() })
+    }
+
+    /// Retention, cluster-wide: drop a time-quantum field's index before an instant.
+    ///
+    /// **This is the spelling `big-bin`'s offline tool said belonged with the other DDL.** Its
+    /// own doc gives the reason: a node that dropped a day while another has not would answer a
+    /// window query with part of the truth and no symptom at all. Going through the leader and
+    /// then every node is what makes the answer the same everywhere.
+    pub fn drop_views_before(&self, table: &str, field: &str, unix_seconds: i64) -> Result<u64> {
+        self.ddl(&Ddl::DropViewsBefore {
+            table: table.to_string(),
+            field: field.to_string(),
+            unix_seconds,
+        })
+    }
+
     pub fn drop_field(&self, table: &str, field: &str) -> Result<bool> {
         self.ddl(&Ddl::DropField { table: table.to_string(), field: field.to_string() })
             .map(|n| n == 1)
@@ -285,6 +309,13 @@ pub fn apply_ddl<P: PagerMut + Sync>(api: &Api<P>, op: &Ddl) -> big_embed::Resul
             api.create_time_quantum(table, field, granularity.clone())? as u64
         }
         Ddl::DropTable { table } => api.drop_table(table)? as u64,
+        // A table that is not here counts as nothing truncated rather than as a failure: the
+        // leader has already ruled on whether it exists, so a peer without it is a peer that
+        // never had the data this is removing.
+        Ddl::TruncateTable { table } => api.truncate_table(table)?.unwrap_or(0),
+        Ddl::DropViewsBefore { table, field, unix_seconds } => {
+            api.drop_days_before(table, field, *unix_seconds)? as u64
+        }
         Ddl::DropField { table, field } => api.drop_field(table, field)? as u64,
         Ddl::CreateDatabase { name } => api.create_database(name)? as u64,
         // Always cascading here: whether `CASCADE` was written was judged at the leader, and

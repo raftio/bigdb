@@ -74,8 +74,23 @@ pub fn expand(parsed: &mut Parsed, catalog: &Catalog) -> Result<()> {
         // `SELECT ... FROM v` means describing the statement `v` stands for. The parser refuses
         // a second `EXPLAIN`, so this recurses exactly once.
         Parsed::Explain { inner, .. } => expand(inner, catalog),
+        // A budget names no source either, so the statement under it is expanded as written.
+        Parsed::Settings { inner, .. } => expand(inner, catalog),
         // A schema change, a listing and a grant name no source to read through.
-        Parsed::Insert(_) | Parsed::Show(_) | Parsed::Ddl(_) | Parsed::Acl(_) => Ok(()),
+        //
+        // A `DELETE` is here with the `INSERT` and for the same reason: it is not expanded, and
+        // naming a view is refused where the table is resolved. Deleting *through* a view is a
+        // coherent thing to want - the view's filter would `AND` into the statement's, exactly
+        // as it does for a read - but it is a decision about which records go, and it is not
+        // being made silently as a side effect of a rewrite written for reads. The behaviour is
+        // pinned in `big-cluster/tests/logic/delete.test`.
+        Parsed::Insert(_)
+        | Parsed::Delete(_)
+        | Parsed::Update(_)
+        | Parsed::Kill(_)
+        | Parsed::Show(_)
+        | Parsed::Ddl(_)
+        | Parsed::Acl(_) => Ok(()),
     }
 }
 

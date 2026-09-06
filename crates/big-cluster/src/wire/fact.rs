@@ -213,9 +213,30 @@ pub enum Ddl {
     DropTable {
         table: String,
     },
+    /// `TRUNCATE TABLE`: the data goes, the table stays.
+    ///
+    /// A variant of its own rather than a drop followed by a create, and the reason is what it
+    /// must *not* do: a table recreated under the same name would intern fresh row ids, and a
+    /// peer still holding a mapping it resolved earlier would then disagree with it about what a
+    /// row id means. Emptying is one operation everywhere, or it is not the same operation.
+    TruncateTable {
+        table: String,
+    },
     DropField {
         table: String,
         field: String,
+    },
+    /// Retention: drop a time-quantum field's index for every period wholly before an instant.
+    ///
+    /// **Travels as a schema change because it has to reach every node.** A node that dropped a
+    /// day while another has not answers a window query with part of the truth and no symptom -
+    /// which is exactly why `big compact`'s offline spelling said a cluster-wide one belongs
+    /// here. The instant travels rather than the day name, so two nodes cannot disagree about
+    /// which day an instant falls in.
+    DropViewsBefore {
+        table: String,
+        field: String,
+        unix_seconds: i64,
     },
     CreateDatabase {
         name: String,
@@ -294,6 +315,16 @@ impl Ddl {
                 for g in granularity {
                     put_u8(&mut out, g.as_char() as u8);
                 }
+            }
+            Self::DropViewsBefore { table, field, unix_seconds } => {
+                put_u8(&mut out, 14);
+                put_str(&mut out, table);
+                put_str(&mut out, field);
+                put_u64(&mut out, *unix_seconds as u64);
+            }
+            Self::TruncateTable { table } => {
+                put_u8(&mut out, 13);
+                put_str(&mut out, table);
             }
             Self::DropTable { table } => {
                 put_u8(&mut out, 4);
@@ -390,6 +421,12 @@ impl Ddl {
             9 => Self::DropView { view: r.str()? },
             10 => Self::CreateRole { role: r.str()? },
             11 => Self::DropRole { role: r.str()? },
+            13 => Self::TruncateTable { table: r.str()? },
+            14 => Self::DropViewsBefore {
+                table: r.str()?,
+                field: r.str()?,
+                unix_seconds: r.u64()? as i64,
+            },
             12 => Self::SetGrant {
                 role: r.str()?,
                 database: r.str()?,

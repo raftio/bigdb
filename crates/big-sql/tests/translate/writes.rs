@@ -171,3 +171,43 @@ fn a_malformed_insert_is_a_syntax_error() {
         assert_eq!(code(sql), "parse_error", "{sql}");
     }
 }
+
+/// **A delete selects by the same tree a select does**, compared as trees rather than as text.
+///
+/// The corpus writes the two statements next to each other so a reader can see it; this is the
+/// version that cannot drift. If these two ever diverge, the predicate a client tested with a
+/// `SELECT` is not the predicate that would do the deleting - which is the one bug in this
+/// feature that nobody would notice until after the records were gone.
+#[test]
+fn a_delete_selects_by_the_same_tree_a_select_does() {
+    for filter in [
+        "amount >= 500",
+        "amount >= 500 AND country = 'GB'",
+        "NOT country = 'GB'",
+        "country IN ('GB', 'US')",
+        "visit BETWEEN 100 AND 200",
+        "country LIKE 'G%'",
+        "amount >= 500 OR (country = 'GB' AND active = true)",
+    ] {
+        let big_sql::Sql::Delete(deleted) =
+            big_sql::translate(&format!("DELETE FROM t WHERE {filter}")).unwrap()
+        else {
+            panic!("a DELETE is a delete")
+        };
+        // The `SELECT *` over the same predicate. Its call is a `Project` whose first argument
+        // is the row set, which is the thing being compared.
+        let counted = translate(&format!("SELECT count(*) FROM t WHERE {filter}")).unwrap();
+        let rows_of_count = counted.calls[0]
+            .call
+            .args
+            .first()
+            .cloned()
+            .expect("a Count carries the row set it counts");
+
+        assert_eq!(
+            big_plan::ast::Expr::Call(deleted.rows.clone()),
+            rows_of_count,
+            "delete and select disagree about `{filter}`"
+        );
+    }
+}

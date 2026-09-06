@@ -18,6 +18,7 @@ use super::Parser;
 use crate::ddl::{Column, ColumnKind};
 use crate::error::{Refused, Result};
 use crate::lex::Tok;
+use crate::show::SYSTEM_DATABASE;
 
 impl Parser<'_> {
     /// `CREATE TABLE [IF NOT EXISTS] <name> [(<column>, ...)] [ENGINE = <engine>]`, with
@@ -43,7 +44,15 @@ impl Parser<'_> {
         if self.word_is("DATABASE") || self.word_is("SCHEMA") || self.word_is("DATASET") {
             self.i += 1;
             let if_not_exists = self.if_exists(true)?;
+            let at = self.at();
             let name = self.bare_ident("a database name")?;
+            // `system` is where this build's own views live, so a database of that name is one
+            // nobody could ever query: `SELECT * FROM system.t` is read as a system view before
+            // it is read as a table. Refused at the name rather than created and shadowed -
+            // a table you can write to and never read from is the worst of the two answers.
+            if name.eq_ignore_ascii_case(SYSTEM_DATABASE) {
+                return Err(self.refuse_at(Refused::SystemTable, at));
+            }
             if self.peek().is_some() {
                 return Err(self.syntax("the end of the statement"));
             }
@@ -93,6 +102,11 @@ impl Parser<'_> {
             None
         };
 
+        // Refused at the word, with the statement that does it named. A `TTL` accepted and
+        // stored would be a promise nothing in this process keeps.
+        if self.word_is("TTL") {
+            return Err(self.refuse(Refused::DeclarativeTtl));
+        }
         if self.peek().is_some() {
             return Err(self.syntax("the end of the statement"));
         }
@@ -317,6 +331,16 @@ impl Parser<'_> {
                     return Err(self.refuse_at(Refused::ColumnType, at));
                 }
                 Column { name, kind: Set, bit_depth: KEYLESS_DEPTH, scale: None }
+            }
+            // The two wrappers this engine recognises and declines, refused at the word that
+            // names them rather than after the bracket is read. Nothing is consumed first
+            // because nothing needs to be: the statement stops here, so there is no second
+            // error for a swallowed bracket to prevent - and refusing at the token means
+            // `Nullable(Decimal(10, 2))`, which `wrapped_type` could not read, says the same
+            // sentence as `Nullable(Int64)` rather than a syntax error about a nested `(`.
+            "NULLABLE" => return Err(self.refuse_at(Refused::NullableType, at)),
+            "BITMAP" | "AGGREGATEFUNCTION" | "HLL" | "QUANTILE_STATE" => {
+                return Err(self.refuse_at(Refused::BitmapType, at))
             }
             "TINYINT" | "SMALLINT" | "INT" | "INTEGER" | "BIGINT" => {
                 if self.peek() == Some(&Tok::LParen) {

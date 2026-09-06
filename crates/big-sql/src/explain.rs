@@ -83,6 +83,24 @@ pub enum Explained<'a> {
     Show(&'a Show),
     /// A change to who may do what, which is already wholly in the parse tree.
     Acl(&'a Acl),
+    /// A delete, as the plan that selects what it would clear.
+    ///
+    /// **Resolved and not run, which is what makes it worth having.** The tree here is the one
+    /// the statement would actually select by, against the real schema - so `EXPLAIN DELETE` is
+    /// how somebody checks a predicate before running it against records they cannot get back.
+    Update {
+        table: &'a str,
+        /// The columns written, as `name = value`.
+        assignments: &'a [(String, big_plan::Literal)],
+        /// The row set, planned.
+        rows: &'a Plan,
+    },
+    Delete {
+        table: &'a str,
+        /// The row set, planned. A `Plan` rather than a `Call`, because the point of explaining
+        /// is to show what it resolves to.
+        rows: &'a Plan,
+    },
 }
 
 /// A statement, written out instead of run. No trailing newline, and **no blank line anywhere**.
@@ -149,6 +167,16 @@ pub fn explained(mode: ExplainMode, what: &Explained<'_>) -> String {
         Explained::Acl(a) => {
             out.push("acl".to_string());
             out.push(acl(a));
+        }
+        Explained::Delete { table, rows } => {
+            out.push(format!("delete {table}"));
+            out.push(big_plan::explain(rows));
+        }
+        Explained::Update { table, assignments, rows } => {
+            let set: Vec<String> =
+                assignments.iter().map(|(c, v)| format!("{c} = {}", literal(v))).collect();
+            out.push(format!("update {table} set {}", set.join(", ")));
+            out.push(big_plan::explain(rows));
         }
     }
     out.join("\n").lines().filter(|l| !l.trim().is_empty()).collect::<Vec<_>>().join("\n")
@@ -472,6 +500,11 @@ pub fn ddl(ddl: &Ddl) -> String {
             write_lines(&mut out, &kids, "");
             out
         }
+        Ddl::TruncateTable { database, table, if_exists } => format!(
+            "TruncateTable {}{}",
+            qualified(database, table),
+            if *if_exists { " if_exists" } else { "" },
+        ),
         Ddl::AlterTable { database, table, changes } => {
             let mut out = format!("AlterTable {}", qualified(database, table));
             let kids: Vec<Line> = changes
@@ -480,6 +513,9 @@ pub fn ddl(ddl: &Ddl) -> String {
                     Line::Text(match c {
                         Alter::Add(col) => format!("add {}", column(col)),
                         Alter::Drop(name) => format!("drop {name}"),
+                        Alter::DropDaysBefore { column, before } => {
+                            format!("drop days before {before} on {column}")
+                        }
                     })
                 })
                 .collect();
@@ -603,6 +639,7 @@ pub fn show(show: &Show) -> String {
             None => "Views".to_string(),
         },
         Shown::Databases => "Databases".to_string(),
+        Shown::Processlist => "Processlist".to_string(),
         Shown::Roles => "Roles".to_string(),
         Shown::Grants { role } => match role {
             Some(r) => format!("Grants {r}"),
@@ -610,6 +647,21 @@ pub fn show(show: &Show) -> String {
         },
         Shown::Create { database, table, view } => {
             format!("Create {}{}", qualified(database, table), if *view { " view" } else { "" })
+        }
+        Shown::System { view, database, table, columns } => {
+            let mut out = format!("System {}", view.as_str());
+            // The columns first, because they are what the answer *is*; the filters after, in
+            // the order the statement could have written them.
+            if let Some(columns) = columns {
+                out.push_str(&format!(" columns=[{}]", columns.join(", ")));
+            }
+            if let Some(d) = database {
+                out.push_str(&format!(" database={d}"));
+            }
+            if let Some(t) = table {
+                out.push_str(&format!(" table={t}"));
+            }
+            out
         }
     };
     match show.format {
@@ -657,6 +709,11 @@ fn privilege_list(privileges: big_sql_privileges) -> String {
 /// Shared with [`crate::Scalar::print`], which writes constants inside an expression and must
 /// write them the same way this does - two printers for one kind of value is one printer plus
 /// the day they disagree about `1.50`.
+/// A literal as it is written back out, for the printers above and for the test corpus.
+pub fn literal_of(literal: &Literal) -> String {
+    self::literal(literal)
+}
+
 pub(crate) fn literal(literal: &Literal) -> String {
     match literal {
         Literal::Int(n) => n.to_string(),

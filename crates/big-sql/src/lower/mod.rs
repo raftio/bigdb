@@ -38,7 +38,8 @@ use big_plan::ast::{Call, Expr, Literal};
 /// denial of service; `avg` costs two, which is the case worth knowing about.
 pub const MAX_CALLS: usize = 16;
 
-mod cond;
+pub(crate) mod cond;
+pub mod delete;
 mod grouped;
 mod join;
 mod measure;

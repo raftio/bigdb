@@ -504,3 +504,63 @@ fn a_scalar_is_checked_against_the_kind_of_column_it_reads() {
         .unwrap_err();
     assert_eq!(e.code(), "bad_rounding");
 }
+
+/// **A budget is not part of what the statement asks**, and this is where that claim is testable.
+///
+/// The whole design of the clause rests on it: if a `SETTINGS` changed the lowering, then two
+/// spellings of one question would resolve to two plans, and the coordinator would be merging
+/// answers to statements that were not the same statement. So the assertion is equality of the
+/// lowered form, not a property of it.
+#[test]
+fn a_settings_clause_changes_nothing_about_the_statement_it_bounds() {
+    let bare = big_sql::translate("SELECT count(*) FROM t WHERE amount >= 500").unwrap();
+    let bounded = big_sql::translate(
+        "SELECT count(*) FROM t WHERE amount >= 500 SETTINGS max_execution_time = 30",
+    )
+    .unwrap();
+
+    let big_sql::Sql::Query(bare) = bare else { panic!("a SELECT is a query") };
+    let big_sql::Sql::Settings { settings, inner } = bounded else { panic!("the clause wraps it") };
+    let big_sql::Sql::Query(bounded) = *inner else { panic!("it wraps a query") };
+
+    assert_eq!(bare, bounded, "the clause changed the plan it was only meant to bound");
+    assert_eq!(settings.max_execution_time, Some(30));
+    assert_eq!(settings.max_memory_usage, None);
+
+    // And what it demands is the inner statement's: a limit is not an authority. Without this a
+    // narrowed statement could reach a table the same statement unnarrowed could not.
+    let bounded =
+        big_sql::translate("SELECT count(*) FROM t SETTINGS max_result_rows = 1").unwrap();
+    let bare = big_sql::translate("SELECT count(*) FROM t").unwrap();
+    assert_eq!(bounded.demands(), bare.demands());
+}
+
+/// One position, so that two of them cannot disagree.
+#[test]
+fn the_settings_clause_is_read_once_and_after_format() {
+    // After `FORMAT`, which is where this dialect puts it - ClickHouse puts it before.
+    assert!(big_sql::translate("SELECT count(*) FROM t FORMAT TSV SETTINGS max_result_rows = 5")
+        .is_ok());
+    // ...so the ClickHouse order is a syntax error rather than a second accepted spelling.
+    assert!(big_sql::translate("SELECT count(*) FROM t SETTINGS max_result_rows = 5 FORMAT TSV")
+        .is_err());
+
+    // Once for the whole union, not once per branch: a union produces one answer, and a
+    // per-branch deadline would bound a part of it nobody receives on its own.
+    let both = big_sql::translate(
+        "SELECT count(*) FROM t UNION ALL SELECT count(*) FROM u SETTINGS max_result_rows = 5",
+    )
+    .unwrap();
+    let big_sql::Sql::Settings { settings, inner } = both else {
+        panic!("the clause wraps the union")
+    };
+    assert_eq!(settings.max_result_rows, Some(5));
+    let big_sql::Sql::Query(q) = *inner else { panic!("a union is a query") };
+    assert_eq!(q.calls.len(), 2, "both branches are still there");
+
+    // A clause on the first branch is not a place the parser reads one.
+    assert!(big_sql::translate(
+        "SELECT count(*) FROM t SETTINGS max_result_rows = 5 UNION ALL SELECT count(*) FROM u"
+    )
+    .is_err());
+}
