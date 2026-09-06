@@ -289,7 +289,7 @@ fn explained(mode: big_sql::ExplainMode, inner: Sql) -> String {
         // The parser refuses a second `EXPLAIN`, so no statement in the corpus reaches this.
         Sql::Explain { .. } => "explain of an explain".to_string(),
         // Nothing is resolved for a kill: it names a query id, not an object in the catalog.
-        Sql::Kill(id) => format!("kill {id}"),
+        Sql::Kill(id) => big_sql::explain::explained(mode, &Explained::Kill(&id)),
         // Resolved against `Stub`, the same way a query's plans are - which is what makes
         // `EXPLAIN DELETE` a way to check a predicate before running it against records that do
         // not come back.

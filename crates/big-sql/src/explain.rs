@@ -88,6 +88,8 @@ pub enum Explained<'a> {
     /// **Resolved and not run, which is what makes it worth having.** The tree here is the one
     /// the statement would actually select by, against the real schema - so `EXPLAIN DELETE` is
     /// how somebody checks a predicate before running it against records they cannot get back.
+    /// `KILL QUERY '<id>'`, which needs no schema: it names a query rather than an object.
+    Kill(&'a str),
     Update {
         table: &'a str,
         /// The columns written, as `name = value`.
@@ -172,6 +174,7 @@ pub fn explained(mode: ExplainMode, what: &Explained<'_>) -> String {
             out.push(format!("delete {table}"));
             out.push(big_plan::explain(rows));
         }
+        Explained::Kill(id) => out.push(format!("kill {id}")),
         Explained::Update { table, assignments, rows } => {
             let set: Vec<String> =
                 assignments.iter().map(|(c, v)| format!("{c} = {}", literal(v))).collect();

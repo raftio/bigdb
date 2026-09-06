@@ -25,9 +25,10 @@
 //! being fuzzed - if it is ever removed this target stops returning and starts crashing, which
 //! is the point.
 //!
-//! **A statement is six different things.** A query, an insert, a listing, a schema change and a
-//! change to who may do what leave by five different doors, an `EXPLAIN` wraps whichever of them
-//! it was given, and each carries structure the others do not. So a successful translation is
+//! **A statement is nine different things.** A query, an insert, a delete, an update, a listing,
+//! a schema change, a change to who may do what and a kill leave by eight different doors; an
+//! `EXPLAIN` wraps whichever of them it was given and a `SETTINGS` clause wraps the ones that
+//! spend something, and each carries structure the others do not. So a successful translation is
 //! walked afterwards: printing it traverses the same tree every reader downstream will, and a
 //! value the parser can build but nothing else can look at fails here rather than in a request.
 //!
@@ -109,6 +110,54 @@ fuzz_target!(|data: &[u8]| {
             assert!(!big_sql::explain::insert(&i).is_empty());
         }
         big_sql::Sql::Show(s) => assert!(!big_sql::explain::show(&s).is_empty()),
+        // **The three promises the parser makes about a delete that its type does not hold.**
+        // The `WHERE` is required, so the call is never a bare `All()` that would clear the
+        // table; the table name resolves to something; and the tables the filter reads are
+        // collected for `demands`, so a name in that list that the statement never wrote would
+        // be a privilege demanded on an object nobody asked about.
+        big_sql::Sql::Delete(d) => {
+            assert!(!d.qualified().is_empty(), "a delete with no table in `{text}`");
+            assert!(d.rows.name != "All", "a delete with no filter in `{text}`");
+            for read in &d.reads {
+                assert!(!read.is_empty(), "a delete reading an unnamed table in `{text}`");
+            }
+        }
+        // The same, and one more: the assignment list is never empty - the parser loops at
+        // least once - and no assignment names the record column, which is refused where it is
+        // written because a record id is an address rather than a value in a column.
+        big_sql::Sql::Update(u) => {
+            assert!(!u.qualified().is_empty(), "an update with no table in `{text}`");
+            assert!(u.rows.name != "All", "an update with no filter in `{text}`");
+            assert!(!u.assignments.is_empty(), "an update assigning nothing in `{text}`");
+            for (column, _) in &u.assignments {
+                assert_ne!(column, big_sql::RECORD_COLUMN, "an update of the id in `{text}`");
+            }
+        }
+        // A kill is one string, and explaining it needs no schema - which is the whole of what
+        // there is to walk.
+        big_sql::Sql::Kill(id) => {
+            assert!(!big_sql::explain::explained(
+                big_sql::ExplainMode::All,
+                &big_sql::explain::Explained::Kill(&id)
+            )
+            .is_empty());
+        }
+        // **The wrapper is never empty and never doubled**, neither of which the type holds:
+        // the parser leaves it off entirely when no key was written, and reads the clause once
+        // per statement. A `max_delete_records` outside a delete is refused in `finish`, so a
+        // statement carrying one anywhere else got past a check that is supposed to be total.
+        big_sql::Sql::Settings { settings, inner } => {
+            assert!(!settings.is_empty(), "an empty SETTINGS wrapper in `{text}`");
+            assert!(
+                !matches!(*inner, big_sql::Sql::Settings { .. }),
+                "`{text}` carried two SETTINGS clauses"
+            );
+            assert!(
+                settings.max_delete_records.is_none()
+                    || matches!(*inner, big_sql::Sql::Delete(_)),
+                "`{text}` bounded a delete that is not one"
+            );
+        }
         // A grant is wholly in the parse tree, so the only thing left to walk is its printer.
         big_sql::Sql::Acl(a) => assert!(!big_sql::explain::acl(&a).is_empty()),
         big_sql::Sql::Ddl(d) => {
@@ -159,9 +208,18 @@ fuzz_target!(|data: &[u8]| {
                 big_sql::Sql::Acl(a) => {
                     (big_sql::explain::Explained::Acl(a), big_sql::explain::acl(a))
                 }
+                big_sql::Sql::Kill(id) => {
+                    (big_sql::explain::Explained::Kill(id), format!("kill {id}"))
+                }
                 // A query's half needs a schema to resolve, and this target links none. Its
-                // plans and shape are fuzzed through the `Sql::Query` arm above instead.
-                big_sql::Sql::Query(_) | big_sql::Sql::Explain { .. } => return,
+                // plans and shape are fuzzed through the `Sql::Query` arm above instead - and a
+                // delete's and an update's are resolved the same way, against a catalog, so they
+                // leave by the same door.
+                big_sql::Sql::Query(_)
+                | big_sql::Sql::Delete(_)
+                | big_sql::Sql::Update(_)
+                | big_sql::Sql::Settings { .. }
+                | big_sql::Sql::Explain { .. } => return,
             };
             assert!(!part.is_empty(), "`{text}` explained to nothing");
             assert!(

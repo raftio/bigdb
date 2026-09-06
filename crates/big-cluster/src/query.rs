@@ -611,9 +611,14 @@ impl<P: PagerMut + Sync> Cluster<P> {
                     Format::default(),
                 )
             }
-            big_embed::Sql::Kill(_)
-            | big_embed::Sql::Explain { .. }
-            | big_embed::Sql::Settings { .. } => {
+            // Explaining a kill needs no schema - it names a query, not an object - so it is
+            // answered rather than refused. Every statement this dialect has is explainable,
+            // which is a property `gates.rs` holds over the whole corpus.
+            big_embed::Sql::Kill(id) => (
+                big_embed::explain::result_set(mode, &big_embed::explain::Explained::Kill(&id)),
+                Format::default(),
+            ),
+            big_embed::Sql::Explain { .. } | big_embed::Sql::Settings { .. } => {
                 return Err(ClusterError::Local(big_embed::ApiError::Sql(
                     big_embed::SqlError::Syntax {
                         at: 0,
