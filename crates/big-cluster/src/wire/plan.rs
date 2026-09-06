@@ -174,7 +174,7 @@ fn get_rows_at(r: &mut Reader<'_>, depth: usize) -> Result<Rows> {
 
 fn get_list(r: &mut Reader<'_>, depth: usize) -> Result<Vec<Rows>> {
     let n = r.count()?;
-    let mut parts = Vec::with_capacity(n);
+    let mut parts = reserve(n);
     for _ in 0..n {
         parts.push(get_rows_at(r, depth + 1)?);
     }
@@ -323,7 +323,7 @@ fn get_plan_at(r: &mut Reader<'_>, depth: usize) -> Result<Plan> {
             let table = r.str()?;
             let rows = get_rows(r)?;
             let n = r.count()?;
-            let mut levels = Vec::with_capacity(n);
+            let mut levels = reserve(n);
             for _ in 0..n {
                 levels.push(get_level(r)?);
             }
@@ -340,7 +340,7 @@ fn get_plan_at(r: &mut Reader<'_>, depth: usize) -> Result<Plan> {
             let table = r.str()?;
             let rows = get_rows(r)?;
             let n = r.count()?;
-            let mut fields = Vec::with_capacity(n);
+            let mut fields = reserve(n);
             for _ in 0..n {
                 fields.push(r.str()?);
             }

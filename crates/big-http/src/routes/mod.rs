@@ -17,7 +17,7 @@
 //! ```text
 //! GET    /health                   liveness; never authenticated
 //! GET    /ready                    readiness; never authenticated
-//! GET    /metrics                  Prometheus text                       read
+//! GET    /metrics                  Prometheus text                    operate
 //! GET    /schema                                                         read
 //! GET    /verify                   do the copies of every range agree     read
 //! POST   /repair                   catch up every copy that is behind     admin
@@ -94,11 +94,13 @@
 //! has one - which is a token in more places than the data it guards. Neither route reveals
 //! anything: liveness is a constant, and readiness is whether the engine answers at all.
 //!
-//! **Why `/metrics` needs only `read`.** Page counts, reader counts and I/O rates are far less
-//! than the data itself - the storage counters say how many pages moved, never which - and a
-//! scraper is not an administrator. Give a scraper its own read token; if a
-//! deployment needs a credential that can scrape and nothing else, a fourth role is the change
-//! to make, not an exception here.
+//! **Why `/metrics` needs `OPERATE` rather than `read`.** It was argued the other way once,
+//! and the argument was about the data: page counts, reader counts and I/O rates say how many
+//! pages moved and never which, so a scraper is not reading anybody's rows. What settled it is
+//! that the question is not about rows at all. `/metrics` answers about the *process* - what
+//! this node is, what its agreement thinks, what its peers are doing - and that is the same
+//! question `/verify` and `/repair` answer, held under the same server-wide privilege. Give a
+//! scraper a role holding `OPERATE` on `*.*` and nothing else.
 //!
 //! Deleting records is a `POST` to `/delete` rather than a `DELETE` on the table, because the
 //! ids arrive in the body: a `DELETE` carrying a body is legal but widely mishandled by

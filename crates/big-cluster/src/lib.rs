@@ -372,6 +372,10 @@ impl<P: PagerMut + Sync> Cluster<P> {
             None => (0, false),
             Some(c) => (c.term(), c.is_leader()),
         };
+        let (wedged, messages_dropped) = match &self.controller {
+            None => (false, 0),
+            Some(c) => (c.wedged(), c.dropped_messages()),
+        };
         let map = self.map();
         let behind = map.stale.len();
         let moving = map.ranges.iter().filter(|r| r.moving.is_some()).count();
@@ -386,6 +390,8 @@ impl<P: PagerMut + Sync> Cluster<P> {
             moving,
             schema_ready: map.schema_ready,
             handover_blocked: self.handover_blocked.load(std::sync::atomic::Ordering::Relaxed),
+            wedged,
+            messages_dropped,
             counts: self.counters.read(),
         }
     }

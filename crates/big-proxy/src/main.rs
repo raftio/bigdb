@@ -29,87 +29,9 @@ use std::sync::Arc;
 
 const DEFAULT_ADDR: &str = "127.0.0.1:7650";
 
-const USAGE: &str = "\
-usage: bigproxy [addr] [options]
-
-  addr                        defaults to 127.0.0.1:7650
-
-Upstreams:
-  --upstream <name=addr>      a node to send requests to; repeat for each one
-                              the name is not decoration: it is the TLS server name, because
-                              a node certificate carries subjectAltName = DNS:<node>
-  --cluster <file>            take name and addr from a cluster.toml instead
-                              shards, replica and schema_leader are read and ignored: every
-                              node is a coordinator, so this proxy does not route by key.
-                              It also does not refuse a file with a shard gap, because that
-                              is the daemon's problem and a front door that will not start
-                              turns one outage into two.
-                              The file is a seed, not the truth: a node admitted after this
-                              proxy started is not in it. See docs/clustering.md
-
-Health:
-  --health-interval <ms>      how often each node is asked GET /ready, default 2000
-  --health-timeout <ms>       how long a node has to answer it, default 1000
-  --health-fail <n>           consecutive failures before a node leaves rotation, default 3
-  --health-pass <n>           consecutive successes before it comes back, default 2
-  --max-retries <n>           tries on other nodes, default 2. Never applied to a write whose
-                              bytes have already left; see readme.md
-
-Membership:
-  --discover                  follow the cluster's membership instead of only the list above.
-                              Off by default: a proxy that grows an upstream nobody wrote down
-                              is one whose shape an operator cannot predict from what they
-                              wrote. On, a node admitted after this process started becomes
-                              reachable without restarting it - and a node removed from the
-                              cluster stops being sent requests.
-                              A discovered node starts *out* of rotation and earns its way in
-                              with --health-pass probes, because the moment a cluster announces
-                              a node is the moment it is least likely to have caught up
-  --discover-credentials <f>  one `user:password` line, mode 600, for a role holding Operate.
-                              Reading the membership is `GET /cluster/topology`, which demands
-                              it; a cluster with no users file needs nothing here
-  --admin-addr <host:port>    a second listener where upstreams can be seeded while this runs:
-                                POST   /admin/upstream?name=a&addr=10.0.0.1:7654
-                                DELETE /admin/upstream?name=a
-                              **Loopback only, and refused anywhere else.** This proxy checks no
-                              credential of its own - it forwards the client's and never reads
-                              it - so a port that could add an upstream is a port that could
-                              point client traffic at anything. Reaching it has to mean already
-                              being on the machine.
-                              With --cluster-id, a seed must answer with that id before it is
-                              adopted, so a local caller cannot point this at another cluster
-  --cluster-id <name>         what the nodes behind this proxy call their cluster, checked
-                              against what a seeded node reports
-
-Forwarding:
-  --allow-ops                 also forward /verify, /repair, /cluster/topology and /admin/*.
-                              Off by default: every one of them asks about one node, and a
-                              proxy chooses which node without telling you
-  --no-ddl                    refuse CREATE and DROP as well, leaving reads and writes.
-                              The daemon's privilege check is the real boundary; this
-                              narrows the front door as well
-  --trust-forwarded-for       append to the client's X-Forwarded-For rather than replacing it.
-                              Only correct with a load balancer already in front
-
-Listener:
-  --tls-cert <file>           PEM certificate chain this proxy presents to clients
-  --tls-key <file>            PEM private key for it; file must be mode 600
-                              both need a build with the `tls` feature
-  --workers <n>               requests handled at once
-  --queue <n>                 connections allowed to wait; past this, 503
-  --read-timeout <seconds>    how long a client may take to send a request
-  --insecure-no-tls           allow a non-loopback bind in the clear. Says what it is.
-                              what you want when something else terminates TLS in front
-
-To the nodes:
-  --upstream-ca <file>        PEM CA the nodes' certificates must chain to. This MAY be the
-                              cluster's peer-ca.pem: trusting that CA is not being trusted
-                              by it. This proxy presents no client certificate and so can
-                              never reach /internal/*. There is deliberately no
-                              --upstream-cert and no --upstream-key; adding them would be
-                              adding /internal/* access
-  --insecure-skip-verify      do not verify node certificates. Says so on every run.
-
+/// The prose that is about the proxy rather than about a flag.
+const AFTER_LONG_HELP: &str = "\
+Environment:
   BIG_LOG=off|error|warn|info|debug   log level, default info
 
 Answered here, never forwarded:
@@ -119,50 +41,206 @@ Answered here, never forwarded:
                  it is not serving
   GET /metrics   Prometheus text about this proxy. The nodes' own /metrics are not
                  forwarded: one node's counters chosen at random are not a cluster's
-
-Everything else it forwards is in readme.md, and /internal/* is not on that list.
 ";
 
-#[derive(Debug)]
+/// Everything `bigproxy` was told.
+///
+/// `allowed` is the one field the command line does not spell directly: `--allow-ops` and
+/// `--no-ddl` are two steps on one ladder, so they are parsed as themselves and folded into a
+/// [`Tier`] by [`Options::tier`].
+#[derive(clap::Parser, Debug)]
+#[command(
+    name = "bigproxy",
+    version,
+    about = "One address in front of many nodes",
+    // Spelled out rather than left to the doc comment above, which is about the *struct* and
+    // would otherwise become what `--help` says this program is for.
+    long_about = "\
+One address in front of many nodes: health-aware forwarding and a route allowlist.
+
+This proxy checks no credential of its own - it forwards the client's Authorization header and
+never reads it - and it links no engine, which is a fact about its dependency graph rather than
+a sentence here. It does not route by key: every node is a coordinator.",
+    after_long_help = AFTER_LONG_HELP
+)]
 struct Options {
+    /// What to bind.
+    #[arg(value_name = "ADDR", default_value = DEFAULT_ADDR)]
     addr: String,
+
+    /// A node to send requests to; repeat for each one.
+    ///
+    /// The name is not decoration: it is the TLS server name, because a node certificate carries
+    /// `subjectAltName = DNS:<node>`.
+    // `long = "upstream"`, singular, because that is the flag: the field is plural because it
+    // collects. Every deploy file and `scripts/local-cluster` writes `--upstream`.
+    #[arg(
+        long = "upstream",
+        value_name = "NAME=ADDR",
+        value_parser = upstream,
+        verbatim_doc_comment
+    )]
     upstreams: Vec<(String, String)>,
+
+    /// Take name and addr from a cluster.toml instead.
+    ///
+    /// shards, replica and schema_leader are read and ignored: every node is a coordinator, so
+    /// this proxy does not route by key. It also does not refuse a file with a shard gap, because
+    /// that is the daemon's problem and a front door that will not start turns one outage into
+    /// two. The file is a seed, not the truth: a node admitted after this proxy started is not in
+    /// it. See docs/clustering.md.
+    #[arg(long, value_name = "FILE", verbatim_doc_comment)]
     cluster: Option<String>,
-    allowed: Tier,
-    trust_forwarded_for: bool,
-    workers: Option<usize>,
-    queue: Option<usize>,
-    read_timeout: Option<u64>,
+
+    /// How often each node is asked GET /ready, in milliseconds.
+    #[arg(long, value_name = "MS")]
     health_interval: Option<u64>,
+
+    /// How long a node has to answer it, in milliseconds.
+    #[arg(long, value_name = "MS")]
     health_timeout: Option<u64>,
+
+    /// Consecutive failures before a node leaves rotation.
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u8).range(1..))]
     health_fail: Option<u8>,
+
+    /// Consecutive successes before it comes back.
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u8).range(1..))]
     health_pass: Option<u8>,
+
+    /// Tries on other nodes.
+    ///
+    /// Never applied to a write whose bytes have already left; see readme.md.
+    #[arg(long, value_name = "N", verbatim_doc_comment)]
     max_retries: Option<usize>,
-    /// Follow the cluster's membership rather than only the list this proxy was given.
+
+    /// Follow the cluster's membership instead of only the list above.
+    ///
+    /// Off by default: a proxy that grows an upstream nobody wrote down is one whose shape an
+    /// operator cannot predict from what they wrote. On, a node admitted after this process
+    /// started becomes reachable without restarting it - and a node removed from the cluster
+    /// stops being sent requests. A discovered node starts *out* of rotation and earns its way in
+    /// with --health-pass probes, because the moment a cluster announces a node is the moment it
+    /// is least likely to have caught up.
+    #[arg(long, verbatim_doc_comment)]
     discover: bool,
-    /// A second listener, loopback only, where upstreams can be seeded while this runs.
-    admin_addr: Option<String>,
-    /// What the cluster behind this proxy is called, checked before a seed is adopted.
-    cluster_id: Option<String>,
-    /// A file holding one `user:password` line, for the read that follows it.
+
+    /// One `user:password` line, mode 600, for a role holding Operate.
+    ///
+    /// Reading the membership is `GET /cluster/topology`, which demands it; a cluster with no
+    /// users file needs nothing here.
+    #[arg(long, value_name = "FILE", verbatim_doc_comment)]
     discover_credentials: Option<String>,
+
+    /// A second listener where upstreams can be seeded while this runs.
+    ///
+    ///   POST   /admin/upstream?name=a&addr=10.0.0.1:7654
+    ///   DELETE /admin/upstream?name=a
+    ///
+    /// **Loopback only, and refused anywhere else.** This proxy checks no credential of its own -
+    /// it forwards the client's and never reads it - so a port that could add an upstream is a
+    /// port that could point client traffic at anything. Reaching it has to mean already being on
+    /// the machine. With --cluster-id, a seed must answer with that id before it is adopted, so a
+    /// local caller cannot point this at another cluster.
+    #[arg(long, value_name = "HOST:PORT", verbatim_doc_comment)]
+    admin_addr: Option<String>,
+
+    /// What the nodes behind this proxy call their cluster.
+    ///
+    /// Checked against what a seeded node reports.
+    #[arg(long, value_name = "NAME", verbatim_doc_comment)]
+    cluster_id: Option<String>,
+
+    /// Also forward /verify, /repair, /cluster/topology and /admin/*.
+    ///
+    /// Off by default: every one of them asks about one node, and a proxy chooses which node
+    /// without telling you.
+    #[arg(long, conflicts_with = "no_ddl", verbatim_doc_comment)]
+    allow_ops: bool,
+
+    /// Refuse CREATE and DROP as well, leaving reads and writes.
+    ///
+    /// The daemon's privilege check is the real boundary; this narrows the front door as well.
+    /// It and --allow-ops name overlapping ranges of one ladder, so asking for both is asking for
+    /// two different answers to one question.
+    #[arg(long, verbatim_doc_comment)]
+    no_ddl: bool,
+
+    /// Append to the client's X-Forwarded-For rather than replacing it.
+    ///
+    /// Only correct with a load balancer already in front.
+    #[arg(long, verbatim_doc_comment)]
+    trust_forwarded_for: bool,
+
+    /// PEM certificate chain this proxy presents to clients.
+    ///
+    /// Needs a build with the `tls` feature.
+    #[arg(long, value_name = "FILE", requires = "tls_key", verbatim_doc_comment)]
     tls_cert: Option<String>,
+
+    /// PEM private key for --tls-cert; file must be mode 600.
+    #[arg(long, value_name = "FILE", requires = "tls_cert")]
     tls_key: Option<String>,
-    upstream_ca: Option<String>,
-    insecure_skip_verify: bool,
+
+    /// Requests handled at once.
+    #[arg(long, value_name = "N")]
+    workers: Option<usize>,
+
+    /// Connections allowed to wait; past this, 503.
+    #[arg(long, value_name = "N")]
+    queue: Option<usize>,
+
+    /// How long a client may take to send a request, in seconds.
+    #[arg(long, value_name = "SECONDS")]
+    read_timeout: Option<u64>,
+
+    /// Allow a non-loopback bind in the clear. Says what it is.
+    ///
+    /// What you want when something else terminates TLS in front.
+    #[arg(long, verbatim_doc_comment)]
     insecure_no_tls: bool,
+
+    /// PEM CA the nodes' certificates must chain to.
+    ///
+    /// This MAY be the cluster's peer-ca.pem: trusting that CA is not being trusted by it. This
+    /// proxy presents no client certificate and so can never reach /internal/*. There is
+    /// deliberately no --upstream-cert and no --upstream-key; adding them would be adding
+    /// /internal/* access.
+    #[arg(long, value_name = "FILE", verbatim_doc_comment)]
+    upstream_ca: Option<String>,
+
+    /// Do not verify node certificates. Says so on every run.
+    #[arg(long)]
+    insecure_skip_verify: bool,
+}
+
+impl Options {
+    /// Which rung of the allowlist the two forwarding flags name.
+    ///
+    /// `--allow-ops` and `--no-ddl` are one ladder rather than two switches, which is why they
+    /// are declared as themselves and folded here: `conflicts_with` refuses both together, and
+    /// this turns whichever was given into the tier it means.
+    fn tier(&self) -> Tier {
+        match (self.allow_ops, self.no_ddl) {
+            (true, _) => Tier::Ops,
+            (_, true) => Tier::Data,
+            _ => Tier::Ddl,
+        }
+    }
+}
+
+/// `<name>=<addr>`, both halves non-empty.
+fn upstream(raw: &str) -> Result<(String, String), String> {
+    match raw.split_once('=') {
+        Some((name, addr)) if !name.is_empty() && !addr.is_empty() => {
+            Ok((name.to_string(), addr.to_string()))
+        }
+        _ => Err(format!("wants <name=addr>, got {raw:?}")),
+    }
 }
 
 fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.iter().any(|a| a == "-h" || a == "--help") {
-        print!("{USAGE}");
-        return;
-    }
-    let options = match parse(&args) {
-        Ok(o) => o,
-        Err(e) => die(&e),
-    };
+    let options = <Options as clap::Parser>::parse();
     if let Err(e) = run(options) {
         die(&e);
     }
@@ -171,92 +249,6 @@ fn main() {
 fn die(message: &str) -> ! {
     eprintln!("bigproxy: {message}");
     std::process::exit(2);
-}
-
-fn parse(args: &[String]) -> Result<Options, String> {
-    let mut o = Options {
-        addr: DEFAULT_ADDR.to_string(),
-        upstreams: Vec::new(),
-        cluster: None,
-        allowed: Tier::Ddl,
-        trust_forwarded_for: false,
-        workers: None,
-        queue: None,
-        read_timeout: None,
-        health_interval: None,
-        health_timeout: None,
-        health_fail: None,
-        health_pass: None,
-        max_retries: None,
-        discover: false,
-        admin_addr: None,
-        cluster_id: None,
-        discover_credentials: None,
-        tls_cert: None,
-        tls_key: None,
-        upstream_ca: None,
-        insecure_skip_verify: false,
-        insecure_no_tls: false,
-    };
-
-    let mut i = 0;
-    // The address is positional and comes first, the way `big serve` takes its file.
-    if let Some(first) = args.first() {
-        if !first.starts_with("--") {
-            o.addr = first.clone();
-            i = 1;
-        }
-    }
-
-    while i < args.len() {
-        let flag = args[i].as_str();
-        let mut value = || -> Result<String, String> {
-            i += 1;
-            args.get(i).cloned().ok_or_else(|| format!("{flag} needs a value"))
-        };
-        match flag {
-            "--upstream" => {
-                let raw = value()?;
-                let (name, addr) = raw
-                    .split_once('=')
-                    .ok_or_else(|| format!("--upstream wants <name=addr>, got {raw:?}"))?;
-                if name.is_empty() || addr.is_empty() {
-                    return Err(format!("--upstream wants <name=addr>, got {raw:?}"));
-                }
-                o.upstreams.push((name.to_string(), addr.to_string()));
-            }
-            "--cluster" => o.cluster = Some(value()?),
-            "--health-interval" => o.health_interval = Some(number(&value()?, flag)? as u64),
-            "--health-timeout" => o.health_timeout = Some(number(&value()?, flag)? as u64),
-            "--health-fail" => o.health_fail = Some(number(&value()?, flag)?.clamp(1, 255) as u8),
-            "--health-pass" => o.health_pass = Some(number(&value()?, flag)?.clamp(1, 255) as u8),
-            "--max-retries" => o.max_retries = Some(number(&value()?, flag)?),
-            "--discover" => o.discover = true,
-            "--admin-addr" => o.admin_addr = Some(value()?),
-            "--cluster-id" => o.cluster_id = Some(value()?),
-            "--discover-credentials" => o.discover_credentials = Some(value()?),
-            "--tls-cert" => o.tls_cert = Some(value()?),
-            "--tls-key" => o.tls_key = Some(value()?),
-            "--upstream-ca" => o.upstream_ca = Some(value()?),
-            "--insecure-skip-verify" => o.insecure_skip_verify = true,
-            "--allow-ops" => o.allowed = Tier::Ops,
-            "--no-ddl" => o.allowed = Tier::Data,
-            "--trust-forwarded-for" => o.trust_forwarded_for = true,
-            "--insecure-no-tls" => o.insecure_no_tls = true,
-            "--workers" => o.workers = Some(number(&value()?, flag)?),
-            "--queue" => o.queue = Some(number(&value()?, flag)?),
-            "--read-timeout" => o.read_timeout = Some(number(&value()?, flag)? as u64),
-            other => return Err(format!("unknown option {other}\n\n{USAGE}")),
-        }
-        i += 1;
-    }
-
-    // `--no-ddl` and `--allow-ops` name overlapping ranges of one ladder, so asking for both is
-    // asking for two different answers to one question.
-    if args.iter().any(|a| a == "--no-ddl") && args.iter().any(|a| a == "--allow-ops") {
-        return Err("--no-ddl and --allow-ops contradict each other".to_string());
-    }
-    Ok(o)
 }
 
 /// Reads `user:password` from a file and encodes the header the membership read carries.
@@ -287,10 +279,6 @@ fn basic_auth(path: &str) -> Result<String, String> {
         return Err(format!("{path} must hold one `user:password` line"));
     }
     Ok(format!("Basic {}", big_tls::base64::encode(line.as_bytes())))
-}
-
-fn number(raw: &str, flag: &str) -> Result<usize, String> {
-    raw.parse().map_err(|_| format!("{flag} wants a number, got {raw:?}"))
 }
 
 /// Every node this proxy will send to, from the file, the flags, or both.
@@ -328,19 +316,15 @@ fn run(o: Options) -> Result<(), String> {
     // admin port is a process that will answer `503` until somebody restarts it, and starting
     // one is a mistake worth hearing about at the moment it is made.
     if nodes.is_empty() && !o.discover && o.admin_addr.is_none() {
-        return Err(format!(
-            "no upstreams, and nothing that could find one. Pass --upstream <name=addr> or \
-             --cluster <file>; or --discover, or --admin-addr to seed one while it runs.\n\n{USAGE}"
-        ));
+        return Err("no upstreams, and nothing that could find one. Pass --upstream <name=addr> \
+             or --cluster <file>; or --discover, or --admin-addr to seed one while it runs."
+            .to_string());
     }
 
-    // A TLS listener needs both halves or neither. One without the other is a typo that would
-    // otherwise serve in the clear on a port somebody believed was encrypted.
-    match (&o.tls_cert, &o.tls_key) {
-        (Some(_), None) => return Err("--tls-cert needs --tls-key".to_string()),
-        (None, Some(_)) => return Err("--tls-key needs --tls-cert".to_string()),
-        _ => {}
-    }
+    // A TLS listener needs both halves or neither - one without the other is a typo that would
+    // otherwise serve in the clear on a port somebody believed was encrypted. That is now
+    // `requires` on both flags, so it is refused before this function is reached; what is left
+    // here is the question the parser cannot answer, which is what this *build* can do.
     if o.tls_cert.is_some() && !cfg!(feature = "tls") {
         return Err(
             "this build has no tls. Rebuild with --features tls, or terminate TLS in front"
@@ -368,6 +352,9 @@ fn run(o: Options) -> Result<(), String> {
             big_tls::TlsConfig::load(
                 std::path::Path::new(cert),
                 std::path::Path::new(key),
+                // No peer CA here, so no revocation list either: this listener never asks for
+                // a client certificate, and there is nothing for a CRL to be about.
+                None,
                 None,
                 Vec::new(),
             )
@@ -377,7 +364,7 @@ fn run(o: Options) -> Result<(), String> {
     };
 
     let mut config = Config {
-        allowed: o.allowed,
+        allowed: o.tier(),
         trust_forwarded_for: o.trust_forwarded_for,
         health,
         proto: if o.tls_cert.is_some() { "https" } else { "http" },
@@ -606,7 +593,7 @@ fn announce(bound: SocketAddr, o: &Options, nodes: &[(String, String)]) {
          a node is still working"
     );
 
-    let forwarded = big_proxy::allowlist::ROUTES.iter().filter(|r| r.tier <= o.allowed).count();
+    let forwarded = big_proxy::allowlist::ROUTES.iter().filter(|r| r.tier <= o.tier()).count();
     println!(
         "bigproxy: {forwarded} of {} routes forwarded; /internal/* is not one of them",
         big_proxy::allowlist::ROUTES.len()
@@ -620,8 +607,10 @@ fn announce(bound: SocketAddr, o: &Options, nodes: &[(String, String)]) {
 mod tests {
     use super::*;
 
-    fn opts(args: &[&str]) -> Result<Options, String> {
-        parse(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+    fn opts(args: &[&str]) -> Result<Options, clap::Error> {
+        <Options as clap::Parser>::try_parse_from(
+            std::iter::once("bigproxy").chain(args.iter().copied()),
+        )
     }
 
     #[test]
@@ -640,9 +629,9 @@ mod tests {
 
     #[test]
     fn the_tier_ladder_defaults_to_reads_writes_and_ddl() {
-        assert_eq!(opts(&["--upstream", "a=x:1"]).unwrap().allowed, Tier::Ddl);
-        assert_eq!(opts(&["--upstream", "a=x:1", "--no-ddl"]).unwrap().allowed, Tier::Data);
-        assert_eq!(opts(&["--upstream", "a=x:1", "--allow-ops"]).unwrap().allowed, Tier::Ops);
+        assert_eq!(opts(&["--upstream", "a=x:1"]).unwrap().tier(), Tier::Ddl);
+        assert_eq!(opts(&["--upstream", "a=x:1", "--no-ddl"]).unwrap().tier(), Tier::Data);
+        assert_eq!(opts(&["--upstream", "a=x:1", "--allow-ops"]).unwrap().tier(), Tier::Ops);
     }
 
     #[test]
@@ -652,14 +641,25 @@ mod tests {
 
     #[test]
     fn a_flag_missing_its_value_names_the_flag() {
-        let e = opts(&["--upstream"]).unwrap_err();
+        let e = opts(&["--upstream"]).unwrap_err().to_string();
         assert!(e.contains("--upstream"), "{e}");
     }
 
+    /// **The wording is the parser's now; naming the flag and offering the usage is not.**
+    /// A refusal that does not say which word was wrong is a refusal somebody has to guess at.
     #[test]
-    fn an_unknown_flag_prints_the_usage() {
-        let e = opts(&["--turbo"]).unwrap_err();
-        assert!(e.contains("--turbo") && e.contains("usage:"), "{e}");
+    fn an_unknown_flag_names_it_and_points_at_the_usage() {
+        let e = opts(&["--turbo"]).unwrap_err().to_string();
+        assert!(e.contains("--turbo") && e.contains("--help"), "{e}");
+    }
+
+    /// A cert without its key would otherwise serve in the clear on a port somebody believed
+    /// was encrypted. `requires` refuses it before `run` is reached.
+    #[test]
+    fn half_a_tls_listener_is_refused() {
+        assert!(opts(&["--upstream", "a=x:1", "--tls-cert", "c"]).is_err());
+        assert!(opts(&["--upstream", "a=x:1", "--tls-key", "k"]).is_err());
+        assert!(opts(&["--upstream", "a=x:1", "--tls-cert", "c", "--tls-key", "k"]).is_ok());
     }
 
     #[test]

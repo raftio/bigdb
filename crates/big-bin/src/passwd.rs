@@ -28,14 +28,8 @@ use big_http::auth::{check_rolename, hash_password};
 use std::io::Write;
 use std::path::Path;
 
-const USAGE: &str = "\
-usage: big passwd <users-file> <command>
-
-  set <user> [--role <role>]   add a user, or change an existing password
-  role <user> <role>           change a role, leaving the password alone
-  delete <user>                remove a user
-  list                         names and roles, never a hash
-
+/// The prose that is about the command rather than about one flag.
+const AFTER_LONG_HELP: &str = "\
 A role is a name, made in SQL with `CREATE ROLE` and given privileges with `GRANT`. This
 command does not check that it exists: the database may not be running, and a name the
 catalog does not have is simply no privileges - which is the safe direction, and leaves
@@ -55,49 +49,65 @@ from it, which is the only non-tty path and is there so a provisioning script ca
 check `big serve` makes runs first, so this refuses any file the server would refuse.
 ";
 
-/// `big passwd`, with the word already stripped by the dispatcher.
-pub fn main(args: &[String]) -> std::io::Result<()> {
-    let strings: Vec<&str> = args.iter().map(String::as_str).collect();
-    match strings.as_slice() {
-        [] | ["-h"] | ["--help"] => {
-            print!("{USAGE}");
-            Ok(())
-        }
-        [path, rest @ ..] => run(Path::new(path), rest).map_err(|e| {
-            eprintln!("big passwd: {e}");
-            std::process::exit(2)
-        }),
-    }
+/// `big passwd <users-file> <command>`.
+#[derive(clap::Args, Debug)]
+#[command(after_long_help = AFTER_LONG_HELP)]
+pub struct Args {
+    /// The users file to edit. Created at mode 600 by `set` if it does not exist.
+    #[arg(value_name = "USERS-FILE")]
+    path: String,
+
+    #[command(subcommand)]
+    command: Cmd,
 }
 
-fn run(path: &Path, args: &[&str]) -> Result<(), String> {
-    match args {
-        ["set", user, flags @ ..] => set(path, user, &role_flag(flags)?),
-        ["role", user, role] => {
-            check_rolename(role)?;
-            change_role(path, user, role)
-        }
-        ["delete", user] => delete(path, user),
-        ["list"] => list(path),
-        [] => Err("a command is required; see --help".to_string()),
-        [other, ..] => Err(format!("`{other}` is not a command; see --help")),
-    }
+#[derive(clap::Subcommand, Debug)]
+enum Cmd {
+    /// Add a user, or change an existing password.
+    Set {
+        user: String,
+        /// The role to give them. Defaults to `none`, which is no privileges at all.
+        ///
+        /// The least role, on purpose: a user created without anybody saying what they should be
+        /// able to do should be able to do the least, not the most. The reserved `superuser`
+        /// holds everything, so it is never what somebody gets by saying nothing.
+        #[arg(long, default_value = "none", value_parser = rolename, verbatim_doc_comment)]
+        role: String,
+    },
+    /// Change a role, leaving the password alone.
+    Role {
+        user: String,
+        #[arg(value_parser = rolename)]
+        role: String,
+    },
+    /// Remove a user.
+    Delete { user: String },
+    /// Names and roles, never a hash.
+    List,
 }
 
-/// `--role` out of what is left of the command line. Defaults to `read`.
+/// A role name the users file is allowed to hold.
 ///
-/// The least role, on purpose: a user created without anybody saying what they should be able to
-/// do should be able to do the least, not the most.
-fn role_flag(flags: &[&str]) -> Result<String, String> {
-    match flags {
-        // The reserved role holds everything, so it is never what somebody gets by saying
-        // nothing. A user made without anybody naming a role holds a name the catalog does not
-        // have, which is no privileges at all - the least, which is the right default.
-        [] => Ok("none".to_string()),
-        ["--role", name] => check_rolename(name).map(|()| name.to_string()),
-        ["--role"] => Err("--role needs a value".to_string()),
-        [other, ..] => Err(format!("unknown option {other}")),
-    }
+/// Checked here rather than against the catalog: the database may not be running, and a name it
+/// does not have is simply no privileges. What is refused is a name the *file format* cannot
+/// carry, which is a different question and one this command can answer on its own.
+fn rolename(s: &str) -> Result<String, String> {
+    check_rolename(s).map(|()| s.to_string())
+}
+
+/// `big passwd`, already parsed by the dispatcher.
+pub fn main(args: Args) -> std::io::Result<()> {
+    let path = Path::new(&args.path);
+    let outcome = match &args.command {
+        Cmd::Set { user, role } => set(path, user, role),
+        Cmd::Role { user, role } => change_role(path, user, role),
+        Cmd::Delete { user } => delete(path, user),
+        Cmd::List => list(path),
+    };
+    outcome.map_err(|e| {
+        eprintln!("big passwd: {e}");
+        std::process::exit(2)
+    })
 }
 
 fn set(path: &Path, user: &str, role: &str) -> Result<(), String> {

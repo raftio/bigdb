@@ -151,7 +151,7 @@ fn compact_returns_space_and_keeps_the_answers() {
 fn the_offline_tool_says_what_it_takes_when_given_nothing() {
     let run = run("big", &[]).expect(2);
 
-    assert!(run.said("usage: big"), "{}", run.err);
+    assert!(run.said("Usage: big"), "{}", run.err);
     assert!(run.said("backup") && run.said("compact") && run.said("verify"), "{}", run.err);
 }
 

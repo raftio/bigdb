@@ -113,12 +113,13 @@ impl TlsConfig {
         cert: &Path,
         key: &Path,
         peer_ca: Option<&Path>,
+        peer_crl: Option<&Path>,
         roster: Vec<String>,
     ) -> io::Result<Self> {
         crate::mode::check_permissions(key, "a private key")?;
         #[cfg(not(feature = "tls"))]
         {
-            let _ = (cert, peer_ca, roster);
+            let _ = (cert, peer_ca, peer_crl, roster);
             Err(io::Error::new(io::ErrorKind::Unsupported, NO_TLS_IN_THIS_BUILD))
         }
         #[cfg(feature = "tls")]
@@ -130,7 +131,9 @@ impl TlsConfig {
                 .map_err(super::tls::bad)?;
             let builder = match peer_ca {
                 None => builder.with_no_client_auth(),
-                Some(ca) => builder.with_client_cert_verifier(super::tls::peer_verifier(ca)?),
+                Some(ca) => {
+                    builder.with_client_cert_verifier(super::tls::peer_verifier(ca, peer_crl)?)
+                }
             };
             let server = builder.with_single_cert(chain, key).map_err(super::tls::bad)?;
             Ok(Self {

@@ -23,35 +23,87 @@
 // another, so the tool follows the repository's existing convention instead.
 use big_db::{copy, Db};
 
-/// Runs one offline subcommand. `usage` is the whole binary's, so a mistake here shows every
-/// command including `serve` rather than only this half.
-pub fn main(args: &[String], usage: &str) {
-    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+// The offline subcommands, flattened into `big`'s own list rather than nested under a word.
+//
+// They were slice patterns over `argv` with a hand-kept `KNOWN` table beside them, whose only
+// job was to tell "wrong arguments for a real command" from "no such command". Declaring the
+// commands is what answers both, and `restore` is an alias rather than a second arm because it
+// was never a second operation: a backup is an ordinary database file, so restoring one is
+// copying it, and the word exists so the procedure has a name.
+//
+// **Deliberately not a doc comment.** `#[command(flatten)]` lifts an enum's `long_about` into
+// its parent, so a `///` here would become what `big --help` says `big` is for. The prose lives
+// in the module doc above instead, where it is one scroll from this and reaches rustdoc anyway.
+#[derive(clap::Subcommand, Debug)]
+pub enum Cmd {
+    /// Write a consistent copy of a database to `<DEST>`, which must not exist.
+    ///
+    /// Safe while a writer is running. Copying a live database with `cp` is NOT safe: a commit
+    /// can land between the bytes cp has already read and the ones it has not.
+    #[command(visible_alias = "restore", verbatim_doc_comment)]
+    Backup {
+        #[arg(value_name = "FILE")]
+        file: String,
+        #[arg(value_name = "DEST")]
+        dest: String,
+    },
 
-    let outcome = match refs.as_slice() {
-        ["backup", file, dest] | ["restore", file, dest] => backup(file, dest),
-        ["compact", file] => compact(file),
-        ["verify", file] => verify(file),
-        ["scrub", file] => scrub(file),
-        ["leaks", file] => leaks(file),
-        ["drop-days", file, table, field, before] => drop_days(file, table, field, before),
-        // Named rather than answered with the usage alone: an operator who typed a real
-        // command with the wrong arguments has made a different mistake from one who typed a
-        // word this binary has never had.
-        [name, ..] if KNOWN.contains(name) => {
-            eprintln!("big: wrong arguments for `{name}`\n");
-            eprint!("{usage}");
-            std::process::exit(2);
-        }
-        [name, ..] => {
-            eprintln!("big: no such command `{name}`\n");
-            eprint!("{usage}");
-            std::process::exit(2);
-        }
-        [] => {
-            eprint!("{usage}");
-            std::process::exit(2);
-        }
+    /// Rewrite a database as a compact copy of itself, in place.
+    Compact {
+        #[arg(value_name = "FILE")]
+        file: String,
+    },
+
+    /// Open a database and report what it holds.
+    Verify {
+        #[arg(value_name = "FILE")]
+        file: String,
+    },
+
+    /// Recompute every checksum the file can reach.
+    ///
+    /// Opening checks the meta page and the chains; this checks the trees, which nothing on the
+    /// query path ever does.
+    #[command(verbatim_doc_comment)]
+    Scrub {
+        #[arg(value_name = "FILE")]
+        file: String,
+    },
+
+    /// Account for every page: reachable, free, or neither.
+    ///
+    /// A page in neither is one nothing will ever read and nothing will ever reuse; one at the
+    /// end of the file stops `compact` giving anything back. Reads only, and never repairs.
+    #[command(verbatim_doc_comment)]
+    Leaks {
+        #[arg(value_name = "FILE")]
+        file: String,
+    },
+
+    /// Drop a time quantum field's day views older than `<UNIX-SECONDS>`.
+    ///
+    /// The day that instant falls in is kept; the records are not removed, only the per-day
+    /// index over them.
+    #[command(verbatim_doc_comment)]
+    DropDays {
+        #[arg(value_name = "FILE")]
+        file: String,
+        table: String,
+        field: String,
+        #[arg(value_name = "UNIX-SECONDS")]
+        before: i64,
+    },
+}
+
+/// Runs one offline subcommand.
+pub fn main(cmd: Cmd) {
+    let outcome = match &cmd {
+        Cmd::Backup { file, dest } => backup(file, dest),
+        Cmd::Compact { file } => compact(file),
+        Cmd::Verify { file } => verify(file),
+        Cmd::Scrub { file } => scrub(file),
+        Cmd::Leaks { file } => leaks(file),
+        Cmd::DropDays { file, table, field, before } => drop_days(file, table, field, *before),
     };
 
     if let Err(e) = outcome {
@@ -59,12 +111,6 @@ pub fn main(args: &[String], usage: &str) {
         std::process::exit(1);
     }
 }
-
-/// Every command word `big` answers to, for telling a typo from a misuse. `serve` is here
-/// because it is a real command of this binary, just not one this half handles - so
-/// `big serve` with no file reaches its own error rather than "no such command".
-const KNOWN: [&str; 8] =
-    ["serve", "backup", "restore", "compact", "verify", "drop-days", "scrub", "leaks"];
 
 fn backup(file: &str, dest: &str) -> Result<(), String> {
     let db = open(file)?;
@@ -111,10 +157,7 @@ fn verify(file: &str) -> Result<(), String> {
 /// not would answer that window with part of the truth and no symptom. A cluster-wide spelling
 /// belongs with the other DDL, which travels over the wire; this one is for a single file and
 /// says so by living in the offline tool.
-fn drop_days(file: &str, table: &str, field: &str, before: &str) -> Result<(), String> {
-    let at: i64 = before
-        .parse()
-        .map_err(|_| format!("<unix-seconds> must be a number of seconds, got `{before}`"))?;
+fn drop_days(file: &str, table: &str, field: &str, at: i64) -> Result<(), String> {
     let db = open(file)?;
     let dropped = db
         .drop_days_before(table, field, at)

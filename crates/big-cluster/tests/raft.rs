@@ -1238,3 +1238,149 @@ fn catching_up_clears_it() {
 
     assert!(!node.behind(), "everything the leader said it had committed is here");
 }
+
+/// **The node being removed has to be told it was removed.**
+///
+/// A configuration change takes effect the moment it is appended, and `peers()` will not send
+/// to a member that has left - so refreshing the membership before the broadcast meant the one
+/// node that most needed this entry was the only node excluded from receiving it. It kept a
+/// membership view in which it was still a voter, and a voter that hears from nobody stands for
+/// election: an ever-rising term, arriving at a healthy cluster, deposing a leader that was
+/// working. Permanent, because no later append reaches it either.
+#[test]
+fn the_node_being_removed_is_told_about_its_own_removal() {
+    let mut sim = Sim::new(3);
+    sim.run(3_000);
+    let leader = sim.leader();
+    let going = (0..3).find(|n| *n != leader).expect("somebody else to remove");
+
+    let mut shrunk = voters(3);
+    shrunk[going].state = MemberState::Gone;
+    let out = sim.nodes[leader].propose(Decision::Members(shrunk)).expect("the leader proposes");
+
+    let told: Vec<NodeId> = out.send.iter().map(|(to, _)| *to).collect();
+    assert!(
+        told.contains(&going),
+        "node {going} is the one being removed and the only one that must not miss this \
+         entry: {told:?}"
+    );
+    let staying = (0..3).find(|n| *n != leader && *n != going).expect("one remains");
+    assert!(told.contains(&staying), "the members that remain are still appended to: {told:?}");
+
+    // The majority it takes to commit this is the one the entry describes, not the one it
+    // replaces - the rule that made the broadcast exclude the departing node in the first place.
+    assert!(
+        !sim.nodes[leader].voters().contains(&going),
+        "a departed member does not count towards a majority"
+    );
+}
+
+/// The other half: once it has been told, it is not sent to again. A removal that went on
+/// heartbeating a decommissioned machine forever would be a different bug.
+#[test]
+fn a_departed_member_is_not_appended_to_by_later_decisions() {
+    let mut sim = Sim::new(3);
+    sim.run(3_000);
+    let leader = sim.leader();
+    let going = (0..3).find(|n| *n != leader).expect("somebody else to remove");
+
+    let mut shrunk = voters(3);
+    shrunk[going].state = MemberState::Gone;
+    sim.nodes[leader].propose(Decision::Members(shrunk)).expect("the leader proposes");
+
+    let out = sim.nodes[leader].propose(Decision::Noop).expect("the leader proposes again");
+    let told: Vec<NodeId> = out.send.iter().map(|(to, _)| *to).collect();
+    assert!(!told.contains(&going), "a member that has left is not sent to again: {told:?}");
+    let staying = (0..3).find(|n| *n != leader && *n != going).expect("one remains");
+    assert!(told.contains(&staying), "the ones that remain are: {told:?}");
+}
+
+/// **The one-at-a-time rule belongs to the core, not to its caller.**
+///
+/// Two membership changes in one entry can leave two majorities that do not overlap, and each
+/// would elect its own leader. The check used to live only in `Controller::propose_members`,
+/// which made it a property of today's single call site rather than of the protocol. A future
+/// caller reaching `Raft::propose` directly would have got no such protection.
+#[test]
+fn the_raft_core_refuses_a_membership_that_moves_two_nodes_at_once() {
+    let mut sim = Sim::new(3);
+    sim.run(3_000);
+    let leader = sim.leader();
+
+    let mut two_at_once = voters(3);
+    for (i, m) in two_at_once.iter_mut().enumerate() {
+        if i != leader {
+            m.state = MemberState::Gone;
+        }
+    }
+    assert!(
+        sim.nodes[leader].propose(Decision::Members(two_at_once)).is_none(),
+        "removing two of three at once leaves a majority of one deciding for the cluster"
+    );
+
+    // And one at a time is still allowed, or the rule would be a cluster that cannot change.
+    let going = (0..3).find(|n| *n != leader).expect("somebody else");
+    let mut one = voters(3);
+    one[going].state = MemberState::Gone;
+    assert!(sim.nodes[leader].may_change_members(&one), "one step is what the rule permits");
+    assert!(sim.nodes[leader].propose(Decision::Members(one)).is_some());
+}
+
+/// **A node still hearing from a leader does not help depose it.**
+///
+/// `observe` raises this node's term on any higher one, which is right for an append and wrong
+/// for a request to *become* leader. The vote itself was always refused correctly - a candidate
+/// that is not a voter, or whose log is behind, never got it - but by then every node that
+/// heard the request had already stepped down and raised its term, so a healthy leader was
+/// deposed by a node that could not have replaced it. A removed node, or one flapping on a bad
+/// link, produced that for as long as its process ran.
+#[test]
+fn a_follower_in_touch_with_its_leader_ignores_a_challenger() {
+    let timing = Timing::default();
+    let mut node = Raft::new(0, voters(3), timing, 0);
+
+    // Node 1 leads term 5, and this node has just heard from it.
+    let append = |term| Message::Append {
+        term,
+        leader: 1,
+        prev_index: 0,
+        prev_term: 0,
+        entries: Vec::new(),
+        commit: 0,
+    };
+    node.deliver(append(5), 0);
+    assert_eq!(node.term(), 5);
+
+    // Node 2 stands for election at a much higher term, well inside the window in which this
+    // node would not have stood for one itself.
+    let challenge = Message::RequestVote { term: 99, candidate: 2, last_index: 0, last_term: 0 };
+    let out = node.deliver(challenge.clone(), timing.election_min / 2);
+
+    assert_eq!(node.term(), 5, "the term does not move for a challenger it is not persuaded by");
+    assert_eq!(node.leader(), Some(1), "and the leader it has is still its leader");
+    assert!(
+        matches!(out.send.first(), Some((2, Message::VoteReply { granted: false, .. }))),
+        "the challenger is answered rather than left waiting: {:?}",
+        out.send
+    );
+
+    // And the rule is a delay, not a veto. Once the leader has been quiet for as long as this
+    // node would wait before standing itself, the same request is heard in full.
+    let out = node.deliver(challenge, timing.election_min + 1);
+    assert_eq!(node.term(), 99, "a leader that has gone quiet is a leader that can be replaced");
+    assert!(matches!(out.send.first(), Some((2, Message::VoteReply { .. }))));
+}
+
+/// The other side of it: a node that has never heard from a leader must be free to vote, or a
+/// cluster could never hold its first election.
+#[test]
+fn a_node_that_has_heard_from_nobody_still_votes() {
+    let mut node = Raft::new(0, voters(3), Timing::default(), 0);
+    let out = node
+        .deliver(Message::RequestVote { term: 1, candidate: 1, last_index: 0, last_term: 0 }, 0);
+    assert!(
+        matches!(out.send.first(), Some((1, Message::VoteReply { granted: true, .. }))),
+        "a fresh node has no leader to protect: {:?}",
+        out.send
+    );
+}

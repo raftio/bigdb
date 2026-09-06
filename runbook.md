@@ -93,6 +93,59 @@ Opening is the check. A bad checksum, an unreadable meta page, or a file version
 does not know is an error on the way in, so anything that opens and prints its tables is
 structurally sound.
 
+## Restore one node of a cluster
+
+**The steps above are the easy half.** A node of a cluster holds a range other nodes route to,
+and it may hold the row-key namespace; a file copied into place is correct on disk and still
+wrong to the cluster. What follows is the order that gets it right.
+
+The node must be **stopped** throughout. A restore under a running daemon is refused - `big`
+takes the exclusive lock - but stopping it is also what keeps the cluster from routing to a
+node in the middle of being rebuilt.
+
+```sh
+# 1. Which node is this, and what did the agreement decide while it was away?
+#    Ask a node that is up, not the one being restored.
+bigctl --addr https://a-node:7654 cluster topology
+# Read three things: does this node still appear; is it named under `behind`; and is
+# `schema_leader` still this node or has the agreement handed the namespace on.
+
+# 2. Put the file in place and check it opens.
+big restore /backup/data-2026-08-27.big /var/lib/big/data.big
+big verify /var/lib/big/data.big
+
+# 3. Start it. It comes back as a member that has been away, not as a fresh node: the
+#    agreement's own state is in <path>.raft beside the database, and it decides what this
+#    node believes about the cluster - the cluster file only seeds a node that has never run.
+big serve /var/lib/big/data.big 0.0.0.0:7654 --cluster /etc/big/cluster.toml --node b
+
+# 4. Catch it up, from a node that is up. Nothing does this on its own.
+bigctl --addr https://a-node:7654 verify     # do the copies agree?
+bigctl --addr https://a-node:7654 repair     # a scan and a copy; run it deliberately
+```
+
+**Two cases the steps above do not cover, and both are silent if you skip them.**
+
+- **This node was the schema leader and the agreement moved the namespace while it was away.**
+  `cluster topology` names somebody else as `schema_leader`, and the restored node is marked
+  `behind` whether or not it holds a copy of anything. That mark is deliberate: the successor
+  rebuilt the row-key mapping from what the surviving *owners* held, so a key this node
+  interned for a write that never landed exists nowhere else - and the successor has since
+  given that row id to a different string. `POST /repair` **reports** the contradiction rather
+  than overwriting it, which is the loud failure and the one you want. Do not clear the mark by
+  hand.
+- **The backup is older than the range this node serves.** A copy restored behind its peers
+  answers with less than it should and nothing contradicts it, because the copy serving a range
+  is the truth. `GET /verify` compares digests across copies and is the only thing that finds
+  this. Run it before the node is allowed to serve anything - and if the digests differ, repair
+  before, not after.
+
+**Replacing a machine rather than a file** is the same procedure with one step in front: the
+new machine needs its own certificate, issued to the *name* the cluster file uses, because a
+peer is identified by the name in its certificate rather than by the address it is reached at.
+Reissuing one node's certificate does not disturb the others; retiring the old one needs a
+revocation list, which is [TLS](#tls).
+
 ## Load a file
 
 `POST /import` is bounded at 8 MiB, so `curl --data-binary @facts.txt` works until the file is
@@ -402,14 +455,30 @@ a file no daemon is serving.
 
 ## What is not covered yet
 
-Honest gaps, so nobody builds a procedure on top of something that does not exist:
+Honest gaps, so nobody builds a procedure on top of something that does not exist.
 
-- **No metrics endpoint, no logging.** A failed import returns an HTTP status and nothing
-  else.
-- **No authentication.** Anyone who can reach the port owns the data. Bind to loopback and put
-  a reverse proxy in front, or do not expose it.
-- **No query timeouts, no connection cap.** A large query runs to completion; a client that
-  disconnects does not stop it.
+**This section used to say there was no authentication, no metrics and no query timeout.**
+All three arrived and the list did not move, which is worse than never having had one: an
+operator who reads it plans a deployment around a threat model this daemon stopped having.
+Authentication is [Users](#users) and [Roles and grants](#roles-and-grants), metrics are
+`GET /metrics`, and the timeout is `--query-timeout`. What follows is the list as it actually
+stands.
+
+- **No rolling upgrade across a wire version.** Two builds with different `version` and the
+  same `wire` run side by side; two with different `wire` do not. `GET /ready` reports both,
+  which is how you find out which kind of upgrade you are about to do. A wire change is a
+  coordinated stop.
+- **No repair in the background.** `POST /repair` is a thing an operator or cron runs. A scan
+  and a copy started unasked is one started at the worst possible moment.
+- **No automatic replication.** The balancer moves ranges and splits them; it does not decide
+  a range needs a second copy. `replica = "..."` in the cluster file is still how a copy comes
+  to exist, and a range with no copy cannot fail over.
+- **No connection cap.** `--query-timeout` bounds how long one query runs, and the worker pool
+  sheds with `503`, but there is no ceiling on how many sockets may be open at once. A client
+  that disconnects mid-query does not stop the query; the timeout does.
+- **No cross-node atomicity, no cluster-wide snapshot, no quorum.** Each is a decision rather
+  than a backlog item, and [docs/clustering.md](docs/clustering.md) gives the reason for each
+  under *What this does not give you*.
 
 ---
 
@@ -832,6 +901,22 @@ command line is the one in the file.
 - **The two directions are exclusive.** A person cannot reach `/internal/*` however privileged
   they are, and a node certificate grants no role on the public routes. Under tokens an `admin`
   credential could post to the internal routes; it cannot now.
+- **Retiring one node's key is `peer_crl_file`.** Without it, one leaked `--peer-key` is retired
+  only by rotating the CA and reissuing every node's certificate on every machine at once, and
+  the stolen key is a peer until that finishes. Name the CA's revocation list beside the CA in
+  the cluster file:
+
+  ```toml
+  peer_ca_file  = "/etc/big/peer-ca.pem"
+  peer_crl_file = "/etc/big/peer-ca.crl"    # optional; what the CA has taken back
+  ```
+
+  It is read at startup, so revoking a certificate means writing a new list and restarting the
+  nodes that check it - one at a time, like any other rollout. Two things about how it fails,
+  because both are deliberate: a file with no `X509 CRL` block is **refused at startup** rather
+  than read as "nothing is revoked", and a certificate whose revocation status cannot be
+  determined from the list is **refused at the handshake**. A revocation control that quietly
+  passed what it could not check would be worse than not configuring one.
 
 ```sh
 # Which node am I talking to, and what does it hold?
@@ -972,7 +1057,9 @@ catalog as a new record kind, which is additive and needs no format version bump
 
 ## Watch these
 
-`GET /metrics`, Prometheus text. A `read` user when `--users` is configured.
+`GET /metrics`, Prometheus text. A user holding `OPERATE` on `*.*` when `--users` is
+configured - it answers about the process rather than about rows, which is the privilege
+`/verify` and `/repair` are held under too.
 
 | Metric | It means |
 |---|---|

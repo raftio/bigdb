@@ -43,16 +43,31 @@ use std::io::BufRead;
 
 /// Parses, sends, prints. Returns the process's exit code.
 pub fn run(args: &[String], io: &mut Io<'_>, env: &dyn Fn(&str) -> Option<String>) -> i32 {
-    let options = match args::parse(args, env) {
-        Ok(o) => o,
-        // `--help` is not a failure: usage to stdout, exit zero. The same split `big serve` makes.
-        Err(e) if e.is_empty() => {
-            let _ = write!(io.out, "{}", args::USAGE);
-            return exit::OK;
-        }
+    // **`try_parse_from`, and the error is rendered by hand.** `clap::Error::exit` writes to the
+    // real stderr and ends the process, and both halves are wrong here: this function returns a
+    // code so that `bigctl` can flush its streams first, and the tests drive it in-process with
+    // streams of their own.
+    //
+    // `argv[0]` is prepended because clap expects it and the caller has already skipped it.
+    let parsed = <args::Cli as clap::Parser>::try_parse_from(
+        std::iter::once("bigctl").chain(args.iter().map(String::as_str)),
+    );
+    let cli = match parsed {
+        Ok(c) => c,
+        // `--help` and `--version` are not failures: stdout, exit zero. clap says which is
+        // which through `use_stderr`, and that is the same split `big serve` makes.
         Err(e) => {
-            let _ = writeln!(io.err, "bigctl: {e}\n");
-            let _ = write!(io.err, "{}", args::USAGE);
+            let usage = e.use_stderr();
+            let stream: &mut dyn std::io::Write = if usage { io.err } else { io.out };
+            let _ = write!(stream, "{}", e.render());
+            return if usage { exit::USAGE } else { exit::OK };
+        }
+    };
+
+    let options = match cli.resolve(env) {
+        Ok(o) => o,
+        Err(e) => {
+            let _ = writeln!(io.err, "bigctl: {e}");
             return exit::USAGE;
         }
     };

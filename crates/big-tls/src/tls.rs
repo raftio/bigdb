@@ -18,7 +18,9 @@
 //! the feature off deletes this module and nothing else has to know.
 
 use crate::pem;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
+use rustls::pki_types::{
+    CertificateDer, CertificateRevocationListDer, PrivateKeyDer, ServerName, UnixTime,
+};
 use std::io;
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
@@ -98,19 +100,56 @@ pub(crate) fn roots(ca: Option<&Path>) -> io::Result<rustls::RootCertStore> {
     Ok(store)
 }
 
-/// The verifier that decides whether a client certificate was signed by the peer CA.
+/// Every `X509 CRL` block in a PEM file: the certificates this CA has taken back.
+///
+/// **The answer to "one node's key leaked".** Without it a compromised peer certificate can
+/// only be retired by rotating the CA and reissuing every node's, on every machine, at once -
+/// which is an operation nobody performs quickly, and the window until they do is a window in
+/// which a stolen key is still a node.
+pub(crate) fn revocations(path: &Path) -> io::Result<Vec<CertificateRevocationListDer<'static>>> {
+    let blocks = pem::parse_file(path)?;
+    let lists: Vec<_> = blocks
+        .into_iter()
+        .filter(|b| b.label == "X509 CRL")
+        .map(|b| CertificateRevocationListDer::from(b.der))
+        .collect();
+    if lists.is_empty() {
+        return Err(bad(format!(
+            "{}: no `X509 CRL` block. An empty revocation list is written by the CA and still \
+             has one; a file with none is the wrong file, and taking it as \"nothing is \
+             revoked\" would turn a typo into a security control that does nothing",
+            path.display()
+        )));
+    }
+    Ok(lists)
+}
+
+/// The verifier that decides whether a client certificate was signed by the peer CA, and - when
+/// a revocation list is given - whether that CA has since taken it back.
 ///
 /// **Optional, not required.** A listener that required a client certificate would refuse every
 /// `bigctl` and every `curl`, which is every client this database has. A connection with no
 /// certificate is `Identity::None` and the route table takes it from there.
+///
+/// **Revocation is checked on the leaf only, and unknown status is an error.** Only the leaf,
+/// because the chain here is one CA and one node certificate and there is nothing in between
+/// to check. An error rather than a pass, because the whole point of naming a CRL is to refuse
+/// a certificate: a deployment that configured revocation and then accepted a certificate it
+/// could not check would have a control that reports success and does nothing. The cost is
+/// that a CRL which does not cover the peer CA refuses every peer - loudly, at the first
+/// handshake, which is where a misconfigured security control should fail.
 pub(crate) fn peer_verifier(
     ca: &Path,
+    crl: Option<&Path>,
 ) -> io::Result<Arc<dyn rustls::server::danger::ClientCertVerifier>> {
     let store = Arc::new(roots(Some(ca))?);
-    rustls::server::WebPkiClientVerifier::builder_with_provider(store, provider())
-        .allow_unauthenticated()
-        .build()
-        .map_err(|e| bad(format!("{}: {e}", ca.display())))
+    let mut builder =
+        rustls::server::WebPkiClientVerifier::builder_with_provider(store, provider())
+            .allow_unauthenticated();
+    if let Some(path) = crl {
+        builder = builder.with_crls(revocations(path)?).only_check_end_entity_revocation();
+    }
+    builder.build().map_err(|e| bad(format!("{}: {e}", ca.display())))
 }
 
 /// Which node of the roster this client certificate names, if any.

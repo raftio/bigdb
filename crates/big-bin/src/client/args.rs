@@ -14,20 +14,36 @@
 
 //! `argv` to one [`Command`], which is one route.
 //!
-//! Hand-rolled, in the shape `big serve`'s own `Options::parse` uses, and for the same reason: a
-//! dozen options do not justify an argument-parsing dependency for a surface this size.
-//!
-//! **This is the only parser `bigctl` has.** There were two, one per binary, agreeing by hand
-//! that `--addr`, `--token-file` and `--timeout` meant the same thing on both - and agreement
-//! by hand is the arrangement that eventually stops agreeing. Merging them is also what lets
-//! `only` refuse `--dry-run` on `schema`: neither parser could once see the other's flags.
+//! **This was hand-rolled, and the reason it no longer is worth writing down.** The argument
+//! for a hand-rolled parser was that a dozen options do not justify a dependency, and that was
+//! true. What broke it was not the option count but a bug class the parser grew for itself:
+//! flags were collected into one flat list and applied wherever they fitted, so
+//! `records t --engine columnar` was accepted and then silently dropped. The fix was `only()`,
+//! a hand-written table of which flags belong to which subcommand, checked by hand, tested by
+//! hand, and one edit away from disagreeing with the parser above it. A parser that has to
+//! police its own design is not cheaper than the crate. clap gives that check by construction:
+//! a flag declared on `import` does not exist on `schema`, so there is nothing to enforce.
 //!
 //! **Every command here is one request, except [`Command::Load`], which is one file.** There is
 //! no subcommand that pages or composes two routes, and that is not laziness - a client that
 //! could answer something the server cannot has become a second engine with a worse test suite.
 //! Adding one means adding a route first.
+//!
+//! Two things this module deliberately does *not* let clap do:
+//!
+//! - **It does not read the environment.** [`crate::client::run`] takes an injected `env`
+//!   closure so its tests are hermetic, so `BIG_ADDR`, `BIG_CREDENTIALS` and `BIG_CA` are
+//!   applied in [`Cli::resolve`] from that closure rather than by `#[arg(env = ...)]`, which
+//!   would reach the real process environment and make the tests depend on the shell that ran
+//!   them.
+//! - **It does not exit.** `run` returns an exit code so that `bigctl` can flush its streams
+//!   before the process ends, so parse failures come back as a [`clap::Error`] to be rendered
+//!   into the caller's streams rather than clap's.
 
-use crate::ingest::args::{Input, Load, Verb, MAX_IN_FLIGHT};
+use crate::ingest::args::{
+    Input, Load, Verb, DEFAULT_CHUNK_BYTES, DEFAULT_CHUNK_LINES, DEFAULT_IN_FLIGHT,
+    DEFAULT_RETRIES, MAX_IN_FLIGHT,
+};
 use std::time::Duration;
 
 /// Where a statement or a body comes from.
@@ -41,7 +57,7 @@ pub enum Source {
 }
 
 /// How to print an answer.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, clap::ValueEnum)]
 pub enum Format {
     /// Aligned columns, for a person.
     Table,
@@ -51,18 +67,11 @@ pub enum Format {
     Json,
 }
 
-impl Format {
-    fn parse(s: &str) -> Option<Self> {
-        Some(match s {
-            "table" => Self::Table,
-            "tsv" => Self::Tsv,
-            "json" => Self::Json,
-            _ => return None,
-        })
-    }
-}
-
 /// One subcommand, which is one public route.
+///
+/// This is the parser's *output* and is deliberately not the clap type: the command line has a
+/// `create table` / `create field` shape that reads well and a flat enum that sends well, and
+/// keeping them separate is what lets either move without the other.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Command {
     Sql(Source),
@@ -183,500 +192,548 @@ pub struct Options {
 /// `BIG_ADDR` when set, this otherwise. The same default `big serve` binds to.
 pub const DEFAULT_ADDR: &str = "127.0.0.1:7654";
 
-pub const USAGE: &str = "\
-usage: bigctl [options] <command> [args]
+const ABOUT: &str = "Ask a running `big serve`";
 
+const LONG_ABOUT: &str = "\
 Asks a running `big serve`. Every command below is exactly one of its routes; there is no offline
 mode and no --file, because a second query path is a path nobody tests. Start a daemon.
 
-Queries:
-  sql <statement>|-           one SELECT over one table, a write, or a schema change:
-                                INSERT INTO t (a, n) VALUES ('GB', 5)
-                                CREATE TABLE IF NOT EXISTS t (a TEXT, n INT)
-                                ALTER TABLE t ADD COLUMN b BIGINT, DROP COLUMN a
-                                DROP TABLE IF EXISTS t
-                                DESCRIBE t | SHOW TABLES | SHOW CREATE TABLE t
-                              An INSERT needs a write token; a schema change an
-                              admin one. Volume goes through `import`, not here.
-  query <table> <call>|-      one PQL call
-  records <table>             every record id, in order
-      --after <id>              resume after this id
-      --limit <n>               how many to return
-  shell                       a loop over sql and query
+Exit codes: 0 answered, 1 the server refused, 2 usage, 3 nothing was listening.";
 
-Schema:
-  schema                      every table and field
-  create table <table>
-      --engine <e>              bitmap | bitmap+columnar | columnar
-                                default bitmap+columnar
-  create field <table> <field> --kind int|signed|decimal|set|mutex|bool|timequantum
-      --bit-depth <n>           for int and signed
-      --scale <n>               for decimal
-      --granularity <chars>     for timequantum
-  drop table <table>
-  drop field <table> <field>
+// ---------------------------------------------------------------------------------------------
+// The command line itself.
+// ---------------------------------------------------------------------------------------------
 
-Data:
-  import <table> <file>|-     one fact per line: `field record value`
-  delete <table> <file>|-     one record id per line
-      --chunk-bytes <n>         bytes per request; default 7340032, ceiling 8388608
-      --chunk-lines <n>         lines per request; default 1000000
-      --resume <file>           write the acknowledged offset here, and start from it
-      --retries <n>             retry a dropped connection this many times; default 3
-      --in-flight <n>           requests waiting on the server at once; default 2, ceiling 8
-                                the second lets the server parse one body while it commits
-                                the one before, which is worth about 1.6x. It does not make
-                                writes concurrent - the engine has one writer - so a third
-                                buys little. Drop to 1 to bound what a resumed load repeats
-      --progress|--no-progress  default: progress when stderr is a terminal
-      --dry-run                 chunk the input and report, without sending anything
-
-Operations:
-  verify                      do the copies of every range still agree
-  repair                      catch up every copy that is behind
-  health | ready | metrics    the three probes
-
-Cluster:
-  cluster topology            who is in it, what each holds, and who leads
-  cluster join <name> <addr>  add a node and print the command that starts it. Two steps on
-                              two machines, in an order that only works one way round, so this
-                              does the half that belongs here
-  cluster add-node <n> <a>    the first half on its own, when the second is scripted elsewhere
-  cluster admit|drain|remove <name>
-  cluster split <shard> [to <node>] | cluster merge <range>
-  cluster move <range> to <node>
-  cluster add-replica <range> to <node>
-                              one more copy of a range that is already serving. It refuses
-                              nothing while it copies: the copy joins the group marked behind,
-                              so writes reach it at once and no read does until it agrees
-  cluster drop-replica <range> from <node>
-                              one copy fewer. The map stops naming it; nothing is deleted
-  cluster rebalance           one step, against facts gathered afresh
-  cluster schema-leader <node>
-
-Options:
-  --addr <host:port>          default 127.0.0.1:7654, or $BIG_ADDR
-                              `https://host:port` speaks TLS; a bare host:port does not
-  --credentials-file <file>   one `user:password` line, mode 600; or $BIG_CREDENTIALS
-  --user <name>               ask for the password on the terminal
-  --ca-file <file>            the CA a server's certificate must chain to
-  --insecure-skip-verify      do not check the certificate at all. Says so on every run
-  --format table|tsv|json     default: table to a terminal, tsv to a pipe
-  --timeout <seconds>         give up on the exchange; default is to wait
-  -h, --help
-
-A password is read from a file or from the terminal and never taken as a flag: an argument is
-visible in `ps` and in shell history, and a password in either has already leaked. A username
-is not a secret and may be a flag.
-
-TLS is chosen by the scheme, not guessed. A bare `host:port` is plaintext, exactly as it has
-always been, and `https://host:port` is not - because a default that guessed from whether the
-host looked like loopback would be the kind of cleverness that fails in the one deployment
-nobody tested.
-
-`bigctl shell` has no line editing on purpose. `rlwrap bigctl shell` gives it history and arrow
-keys, and does it better than a hand-rolled termios mode would.
-
-`import` and `delete` read a FILE, or `-` for standard input. They are the one pair that is not
-one request: the server bounds a body at 8 MiB, so a larger file is cut into chunks and sent as
-several. A file under --chunk-bytes is one chunk and therefore one request, so the small case
-costs nothing. (`bigc` took the facts themselves on the command line and could not read a path.
-Write them to a file, or pipe them with `-`.)
-
-A load can be resumed and can be run twice. Every fact is a bit set at a record id written in
-the line, so sending a chunk twice writes what sending it once wrote - which is what --resume
-rests on, and what lets a dropped connection be retried at all. --resume needs a seekable file,
-so it does not go with `-`. A retry covers a dropped connection, never a refusal.
-
-Exit codes: 0 answered, 1 the server refused, 2 usage, 3 nothing was listening.
-";
-
-/// Parses `argv`. `Err("")` means `--help` was asked for, which is not a failure.
-pub fn parse(args: &[String], env: &dyn Fn(&str) -> Option<String>) -> Result<Options, String> {
-    let mut addr = env("BIG_ADDR").unwrap_or_else(|| DEFAULT_ADDR.to_string());
-    let mut credentials_file = env("BIG_CREDENTIALS");
-    let mut user = None;
-    let mut ca_file = env("BIG_CA");
-    let mut insecure_skip_verify = false;
-
-    // **Refused, not ignored.** The worst outcome here is a script that keeps working against a
-    // loopback development server and silently stops authenticating in production, which is
-    // exactly what silently dropping a now-meaningless variable would produce.
-    if env("BIG_TOKEN").is_some() && credentials_file.is_none() {
-        return Err("BIG_TOKEN is no longer used: bearer tokens were replaced by usernames and \
-                    passwords. Set BIG_CREDENTIALS to a file holding one `user:password` line, \
-                    readable only by you."
-            .to_string());
-    }
-    let mut format = None;
-    let mut timeout = None;
-    // Flags that belong to a subcommand rather than to the client. Collected here because they
-    // may be written before or after the positional arguments, which is what everybody expects
-    // and what nobody says out loud.
-    // One list rather than a variable each, because the check that was missing is a check
-    // *across* them: which flags a subcommand accepts. See `command`.
-    let mut scoped: Vec<(String, String)> = Vec::new();
-    let mut positional: Vec<String> = Vec::new();
-
-    let mut i = 0;
-    while i < args.len() {
-        let arg = args[i].as_str();
-        let value = || args.get(i + 1).cloned().ok_or_else(|| format!("{arg} needs a value"));
-        match arg {
-            "--addr" => {
-                addr = value()?;
-                i += 2;
-            }
-            "--credentials-file" => {
-                credentials_file = Some(value()?);
-                i += 2;
-            }
-            "--user" => {
-                user = Some(value()?);
-                i += 2;
-            }
-            "--ca-file" => {
-                ca_file = Some(value()?);
-                i += 2;
-            }
-            "--insecure-skip-verify" => {
-                insecure_skip_verify = true;
-                i += 1;
-            }
-            // Recognised for one release so that it can say what happened, rather than falling
-            // through to "unknown option" and sending somebody to check their spelling.
-            "--token-file" => {
-                return Err("--token-file is gone: bearer tokens were replaced by usernames and \
-                            passwords. Use --credentials-file with a file holding one \
-                            `user:password` line."
-                    .to_string())
-            }
-            "--format" => {
-                let v = value()?;
-                format = Some(
-                    Format::parse(&v)
-                        .ok_or_else(|| format!("--format takes table, tsv or json, got `{v}`"))?,
-                );
-                i += 2;
-            }
-            "--timeout" => {
-                let secs: u64 = number(&value()?, arg)?;
-                // Zero means "wait", not "give up immediately", which would be a confusing way
-                // to spell a client that never works. Same reading `big serve` gives its own.
-                timeout = (secs > 0).then(|| Duration::from_secs(secs));
-                i += 2;
-            }
-            // The boolean ones go into the same list as the rest, carrying an empty value, so
-            // that `only()` polices them too. A flag that is silently dropped where it means
-            // nothing is the failure `only()` exists to prevent, and a `--dry-run` that did
-            // nothing on `schema` would be exactly that one level up.
-            "--progress" | "--no-progress" | "--dry-run" => {
-                scoped.push((arg.trim_start_matches("--").replace('-', "_"), String::new()));
-                i += 1;
-            }
-            "--after" | "--limit" | "--kind" | "--bit-depth" | "--scale" | "--granularity"
-            | "--engine" | "--chunk-bytes" | "--chunk-lines" | "--resume" | "--retries"
-            | "--in-flight" => {
-                // Values are passed through as the query parameter the route already takes,
-                // rather than re-spelled here. A field kind or an engine name this client has
-                // never heard of is a matter between the caller and the server.
-                //
-                // Which *flags* a subcommand takes is this client's business, though, and is
-                // checked in `command`.
-                scoped.push((arg.trim_start_matches("--").replace('-', "_"), value()?));
-                i += 2;
-            }
-            "-h" | "--help" => return Err(String::new()),
-            other if other.starts_with("--") => return Err(format!("unknown option {other}")),
-            other => {
-                positional.push(other.to_string());
-                i += 1;
-            }
-        }
-    }
-
-    let command = command(&positional, scoped)?;
-    Ok(Options {
-        addr,
-        credentials_file,
-        user,
-        ca_file,
-        insecure_skip_verify,
-        format,
-        timeout,
-        command,
-    })
-}
-
-/// The flag name as it was typed, for an error message. The list stores query-parameter names,
-/// which spell `bit_depth` where the flag says `--bit-depth`.
-fn flag(param: &str) -> String {
-    format!("--{}", param.replace('_', "-"))
-}
-
-fn command(positional: &[String], scoped: Vec<(String, String)>) -> Result<Command, String> {
-    let words: Vec<&str> = positional.iter().map(String::as_str).collect();
-
-    /// Refuses a subcommand flag that belongs to a different subcommand.
+#[derive(clap::Parser, Debug)]
+#[command(
+    name = "bigctl",
+    version,
+    about = ABOUT,
+    long_about = LONG_ABOUT,
+    disable_help_flag = false,
+    // A misspelling should cost one line, not a re-read of the whole help.
+    infer_subcommands = false,
+    // `wrap_help` is off - it is a crate, `terminal_size`, rather than code - so the prose below
+    // is wrapped by hand and must reach `--help` the way it is written here.
+    verbatim_doc_comment
+)]
+pub struct Cli {
+    /// Where the daemon is; `https://host:port` speaks TLS.
     ///
-    /// **This is the check that used to be missing, and its absence was a silent failure rather
-    /// than a small one.** Every one of these flags was accepted on every command and then
-    /// dropped wherever it meant nothing, so `records t --limit 5` worked and
-    /// `records t --engine columnar` did nothing at all - with no error, no output difference,
-    /// and nothing for the caller to notice. A client that swallows what it was given is worse
-    /// than one that refuses it.
-    fn only(scoped: &[(String, String)], command: &str, allowed: &[&str]) -> Result<(), String> {
-        for (name, _) in scoped {
-            if !allowed.contains(&name.as_str()) {
-                return Err(format!("{} does not belong to `{command}`", flag(name)));
-            }
-        }
-        Ok(())
-    }
+    /// Defaults to $BIG_ADDR, or 127.0.0.1:7654 when that is unset. A bare `host:port` does not
+    /// speak TLS - the scheme is how this client is told, because a client that guessed would
+    /// eventually guess "plaintext" against a server that wanted otherwise.
+    #[arg(long, global = true, value_name = "HOST:PORT", verbatim_doc_comment)]
+    addr: Option<String>,
 
-    /// A numeric flag, or `None` when it was not given.
-    fn num(scoped: &[(String, String)], name: &str) -> Result<Option<u64>, String> {
-        match scoped.iter().find(|(k, _)| k == name) {
-            None => Ok(None),
-            Some((_, v)) => number(v, &flag(name)).map(Some),
-        }
-    }
+    /// A file holding one `user:password` line, mode 600; or $BIG_CREDENTIALS.
+    #[arg(long, global = true, value_name = "FILE")]
+    credentials_file: Option<String>,
 
-    /// The knobs `import` and `delete` accept, and no other command does.
-    fn load(scoped: &[(String, String)]) -> Result<Load, String> {
-        let has = |name: &str| scoped.iter().any(|(k, _)| k == name);
-        let text = |name: &str| scoped.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone());
+    /// A username; the password is then asked for on the terminal.
+    ///
+    /// A username is not a secret and the server logs it anyway, so unlike a password it is
+    /// allowed to be a flag. There is deliberately no `--password`.
+    #[arg(long, global = true, value_name = "NAME", verbatim_doc_comment)]
+    user: Option<String>,
 
-        // `--progress` and `--no-progress` are two keys rather than one carrying `false`, so
-        // that `only()` can name the flag the caller actually typed.
-        let progress = match (has("progress"), has("no_progress")) {
-            (true, true) => return Err("--progress and --no-progress contradict".to_string()),
-            (true, false) => Some(true),
-            (false, true) => Some(false),
-            (false, false) => None,
-        };
+    /// The CA the server's certificate must chain to; or $BIG_CA.
+    #[arg(long, global = true, value_name = "FILE")]
+    ca_file: Option<String>,
 
-        let mut out =
-            Load { progress, dry_run: has("dry_run"), resume: text("resume"), ..Load::default() };
+    /// Connect without checking the server's certificate at all.
+    ///
+    /// Announced on stderr on every run, because a flag that turns off the thing TLS is for
+    /// should not be quiet about it.
+    #[arg(long, global = true, verbatim_doc_comment)]
+    insecure_skip_verify: bool,
 
-        if let Some(n) = num(scoped, "chunk_bytes")? {
-            // The ceiling is the server's, and a chunk above it is refused for the whole
-            // chunk rather than trimmed - so it is caught here, where the flag has a name.
-            if n == 0 || n as usize > big_http::MAX_BODY {
-                return Err(format!(
-                    "--chunk-bytes must be between 1 and {}, got {n}",
-                    big_http::MAX_BODY
-                ));
-            }
-            out.chunk_bytes = n as usize;
-        }
-        if let Some(n) = num(scoped, "chunk_lines")? {
-            if n == 0 {
-                return Err("--chunk-lines cannot be zero".to_string());
-            }
-            out.chunk_lines = n as usize;
-        }
-        if let Some(n) = num(scoped, "retries")? {
-            out.retries = n as u32;
-        }
-        if let Some(n) = num(scoped, "in_flight")? {
-            if n == 0 || n as usize > MAX_IN_FLIGHT {
-                return Err(format!("--in-flight must be between 1 and {MAX_IN_FLIGHT}, got {n}"));
-            }
-            out.in_flight = n as usize;
-        }
-        Ok(out)
-    }
+    /// How to print an answer. Default: table on a terminal, tsv into a pipe.
+    #[arg(long, global = true, value_enum, value_name = "FORMAT")]
+    format: Option<Format>,
 
-    Ok(match words.as_slice() {
-        [] => return Err("a command is required".to_string()),
+    /// Give up after this many seconds. `0` means wait.
+    ///
+    /// Zero means "wait", not "give up immediately", which would be a confusing way to spell a
+    /// client that never works. The same reading `big serve` gives its own.
+    #[arg(long, global = true, value_name = "SECONDS", verbatim_doc_comment)]
+    timeout: Option<u64>,
 
-        ["sql", statement] => {
-            only(&scoped, "sql", &[])?;
-            Command::Sql(source(statement))
-        }
-        ["query", table, call] => {
-            only(&scoped, "query", &[])?;
-            Command::Query { table: (*table).to_string(), text: source(call) }
-        }
-        ["records", table] => {
-            only(&scoped, "records", &["after", "limit"])?;
-            Command::Records {
-                table: (*table).to_string(),
-                after: num(&scoped, "after")?,
-                limit: num(&scoped, "limit")?,
-            }
-        }
-        [verb @ ("import" | "delete"), table, file] => {
-            only(&scoped, verb, &LOAD)?;
-            let verb = if *verb == "import" { Verb::Import } else { Verb::Delete };
-            let input = if *file == "-" { Input::Stdin } else { Input::Path((*file).to_string()) };
-            Command::Load { verb, table: (*table).to_string(), input, load: load(&scoped)? }
-        }
+    /// Gone: bearer tokens were replaced by usernames and passwords.
+    ///
+    /// Recognised for one release so that it can say what happened, rather than falling through
+    /// to "unknown option" and sending somebody to check their spelling.
+    #[arg(long, global = true, hide = true, num_args = 0..=1, value_name = "FILE", verbatim_doc_comment)]
+    token_file: Option<Option<String>>,
 
-        ["schema"] => {
-            only(&scoped, "schema", &[])?;
-            Command::Schema
-        }
-        ["create", "table", table] => {
-            only(&scoped, "create table", &["engine"])?;
-            Command::CreateTable { table: (*table).to_string(), params: scoped }
-        }
-        ["create", "field", table, field] => {
-            only(&scoped, "create field", &["kind", "bit_depth", "scale", "granularity"])?;
-            if !scoped.iter().any(|(k, _)| k == "kind") {
-                return Err("create field needs --kind".to_string());
-            }
-            Command::CreateField {
-                table: (*table).to_string(),
-                field: (*field).to_string(),
-                params: scoped,
-            }
-        }
-        ["drop", "table", table] => {
-            only(&scoped, "drop table", &[])?;
-            Command::DropTable { table: (*table).to_string() }
-        }
-        ["drop", "field", table, field] => {
-            only(&scoped, "drop field", &[])?;
-            Command::DropField { table: (*table).to_string(), field: (*field).to_string() }
-        }
-
-        ["verify"] => {
-            only(&scoped, "verify", &[])?;
-            Command::Verify
-        }
-        ["repair"] => {
-            only(&scoped, "repair", &[])?;
-            Command::Repair
-        }
-
-        // **Three verbs, and the shape of the cluster is all of them.** An operator types
-        // these; an autoscaler and a Kubernetes controller reach the same routes directly.
-        ["cluster", "topology"] => {
-            only(&scoped, "cluster topology", &[])?;
-            Command::ClusterTopology
-        }
-        ["cluster", "split", at] => {
-            only(&scoped, "cluster split", &[])?;
-            let at = at
-                .parse()
-                .map_err(|_| format!("`{at}` is not a shard number; write `cluster split 900`"))?;
-            Command::ClusterSplit { at, to: None }
-        }
-        ["cluster", "split", at, "to", node] => {
-            only(&scoped, "cluster split", &[])?;
-            let at = at
-                .parse()
-                .map_err(|_| format!("`{at}` is not a shard number; write `cluster split 900`"))?;
-            Command::ClusterSplit { at, to: Some((*node).to_string()) }
-        }
-        ["cluster", "add-node", name, addr] => {
-            only(&scoped, "cluster add-node", &[])?;
-            Command::ClusterAddNode { name: (*name).to_string(), addr: (*addr).to_string() }
-        }
-        ["cluster", "add-replica", range, "to", node] => {
-            only(&scoped, "cluster add-replica", &[])?;
-            let range = range.parse().map_err(|_| {
-                format!("`{range}` is not a range id; write `cluster add-replica 1 to d`")
-            })?;
-            Command::ClusterReplica { add: true, range, node: (*node).to_string() }
-        }
-        ["cluster", "drop-replica", range, "from", node] => {
-            only(&scoped, "cluster drop-replica", &[])?;
-            let range = range.parse().map_err(|_| {
-                format!("`{range}` is not a range id; write `cluster drop-replica 1 from d`")
-            })?;
-            Command::ClusterReplica { add: false, range, node: (*node).to_string() }
-        }
-        ["cluster", "join", name, addr] => {
-            only(&scoped, "cluster join", &[])?;
-            Command::ClusterJoin { name: (*name).to_string(), addr: (*addr).to_string() }
-        }
-        ["cluster", "admit", name] => {
-            only(&scoped, "cluster admit", &[])?;
-            Command::ClusterMember { verb: "admit", name: (*name).to_string() }
-        }
-        ["cluster", "drain", name] => {
-            only(&scoped, "cluster drain", &[])?;
-            Command::ClusterMember { verb: "drain", name: (*name).to_string() }
-        }
-        ["cluster", "remove", name] => {
-            only(&scoped, "cluster remove", &[])?;
-            Command::ClusterMember { verb: "remove", name: (*name).to_string() }
-        }
-        ["cluster", "move", range, "to", node] => {
-            only(&scoped, "cluster move", &[])?;
-            let range = range
-                .parse()
-                .map_err(|_| format!("`{range}` is not a range id; write `cluster move 2 to c`"))?;
-            Command::ClusterMove { range, to: (*node).to_string() }
-        }
-        ["cluster", "schema-leader", node] => {
-            only(&scoped, "cluster schema-leader", &[])?;
-            Command::ClusterSchemaLeader { to: (*node).to_string() }
-        }
-        ["cluster", "rebalance"] => {
-            only(&scoped, "cluster rebalance", &[])?;
-            Command::ClusterRebalance
-        }
-        ["cluster", "cancel", range] => {
-            only(&scoped, "cluster cancel", &[])?;
-            let range = range
-                .parse()
-                .map_err(|_| format!("`{range}` is not a range id; write `cluster cancel 2`"))?;
-            Command::ClusterCancel { range }
-        }
-        ["cluster", "merge", range] => {
-            only(&scoped, "cluster merge", &[])?;
-            let range = range
-                .parse()
-                .map_err(|_| format!("`{range}` is not a range id; write `cluster merge 2`"))?;
-            Command::ClusterMerge { range }
-        }
-        ["health"] => {
-            only(&scoped, "health", &[])?;
-            Command::Health
-        }
-        ["ready"] => {
-            only(&scoped, "ready", &[])?;
-            Command::Ready
-        }
-        ["metrics"] => {
-            only(&scoped, "metrics", &[])?;
-            Command::Metrics
-        }
-        ["shell"] => {
-            only(&scoped, "shell", &[])?;
-            Command::Shell
-        }
-
-        // Named rather than answered with the usage alone: "wrong number of arguments to a
-        // command that exists" and "no such command" are different mistakes.
-        [name, ..] if KNOWN.contains(name) => return Err(format!("wrong arguments for `{name}`")),
-        [name, ..] => return Err(format!("no such command `{name}`")),
-    })
+    #[command(subcommand)]
+    command: Cmd,
 }
 
-/// The flags a load accepts. Every other subcommand's allow-list is unchanged, which now means
-/// `bigctl schema --dry-run` and `bigctl sql "..." --resume f` are refused by name - coverage
-/// the two separate binaries could not have had, because neither knew the other's flags.
-const LOAD: [&str; 8] = [
-    "chunk_bytes",
-    "chunk_lines",
-    "resume",
-    "retries",
-    "in_flight",
-    "progress",
-    "no_progress",
-    "dry_run",
-];
+#[derive(clap::Subcommand, Debug)]
+enum Cmd {
+    /// One SELECT over one table, a write, or a schema change. `-` reads stdin.
+    #[command(long_about = "\
+One SELECT over one table, a write, or a schema change:
 
-/// Every first word this client answers to, for telling a typo from a misuse.
-const KNOWN: [&str; 16] = [
-    "sql", "query", "records", "import", "delete", "schema", "create", "drop", "verify", "repair",
-    "health", "ready", "metrics", "shell", "help", "cluster",
-];
+  INSERT INTO t (a, n) VALUES ('GB', 5)
+  CREATE TABLE IF NOT EXISTS t (a TEXT, n INT)
+  ALTER TABLE t ADD COLUMN b BIGINT, DROP COLUMN a
+  DROP TABLE IF EXISTS t
+  DESCRIBE t | SHOW TABLES | SHOW CREATE TABLE t
+
+An INSERT needs a write token; a schema change an admin one. Volume goes through `import`, not
+here.")]
+    Sql {
+        /// The statement, or `-` to read it from stdin.
+        #[arg(value_name = "STATEMENT")]
+        statement: String,
+    },
+
+    /// One PQL call. `-` reads stdin.
+    Query {
+        table: String,
+        /// The call, or `-` to read it from stdin.
+        #[arg(value_name = "CALL")]
+        call: String,
+    },
+
+    /// Every record id, in order.
+    Records {
+        table: String,
+        /// Resume after this id.
+        #[arg(long, value_name = "ID")]
+        after: Option<u64>,
+        /// How many to return.
+        #[arg(long, value_name = "N")]
+        limit: Option<u64>,
+    },
+
+    /// Load facts from a file: one `field record value` per line. `-` reads stdin.
+    Import {
+        table: String,
+        /// The file, or `-` for standard input.
+        #[arg(value_name = "FILE")]
+        file: String,
+        #[command(flatten)]
+        load: LoadArgs,
+    },
+
+    /// Delete records listed in a file: one record id per line. `-` reads stdin.
+    Delete {
+        table: String,
+        /// The file, or `-` for standard input.
+        #[arg(value_name = "FILE")]
+        file: String,
+        #[command(flatten)]
+        load: LoadArgs,
+    },
+
+    /// Every table and field.
+    Schema,
+
+    /// Add a table or a field.
+    #[command(subcommand)]
+    Create(CreateCmd),
+
+    /// Remove a table or a field.
+    #[command(subcommand)]
+    Drop(DropCmd),
+
+    /// Do the copies of every range still agree.
+    Verify,
+
+    /// Catch up every copy that is behind.
+    Repair,
+
+    /// Who is in the cluster, and the changes that reshape it.
+    #[command(subcommand)]
+    Cluster(ClusterCmd),
+
+    /// Is the process alive.
+    Health,
+
+    /// Is it ready to serve.
+    Ready,
+
+    /// The metrics endpoint, passed through verbatim.
+    Metrics,
+
+    /// A loop over sql and query.
+    Shell,
+}
+
+#[derive(clap::Subcommand, Debug)]
+#[command(verbatim_doc_comment)]
+enum CreateCmd {
+    /// Add a table.
+    Table {
+        table: String,
+        /// bitmap | bitmap+columnar | columnar. Default bitmap+columnar.
+        ///
+        /// Passed through to the server rather than checked here: an engine name this client
+        /// has never heard of is a matter between the caller and the server.
+        #[arg(long, value_name = "ENGINE", verbatim_doc_comment)]
+        engine: Option<String>,
+    },
+    /// Add a field to a table.
+    Field {
+        table: String,
+        field: String,
+        /// int | signed | decimal | set | mutex | bool | timequantum.
+        #[arg(long, required = true, value_name = "KIND")]
+        kind: String,
+        /// For int and signed.
+        #[arg(long, value_name = "N")]
+        bit_depth: Option<String>,
+        /// For decimal.
+        #[arg(long, value_name = "N")]
+        scale: Option<String>,
+        /// For timequantum.
+        #[arg(long, value_name = "CHARS")]
+        granularity: Option<String>,
+    },
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum DropCmd {
+    /// Remove a table.
+    Table { table: String },
+    /// Remove a field from a table.
+    Field { table: String, field: String },
+}
+
+#[derive(clap::Subcommand, Debug)]
+#[command(verbatim_doc_comment)]
+enum ClusterCmd {
+    /// Who is in it, what each holds, and who leads.
+    Topology,
+
+    /// Cut a range in two, optionally handing the upper half to a node.
+    Split {
+        /// The shard to cut at.
+        #[arg(value_name = "SHARD")]
+        at: u64,
+        /// The word `to`, when a destination follows.
+        #[arg(value_parser = ["to"], value_name = "to", requires = "node")]
+        to: Option<String>,
+        /// The node that takes the upper half.
+        node: Option<String>,
+    },
+
+    /// Join a range to the one after it.
+    Merge {
+        /// The range to fold into the one after it.
+        #[arg(value_name = "RANGE")]
+        range: u64,
+    },
+
+    #[command(verbatim_doc_comment)]
+    /// Add a node, as a learner.
+    ///
+    /// The first half of a join on its own, for when the second half is scripted elsewhere.
+    AddNode {
+        name: String,
+        #[arg(id = "node_addr", value_name = "ADDR")]
+        addr: String,
+    },
+
+    #[command(verbatim_doc_comment)]
+    /// Add a node and print the command that starts it.
+    ///
+    /// Two steps on two machines, in an order that only works one way round, so this does the
+    /// half that belongs here.
+    Join {
+        name: String,
+        #[arg(id = "node_addr", value_name = "ADDR")]
+        addr: String,
+    },
+
+    #[command(verbatim_doc_comment)]
+    /// One more copy of a range that is already serving.
+    ///
+    /// It refuses nothing while it copies: the copy joins the group marked behind, so writes
+    /// reach it at once and no read does until it agrees.
+    AddReplica {
+        /// The range that gains a copy.
+        #[arg(value_name = "RANGE")]
+        range: u64,
+        /// The word `to`, so the command reads as a sentence.
+        #[arg(value_parser = ["to"], value_name = "to")]
+        _to: String,
+        /// The node that gains the copy.
+        node: String,
+    },
+
+    /// One copy fewer. The map stops naming it; nothing is deleted.
+    DropReplica {
+        /// The range that loses a copy.
+        #[arg(value_name = "RANGE")]
+        range: u64,
+        /// The word `from`, so the command reads as a sentence.
+        #[arg(value_parser = ["from"], value_name = "from")]
+        _from: String,
+        /// The node that loses the copy.
+        node: String,
+    },
+
+    /// Let a learner start serving.
+    Admit { name: String },
+
+    /// Move a node's work elsewhere, leaving it in the cluster.
+    Drain { name: String },
+
+    /// Take a node out of the cluster.
+    Remove { name: String },
+
+    /// Hand a populated range over to another node.
+    Move {
+        /// The range to hand over.
+        #[arg(value_name = "RANGE")]
+        range: u64,
+        /// The word `to`, so the command reads as a sentence.
+        #[arg(value_parser = ["to"], value_name = "to")]
+        _to: String,
+        /// The node that takes it.
+        node: String,
+    },
+
+    /// Abandon a move in flight.
+    Cancel {
+        /// The range whose move should be abandoned.
+        #[arg(value_name = "RANGE")]
+        range: u64,
+    },
+
+    /// Take one balancing step, against facts gathered afresh.
+    Rebalance,
+
+    /// Hand the row-key namespace over.
+    SchemaLeader { node: String },
+}
+
+/// The knobs `import` and `delete` accept, and no other command does.
+///
+/// This is the whole of what `only()` used to enforce by hand. Declaring them here means
+/// `bigctl schema --dry-run` is refused because `--dry-run` does not exist on `schema`, not
+/// because a table said it should not.
+#[derive(clap::Args, Debug)]
+#[command(verbatim_doc_comment)]
+struct LoadArgs {
+    /// Bytes per request. Ceiling 8388608, the server's body limit.
+    #[arg(long, value_name = "N", default_value_t = DEFAULT_CHUNK_BYTES, value_parser = chunk_bytes)]
+    chunk_bytes: usize,
+
+    /// Lines per request.
+    #[arg(long, value_name = "N", default_value_t = DEFAULT_CHUNK_LINES, value_parser = chunk_lines)]
+    chunk_lines: usize,
+
+    /// Write the acknowledged offset here, and start from it.
+    ///
+    /// Needs a seekable file, so it does not go with `-`. A load can be run twice: every fact
+    /// is a bit set at a record id written in the line, so sending a chunk twice writes what
+    /// sending it once wrote - which is what this rests on, and what lets a dropped connection
+    /// be retried at all.
+    #[arg(long, value_name = "FILE", verbatim_doc_comment)]
+    resume: Option<String>,
+
+    /// Retry a dropped connection this many times. Never a refusal.
+    #[arg(long, value_name = "N", default_value_t = DEFAULT_RETRIES)]
+    retries: u32,
+
+    /// Requests waiting on the server at once. Ceiling 8.
+    #[arg(long, value_name = "N", default_value_t = DEFAULT_IN_FLIGHT, value_parser = in_flight,
+          long_help = "\
+Requests waiting on the server at once; default 2, ceiling 8.
+
+With a single request outstanding the load is strictly alternating: the client waits while the
+server parses and commits, then the server waits while the client reads and sends. A second
+request lets the server parse one body while it commits the one before, which is the only
+overlap available - the engine has one writer, so this does not make writes concurrent. It is
+worth about 1.6x; a third is inside the noise and a fourth is nothing at all.
+
+What it costs is how much a resumed load repeats. A checkpoint is one offset meaning
+\"everything before this is written\", so it may only advance across a contiguous run of
+acknowledged chunks. Drop to 1 to bound that at a single --chunk-bytes.")]
+    in_flight: usize,
+
+    /// Show progress on stderr. Default: progress when stderr is a terminal.
+    #[arg(long, conflicts_with = "no_progress")]
+    progress: bool,
+
+    /// Do not show progress.
+    #[arg(long)]
+    no_progress: bool,
+
+    /// Chunk the input and report, without sending anything.
+    #[arg(long)]
+    dry_run: bool,
+}
+
+// ---------------------------------------------------------------------------------------------
+// Value parsers. Bounds live here rather than in the operation, so a refusal names the flag.
+// ---------------------------------------------------------------------------------------------
+
+fn chunk_bytes(s: &str) -> Result<usize, String> {
+    // The ceiling is the server's, and a chunk above it is refused for the whole chunk rather
+    // than trimmed - so it is caught here, where the flag has a name.
+    let n: usize = s.parse().map_err(|_| format!("`{s}` is not a number"))?;
+    if n == 0 || n > big_http::MAX_BODY {
+        return Err(format!("must be between 1 and {}, got {n}", big_http::MAX_BODY));
+    }
+    Ok(n)
+}
+
+fn chunk_lines(s: &str) -> Result<usize, String> {
+    let n: usize = s.parse().map_err(|_| format!("`{s}` is not a number"))?;
+    if n == 0 {
+        return Err("cannot be zero".to_string());
+    }
+    Ok(n)
+}
+
+fn in_flight(s: &str) -> Result<usize, String> {
+    let n: usize = s.parse().map_err(|_| format!("`{s}` is not a number"))?;
+    if n == 0 || n > MAX_IN_FLIGHT {
+        return Err(format!("must be between 1 and {MAX_IN_FLIGHT}, got {n}"));
+    }
+    Ok(n)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Lowering: the command line to the run.
+// ---------------------------------------------------------------------------------------------
+
+impl Cli {
+    /// Applies the environment and folds the parsed command line into one [`Options`].
+    ///
+    /// `env` is injected rather than read, so that the tests are hermetic - see the module doc.
+    pub fn resolve(self, env: &dyn Fn(&str) -> Option<String>) -> Result<Options, String> {
+        // **Refused, not ignored.** The worst outcome here is a script that keeps working
+        // against a loopback development server and silently stops authenticating in
+        // production, which is exactly what silently dropping a now-meaningless flag or
+        // variable would produce.
+        if self.token_file.is_some() {
+            return Err("--token-file is gone: bearer tokens were replaced by usernames and \
+                        passwords. Use --credentials-file with a file holding one \
+                        `user:password` line."
+                .to_string());
+        }
+
+        let credentials_file = self.credentials_file.or_else(|| env("BIG_CREDENTIALS"));
+        if env("BIG_TOKEN").is_some() && credentials_file.is_none() {
+            return Err("BIG_TOKEN is no longer used: bearer tokens were replaced by usernames \
+                        and passwords. Set BIG_CREDENTIALS to a file holding one \
+                        `user:password` line, readable only by you."
+                .to_string());
+        }
+
+        Ok(Options {
+            addr: self.addr.or_else(|| env("BIG_ADDR")).unwrap_or_else(|| DEFAULT_ADDR.to_string()),
+            credentials_file,
+            user: self.user,
+            ca_file: self.ca_file.or_else(|| env("BIG_CA")),
+            insecure_skip_verify: self.insecure_skip_verify,
+            format: self.format,
+            // Zero means "wait", not "give up immediately".
+            timeout: self.timeout.filter(|s| *s > 0).map(Duration::from_secs),
+            command: self.command.into(),
+        })
+    }
+}
+
+impl From<Cmd> for Command {
+    fn from(cmd: Cmd) -> Self {
+        match cmd {
+            Cmd::Sql { statement } => Command::Sql(source(&statement)),
+            Cmd::Query { table, call } => Command::Query { table, text: source(&call) },
+            Cmd::Records { table, after, limit } => Command::Records { table, after, limit },
+            Cmd::Import { table, file, load } => {
+                Command::Load { verb: Verb::Import, table, input: input(&file), load: load.into() }
+            }
+            Cmd::Delete { table, file, load } => {
+                Command::Load { verb: Verb::Delete, table, input: input(&file), load: load.into() }
+            }
+            Cmd::Schema => Command::Schema,
+            Cmd::Create(CreateCmd::Table { table, engine }) => {
+                Command::CreateTable { table, params: params([("engine", engine)]) }
+            }
+            Cmd::Create(CreateCmd::Field { table, field, kind, bit_depth, scale, granularity }) => {
+                Command::CreateField {
+                    table,
+                    field,
+                    // Query-parameter names, which spell `bit_depth` where the flag says
+                    // `--bit-depth`. The route already takes them in this spelling.
+                    params: params([
+                        ("kind", Some(kind)),
+                        ("bit_depth", bit_depth),
+                        ("scale", scale),
+                        ("granularity", granularity),
+                    ]),
+                }
+            }
+            Cmd::Drop(DropCmd::Table { table }) => Command::DropTable { table },
+            Cmd::Drop(DropCmd::Field { table, field }) => Command::DropField { table, field },
+            Cmd::Verify => Command::Verify,
+            Cmd::Repair => Command::Repair,
+            Cmd::Cluster(c) => c.into(),
+            Cmd::Health => Command::Health,
+            Cmd::Ready => Command::Ready,
+            Cmd::Metrics => Command::Metrics,
+            Cmd::Shell => Command::Shell,
+        }
+    }
+}
+
+impl From<ClusterCmd> for Command {
+    fn from(cmd: ClusterCmd) -> Self {
+        match cmd {
+            ClusterCmd::Topology => Command::ClusterTopology,
+            ClusterCmd::Split { at, node, .. } => Command::ClusterSplit { at, to: node },
+            ClusterCmd::Merge { range } => Command::ClusterMerge { range },
+            ClusterCmd::AddNode { name, addr } => Command::ClusterAddNode { name, addr },
+            ClusterCmd::Join { name, addr } => Command::ClusterJoin { name, addr },
+            ClusterCmd::AddReplica { range, node, .. } => {
+                Command::ClusterReplica { add: true, range, node }
+            }
+            ClusterCmd::DropReplica { range, node, .. } => {
+                Command::ClusterReplica { add: false, range, node }
+            }
+            ClusterCmd::Admit { name } => Command::ClusterMember { verb: "admit", name },
+            ClusterCmd::Drain { name } => Command::ClusterMember { verb: "drain", name },
+            ClusterCmd::Remove { name } => Command::ClusterMember { verb: "remove", name },
+            ClusterCmd::Move { range, node, .. } => Command::ClusterMove { range, to: node },
+            ClusterCmd::Cancel { range } => Command::ClusterCancel { range },
+            ClusterCmd::Rebalance => Command::ClusterRebalance,
+            ClusterCmd::SchemaLeader { node } => Command::ClusterSchemaLeader { to: node },
+        }
+    }
+}
+
+impl From<LoadArgs> for Load {
+    fn from(a: LoadArgs) -> Self {
+        Load {
+            chunk_bytes: a.chunk_bytes,
+            chunk_lines: a.chunk_lines,
+            resume: a.resume,
+            retries: a.retries,
+            in_flight: a.in_flight,
+            // Two flags rather than one carrying `false`, so that each can be named in help and
+            // refused where it does not belong. `conflicts_with` is what makes them exclusive.
+            progress: match (a.progress, a.no_progress) {
+                (true, _) => Some(true),
+                (_, true) => Some(false),
+                _ => None,
+            },
+            dry_run: a.dry_run,
+        }
+    }
+}
+
+/// The flags that were given, in the query-parameter spelling the route takes.
+fn params<const N: usize>(given: [(&str, Option<String>); N]) -> Vec<(String, String)> {
+    given.into_iter().filter_map(|(name, value)| value.map(|v| (name.to_string(), v))).collect()
+}
 
 fn source(arg: &str) -> Source {
     if arg == "-" {
@@ -686,6 +743,10 @@ fn source(arg: &str) -> Source {
     }
 }
 
-fn number(s: &str, flag: &str) -> Result<u64, String> {
-    s.parse().map_err(|_| format!("{flag} needs a number, got `{s}`"))
+fn input(arg: &str) -> Input {
+    if arg == "-" {
+        Input::Stdin
+    } else {
+        Input::Path(arg.to_string())
+    }
 }

@@ -102,7 +102,7 @@ pub fn get_raft(bytes: &[u8]) -> Result<raft::Message> {
             let prev_term = r.u64()?;
             let commit = r.u64()?;
             let n = r.count()?;
-            let mut entries = Vec::with_capacity(n);
+            let mut entries = reserve(n);
             for _ in 0..n {
                 let term = r.u64()?;
                 let decision = match r.u8()? {
@@ -191,14 +191,14 @@ fn get_range_map(r: &mut Reader<'_>) -> Result<raft::RangeMap> {
     let epoch = r.u64()?;
     let schema_leader = r.u64()? as raft::NodeId;
     let n = r.count()?;
-    let mut ranges = Vec::with_capacity(n);
+    let mut ranges = reserve(n);
     for _ in 0..n {
         let id = r.u64()?;
         let start = r.u64()?;
         let end = r.opt_u64()?;
         let primary = r.u64()? as raft::NodeId;
         let count = r.count()?;
-        let mut group = Vec::with_capacity(count);
+        let mut group = reserve(count);
         for _ in 0..count {
             group.push(r.u64()? as raft::NodeId);
         }
@@ -223,12 +223,12 @@ fn get_range_map(r: &mut Reader<'_>) -> Result<raft::RangeMap> {
         });
     }
     let count = r.count()?;
-    let mut stale = Vec::with_capacity(count);
+    let mut stale = reserve(count);
     for _ in 0..count {
         stale.push(r.u64()? as raft::NodeId);
     }
     let count = r.count()?;
-    let mut reserved = Vec::with_capacity(count);
+    let mut reserved = reserve(count);
     for _ in 0..count {
         reserved.push((r.str()?, r.u64()?));
     }
@@ -255,7 +255,7 @@ fn put_members(out: &mut Vec<u8>, members: &[raft::Member]) {
 
 fn get_members(r: &mut Reader<'_>) -> Result<Vec<raft::Member>> {
     let n = r.count()?;
-    let mut out = Vec::with_capacity(n);
+    let mut out = reserve(n);
     for _ in 0..n {
         let name = r.str()?;
         let addr = r.str()?;

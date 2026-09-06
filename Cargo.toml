@@ -72,6 +72,23 @@ big-testfile = { path = "crates/big-testfile" }
 big-message = { path = "contrib/big-message" }
 big-message-redis = { path = "contrib/big-message-redis" }
 
+# The one third-party crate the *binaries* share, named here so the two of them cannot drift
+# into different feature sets - which is the failure the five hand-rolled parsers it replaces
+# actually had. See `docs/dependencies.md` for what it costs and why that was judged worth it.
+#
+# `default-features = false` because two of clap's defaults are crates rather than code:
+# `color` pulls `anstream` and `wrap_help` pulls `terminal_size`, and neither earns its place in
+# a tree this small when half of what reads this output is a shell script. What is left -
+# `help`, `usage`, `error-context` and `suggestions` - is the parsing and the diagnostics.
+clap = { version = "4.6", default-features = false, features = [
+    "std",
+    "help",
+    "usage",
+    "error-context",
+    "suggestions",
+    "derive",
+] }
+
 [profile.release]
 opt-level = 3
 lto = "thin"

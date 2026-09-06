@@ -165,5 +165,18 @@ pub struct Snapshot {
     /// Whether the last handover found two survivors disagreeing about a row id. **Somebody
     /// has to look**: nothing clears this but a handover that succeeds.
     pub handover_blocked: bool,
+    /// Whether this node stopped participating because it could not write its state down.
+    ///
+    /// **The one failure that leaves a process up, a port answering and the node contributing
+    /// nothing.** Without it, a full disk under the agreement's state file looks from outside
+    /// like a node that is merely quiet, and the symptom found first is an election that never
+    /// settles somewhere else in the cluster.
+    pub wedged: bool,
+    /// Inbound raft messages dropped because the deciding thread was behind.
+    ///
+    /// Not zero is not a failure - the protocol retries - but a number that climbs says this
+    /// node cannot keep up with what its peers send it, which is the difference between a
+    /// network problem and a machine that is too small.
+    pub messages_dropped: u64,
     pub counts: Counts,
 }

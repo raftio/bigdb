@@ -91,6 +91,10 @@ kubectl get namespace "$ns" >/dev/null 2>&1 || kubectl create namespace "$ns"
 # every key. That is the trade one workload makes; 20-nodes.yaml says what to do if it is the
 # wrong way round for you.
 set -- --from-file=users="$out/users" --from-file=peer-ca.pem="$out/peer-ca.pem"
+# The revocation list travels with the CA. `certs.sh` writes an empty one at bootstrap, so
+# revocation is configured before anybody needs it: turning it on later means restarting every
+# node, and the moment a key leaks is the worst moment to be planning a rollout.
+[ -f "$out/peer-ca.crl" ] && set -- "$@" --from-file=peer-ca.crl="$out/peer-ca.crl"
 for node in $nodes; do
     set -- "$@" --from-file="$node.pem=$out/$node.pem" --from-file="$node.key=$out/$node.key"
 done
@@ -111,7 +115,7 @@ kubectl -n "$ns" create secret generic big-joiner \
 
 echo
 echo "namespace $ns now holds:"
-echo "  big-nodes    users, peer-ca.pem, and a certificate for each of: $nodes"
+echo "  big-nodes    users, peer-ca.pem, peer-ca.crl, and a certificate for each of: $nodes"
 echo "  big-proxy    peer-ca.pem"
 echo "  big-joiner   the credential a new pod registers itself with"
 echo

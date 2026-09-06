@@ -98,9 +98,11 @@ are the only two places a ceiling exists.
 
 ## Scaling in is not the mirror image
 
-`kubectl scale --replicas=3` deletes `big-4`, and if `big-4` holds a range that range is
-unanswerable until it comes back: nothing here is replicated, so the proxy picks a node that is
-up and cannot pick data that is not there. **Take the work off it first:**
+`kubectl scale --replicas=3` deletes `big-4`, and if `big-4` holds a range with no copy that
+range is unanswerable until it comes back: the proxy picks a node that is up and cannot pick
+data that is not there. Only `0..96` ships with a copy - every range the balancer hands to a
+pod that joins later has none - so this applies to exactly the nodes scaling added.
+**Take the work off it first:**
 
 ```sh
 ctl cluster drain big-4      # still votes, still coordinates; the balancer moves its ranges away
@@ -220,17 +222,25 @@ allowlist rather than an omission: each asks about *one node*, and a proxy choos
 without telling you. `POST /admin/backup` is the sharpest case - through a front door it would
 mean "back up a node, unspecified". `--allow-ops` turns them on if you want that anyway.
 
-## Rollouts, drains, and the range that has no copy
+## Rollouts, drains, and which ranges have a copy
 
-No range here has a copy, so **stopping a node makes its range unanswerable until it comes
-back**. Every operation below inherits that one fact.
+**`0..96` has a copy and everything else does not.** `big-0` holds it and `big-2` holds the
+same shards, so either can serve it and losing one of them costs an election rather than an
+outage. `big-1`'s range, and every range the balancer hands to a pod that joined later, has one
+holder - and stopping that pod makes those shards unanswerable until it comes back. Every
+operation below inherits that split.
 
-- **A rollout** deletes one pod at a time, so each node's range is down for as long as its pod
-  takes to come back. `kubectl rollout status` is the length of it.
-- **`kubectl drain`** on a machine evicts the pod, which is the same thing. There is no
-  PodDisruptionBudget on the nodes on purpose: `maxUnavailable: 0` would not protect the data, it
-  would hang the drain forever and call that protection. What makes a node evictable is a copy of
-  its range.
+- **A rollout** deletes one pod at a time. For `big-0` and `big-2` that is a failover; for
+  every other pod it is its range going away for as long as the pod takes to come back.
+  `kubectl rollout status` is the length of it.
+- **`kubectl drain`** on a machine evicts the pod, which is the same thing. There is still no
+  PodDisruptionBudget on the nodes, and the reason has not changed: `maxUnavailable: 0` would
+  not protect the data, it would hang the drain forever and call that protection. What makes a
+  node evictable is a copy of its range - which `big-0` and `big-2` now have, and the rest do
+  not.
+- **Giving another range a copy** is an edit to `10-config.yaml` and a restart, not a command:
+  the balancer moves ranges and splits them, and deliberately does not decide that a range
+  needs a second copy.
 - **The proxy has one**, `minAvailable: 1`, because a second proxy genuinely is as good as the
   first - it holds no file, no lock and no identity.
 - **A killed pod loses nothing.** A commit writes its pages, fsyncs, flips the meta page and

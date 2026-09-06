@@ -56,10 +56,23 @@ const BACKOFF_TO: Duration = Duration::from_secs(60);
 /// How long a range may sit in one state of a move before somebody is told.
 ///
 /// A move takes seconds. Ten minutes in the same state is not a slow move; it is a move whose
-/// driver died, and a range marked moving silences the balancer cluster-wide until an operator
-/// runs `POST /admin/cluster/cancel`. Said once per transition rather than every pass, and
-/// never acted on: a canceller racing a slow-but-progressing move would throw away real work.
+/// driver died, and a range marked moving silences the balancer cluster-wide until somebody
+/// calls it off. Said once per transition rather than every pass.
 const STUCK_AFTER: Duration = Duration::from_secs(600);
+
+/// **And in `Cutover`, said once and then acted on.**
+///
+/// The two states of a move are not the same kind of stuck. `Seeding` copies a range, which on
+/// a large one legitimately takes far longer than [`STUCK_AFTER`] while denying nothing - so a
+/// canceller there would throw away real work to fix a problem nobody has. `Cutover` is the
+/// cut, not the copy: it is meant to last as long as one last difference takes, it is the only
+/// window in a move where writes are refused, and a driver that died in it leaves that refusal
+/// standing on every node until an operator notices. Waiting for that operator is an outage
+/// measured in however long it takes somebody to read a log line.
+///
+/// Cancelling is the safe direction. The target was never read from, so calling a move off
+/// puts the range back exactly where it already was.
+const CANCEL_CUTOVER_AFTER: Duration = STUCK_AFTER;
 
 /// How much of the file has to be reclaimable before the tail is worth trying to give back.
 ///
@@ -87,6 +100,11 @@ pub(crate) fn run<P: PagerMut + Sync + Send + 'static>(state: &State<P>) {
                     ("for_secs", log::F::N(for_.as_secs())),
                 ],
             );
+            // Warned first and cancelled second, in that order, so the log says what was wrong
+            // before it says what was done about it.
+            if refuses_writes(in_state) {
+                unstick(state, range);
+            }
         }
 
         // The handover first: while it is open nobody assigns row ids, and nothing the
@@ -216,6 +234,55 @@ fn reclaim<P: PagerMut + Sync + Send + 'static>(state: &State<P>) {
     }
 }
 
+/// Whether a range in this state of a move is denying anything to a client.
+///
+/// The whole of why one stuck state is cancelled and the other is only reported. Written as a
+/// question about *clients* rather than as a match on the state's name, because that is the
+/// property that decides it: a move nobody can feel is a move worth waiting for.
+fn refuses_writes(state: MoveState) -> bool {
+    match state {
+        // Copying, out of the write path entirely. A large range takes as long as it takes.
+        MoveState::Seeding => false,
+        // The cut. Writes to this one range are refused until it finishes or is called off.
+        MoveState::Cutover => true,
+    }
+}
+
+/// Calls off a move that has been refusing writes to its range for too long.
+///
+/// **The agreement's leader, and only it**, for the reason every other proposal here stands
+/// behind one: a decision about a map is the leader's to make, and a follower proposing would
+/// be a second opinion about a state that is already gone. On a node that is not the leader
+/// this does nothing at all and says nothing - the leader is running the same pass and will
+/// reach the same conclusion.
+fn unstick<P: PagerMut + Sync + Send + 'static>(state: &State<P>, range: RangeId) {
+    let Some(controller) = state.cluster.controller() else {
+        return;
+    };
+    if !controller.is_leader() || !controller.settled() {
+        return;
+    }
+    match state.cluster.cancel_move(range) {
+        Ok(()) => log::emit(
+            log::Level::Warn,
+            "move_cancelled",
+            &[
+                ("range", log::F::N(range)),
+                ("after_secs", log::F::N(CANCEL_CUTOVER_AFTER.as_secs())),
+                ("why", log::F::S("stuck in cutover; writes to this range were being refused")),
+            ],
+        ),
+        // Left for the operator, which is where it was before this existed. The range stays
+        // marked as moving, so `big_cluster_ranges_moving` stays up - which is the alert the
+        // runbook already names, and a truer signal than a log line nobody greps for.
+        Err(e) => log::emit(
+            log::Level::Error,
+            "move_cancel_failed",
+            &[("range", log::F::N(range)), ("error", log::F::S(&e.to_string()))],
+        ),
+    }
+}
+
 /// The one move in flight, if there is one. The map allows at most one.
 fn moving<P: PagerMut + Sync>(state: &State<P>) -> Option<(RangeId, MoveState)> {
     state.cluster.map().ranges.iter().find_map(|r| r.moving.as_ref().map(|m| (r.id, m.state)))
@@ -336,5 +403,19 @@ mod tests {
         // Finished: nothing to watch, nothing remembered.
         assert_eq!(w.observe(None, t0 + STUCK_AFTER * 4), None);
         assert_eq!(w.observe(seeding, t0 + STUCK_AFTER * 4), None, "a new move starts fresh");
+    }
+
+    /// **Only the state that denies something is ever called off.**
+    ///
+    /// A stuck `Cutover` refuses writes to its range on every node until somebody clears it,
+    /// so waiting for an operator to read a log line is an outage as long as it takes them to
+    /// read it. A stuck `Seeding` denies nothing: it is a copy, a large range legitimately
+    /// takes longer than the threshold, and cancelling one would throw away real work to fix a
+    /// problem nobody has. Getting this backwards turns a slow move into a move that can never
+    /// finish, so it is asserted rather than left to the reader of a match arm.
+    #[test]
+    fn a_stuck_move_is_called_off_only_while_it_is_refusing_writes() {
+        assert!(refuses_writes(MoveState::Cutover), "the cut denies writes and is cancelled");
+        assert!(!refuses_writes(MoveState::Seeding), "the copy denies nothing and is left alone");
     }
 }

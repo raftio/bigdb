@@ -927,6 +927,13 @@ pub struct Raft {
     // --- clocks, all in the caller's milliseconds ---
     election_at: u64,
     heartbeat_at: u64,
+    /// When this node last accepted an append or a snapshot from the node it believes leads.
+    ///
+    /// **Not persisted, and deliberately not derived from `heard`.** `heard` records contact
+    /// with anybody, a candidate included; this records contact with the *leader*, which is the
+    /// only thing that can say "the cluster is fine, and a node standing for election is
+    /// wrong". See the disruption rule in [`Raft::deliver`].
+    leader_at: Option<u64>,
     /// When each member was last heard from. The failure detector, and it costs nothing: a
     /// protocol that already heartbeats knows who is answering.
     heard: BTreeMap<NodeId, u64>,
@@ -959,6 +966,7 @@ impl Raft {
             matched: BTreeMap::new(),
             election_at: 0,
             heartbeat_at: 0,
+            leader_at: None,
             heard: BTreeMap::new(),
         };
         raft.reset_election(now);
@@ -1179,6 +1187,19 @@ impl Raft {
         self.commit
     }
 
+    /// Whether this node is still hearing from a leader it believes in.
+    ///
+    /// The guard on the disruption rule in [`Raft::deliver`]. False on a node that has never
+    /// heard from one, which is a node at startup and exactly the case that must be free to
+    /// vote. A leader is in touch with itself, so a leader doing its job does not stand aside
+    /// for a challenger either.
+    fn leader_in_touch(&self, now: u64) -> bool {
+        match (self.leader, self.leader_at) {
+            (Some(_), Some(at)) => now.saturating_sub(at) < self.timing.election_min,
+            _ => false,
+        }
+    }
+
     /// When this node last heard anything from `node`.
     pub fn last_heard(&self, node: NodeId) -> Option<u64> {
         self.heard.get(&node).copied()
@@ -1340,6 +1361,7 @@ impl Raft {
     fn win(&mut self, now: u64, out: &mut Output) {
         self.role = Role::Leader;
         self.leader = Some(self.id);
+        self.leader_at = Some(now);
         self.next.clear();
         self.matched.clear();
         for peer in self.peers() {
@@ -1378,8 +1400,27 @@ impl Raft {
         if self.role != Role::Leader {
             return None;
         }
+        // **The safety rule for a configuration change, enforced where the change happens.**
+        // One member at a time keeps the old majority and the new one overlapping, which is
+        // what makes this safe without joint consensus; two at once can split the cluster into
+        // two majorities that do not overlap and each elect a leader. The caller checks this
+        // too and says so in words - see `Controller::propose_members` - but a rule that lives
+        // only in the one call site that happens to exist today is a rule the next call site
+        // will not have. Refused here so it cannot be got around at all.
+        if let Decision::Members(next) = &decision {
+            if !self.may_change_members(next) {
+                return None;
+            }
+        }
         let mut out = Output { persist: true, ..Default::default() };
         let carries_members = matches!(decision, Decision::Members(_));
+        // **Who to send to is decided before the change, who counts is decided after.** The two
+        // are different questions and conflating them is what left a removed node uninformed:
+        // `peers()` skips a member that has left, so refreshing first excluded the one node
+        // whose whole reason to receive this entry is that it says it has left. A node that
+        // never hears it goes on believing it is a voter, and a voter hearing from nobody
+        // stands for election - for ever, because no later append reaches it either.
+        let outgoing = self.peers();
         self.log.push(Entry { term: self.term, decision });
         // Before the appends go out, so that this node is already counting the majority the
         // change describes rather than the one it replaces.
@@ -1387,11 +1428,30 @@ impl Raft {
             self.refresh_members();
         }
         self.matched.insert(self.id, self.last_index());
-        for peer in self.peers() {
+        // The union of both configurations, which is the rule the paper states for the span in
+        // which a change is in flight. Only ever wider than `peers()` by the members this entry
+        // removes, and only for this one append: the next decision sends to `peers()` alone.
+        let mut targets = self.peers();
+        for peer in outgoing {
+            if !targets.contains(&peer) {
+                targets.push(peer);
+            }
+        }
+        for peer in targets {
             self.send_append(peer, &mut out);
         }
         self.advance_commit(&mut out);
         Some(out)
+    }
+
+    /// Whether this membership is one step from the current one.
+    ///
+    /// Public because the caller wants to *say* why it refused, and `propose` can only decline.
+    /// The two are the same rule read twice rather than two rules that could drift: this is the
+    /// one the core enforces, and the caller asks it first so an operator gets a sentence
+    /// instead of a silence.
+    pub fn may_change_members(&self, next: &[Member]) -> bool {
+        differences(self.membership(), next) <= 1
     }
 
     fn send_append(&mut self, peer: NodeId, out: &mut Output) {
@@ -1435,6 +1495,34 @@ impl Raft {
         match m {
             Message::RequestVote { term, candidate, last_index, last_term } => {
                 self.heard.insert(candidate, now);
+                // **A node in touch with a leader does not help depose it.**
+                //
+                // `observe` below bumps the term on any higher one, unconditionally, and that
+                // is right for an append: a leader exists and this node has to follow it. It
+                // is wrong for a *request* to become leader. `grant` would refuse the vote -
+                // the candidate is not a voter, or its log is behind - but by then every node
+                // that heard the request has already stepped down and raised its term, so a
+                // healthy leader is deposed by a node that could never have replaced it. That
+                // is the disruptive-server problem, and a node removed from the cluster, or
+                // one flapping on a bad link, produces it for as long as it runs.
+                //
+                // So a request arriving while this node is still hearing from a leader is
+                // answered and otherwise ignored. `election_min` is the threshold because it
+                // is the same one this node applies to itself: below it, it would not have
+                // stood for election either, so it has no reason to believe somebody else
+                // should have. Past it the leader really is gone and every vote proceeds.
+                //
+                // This costs nothing on the wire, which is the reason it is here rather than
+                // PreVote: an extra round of messages would be a new message type, and a new
+                // message type is a wire version, and a wire version is a coordinated stop for
+                // every cluster that upgrades.
+                if self.leader_in_touch(now) {
+                    out.to(
+                        candidate,
+                        Message::VoteReply { term: self.term, from: self.id, granted: false },
+                    );
+                    return out;
+                }
                 self.observe(term, &mut out);
                 let granted = self.grant(term, candidate, last_index, last_term);
                 if granted {
@@ -1469,6 +1557,7 @@ impl Raft {
                 }
                 self.role = Role::Follower;
                 self.leader = Some(leader);
+                self.leader_at = Some(now);
                 self.reset_election(now);
                 self.log = vec![Entry { term: last_term, decision: Decision::Ranges(ranges) }];
                 self.base = index;
@@ -1532,6 +1621,7 @@ impl Raft {
                 // A leader of this term exists, so this node is not standing for election in it.
                 self.role = Role::Follower;
                 self.leader = Some(leader);
+                self.leader_at = Some(now);
                 self.reset_election(now);
 
                 if self.term_at(prev_index) != Some(prev_term) {
@@ -1787,14 +1877,29 @@ impl Store for FileStore {
         }
         std::fs::rename(&tmp, &self.path)?;
         // The rename itself has to reach the disk, or a crash can leave the old file in place
-        // having reported the new one written.
-        if let Some(dir) = self.path.parent() {
-            if let Ok(d) = std::fs::File::open(dir) {
-                let _ = d.sync_all();
-            }
-        }
-        Ok(())
+        // having reported the new one written. **Reported rather than swallowed**: a failure
+        // here is exactly the case the line above is defending against, and a `save` that
+        // returns `Ok` after it tells the caller a vote is durable when it is not.
+        fsync_dir(&self.path)
     }
+}
+
+/// Flushes the directory entry a freshly renamed file was created by.
+///
+/// Its own function because it is the half of [`FileStore::save`] that used to fail in silence,
+/// and because the only honest test of "this reports what it cannot do" is one that calls it
+/// with a directory that is not there.
+///
+/// A path with no directory part - `state.raft` rather than `/var/lib/big/state.raft` - names
+/// the working directory, and `Path::parent` answers that as an empty path rather than as
+/// `.`. Opening `""` fails, so the two are folded together here; getting this wrong would
+/// turn every relative state path into a node that refuses to start.
+fn fsync_dir(file: &std::path::Path) -> std::io::Result<()> {
+    let dir = match file.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => std::path::Path::new("."),
+    };
+    std::fs::File::open(dir)?.sync_all()
 }
 
 fn put_u64(out: &mut Vec<u8>, v: u64) {
@@ -2022,10 +2127,59 @@ fn decode_state(bytes: &[u8]) -> core::result::Result<State, &'static str> {
     Ok(State { term, voted_for, commit, base, log, seed })
 }
 
+/// How many slots differ between two member lists, counting a longer list as that many more.
+///
+/// Beside [`Raft::may_change_members`] rather than beside its caller, because it is the
+/// arithmetic that rule is made of.
+fn differences(before: &[Member], after: &[Member]) -> usize {
+    let common = before.len().min(after.len());
+    let changed = (0..common).filter(|i| before[*i] != after[*i]).count();
+    changed + before.len().abs_diff(after.len())
+}
+
 /// The members whose agreement counts, by index.
 ///
 /// A free function because it is a property of a list rather than of a node, and both
 /// [`Raft::new`] and [`Raft::refresh_members`] need it before there is a `self` to ask.
 fn voters_of(members: &[Member]) -> Vec<NodeId> {
     (0..members.len()).filter(|i| members[*i].votes()).collect()
+}
+
+#[cfg(test)]
+mod store_tests {
+    use super::*;
+
+    /// **The half that used to fail in silence.**
+    ///
+    /// `save` flushed the directory entry behind a `let _ =`, so a filesystem that refused the
+    /// flush produced a `save` that reported success - and the comment above that line says
+    /// exactly what that costs: a crash could then leave the old state file in place having
+    /// reported the new one written, which is a vote cast twice.
+    #[test]
+    fn a_directory_that_cannot_be_flushed_is_reported_rather_than_swallowed() {
+        let missing = std::path::Path::new("/big-no-such-directory-42/state.raft");
+        let e = fsync_dir(missing).expect_err("a directory that is not there cannot be flushed");
+        assert_eq!(e.kind(), std::io::ErrorKind::NotFound, "{e}");
+    }
+
+    /// The other half, and the reason `fsync_dir` does not simply hand `parent()` to `open`:
+    /// a state path with no directory part means the working directory, and `parent()` answers
+    /// that as `""`, which opens as nothing at all. Without the fold, propagating the error
+    /// above would turn every relative `--cluster` state path into a node that cannot save.
+    #[test]
+    fn a_state_path_with_no_directory_part_flushes_the_working_directory() {
+        fsync_dir(std::path::Path::new("state.raft"))
+            .expect("a bare filename names the working directory, which is there");
+    }
+
+    /// And the whole of `save`, over a real directory: the round trip still works once the
+    /// flush is load bearing.
+    #[test]
+    fn a_saved_state_reads_back_with_the_flush_propagated() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileStore::new(dir.path().join("state.raft"));
+        let state = State { term: 7, voted_for: Some(1), commit: 3, base: 0, ..State::default() };
+        store.save(&state).expect("a real directory flushes");
+        assert_eq!(store.load().unwrap().expect("it was just written"), state);
+    }
 }

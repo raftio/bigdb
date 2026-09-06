@@ -122,6 +122,7 @@ impl<P: PagerMut + Sync> Cluster<P> {
                     .to_string(),
             ));
         };
+        self.await_settled()?;
         let epoch =
             controller.propose_map(next).map_err(|e| ClusterError::Refused(e.to_string()))?;
         self.await_epoch(epoch)
@@ -143,6 +144,36 @@ impl<P: PagerMut + Sync> Cluster<P> {
         Err(ClusterError::Refused(format!(
             "the change was proposed but has not been agreed after {}s; the cluster may have \
              lost its leader. Nothing was applied - `cluster topology` says where it stands",
+            PROPOSAL_TIMEOUT.as_secs()
+        )))
+    }
+
+    /// Waits until nothing this node has appended is still in flight.
+    ///
+    /// **The other half of the wait below, and the one that was missing.** Every verb here
+    /// already waits for its *own* change to settle, precisely so that a caller making two in a
+    /// row does not have the second refused as busy. What that does not cover is the change
+    /// this process did not make: a leader appends a no-op the moment it is elected, and for
+    /// the width of one round trip afterwards the agreement is unsettled through no fault of
+    /// whoever is calling.
+    ///
+    /// The refusal in that window is correct and the wait does not weaken it - `propose_map`
+    /// and `propose_members` still refuse an unsettled map, and this only declines to ask them
+    /// until asking can succeed. What it removes is a transient state reaching an operator as
+    /// an exit code, on the one command a cluster is grown with.
+    ///
+    /// Bounded, because "not settled" is also what a cluster with no leader looks like, and a
+    /// wait with no end there would be a command that hangs instead of one that explains.
+    fn await_settled(&self) -> Result<()> {
+        let deadline = Instant::now() + PROPOSAL_TIMEOUT;
+        while Instant::now() < deadline {
+            if self.settled() {
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        Err(ClusterError::Refused(format!(
+            "a change to the map has been in flight for {}s and has not been agreed; the              cluster may have lost its leader. Nothing was proposed - `cluster topology` says              where it stands, and `settled` there is what this was waiting for",
             PROPOSAL_TIMEOUT.as_secs()
         )))
     }
@@ -546,6 +577,7 @@ impl<P: PagerMut + Sync> Cluster<P> {
                     .to_string(),
             ));
         };
+        self.await_settled()?;
         controller
             .propose_members(next.clone())
             .map_err(|e| ClusterError::Refused(e.to_string()))?;
@@ -943,6 +975,7 @@ impl<P: PagerMut + Sync> Cluster<P> {
                 })
                 .collect(),
             behind: self.behind(),
+            settled: self.settled(),
         }
     }
 }
@@ -1005,6 +1038,14 @@ pub struct Topology {
     pub ranges: Vec<RangeReport>,
     /// Copies the agreement will not promote until a repair has been run.
     pub behind: Vec<String>,
+    /// Whether everything this node has appended to the agreement has been agreed.
+    ///
+    /// **What a script has to wait for before it reshapes anything.** Every verb that changes
+    /// the map is refused while a change is still in flight, and that refusal is correct - but
+    /// without this field the only way to find out was to try the change and read the failure,
+    /// which turns a freshly elected leader into an exit code. `true` on a node with no
+    /// agreement, where there is nothing that can be in flight.
+    pub settled: bool,
 }
 
 /// One node, as the agreement sees it.

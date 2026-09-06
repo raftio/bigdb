@@ -196,6 +196,13 @@ impl<'a> Reader<'a> {
     /// Every element of every list here costs at least one byte, so a count larger than the
     /// bytes remaining is a lie, and refusing it is what keeps a four-byte header from asking
     /// for a four-gigabyte allocation.
+    ///
+    /// **It is a bound on the count, not on the allocation, and the difference matters.** One
+    /// byte per element is the honest floor for the *encoding*, and it is far below what an
+    /// element weighs in memory: a `Tuple` is tens of bytes, so a body at the internal ceiling
+    /// could pass this check and still reserve orders of magnitude more than it describes.
+    /// [`reserve`] is what closes that, and every list here is built through it.
+    ///
     pub fn count(&mut self) -> Result<usize> {
         let n = self.u32()? as usize;
         if n > self.remaining() {
@@ -203,6 +210,23 @@ impl<'a> Reader<'a> {
         }
         Ok(n)
     }
+}
+
+/// The most elements any list reserves room for up front, however many it was promised.
+///
+/// A list longer than this still decodes; it grows as it fills, which is one reallocation per
+/// doubling and nothing anybody can measure on a message this size.
+const RESERVE_AT_MOST: usize = 1_024;
+
+/// An empty vector, sized for `n` elements but never for more than a thousand of them.
+///
+/// **Because a count that passed [`Reader::count`] is still a stranger's number.** That check
+/// says the bytes could hold `n` elements at one byte each; this one refuses to turn that into
+/// `n` elements' worth of memory before a single one has been read. What is left is a decoder
+/// whose peak allocation follows the bytes actually decoded rather than the number a peer put
+/// in a header.
+pub fn reserve<T>(n: usize) -> Vec<T> {
+    Vec::with_capacity(n.min(RESERVE_AT_MOST))
 }
 
 pub fn put_u8(out: &mut Vec<u8>, v: u8) {
@@ -291,7 +315,7 @@ pub fn get_shards(r: &mut Reader<'_>) -> Result<Option<Vec<big_engine::ShardRang
         return Ok(None);
     }
     let n = r.count()?;
-    let mut out = Vec::with_capacity(n.min(1024));
+    let mut out = reserve(n);
     for _ in 0..n {
         out.push(big_engine::ShardRange { start: r.u64()?, end: r.opt_u64()? });
     }

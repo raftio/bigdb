@@ -23,6 +23,12 @@ tls = ["big-tls/tls"]
 # No web framework and no async runtime, matching the rest of the workspace. A proxy is an accept
 # loop, a route table and a socket pool; pulling in a runtime for that would be a larger
 # commitment than the engine it fronts has made.
+#
+# **What this section is and is not a claim about.** It is not "no third-party crates" - `clap` is
+# one, and so are the four it brings. It is that nothing here links the engine, a password hasher,
+# a TLS stack this binary did not ask for, or an async runtime, which is what `big-wire` was split
+# out of `big-http` to make checkable. The CI grep in `.github/workflows/ci.yml` is the actual
+# guarantee; this comment only says what it is looking for.
 [dependencies]
 # `Request`, `Response` and `log` — the HTTP/1.1 framing this proxy speaks on both sides, and the
 # structured log format the daemon already writes, so one X-Request-Id reads across both.
@@ -34,6 +40,11 @@ tls = ["big-tls/tls"]
 big-wire.workspace = true
 # The socket, plain or TLS. With `tls` off this is a `TcpStream` behind one `match`.
 big-tls.workspace = true
+# The argument parser, with its feature set pinned once at the workspace root so that this binary
+# and `big`/`bigctl` cannot drift into different ones. Twenty-two flags, four of which need
+# another flag to mean anything - `requires` and `conflicts_with` say that once each, where the
+# hand-rolled parser said it twice: at the bottom of `parse`, and again inside `run`.
+clap.workspace = true
 
 [dev-dependencies]
 # The tests run real daemons and compare this crate's cluster.toml reader against the daemon's.

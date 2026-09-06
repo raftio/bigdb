@@ -32,6 +32,21 @@ nothing listening - a script branches on those. `--format tsv` is stable because
 it. **Table rendering is not promised**: it is for a person looking at a terminal, and a column
 width is not an interface. The `big-bin` *library* is internal like the rest.
 
+**Nor is the wording of a refusal, and that came due when the parsers moved to `clap`.** Every
+subcommand that worked before works now and the four exit codes are unchanged, so a script that
+branches on a code still branches correctly. What changed is what a mistake *says*:
+`bigctl: unknown option --nope` is now `error: unexpected argument '--nope' found`, often with a
+did-you-mean. A script matching on those strings was matching on something that was never
+promised - match the exit code. Three things also widened, which no caller can be broken by:
+`--flag=value` is accepted everywhere, `-V`/`--version` exist, and `bigctl help <command>` works
+rather than exiting 2.
+
+The one narrowing: a load's own flags must now follow their subcommand.
+`bigctl --dry-run import t f` is refused; `bigctl import t f --dry-run` is not. Those flags mean
+nothing to any other command, and accepting them anywhere was what let `bigctl schema --dry-run`
+be silently ignored. The *client's* flags - `--addr`, `--format`, `--timeout`, the credential
+ones - are still accepted on either side of the subcommand.
+
 **The binaries were renamed before 1.0, and that broke the promise above once.** Four became
 two: `bigd` is `big serve`, `bigc` is `bigctl`, and `bigi` is `bigctl import`. The subcommands,
 the flags and the four exit codes came through unchanged, so a script that branches on a code
