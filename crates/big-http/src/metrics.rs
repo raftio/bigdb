@@ -581,6 +581,22 @@ pub fn render_cluster(out: &mut String, c: &big_cluster::counters::Snapshot, bal
     );
     gauge(
         out,
+        "big_cluster_wedged",
+        "1 when this node stopped participating in the agreement because it could not write \
+         its state file. The process is up and the port answers; the node decides nothing. \
+         Alert on this: a full disk here looks from outside like a node that is merely quiet.",
+        c.wedged as u64,
+    );
+    counter(
+        out,
+        "big_cluster_messages_dropped_total",
+        "Inbound agreement messages dropped because the one deciding thread was behind. The \
+         protocol retries, so this is not a failure - but a number that climbs is a node that \
+         cannot keep up with what its peers send it.",
+        c.messages_dropped,
+    );
+    gauge(
+        out,
         "big_cluster_balancer_enabled",
         "1 when this node was started with --balance and may reshape the cluster by itself.",
         balancing as u64,

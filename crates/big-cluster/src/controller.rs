@@ -86,6 +86,20 @@ impl Leases {
     pub const SCHEMA_FAILOVER: Duration = Duration::from_secs(15);
 }
 
+/// How many inbound raft messages may wait for the one thread that decides.
+///
+/// **A ceiling, where there used to be none.** The outbound side has always had one - sixty
+/// four per peer, and a heartbeat that cannot be queued is dropped - for the reason that
+/// blocking on a node that is not answering is how a live cluster is brought down by a dead
+/// one. The inbound side is the same argument pointing the other way: every peer's messages
+/// arrive on HTTP workers and are handed to a single driver, so a peer that sends faster than
+/// this node decides grew a queue with nothing to stop it.
+///
+/// Sized for a burst rather than for a backlog: several heartbeat rounds from every member of
+/// a cluster far larger than this one. Anything past that is not a burst, it is a node that
+/// cannot keep up, and holding the messages would only make it slower.
+const INBOX_DEPTH: usize = 1_024;
+
 /// The lease of a node that has not yet heard from the agreement at all.
 ///
 /// A sentinel rather than a zero because the clock it is compared against also starts at zero:
@@ -118,6 +132,14 @@ pub struct Controller {
     /// `TlsConfig` is a handle onto one `Arc`, so writing the roster here is the same roster
     /// the accept path reads.
     roster: RwLock<Option<big_tls::TlsConfig>>,
+    /// Inbound raft messages this node had to drop because [`INBOX_DEPTH`] was full.
+    dropped: AtomicU64,
+    /// Set once the state file has refused a write, and never cleared.
+    ///
+    /// Its own flag rather than a variant of `stop`, because the two mean opposite things to
+    /// an operator: `stop` is this process shutting down on purpose, and this is this process
+    /// still running while refusing to speak for an agreement it can no longer record.
+    wedged: AtomicBool,
     /// Milliseconds since this process started, at the last moment this node could prove it
     /// was still in touch with a majority. The lease, in one number.
     ///
@@ -132,7 +154,7 @@ pub struct Controller {
     /// [`Controller::behind_agreement`], which is the only thing that reads it.
     published: AtomicU64,
     started: Instant,
-    inbox: mpsc::Sender<Message>,
+    inbox: mpsc::SyncSender<Message>,
     /// One sender thread per peer, made on demand.
     outbox: Outbox,
     stop: Arc<AtomicBool>,
@@ -262,7 +284,7 @@ impl Controller {
             }
         }
 
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(INBOX_DEPTH);
         let stop = Arc::new(AtomicBool::new(false));
 
         // One sender thread per peer, each with a short queue. A heartbeat that cannot be
@@ -287,6 +309,8 @@ impl Controller {
             inbox: tx,
             outbox,
             stop: Arc::clone(&stop),
+            wedged: AtomicBool::new(false),
+            dropped: AtomicU64::new(0),
         });
 
         let driver = Arc::clone(&controller);
@@ -407,7 +431,7 @@ impl Controller {
     /// reads no reservation at all and re-issues every id its predecessor promised.
     pub fn behind_agreement(&self) -> bool {
         let raft = self.raft.lock().expect("no panic holds this lock");
-        raft.behind() || self.published.load(Ordering::Relaxed) < raft.applied_index()
+        raft.behind() || self.published.load(Ordering::Acquire) < raft.applied_index()
     }
 
     pub fn may_lead_schema(&self) -> bool {
@@ -428,7 +452,24 @@ impl Controller {
     /// Queued rather than handled here: every decision this protocol makes happens on one
     /// thread, so a message arriving on an HTTP worker cannot race a heartbeat.
     pub fn deliver(&self, m: Message) {
-        let _ = self.inbox.send(m);
+        // **Dropped rather than waited for, for the reason the outbound side drops.** This is
+        // called on an HTTP worker, and blocking it until the one deciding thread catches up
+        // would let a peer that talks faster than this node decides consume the pool that
+        // answers queries. Raft is built for a network that loses messages: a dropped append
+        // is retried by the leader on its next heartbeat, and a dropped vote costs one
+        // election. A queue with no ceiling costs memory with no ceiling, which is worse.
+        if self.inbox.try_send(m).is_err() {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Raft messages this node could not queue, because the deciding thread was behind.
+    ///
+    /// Not zero on a healthy node under load, and not a failure on its own - it is what says
+    /// whether an election that will not settle is a network problem or this node being unable
+    /// to keep up with what it is being sent.
+    pub fn dropped_messages(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
     }
 
     pub fn is_leader(&self) -> bool {
@@ -442,6 +483,15 @@ impl Controller {
     /// Who the agreement currently answers to, as this node understands it.
     pub fn leader(&self) -> Option<NodeId> {
         self.raft.lock().expect("no panic holds this lock").leader()
+    }
+
+    /// Whether this node has stopped participating because it could not write its state down.
+    ///
+    /// Read by `/ready` and by the metrics, because this is the one failure that leaves a
+    /// process up, a port answering and the node contributing nothing - the shape of outage
+    /// that is otherwise found by noticing an election that never settles.
+    pub fn wedged(&self) -> bool {
+        self.wedged.load(Ordering::Relaxed)
     }
 
     /// Stops the threads. Only a test has a reason to: a daemon runs until it is killed.
@@ -458,6 +508,17 @@ impl Controller {
         let tick = Duration::from_millis(50);
         while !self.stop.load(Ordering::Relaxed) {
             let incoming = rx.recv_timeout(tick).ok();
+
+            // **Wedged is final.** Set when the state file refused a write, and never cleared:
+            // the raft core in memory has moved past what the disk holds, so resuming would
+            // mean speaking for decisions no restart could honour. The queue is still drained
+            // so it cannot grow without bound, and nothing is answered - which is a node that
+            // is down, and every peer already knows what to do about one of those.
+            if self.wedged.load(Ordering::Relaxed) {
+                drop(incoming);
+                continue;
+            }
+
             let now = self.now();
 
             let applied_to;
@@ -497,10 +558,20 @@ impl Controller {
             // not; nothing else writes this state, so there is nothing to race with.
             if let Some(state) = persist_state {
                 if let Err(e) = self.store.save(&state) {
-                    // A node that cannot persist may not participate. Dropping the messages is
-                    // what makes that true: it looks exactly like a node that is down, which
-                    // is the one failure every other node here already handles.
+                    // A node that cannot persist may not participate, and **it may not start
+                    // again either**. Dropping this turn's messages was never enough: the raft
+                    // core has already moved - a term bumped, a vote cast, entries appended -
+                    // and the next turn that needs no save would have sent heartbeats built on
+                    // state the disk has never seen. A leader elected in a term its own file
+                    // does not record is a leader that comes back from a crash free to grant
+                    // that term's vote to somebody else, which is the two-leaders failure this
+                    // store exists to prevent.
+                    //
+                    // So the node wedges. That looks exactly like a node that is down, which is
+                    // the one failure every other node here already handles, and it is the
+                    // state the comment on this branch always claimed to produce.
                     crate::log_persist_failure(&e);
+                    self.wedged.store(true, Ordering::Relaxed);
                     continue;
                 }
             }
@@ -546,7 +617,14 @@ impl Controller {
             // **After the decisions above, never before.** This is what says the shared state
             // has caught up with the log, and a watermark raised ahead of the work it stands
             // for would be a promise this node cannot keep.
-            self.published.store(applied_to, Ordering::Relaxed);
+            // **Release, and `Acquire` where it is read.** The whole point of this number is
+            // that a reader which sees it has also seen the writes above - the map replaced,
+            // the decisions folded in. `Relaxed` does not promise that: it orders nothing but
+            // the number itself, and the pairing only held by accident of x86 and of these two
+            // statements sitting next to each other. Naming the ordering costs nothing on the
+            // machines this runs on and stops the guarantee being one a refactor can delete
+            // without touching this line.
+            self.published.store(applied_to, Ordering::Release);
 
             for (to, m) in out.send {
                 self.outbox.send(to, m);
@@ -734,8 +812,9 @@ impl Controller {
         if raft.commit_index() != raft.last_index() {
             return Err(ProposeError::Busy);
         }
-        let before = raft.membership().to_vec();
-        if differences(&before, &next) > 1 {
+        // Asked before proposing so the refusal can say what is wrong. `Raft::propose` applies
+        // the same rule itself and would decline silently - this is the half that explains.
+        if !raft.may_change_members(&next) {
             return Err(ProposeError::TooManyAtOnce);
         }
         match raft.propose(Decision::Members(next)) {
@@ -835,11 +914,4 @@ impl core::fmt::Display for ProposeError {
             Self::Invalid(e) => write!(f, "the change would leave the map invalid: {e}"),
         }
     }
-}
-
-/// How many slots differ between two member lists, counting a longer list as that many more.
-fn differences(before: &[Member], after: &[Member]) -> usize {
-    let common = before.len().min(after.len());
-    let changed = (0..common).filter(|i| before[*i] != after[*i]).count();
-    changed + before.len().abs_diff(after.len())
 }

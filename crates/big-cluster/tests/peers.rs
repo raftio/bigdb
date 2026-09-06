@@ -343,3 +343,67 @@ fn a_node_that_has_never_voted_starts() {
     .expect("a node with no state file has never voted, which is a node that may start");
     c.stop();
 }
+
+/// A store that refuses every save, to stand in for a full disk.
+struct Unwritable;
+
+impl raft::Store for Unwritable {
+    fn load(&self) -> std::io::Result<Option<raft::State>> {
+        Ok(None)
+    }
+
+    fn save(&self, _: &raft::State) -> std::io::Result<()> {
+        Err(std::io::Error::new(std::io::ErrorKind::StorageFull, "no space left on device"))
+    }
+}
+
+/// **A node that cannot write its vote down stops being a node.**
+///
+/// The rule is the one the module has always stated: a vote that reaches the network and not
+/// the disk is a vote this node can cast again after a restart, which is two leaders in one
+/// term. What was missing is that the loop only dropped *that turn's* messages and then went
+/// on delivering, ticking and sending with in-memory state the disk had never seen - so a
+/// leader elected in a term its own file never recorded could come back after a crash and
+/// grant that term's vote to somebody else.
+#[test]
+fn a_node_that_cannot_persist_stops_participating() {
+    let api = Api::in_memory().unwrap();
+    let config: ClusterConfig = ClusterFile::parse(THREE).unwrap().for_node(Some("a"), "").unwrap();
+    let peers = Fake::new(vec![None, Some(Reply::Unreachable), Some(Reply::Unreachable)]);
+
+    let c = Cluster::with_peers(
+        api,
+        config,
+        peers,
+        Box::new(Unwritable),
+        raft::Timing::default(),
+        Default::default(),
+    )
+    .expect("a store that loads nothing is a node that has never voted");
+
+    let controller = c.controller().expect("three nodes run an agreement").clone();
+
+    // The first thing this node does unprompted is stand for election, and standing means
+    // writing down the term and the vote. That is the save that cannot happen.
+    let wedged = wait_for(Duration::from_secs(5), || controller.wedged());
+    assert!(wedged, "a node whose state file refuses every write must stop participating");
+
+    // And it stays stopped rather than quietly carrying on: nothing it holds in memory was
+    // ever agreed to, so it must look exactly like a node that is down.
+    assert!(!controller.is_leader(), "a node that never wrote its vote down cannot have won");
+    assert!(!c.may_serve(), "a wedged node lets its lease lapse rather than answering on it");
+    c.stop();
+}
+
+/// Polls a condition rather than sleeping for a fixed time, so the test is as fast as the
+/// machine allows and still passes on a slow one.
+fn wait_for(within: Duration, mut done: impl FnMut() -> bool) -> bool {
+    let deadline = std::time::Instant::now() + within;
+    while std::time::Instant::now() < deadline {
+        if done() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    done()
+}
