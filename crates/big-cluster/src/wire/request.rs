@@ -99,12 +99,12 @@ impl ImportRequest {
         let mut r = Reader::new(bytes);
         let table = r.str()?;
         let n = r.count()?;
-        let mut keys = Vec::with_capacity(n);
+        let mut keys = reserve(n);
         for _ in 0..n {
             keys.push(Assignment { field: r.str()?, key: r.str()?, row: r.u64()? });
         }
         let n = r.count()?;
-        let mut facts = Vec::with_capacity(n);
+        let mut facts = reserve(n);
         for _ in 0..n {
             facts.push(get_fact(&mut r)?);
         }
@@ -140,7 +140,7 @@ impl DeleteRequest {
         let mut r = Reader::new(bytes);
         let table = r.str()?;
         let n = r.count()?;
-        let mut records = Vec::with_capacity(n);
+        let mut records = reserve(n);
         for _ in 0..n {
             records.push(r.u64()?);
         }
@@ -242,7 +242,7 @@ impl InternRequest {
         let table = r.str()?;
         let field = r.str()?;
         let n = r.count()?;
-        let mut keys = Vec::with_capacity(n);
+        let mut keys = reserve(n);
         for _ in 0..n {
             keys.push(r.str()?);
         }
@@ -328,7 +328,7 @@ pub fn put_records(out: &mut Vec<u8>, ids: &[RecordId]) {
 pub fn get_records(bytes: &[u8]) -> Result<Vec<RecordId>> {
     let mut r = Reader::new(bytes);
     let n = r.count()?;
-    let mut out = Vec::with_capacity(n);
+    let mut out = reserve(n);
     for _ in 0..n {
         out.push(r.u64()?);
     }
@@ -431,7 +431,7 @@ pub fn put_fragment_list(out: &mut Vec<u8>, list: &[(FragmentAddr, u64)]) {
 pub fn get_fragment_list(bytes: &[u8]) -> Result<Vec<(FragmentAddr, u64)>> {
     let mut r = Reader::new(bytes);
     let n = r.count()?;
-    let mut out = Vec::with_capacity(n);
+    let mut out = reserve(n);
     for _ in 0..n {
         out.push((get_addr(&mut r)?, r.u64()?));
     }
@@ -515,21 +515,21 @@ impl FragmentBody {
         let n = r.count()?;
         let data = match tag {
             data_tag::CONTAINERS => {
-                let mut containers = Vec::with_capacity(n);
+                let mut containers = reserve(n);
                 for _ in 0..n {
                     containers.push((r.u64()?, get_container(&mut r)?));
                 }
                 FragmentData::Containers(containers)
             }
             data_tag::CELLS => {
-                let mut cells = Vec::with_capacity(n);
+                let mut cells = reserve(n);
                 for _ in 0..n {
                     let local = r.u64()?;
                     let cell = match r.u8()? {
                         cell_tag::VALUE => ColumnCell::Value(r.u64()?),
                         cell_tag::LIST => {
                             let k = r.count()?;
-                            let mut rows = Vec::with_capacity(k);
+                            let mut rows = reserve(k);
                             for _ in 0..k {
                                 rows.push(r.u64()?);
                             }
@@ -597,7 +597,7 @@ impl KeysBody {
         let mut r = Reader::new(bytes);
         let table = r.str()?;
         let n = r.count()?;
-        let mut keys = Vec::with_capacity(n);
+        let mut keys = reserve(n);
         for _ in 0..n {
             keys.push(Assignment { field: r.str()?, key: r.str()?, row: r.u64()? });
         }
@@ -652,14 +652,14 @@ pub fn put_schema(
 pub fn get_schema(bytes: &[u8]) -> Result<(Vec<big_embed::TableInfo>, Vec<big_embed::ViewInfo>)> {
     let mut r = Reader::new(bytes);
     let n = r.count()?;
-    let mut tables = Vec::with_capacity(n);
+    let mut tables = reserve(n);
     for _ in 0..n {
         let name = r.str()?;
         let e = r.u8()?;
         let engine =
             TableEngine::from_u8(e).ok_or(WireError::BadTag { what: "table engine", tag: e })?;
         let count = r.count()?;
-        let mut fields = Vec::with_capacity(count);
+        let mut fields = reserve(count);
         for _ in 0..count {
             let field = r.str()?;
             let k = r.u8()?;
@@ -668,7 +668,7 @@ pub fn get_schema(bytes: &[u8]) -> Result<(Vec<big_embed::TableInfo>, Vec<big_em
             let bit_depth = r.u32()?;
             let scale = r.u8()? as i8;
             let n = r.count()?;
-            let mut granularity = Vec::with_capacity(n);
+            let mut granularity = reserve(n);
             for _ in 0..n {
                 let c = r.u8()?;
                 granularity.push(
@@ -686,7 +686,7 @@ pub fn get_schema(bytes: &[u8]) -> Result<(Vec<big_embed::TableInfo>, Vec<big_em
         });
     }
     let n = r.count()?;
-    let mut views = Vec::with_capacity(n);
+    let mut views = reserve(n);
     for _ in 0..n {
         let name = r.str()?;
         let text = r.str()?;
@@ -778,7 +778,7 @@ pub fn get_join(bytes: &[u8]) -> Result<(String, Vec<(String, String)>)> {
     let mut r = Reader::new(bytes);
     let cluster_id = r.str()?;
     let n = r.count()?;
-    let mut members = Vec::with_capacity(n);
+    let mut members = reserve(n);
     for _ in 0..n {
         members.push((r.str()?, r.str()?));
     }
@@ -799,7 +799,7 @@ pub fn put_floors(floors: &[(String, RecordId)]) -> Vec<u8> {
 pub fn get_floors(bytes: &[u8]) -> Result<Vec<(String, RecordId)>> {
     let mut r = Reader::new(bytes);
     let n = r.count()?;
-    let mut out = Vec::with_capacity(n);
+    let mut out = reserve(n);
     for _ in 0..n {
         out.push((r.str()?, r.u64()?));
     }

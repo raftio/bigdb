@@ -480,3 +480,58 @@ fn a_body_with_an_unknown_data_tag_is_refused() {
     bytes[tag_at] = 9;
     assert!(wire::FragmentBody::decode(&bytes).is_err());
 }
+
+/// **A count that passed the truncation check is still a stranger's number.**
+///
+/// `Reader::count` refuses a count larger than the bytes remaining, on the honest floor of one
+/// byte per element. That floor is far below what an element weighs in memory, so a body near
+/// the internal ceiling could pass the check and still ask for orders of magnitude more memory
+/// than it describes - one `Vec::with_capacity` on a number a peer chose. The decoder must
+/// refuse the message on its contents rather than on its header, and must not have reserved
+/// the promised room to find that out.
+#[test]
+fn a_list_that_promises_far_more_than_it_carries_is_refused_not_reserved() {
+    // A `Matches` header claiming a million shards, carrying none of them.
+    let mut body = Vec::new();
+    big_cluster::wire::put_u32(&mut body, 1_000_000);
+
+    let mut r = big_cluster::wire::Reader::new(&body);
+    // The count itself is refused here, because a million elements cannot fit in four bytes.
+    assert!(r.count().is_err(), "a count larger than the bytes left is a lie");
+
+    // And the case the count check cannot catch: a promise that *does* fit the one-byte floor
+    // but not the elements themselves. Sixty-four thousand shard ranges, in a body with room
+    // for none of them - each is twelve bytes on the wire, so this is off by a factor of a
+    // thousand and still passes `count`.
+    //
+    // What this half asserts is the refusal, which held before `reserve` existed too. That the
+    // refusal is now reached *without* having reserved the promised room is asserted directly
+    // below, on `reserve` itself - there is no portable way to observe an allocation from
+    // here, so the bound is tested where it is written rather than guessed at through a decoder.
+    let mut body = Vec::new();
+    big_cluster::wire::put_bool(&mut body, true);
+    big_cluster::wire::put_u32(&mut body, 64_000);
+    body.extend(std::iter::repeat_n(0u8, 64_000));
+
+    let mut r = big_cluster::wire::Reader::new(&body);
+    let shards = big_cluster::wire::get_shards(&mut r);
+    assert!(shards.is_err(), "the elements are not there, so the message is refused");
+}
+
+/// The bound itself, where it is written.
+///
+/// A list far longer than the ceiling still decodes - it grows as it fills - so what is
+/// asserted is that nothing is *taken* up front on a stranger's word.
+#[test]
+fn a_reservation_is_capped_however_much_it_was_promised() {
+    let modest: Vec<u64> = big_cluster::wire::reserve(8);
+    assert!(modest.capacity() >= 8, "a plausible count is still reserved for, exactly");
+
+    let outrageous: Vec<u64> = big_cluster::wire::reserve(usize::MAX / 2);
+    assert!(
+        outrageous.capacity() <= 1_024,
+        "a count no body could carry reserves the ceiling and no more, not {}",
+        outrageous.capacity()
+    );
+    assert!(outrageous.is_empty(), "and nothing is in it until something has been read");
+}

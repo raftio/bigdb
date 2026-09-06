@@ -274,7 +274,7 @@ fn get_projection(r: &mut Reader<'_>) -> Result<Projection> {
         projection_tag::TEXT => Projection::Text(r.str()?),
         projection_tag::TEXTS => {
             let n = r.count()?;
-            let mut out = Vec::with_capacity(n);
+            let mut out = reserve(n);
             for _ in 0..n {
                 out.push(r.str()?);
             }
@@ -376,7 +376,7 @@ fn get_value_at(r: &mut Reader<'_>, depth: usize) -> Result<Value> {
         value_tag::REAL_EXTREME => Value::RealExtreme(r.opt_u64()?.map(f64::from_bits)),
         value_tag::GROUPS => {
             let n = r.count()?;
-            let mut groups = Vec::with_capacity(n);
+            let mut groups = reserve(n);
             for _ in 0..n {
                 groups.push(get_group(r, depth)?);
             }
@@ -384,10 +384,10 @@ fn get_value_at(r: &mut Reader<'_>, depth: usize) -> Result<Value> {
         }
         value_tag::TUPLES => {
             let n = r.count()?;
-            let mut tuples = Vec::with_capacity(n);
+            let mut tuples = reserve(n);
             for _ in 0..n {
                 let arity = r.count()?;
-                let mut keys = Vec::with_capacity(arity);
+                let mut keys = reserve(arity);
                 for _ in 0..arity {
                     keys.push(get_group_key(r)?);
                 }
@@ -397,11 +397,11 @@ fn get_value_at(r: &mut Reader<'_>, depth: usize) -> Result<Value> {
         }
         value_tag::TABLE => {
             let n = r.count()?;
-            let mut rows = Vec::with_capacity(n);
+            let mut rows = reserve(n);
             for _ in 0..n {
                 let record = r.u64()?;
                 let cells = r.count()?;
-                let mut values = Vec::with_capacity(cells);
+                let mut values = reserve(cells);
                 for _ in 0..cells {
                     values.push(get_projection(r)?);
                 }

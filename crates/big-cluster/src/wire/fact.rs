@@ -371,7 +371,7 @@ impl Ddl {
                 field: r.str()?,
                 granularity: {
                     let n = r.count()?;
-                    let mut out = Vec::with_capacity(n);
+                    let mut out = reserve(n);
                     for _ in 0..n {
                         let c = r.u8()?;
                         out.push(
