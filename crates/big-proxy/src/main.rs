@@ -71,7 +71,7 @@ struct Options {
     /// A node to send requests to; repeat for each one.
     ///
     /// The name is not decoration: it is the TLS server name, because a node certificate carries
-    /// subjectAltName = DNS:<node>.
+    /// `subjectAltName = DNS:<node>`.
     // `long = "upstream"`, singular, because that is the flag: the field is plural because it
     // collects. Every deploy file and `scripts/local-cluster` writes `--upstream`.
     #[arg(

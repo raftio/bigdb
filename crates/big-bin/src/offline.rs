@@ -36,7 +36,7 @@ use big_db::{copy, Db};
 // in the module doc above instead, where it is one scroll from this and reaches rustdoc anyway.
 #[derive(clap::Subcommand, Debug)]
 pub enum Cmd {
-    /// Write a consistent copy of a database to <DEST>, which must not exist.
+    /// Write a consistent copy of a database to `<DEST>`, which must not exist.
     ///
     /// Safe while a writer is running. Copying a live database with `cp` is NOT safe: a commit
     /// can land between the bytes cp has already read and the ones it has not.
@@ -80,7 +80,7 @@ pub enum Cmd {
         file: String,
     },
 
-    /// Drop a time quantum field's day views older than <UNIX-SECONDS>.
+    /// Drop a time quantum field's day views older than `<UNIX-SECONDS>`.
     ///
     /// The day that instant falls in is kept; the records are not removed, only the per-day
     /// index over them.
