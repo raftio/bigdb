@@ -159,6 +159,30 @@ fn the_k8s_seed_is_a_membership_both_readers_accept() {
     assert_ne!(proxy[0].name, proxy[0].addr, "the name is what the certificate carries");
 }
 
+/// **The shipped cluster must survive losing a node.**
+///
+/// Three pods with a range each is three single points of failure, not a highly available
+/// cluster: the map fails over, the *data* does not, because a range with no copy has nowhere
+/// to fail over to. `--balance` cannot rescue it either - a move reads the range off its
+/// source, and a source that is gone cannot be read. So the manifest that ships has to declare
+/// a copy, or every word about availability in its readme is about a machinery nobody here
+/// turned on.
+#[test]
+fn the_k8s_seed_declares_a_copy_of_a_range() {
+    let seed = block(&manifest(), "seed.toml");
+    let daemon = ClusterFile::parse(&seed).expect("the seed is what a founding node starts from");
+
+    let copies = daemon.nodes().iter().filter(|n| n.replica_of.is_some()).count();
+    assert!(
+        copies > 0,
+        "no node in the shipped k8s seed holds a copy of another's range, so losing one pod \
+         leaves its shards unanswerable until it comes back"
+    );
+    // And the arithmetic that makes a copy usable at all: a failover is a decision a majority
+    // has to commit, so the copy needs a third node to settle the vote.
+    assert!(daemon.nodes().len() >= 3, "a replicated cluster is refused below three nodes");
+}
+
 #[test]
 fn the_k8s_upstream_list_may_name_pods_that_do_not_exist() {
     let upstreams = block(&manifest(), "upstreams.toml");

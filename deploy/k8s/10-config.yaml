@@ -35,25 +35,42 @@ data:
 
     schema_leader   = "big-0"
     peer_ca_file    = "/run/big/peer-ca.pem"
+    # And what that CA has taken back. Written empty by `certs.sh` at bootstrap and staged by
+    # the entrypoint, so a leaked node key can be retired by reissuing this list and rolling the
+    # StatefulSet - rather than by rotating the CA and every certificate at once.
+    peer_crl_file   = "/run/big/peer-ca.crl"
 
     # The names are the pods'; the addresses are the headless Service's. They differ, and the
     # daemon is built for them differing: a certificate is issued to a *name*, and
     # `ClientWire::connect` is handed `peer.name` as the TLS server name rather than the host it
     # dialled. So a node keeps its identity wherever it is reached.
+    # **Two ranges and one copy, not three ranges.** Three pods holding a range each is three
+    # single points of failure wearing the word "cluster": the map fails over and the data does
+    # not, because a range with no copy has nowhere to fail over to. `--balance` cannot repair
+    # that either - a move reads the range off its source, and a source that is gone cannot be
+    # read. So the third pod is a copy rather than a third slice, and the cluster that ships
+    # can lose a machine.
+    #
+    # Scaling still adds ranges: `kubectl scale` gives a new pod the tail of the shard space,
+    # which is a split that moves no bytes. What it does not do is decide that a range needs a
+    # second copy - that is this file's job, and it is why the copy is written here.
     [[node]]
     name   = "big-0"
     addr   = "big-0.nodes:7654"
-    shards = "0..64"
+    shards = "0..96"
 
     [[node]]
     name   = "big-1"
     addr   = "big-1.nodes:7654"
-    shards = "64..128"
+    shards = "96.."
 
+    # No range of its own: it holds exactly what `big-0` holds, and either of them may be the
+    # one serving it. Listed after the primaries because that ordering is what says which
+    # nodes divide the space and which copy part of it.
     [[node]]
-    name   = "big-2"
-    addr   = "big-2.nodes:7654"
-    shards = "128.."
+    name    = "big-2"
+    addr    = "big-2.nodes:7654"
+    replica = "big-0"
 
   upstreams.toml: |
     # What the proxy may forward to. It reads `name` and `addr` and discards the rest - it does
