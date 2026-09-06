@@ -1,7 +1,3 @@
-<p align="center">
-  <img src="docs/img/bigdb-lockup.svg" alt="bigdb" width="253" height="65">
-</p>
-
 A distributed bitmap-native analytical database.
 
 A b-tree of roaring containers over 8 KB pages, pure copy-on-write, with the read path borrowing
