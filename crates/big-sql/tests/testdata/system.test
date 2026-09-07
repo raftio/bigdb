@@ -1,0 +1,153 @@
+# The catalog, asked about in the language everything else is asked about in.
+#
+# **These parse to a `Shown`, not a query.** Every cell of a shape names a plan by index and no
+# plan produces this - the answer is already in the catalog each node holds. So `system.*` joins
+# the listings rather than becoming the first statement with an empty `calls` list under a shape
+# naming plans that do not exist.
+#
+# The fork happens on the `FROM`, before the select list is read, because `*` means two different
+# things: the record id over a table, every column over a system view.
+
+## The four views.
+
+show
+SELECT * FROM system.tables
+----
+System tables
+
+show
+SELECT * FROM system.columns
+----
+System columns
+
+show
+SELECT * FROM system.databases
+----
+System databases
+
+show
+SELECT * FROM system.parts
+----
+System parts
+
+# Case-insensitive, like every other name here.
+show
+select * from SYSTEM.Tables
+----
+System tables
+
+## A named column list, which is kept in the order it was written.
+
+show
+SELECT database, name FROM system.tables
+----
+System tables columns=[database, name]
+
+## The one filter these views take, because it is already the parameter the introspection has.
+
+show
+SELECT * FROM system.tables WHERE database = 'sales'
+----
+System tables database=sales
+
+show
+SELECT * FROM system.columns WHERE database = 'sales' AND table = 'orders'
+----
+System columns database=sales table=orders
+
+show
+SELECT * FROM system.parts WHERE table = 'orders'
+----
+System parts table=orders
+
+## `FORMAT` still applies: it changes the bytes and nothing else, here as everywhere.
+
+show
+SELECT * FROM system.databases FORMAT TSV
+----
+System databases format=tsv
+
+## A name under `system.` this build does not have.
+#
+# Its own refusal rather than the planner's `unknown_table`: `system` is not a database anybody
+# created, so a wrong name there is a question about this engine and the answer is the list.
+
+error
+SELECT * FROM system.query_log
+----
+sql_system_table
+
+error
+SELECT * FROM system.processlist
+----
+sql_system_table
+
+error
+SELECT * FROM system.nope
+----
+sql_system_table
+
+## `system` is not a database somebody may create, because a table in it could never be read:
+## `SELECT * FROM system.t` is a system view before it is a table.
+
+error
+CREATE DATABASE system
+----
+sql_system_table
+
+error
+DROP DATABASE system
+----
+sql_system_table
+
+## Clauses a listing cannot take. The answer is rows from the catalog, not a shape over plans, so
+## there is nothing here for these to act on without a second filter engine over rows.
+
+error
+SELECT * FROM system.tables ORDER BY name
+----
+sql_system_clause
+
+error
+SELECT * FROM system.tables LIMIT 10
+----
+sql_system_clause
+
+error
+SELECT * FROM system.tables GROUP BY database
+----
+sql_system_clause
+
+error
+SELECT count(*) FROM system.tables
+----
+sql_system_clause
+
+error
+SELECT name AS n FROM system.tables
+----
+sql_system_clause
+
+error
+SELECT * FROM system.tables SETTINGS max_result_rows = 5
+----
+sql_system_clause
+
+# A filter on a column that is not one of the two parameters.
+error
+SELECT * FROM system.tables WHERE name = 'orders'
+----
+sql_system_clause
+
+# `table` means nothing on a listing of databases, and a filter that selected nothing while
+# reading as though it had filtered is the worst of the two answers.
+error
+SELECT * FROM system.databases WHERE table = 'orders'
+----
+sql_system_clause
+
+# Not an equality against a literal.
+error
+SELECT * FROM system.tables WHERE database > 'a'
+----
+sql_system_clause

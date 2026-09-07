@@ -684,3 +684,35 @@ pub enum Rounding {
     /// `ceil(x)`: the whole number at or above.
     Ceil,
 }
+
+/// `DELETE FROM t WHERE ...` as it was written.
+///
+/// The lowered half is [`crate::delete::Delete`]. Here as an AST node rather than there for the
+/// reason [`Select`] is here: it carries a `Cond` and byte offsets, neither of which survives
+/// lowering, and both of which a refusal needs in order to point at the thing that was written.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Delete {
+    pub database: Option<String>,
+    pub table: String,
+    /// **Never `None`.** `DELETE FROM t` with no `WHERE` is refused at parse time and pointed at
+    /// `TRUNCATE TABLE`, so the type does not have to carry a case the parser cannot produce -
+    /// which is also what stops a later edit from reading a missing filter as "every record".
+    pub filter: Cond,
+    /// Where the table name is, for the refusals raised once the set has been counted.
+    pub at: usize,
+}
+
+/// `UPDATE t SET c = v WHERE ...` as it was written.
+///
+/// The lowered half is [`crate::update::Update`], and the split is [`Delete`]'s.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Update {
+    pub database: Option<String>,
+    pub table: String,
+    /// The columns to write and the value each takes, in the order written.
+    pub assignments: Vec<(String, big_plan::Literal)>,
+    /// **Never `None`**, for the reason [`Delete::filter`] is never `None`.
+    pub filter: Cond,
+    /// Where the table name is, for the refusals raised once the set has been counted.
+    pub at: usize,
+}

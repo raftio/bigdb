@@ -1,0 +1,150 @@
+# `DELETE FROM t WHERE ...` against real records.
+#
+# The parser corpus pins the tree a delete selects by; this pins what actually goes. The two
+# halves matter separately here because they fail differently: a wrong tree deletes the wrong
+# records, and a right tree wrongly applied deletes some of them.
+
+statement
+CREATE TABLE tx (amount UINT(32), country SET, active BOOL)
+
+statement
+INSERT INTO tx (_record_id, amount, country, active) VALUES
+  (1, 100, 'GB', true),
+  (2, 900, 'US', false),
+  (3, 500, 'GB', true),
+  (4, 700, 'FR', true),
+  (5, 200, 'US', true)
+
+query
+SELECT count(*) FROM tx
+----
+count
+5
+
+## The count a delete answers with is what the predicate selected, and the table agrees.
+
+exec
+DELETE FROM tx WHERE country = 'US'
+----
+deleted
+2
+
+query
+SELECT count(*) FROM tx
+----
+count
+3
+
+query rowsort
+SELECT amount, country FROM tx
+----
+amount  country
+100     GB
+500     GB
+700     FR
+
+## The records are gone from **every** field, not only the one the predicate named - which is
+## what "a record is the bits set for it across every field" means in practice.
+
+query
+SELECT count(*) FROM tx WHERE active = true
+----
+count
+3
+
+query
+SELECT count(*) FROM tx WHERE amount >= 500
+----
+count
+2
+
+## Deleting nothing is not an error, and answers zero.
+
+exec
+DELETE FROM tx WHERE country = 'DE'
+----
+deleted
+0
+
+query
+SELECT count(*) FROM tx
+----
+count
+3
+
+## Idempotent: running the same delete twice removes nothing the second time.
+
+exec
+DELETE FROM tx WHERE amount = 100
+----
+deleted
+1
+
+exec
+DELETE FROM tx WHERE amount = 100
+----
+deleted
+0
+
+query
+SELECT count(*) FROM tx
+----
+count
+2
+
+## The ids are reusable addresses, so a record can be written back at one that was cleared. This
+## is the case that would catch a delete leaving a bit set in some field nobody looked at: the
+## new record would answer for the old one's values.
+
+statement
+INSERT INTO tx (_record_id, amount, country, active) VALUES (2, 42, 'DE', false)
+
+query rowsort
+SELECT amount, country FROM tx
+----
+amount  country
+42      DE
+500     GB
+700     FR
+
+query
+SELECT count(*) FROM tx WHERE country = 'US'
+----
+count
+0
+
+## `EXPLAIN DELETE` resolves the tree and runs none of it, which is the only time a predicate can
+## be checked before it clears records that do not come back.
+
+query
+EXPLAIN DELETE FROM tx WHERE amount >= 500
+----
+explain
+delete tx
+Rows tx
+└── amount >= 500
+
+query
+SELECT count(*) FROM tx WHERE amount >= 500
+----
+count
+2
+
+## A delete through a view is not expanded and is refused where the table is resolved, the same
+## as an insert into one. Deleting *through* a view is coherent to want and is not being decided
+## as a side effect of a rewrite written for reads.
+
+statement
+CREATE VIEW big AS SELECT amount FROM tx WHERE amount >= 500
+
+error
+DELETE FROM big WHERE amount > 0
+----
+error: unknown_table
+
+## No `WHERE` names every record, and is pointed at the statement that frees the fragments.
+
+error
+DELETE FROM tx
+----
+error: sql_delete_all

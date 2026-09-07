@@ -93,7 +93,7 @@ fn every_refusal_is_reached_by_a_statement_in_the_corpus() {
     /// because it was the refusal a window earned before the planner had a field class that
     /// could tell a set from a time quantum, and the window it refused is now answered. This
     /// gate found that, and the variant is gone.
-    const EXCUSED: [(&str, &str); 7] = [
+    const EXCUSED: [(&str, &str); 9] = [
         ("sql_insert_too_large", "needs 10,001 tuples; covered in tests/translate/writes.rs"),
         // The two refusals a view is expanded into. `translate` holds no catalog - which is
         // what makes every test in this crate a parser test - so no statement here can reach a
@@ -109,6 +109,14 @@ fn every_refusal_is_reached_by_a_statement_in_the_corpus() {
         // ids came back is a fact about that table's contents, not about the text, so neither
         // can be reached by a statement alone.
         ("sql_set_too_large", "needs the inner set to have run; covered in big-http/tests/sql.rs"),
+        // How many records a predicate selects is a fact about the table's contents, so no
+        // statement here can reach the ceiling it is compared against.
+        (
+            "sql_delete_too_large",
+            "needs the set to have been counted; covered in big-http/tests/sql.rs",
+        ),
+        // Which kind a column is is a fact about the schema, so no statement here reaches it.
+        ("sql_update_column", "needs the field kinds; covered in big-cluster/tests/logic"),
         ("sql_explain_set", "needs a resolved statement; covered in big-http/tests/sql.rs"),
         // Which table a segment's view is over is a fact about the catalog, so no statement
         // here can reach the refusal that compares it against the ones in scope.
@@ -244,14 +252,27 @@ fn what_a_statement_demands_agrees_with_the_word_it_opens_with() {
             }
             "ALTER" => demanded.contains(&Privilege::Alter),
             "DROP" => demanded.contains(&Privilege::Drop) || demanded.contains(&Privilege::Roles),
+            // The same privilege a drop takes, because what it costs the caller is the data.
+            "TRUNCATE" => demanded.contains(&Privilege::Drop),
+            // And `Select` too when the filter reads another table, which is why this is a
+            // `contains` rather than an equality.
+            "DELETE" => demanded.contains(&Privilege::Delete),
+            // Both, because an update writes the new fact and clears the old one.
+            "UPDATE" => {
+                demanded.contains(&Privilege::Insert) && demanded.contains(&Privilege::Delete)
+            }
             // A write, and a read too when the values come from a query.
             "INSERT" => demanded.contains(&Privilege::Insert),
             "GRANT" | "REVOKE" => demanded == [Privilege::Roles],
+            // Stopping somebody else's query is operating the server.
+            "KILL" => demanded == [Privilege::Operate],
             // `WITH` binds constants for a `SELECT`; the rest read what is already there. A
             // listing of names demands nothing at all - see `Sql::demands`.
-            "SELECT" | "WITH" | "DESCRIBE" | "DESC" | "SHOW" => {
-                demanded.iter().all(|p| matches!(p, Privilege::Select | Privilege::Roles))
-            }
+            // `SHOW PROCESSLIST` is the one listing that is an administrative question, which
+            // is why `Operate` is in this set and nowhere else among the reads.
+            "SELECT" | "WITH" | "DESCRIBE" | "DESC" | "SHOW" => demanded
+                .iter()
+                .all(|p| matches!(p, Privilege::Select | Privilege::Roles | Privilege::Operate)),
             other => panic!("{}:{line}: nothing expected for `{other}`", path.display()),
         };
         assert!(ok, "{}:{line}: `{word}` statement demands {demanded:?}\n  {sql}", path.display());

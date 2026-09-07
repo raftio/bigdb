@@ -34,6 +34,8 @@
 //! | `error` | the stable code the refusal carries |
 //! | `ddl` | the schema change |
 //! | `insert` | the write |
+//! | `delete` | the table, and the plan the filter selects by |
+//! | `update` | the assignments, and the plan the filter selects by |
 //! | `show` | the question about the catalog |
 //! | `explain` | what `EXPLAIN` answers with, line for line |
 //! | `render` | a `CREATE TABLE` written back out of the columns it declared |
@@ -156,6 +158,38 @@ fn dispatch(case: &Case) -> String {
             Sql::Explain { mode, inner } => explained(mode, *inner),
             other => not(&other, "an explanation"),
         }),
+        // The call a delete selects by, so the corpus can pin that it is **the same tree** the
+        // equivalent `SELECT *` produces. Two lowerings of one predicate is two sets waiting to
+        // differ, and the one that differed would be the one doing the deleting.
+        // The same, for an update: the assignments and the tree it selects by.
+        "update" => with(sql, |s| match s {
+            Sql::Update(u) => match big_plan::plan(&u.qualified(), &u.rows, &Stub) {
+                Ok(plan) => format!(
+                    "update {} set {}\n{}",
+                    u.qualified(),
+                    u.assignments
+                        .iter()
+                        .map(|(c, v)| format!("{c} = {}", big_sql::explain::literal_of(v)))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    big_plan::explain(&plan)
+                ),
+                Err(e) => format!("did not resolve: {e}"),
+            },
+            other => not(&other, "an update"),
+        }),
+        "delete" => with(sql, |s| match s {
+            Sql::Delete(d) => match big_plan::plan(&d.qualified(), &d.rows, &Stub) {
+                Ok(plan) => format!("delete {}\n{}", d.qualified(), big_plan::explain(&plan)),
+                Err(e) => format!("did not resolve: {e}"),
+            },
+            other => not(&other, "a delete"),
+        }),
+        // The clause itself, so the corpus pins which keys are read and what each becomes.
+        "settings" => with(sql, |s| match s {
+            Sql::Settings { settings, .. } => format!("{settings:?}"),
+            other => not(&other, "a bounded statement"),
+        }),
         "render" => with(sql, |s| match s {
             Sql::Ddl(big_sql::Ddl::CreateTable {
                 database: None, table, engine, columns, ..
@@ -181,6 +215,14 @@ fn with(sql: &str, f: impl FnOnce(Sql) -> String) -> String {
 fn with_query(sql: &str, f: impl FnOnce(big_sql::Statement) -> String) -> String {
     with(sql, |s| match s {
         Sql::Query(q) => f(q),
+        // **A budget is unwrapped and not printed here, which is the claim worth pinning.** A
+        // statement with a `SETTINGS` clause lowers to exactly the plan and shape the same
+        // statement without one lowers to - the clause changes what the executor gives it, not
+        // what it asks. Any corpus case writing both spellings expects one block.
+        Sql::Settings { inner, .. } => match *inner {
+            Sql::Query(q) => f(q),
+            other => not(&other, "a query"),
+        },
         other => not(&other, "a query"),
     })
 }
@@ -194,6 +236,10 @@ fn not(sql: &Sql, wanted: &str) -> String {
         Sql::Ddl(_) => "a schema change",
         Sql::Acl(_) => "a change to who may do what",
         Sql::Explain { .. } => "an explanation",
+        Sql::Delete(_) => "a delete",
+        Sql::Update(_) => "an update",
+        Sql::Kill(_) => "a kill",
+        Sql::Settings { .. } => "a bounded statement",
     };
     format!("not {wanted}: {what}")
 }
@@ -242,6 +288,36 @@ fn explained(mode: big_sql::ExplainMode, inner: Sql) -> String {
         Sql::Show(s) => big_sql::explain::explained(mode, &Explained::Show(&s)),
         // The parser refuses a second `EXPLAIN`, so no statement in the corpus reaches this.
         Sql::Explain { .. } => "explain of an explain".to_string(),
+        // Nothing is resolved for a kill: it names a query id, not an object in the catalog.
+        Sql::Kill(id) => big_sql::explain::explained(mode, &Explained::Kill(&id)),
+        // Resolved against `Stub`, the same way a query's plans are - which is what makes
+        // `EXPLAIN DELETE` a way to check a predicate before running it against records that do
+        // not come back.
+        Sql::Delete(d) => match big_plan::plan(&d.qualified(), &d.rows, &Stub) {
+            Ok(plan) => big_sql::explain::explained(
+                mode,
+                &Explained::Delete { table: &d.qualified(), rows: &plan },
+            ),
+            Err(e) => format!("did not resolve: {e}"),
+        },
+        Sql::Update(u) => match big_plan::plan(&u.qualified(), &u.rows, &Stub) {
+            Ok(plan) => big_sql::explain::explained(
+                mode,
+                &Explained::Update {
+                    table: &u.qualified(),
+                    assignments: &u.assignments,
+                    rows: &plan,
+                },
+            ),
+            Err(e) => format!("did not resolve: {e}"),
+        },
+        // **The budget is unwrapped and not printed, because this printer cannot know it.** The
+        // `settings` line a client reads carries the *effective* numbers - the minimum of what
+        // the statement asked for and what the operator configured - and the second of those is
+        // a fact about a running server, which a parser test has none of. So the line is added
+        // where the options are, in `Cluster::sql_explain`, and pinned in `big-http`'s tests;
+        // what this corpus pins is that everything else about the explanation is unchanged.
+        Sql::Settings { inner, .. } => explained(mode, *inner),
     }
 }
 

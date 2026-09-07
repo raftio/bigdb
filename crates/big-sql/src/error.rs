@@ -71,7 +71,11 @@ pub enum Refused {
     MultiDistinct,
     /// `IS NULL` or `IS NOT NULL`.
     Null,
-    /// `UPDATE`, `TRUNCATE`, `MERGE`, or a schema change this engine has no operation behind.
+    /// `MERGE`, `REPLACE`, or a schema change this engine has no operation behind.
+    ///
+    /// `TRUNCATE`, `DELETE` and `UPDATE` were all here and are statements now. What stayed are
+    /// the ones with nothing behind them at all: a merge needs a row to match on, and
+    /// `CREATE INDEX` names a thing a bitmap already is.
     Write,
     /// An `INSERT` with no column list, which would be positional against a field order the
     /// statement does not carry.
@@ -92,13 +96,80 @@ pub enum Refused {
     InsertSelfRead,
     /// More rows in one `INSERT` than a statement may carry.
     InsertSize,
-    /// `DELETE FROM`, which asks for a row this engine does not store.
-    DeleteRows,
+    /// `DELETE FROM t` with no `WHERE`, which names every record.
+    ///
+    /// Not answered slowly: clearing every record one id at a time is the same answer
+    /// `TRUNCATE TABLE` gives by freeing the fragments, at the worst price this engine can
+    /// charge for it. Its own refusal rather than [`Self::DeleteTooLarge`] because it is decided
+    /// at parse time and needs no count - and because what to write instead is a different
+    /// statement rather than a narrower predicate. It also catches the `ORDER BY` and `LIMIT`
+    /// MySQL takes on a delete: there is no order to take the first of here.
+    DeleteAll,
+    /// A delete whose `WHERE` selects more records than one transaction may clear.
+    ///
+    /// **The bound is on the half that cannot be interrupted.** The selection is a read and is
+    /// bounded like every read - `SETTINGS max_execution_time` really stops it. The clearing is
+    /// one transaction and nothing stops one, so what bounds it is the *count*, taken from the
+    /// merged set before a bit is cleared. Raised where the count is known, which is the
+    /// coordinator, so no statement in this crate's corpus reaches it.
+    DeleteTooLarge,
+    /// An `UPDATE` naming a column where writing a value adds one rather than replacing it.
+    ///
+    /// A `SET` column holds every value a record was ever given - that is what makes it a set -
+    /// and a `TIMEQUANTUM` column writes a copy into the view for each moment. There is no
+    /// per-value unset below this layer, so a new value would join the old rather than replace
+    /// it. Raised in `big-cluster`, where the field kinds are, so no statement in this crate's
+    /// corpus reaches it.
+    UpdateColumn,
     /// `USE`, which asks a stateless surface to remember something between statements.
     ///
     /// Databases exist; a *session* does not. `POST /sql` answers one statement and keeps
     /// nothing, so `USE` is the client's to hold - `bigctl` does, and sends it as `?database=`.
     SessionUse,
+    /// `SET`, `SET SESSION`, `SHOW VARIABLES`: a limit asked to outlive the statement it bounds.
+    ///
+    /// The same decision as [`Self::SessionUse`], reached from the other side - one statement is
+    /// one request, answered and forgotten, so there is nothing for a `SET` to stick a limit to.
+    /// What exists instead is the `SETTINGS` clause, which writes the limit on the statement,
+    /// and which is therefore also the only spelling that survives a reconnect, a pooled proxy
+    /// connection or a retry on another node.
+    SessionSetting,
+    /// A key in a `SETTINGS` clause that names no limit this engine reads.
+    ///
+    /// Refused rather than ignored, which is the opposite of what ClickHouse does. There are no
+    /// bind parameters in this dialect, so the key was typed - and a dropped
+    /// `max_execution_tim = 30` is a query running unbounded while its author believes it is
+    /// bounded, which reads exactly like a query that was bounded and slow. See [`Self::Round`],
+    /// which makes the same argument about a value.
+    Setting,
+    /// A `KILL` that names something other than one running query by its id.
+    ///
+    /// A predicate over users, tables or elapsed time kills a set nobody named, and which set it
+    /// kills depends on what happened to be running when it arrived. `KILL MUTATION` names work
+    /// this engine does not queue: a schema change is applied and finished.
+    KillTarget,
+    /// `TTL ts + INTERVAL 90 DAY`: retention as a standing promise.
+    ///
+    /// **Nothing here would keep it.** There is no scheduler in this workspace and `big-embed`
+    /// publishes that it spawns no threads, so a `TTL` stored in the catalog would be a table
+    /// plus a promise nothing keeps - which is the object [`Self::MaterializedView`] already
+    /// refuses by name. What exists instead is the statement that does it now, and it is honest
+    /// about what it does: it drops the *index* over those periods, not the records.
+    DeclarativeTtl,
+    /// A name under `system.` this build does not have.
+    ///
+    /// Its own refusal rather than the planner's `unknown_table`, because `system` is not a
+    /// database anybody created: the views under it are this build's, so a wrong name there is a
+    /// question about *this engine* and the answer is the list of the ones that exist.
+    SystemTable,
+    /// A clause a system view does not take.
+    ///
+    /// A `Shown` answer is a `ResultSet` built from the catalog, not a shape over plans - so
+    /// there is nothing for a `GROUP BY` to group or an `ORDER BY` to order without a second
+    /// filter engine over rows, which is the thing this variant exists in order not to need. The
+    /// one exception is `WHERE database = '…'` (and `table = '…'` where it means something),
+    /// because those two are already the parameters of the introspection underneath.
+    SystemClause,
     /// `sales.orders.amount`: a column qualified by more than an alias.
     ThreePartName,
     /// A **materialised** view. A plain one exists - see [`crate::Ddl::CreateView`].
@@ -129,6 +200,17 @@ pub enum Refused {
     Cast,
     /// An aggregate this engine has no fold for — `argMin`, `stddev`, `corr`, `any`.
     Aggregate,
+    /// `bitmap_and`, `bitmap_count`, `bsi_sum`, `to_bitmap`: a bitmap named as a value to pass
+    /// between functions.
+    ///
+    /// **Its own refusal rather than a [`Self::Aggregate`], because nothing here is missing.**
+    /// Every one of these has an answer on this surface already, under the spelling the rest of
+    /// the dialect uses - `sum` is the bit-sliced sum, `count(DISTINCT x)` is the cardinality of
+    /// a row, `AND` is the intersection. What the Doris and ClickHouse spellings assume is a
+    /// `BITMAP` column to hand around, which is what [`Self::BitmapType`] is about; the message
+    /// here names the local spelling for each family so that a query ported from either engine
+    /// is told what to write, not that the feature is absent.
+    BitmapFunction,
     /// `MODIFY`, `ALTER COLUMN` or `CHANGE`: a field's kind and depth are what its bit planes
     /// are, and there is no operation below that changes either.
     AlterKind,
@@ -139,6 +221,24 @@ pub enum Refused {
     AlterEngine,
     /// A type name in a column list that names nothing this engine stores.
     ColumnType,
+    /// `Nullable(T)`: a column declared to hold a value that may be absent.
+    ///
+    /// Separate from [`Self::ColumnType`] because it is not a name this engine failed to
+    /// recognise - it is a name it recognises and declines. Absence is already how a column
+    /// answers here: a record either has the bit set or it does not, and `SELECT *` says so by
+    /// omission rather than by a null. Declaring it would add a second way to be absent that
+    /// nothing below could tell from the first, and [`Self::Null`] is the other half of that
+    /// same decision - it is why `IS NULL` has nothing to compare.
+    NullableType,
+    /// `BITMAP`, `AggregateFunction(groupBitmap, ...)`, `HLL`: a bitmap declared as a column's
+    /// type.
+    ///
+    /// **A bitmap is not a value a column holds here; it is what every column already is.** A
+    /// `SET` column is one bitmap per interned key and an integer column is one per bit plane,
+    /// so a `BITMAP` column would be a bitmap inside a bitmap - and the operations it exists to
+    /// carry are the ones this dialect already spells with `AND`, `count(DISTINCT)` and `sum`.
+    /// See [`Self::BitmapFunction`] for the mapping.
+    BitmapType,
     /// `date_trunc` given a boundary the calendar does not have, or one finer than the column.
     TruncUnit,
     /// An interval spelling of a rounding this dialect writes as `date_trunc`.
@@ -238,7 +338,7 @@ impl Refused {
     /// Kept honest by [`Refused::rank`] below, whose exhaustive match will not compile until a
     /// new variant is named - and by a test asserting that every rank appears here exactly once,
     /// which is what catches naming one and forgetting to add it.
-    pub const ALL: [Self; 63] = [
+    pub const ALL: [Self; 74] = [
         Self::Joins,
         Self::OuterJoin,
         Self::JoinOn,
@@ -260,16 +360,25 @@ impl Refused {
         Self::InsertSelect,
         Self::InsertSelfRead,
         Self::InsertSize,
-        Self::DeleteRows,
+        Self::DeleteAll,
+        Self::DeleteTooLarge,
+        Self::UpdateColumn,
+        Self::DeclarativeTtl,
+        Self::KillTarget,
         Self::SessionUse,
+        Self::SessionSetting,
+        Self::Setting,
         Self::MaterializedView,
         Self::Case,
         Self::Cast,
         Self::Aggregate,
+        Self::BitmapFunction,
         Self::AlterKind,
         Self::Rename,
         Self::AlterEngine,
         Self::ColumnType,
+        Self::NullableType,
+        Self::BitmapType,
         Self::TruncUnit,
         Self::Interval,
         Self::ScalarFilter,
@@ -288,6 +397,8 @@ impl Refused {
         Self::Format,
         Self::Union,
         Self::Quantile,
+        Self::SystemTable,
+        Self::SystemClause,
         Self::ThreePartName,
         Self::ViewBody,
         Self::ViewColumn,
@@ -334,7 +445,11 @@ impl Refused {
             Self::InsertSelect => 18,
             Self::InsertSelfRead => 48,
             Self::InsertSize => 19,
-            Self::DeleteRows => 20,
+            Self::DeleteAll => 20,
+            Self::DeleteTooLarge => 70,
+            Self::UpdateColumn => 71,
+            Self::DeclarativeTtl => 72,
+            Self::KillTarget => 73,
             Self::SessionUse => 21,
             Self::MaterializedView => 22,
             Self::Case => 23,
@@ -376,6 +491,13 @@ impl Refused {
             Self::ReservedRole => 60,
             Self::Round => 61,
             Self::GroupExpression => 62,
+            Self::BitmapFunction => 63,
+            Self::NullableType => 64,
+            Self::BitmapType => 65,
+            Self::SessionSetting => 66,
+            Self::Setting => 67,
+            Self::SystemTable => 68,
+            Self::SystemClause => 69,
         }
     }
 
@@ -397,10 +519,16 @@ impl Refused {
             Self::JoinFilter => "sql_join_filter",
             Self::Order => "sql_unsupported_order",
             Self::Null => "sql_no_nulls",
-            // A `DELETE` shares `sql_read_only` with the other writes this surface does not
-            // take: what the client does about it is the same in both cases, which is the rule
-            // this list follows.
-            Self::Write | Self::DeleteRows => "sql_read_only",
+            Self::Write => "sql_read_only",
+            // Their own codes, and not `sql_read_only`: a delete *is* taken now, so a client
+            // reading "this surface does not write" would be told something untrue about a
+            // statement that is fine. What each needs is different too - one says write a
+            // different statement, the other says narrow the one you wrote.
+            Self::DeleteAll => "sql_delete_all",
+            Self::DeleteTooLarge => "sql_delete_too_large",
+            Self::UpdateColumn => "sql_update_column",
+            Self::DeclarativeTtl => "sql_declarative_ttl",
+            Self::KillTarget => "sql_kill_target",
             Self::InsertColumns | Self::InsertId => "sql_insert_shape",
             Self::IdColumn => "sql_id_column",
             Self::InsertSize => "sql_insert_too_large",
@@ -408,6 +536,10 @@ impl Refused {
             // through a second table, which is nothing like what the other shapes need.
             Self::InsertSelfRead => "sql_insert_self_read",
             Self::SessionUse => "sql_use_unsupported",
+            Self::SessionSetting => "sql_no_session_settings",
+            Self::Setting => "sql_unknown_setting",
+            Self::SystemTable => "sql_system_table",
+            Self::SystemClause => "sql_system_clause",
             Self::MaterializedView => "sql_no_materialized_views",
             Self::ViewBody => "sql_view_body",
             Self::ViewColumn => "sql_view_column",
@@ -416,6 +548,13 @@ impl Refused {
             Self::Rename => "sql_no_rename",
             Self::AlterEngine => "sql_no_alter_engine",
             Self::ColumnType => "sql_unknown_column_type",
+            // Three codes rather than one shared with `sql_unknown_column_type` or
+            // `sql_unsupported`: each names a construct the client has to *rewrite*, and the
+            // rewrite is different in all three - drop the wrapper, declare `SET`, or spell the
+            // operation the way this dialect spells it.
+            Self::NullableType => "sql_nullable_type",
+            Self::BitmapType => "sql_bitmap_type",
+            Self::BitmapFunction => "sql_bitmap_function",
             Self::TruncUnit => "sql_bad_trunc_unit",
             Self::Interval => "sql_unsupported",
             Self::ScalarFilter => "sql_scalar_in_filter",
@@ -568,10 +707,9 @@ impl Refused {
                 "the writes on this surface are `INSERT INTO t (...) VALUES (...)`, \
                  `CREATE TABLE`, `ALTER TABLE ... ADD`/`DROP COLUMN`, `DROP TABLE`, \
                  `CREATE DATABASE`/`DROP DATABASE` and `CREATE VIEW`/`DROP VIEW`. \
-                 `UPDATE` has no row to change in place - a fact is a bit at `(row, record)`, \
-                 so changing one means writing the new fact and clearing the old; `ALTER VIEW` \
+                 `ALTER VIEW` \
                  is `CREATE OR REPLACE VIEW`, which says the whole statement rather than a \
-                 change to one; and `TRUNCATE`, `MERGE`, `REPLACE` and `CREATE INDEX` are each \
+                 change to one; and `MERGE`, `REPLACE` and `CREATE INDEX` are each \
                  a statement with no operation behind it here: a bitmap is already the index. \
                  Write facts in volume with `POST /table/{t}/import` and use the `/table` \
                  routes for the rest"
@@ -624,17 +762,95 @@ impl Refused {
                  `POST /table/{t}/import` is the route for volume: one fact per line, with no \
                  statement to hold"
             }
-            Self::DeleteRows => {
-                "there is no row here to delete: a record is the bits set for it across every \
-                 field, and removing it means clearing each of them. `POST /table/{t}/delete` \
-                 takes the record ids to clear, one per line - which is the `SELECT *` of the \
-                 same `WHERE`, written back"
+            Self::KillTarget => {
+                "`KILL QUERY` names one running query by its id, as `KILL QUERY '<node>/<n>'` \
+                 or `KILL QUERY WHERE query_id = '<node>/<n>'`. `SHOW PROCESSLIST` says what the \
+                 ids are. A predicate over users, tables or elapsed time would kill a set nobody \
+                 named - and a different set each time it ran - and `KILL MUTATION` names work \
+                 this engine does not queue: a schema change is applied and finished, with no \
+                 background rewrite left to cancel"
+            }
+            Self::DeclarativeTtl => {
+                "`TTL` names a promise to expire data on its own, and there is nothing here to \
+                 keep one: this database has no scheduler and the library under it starts no \
+                 threads. What exists is the statement that does it when you run it - \
+                 `ALTER TABLE t DROP DAYS BEFORE '2026-01-01' ON ts` - which travels to every \
+                 node the way a schema change does, so no two of them disagree about what a \
+                 window holds. Note what it removes: the per-period *index* over those days, not \
+                 the records. A `BETWEEN` stops finding them and `count(*)` does not change; \
+                 `DELETE FROM t WHERE ts < '2026-01-01'` is the one that removes them. Run it \
+                 from cron"
+            }
+            Self::UpdateColumn => {
+                "that column holds every value a record was ever given, so writing a new one \
+                 adds it rather than replacing it - and there is no per-value unset below this \
+                 surface to remove the old. What updates in place are the columns where one \
+                 record holds one value: the integer, decimal and float columns, `MUTEX` and \
+                 `BOOL`. For a `SET` or a `TIMEQUANTUM`, delete the record and write it again, \
+                 which is two statements because it is two operations"
+            }
+            Self::DeleteAll => {
+                "a `DELETE` here names the records to clear, as \
+                 `DELETE FROM t WHERE ts < '2026-01-01'`. Without a `WHERE` it names every one of \
+                 them, and clearing them id by id is the most expensive way to say what \
+                 `TRUNCATE TABLE t` says by freeing the fragments - which keeps the table, its \
+                 fields and its row keys. `ORDER BY` and `LIMIT` are refused for a different \
+                 reason: a record id is an address rather than a position, so taking the first \
+                 ten of a set would clear an arbitrary ten while reading as though it had chosen \
+                 them"
+            }
+            Self::DeleteTooLarge => {
+                "a delete is one transaction and nothing interrupts one: the `WHERE` is bounded \
+                 by `max_execution_time`, and the clearing that follows it is not. This one \
+                 selects more records than that half may carry. Narrow the `WHERE` - a window on \
+                 a time column is the usual way, deleting a day or a month at a time - or lower \
+                 the ceiling deliberately with `SETTINGS max_delete_records`, which may only \
+                 tighten it. `TRUNCATE TABLE t` is the whole-table spelling and costs fragments \
+                 rather than records"
             }
             Self::SessionUse => {
                 "`USE` asks this surface to remember a database between statements, and it \
                  remembers nothing: one statement is one request, answered and forgotten. The \
                  database is per request - send `?database=sales`, or qualify the name as \
                  `sales.orders`. `bigctl` accepts `USE` and does exactly that for you"
+            }
+            Self::SessionSetting => {
+                "`SET` asks this surface to remember a limit between statements, and it remembers \
+                 nothing: one statement is one request, answered and forgotten - the same reason \
+                 `USE` is refused. A limit is written on the statement it bounds, as \
+                 `SELECT ... SETTINGS max_execution_time = 30`, which is also the only spelling \
+                 that survives a reconnect, a pooled proxy connection or a retry on another \
+                 node. The keys are `max_execution_time` (seconds), `max_memory_usage` (bytes), \
+                 `max_result_rows` and `max_delete_records`, and each may only lower what the \
+                 server allows"
+            }
+            Self::Setting => {
+                "that key names no limit this engine reads. The three it reads are \
+                 `max_execution_time` (seconds a read may run), `max_memory_usage` (bytes of \
+                 bitmap it may hold) and `max_result_rows` (records it may read back). \
+                 `max_threads`, `max_block_size` and `join_algorithm` are refused rather than \
+                 accepted and ignored: there are no bind parameters here, so a key was typed, \
+                 and a dropped one is a statement running without the bound its author believes \
+                 it has"
+            }
+            Self::SystemTable => {
+                "there is no such view under `system.`. This build has `system.tables` (every \
+                 table and view, in every database), `system.columns` (every column of every \
+                 table), `system.databases` and `system.parts` (every fragment: table, field, \
+                 view and shard, which is the one thing no other statement shows). `system` is \
+                 not a database anybody creates, so a name here is a question about this engine \
+                 rather than about your schema - `system.query_log` and `system.processlist` \
+                 would each need state this build does not keep"
+            }
+            Self::SystemClause => {
+                "a system view answers in full, and the clause it takes is \
+                 `WHERE database = '<name>'` - on `system.columns` and `system.parts` also \
+                 `WHERE table = '<name>'`, joined by `AND`. Those two are the only ones because \
+                 they are already what `SHOW TABLES FROM d` and `DESCRIBE t` pass underneath; \
+                 the answer is a set of rows read out of the catalog rather than a plan over \
+                 bitmaps, so there is nothing here for a join, a grouping, an ordering, a limit \
+                 or a `SETTINGS` budget to act on. Order it and cut it in the client, or select \
+                 the columns you want by name"
             }
             Self::ThreePartName => {
                 "a column is qualified by an alias and nothing else, so `sales.orders.amount` \
@@ -687,6 +903,33 @@ impl Refused {
                  `argMax`, `stddev`, `varPop` and `corr` need each record's value revisited \
                  against a running total, and this engine holds bits at `(row, record)` rather \
                  than values to revisit"
+            }
+            Self::BitmapFunction => {
+                "every one of these already has an answer here, spelled the way the rest of the \
+                 dialect is spelled - the bitmaps are the storage, not a value to pass between \
+                 functions. `bitmap_count` and `bitmapCardinality` are `count(DISTINCT x)`, and \
+                 exact, because the cardinality of a bitmap is a popcount - which is also why \
+                 `uniq`, `uniqHLL12` and `approx_count_distinct` are read as written and answered \
+                 exactly rather than refused at all; `bsi_sum` is `sum(x)` and \
+                 `bsi_range` is `x BETWEEN a AND b`, both folds over bit planes; `bitmap_and` is \
+                 `AND` and `bitmap_andnot` is `NOT IN (SELECT _record_id FROM ...)`; `to_bitmap` \
+                 and `groupBitmapState` name what a `SET` column already did when the fact was \
+                 written. What has no spelling here is a bitmap held *in* a column, which is what \
+                 a `BITMAP` type would be"
+            }
+            Self::NullableType => {
+                "absence is already how a column answers here, so there is no wrapper to declare: \
+                 a record either has the bit set for a value or it does not, and `SELECT *` says \
+                 so by leaving the cell out. `Nullable(String)` would add a second way to be \
+                 absent that nothing below could tell from the first. Declare the type itself - \
+                 `TEXT`, `INT`, `DECIMAL(10, 2)` - and read the absence off the answer"
+            }
+            Self::BitmapType => {
+                "a bitmap is not a value a column holds here; it is what every column already is. \
+                 A `SET` column is one bitmap per interned key and an integer column is one per \
+                 bit plane, so a `BITMAP` column would be a bitmap inside a bitmap. Declare `SET` \
+                 for the column you would have built one from: `count(DISTINCT x)` over it is the \
+                 cardinality, and it is exact rather than a sketch"
             }
             Self::AlterKind => {
                 "a field's kind decides how every fact in it was routed and its bit depth is \

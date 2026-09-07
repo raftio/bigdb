@@ -204,3 +204,164 @@ error
 SELECT count(*) FROM tx WHERE amount = 'GB'
 ----
 error: operator_not_allowed
+
+## `TRUNCATE TABLE`: the records go, the table stays.
+#
+# The claim is not just that the count drops - a `DROP TABLE` would do that too. It is that the
+# table is still *declared*, with the same fields, and takes writes again immediately.
+
+statement
+CREATE TABLE emptied (amount UINT(32), country SET)
+
+statement
+INSERT INTO emptied (_record_id, amount, country) VALUES (1, 100, 'GB'), (2, 900, 'US')
+
+query
+SELECT count(*) FROM emptied
+----
+count
+2
+
+exec
+TRUNCATE TABLE emptied
+----
+fragments
+5
+
+query
+SELECT count(*) FROM emptied
+----
+count
+0
+
+# The declaration survived, which is the whole difference from a drop: `DESCRIBE` still answers
+# and the fields are the ones that were there.
+query
+DESCRIBE emptied
+----
+name     kind  bit_depth  scale  granularity
+amount   int   32         NULL   NULL
+country  set   32         NULL   NULL
+
+# And it takes writes again. **This is the case that would catch forgetting the row keys**: the
+# keyed column re-interns `'GB'`, and if `TRUNCATE` had called `keys.remove_table` the id behind
+# it could come back meaning something else on a node that still cached the old mapping.
+statement
+INSERT INTO emptied (_record_id, amount, country) VALUES (3, 50, 'GB')
+
+query
+SELECT count(*) FROM emptied WHERE country = 'GB'
+----
+count
+1
+
+# Emptying it again is not an error, and the count is the fragments the last insert recreated -
+# not zero, because a table that has been written to since is not empty.
+exec
+TRUNCATE TABLE emptied
+----
+fragments
+5
+
+# And now it really is empty, which is the case that says a second truncate frees nothing rather
+# than failing.
+exec
+TRUNCATE TABLE emptied
+----
+fragments
+0
+
+# A table that is not there, with and without `IF EXISTS`.
+exec
+TRUNCATE TABLE IF EXISTS nope
+----
+fragments
+0
+
+# Without `IF EXISTS`, a table that is not there is an error - the same one `DROP TABLE` gives.
+# Anything else would make `IF EXISTS` mean nothing.
+error
+TRUNCATE TABLE nope
+----
+error: unknown_table
+
+## Retention, as the statement that travels to every node.
+#
+# **It drops the index over those periods, not the records** - which is the whole reason it is not
+# called `TTL`. A window query stops finding them; `count(*)` does not change. Both halves are
+# asserted, because a reader who only checked the first would conclude the records had gone.
+#
+# A time-quantum value is written `key@unix_seconds`: the key is what `= 'home'` matches and the
+# instant is what the per-period views are built from. Written without the `@` it is an ordinary
+# key with no time at all - which is a real thing to want and is also how this test was wrong
+# the first time, asserting retention against a table that had no day views to drop.
+
+statement
+CREATE TABLE visits (visit TIMEQUANTUM, country SET)
+
+statement
+INSERT INTO visits (_record_id, visit, country) VALUES
+  (1, 'home@1766620800', 'GB'),
+  (2, 'home@1767225600', 'US'),
+  (3, 'home@1767571200', 'GB')
+
+query
+SELECT count(*) FROM visits
+----
+count
+3
+
+# The day views the inserts created, *before* any retention - so what the statement removes is
+# readable as a difference rather than asserted from an empty list.
+query rowsort
+SELECT view FROM system.parts WHERE table = 'visits'
+----
+view
+20251225
+20260101
+20260105
+_column
+_column
+_standard
+_standard
+_standard
+
+exec
+ALTER TABLE visits DROP DAYS BEFORE '2026-01-02' ON visit
+----
+fields
+1
+
+# The records are all still there. This is the half that reads as a surprise and is the truth.
+query
+SELECT count(*) FROM visits
+----
+count
+3
+
+# What went is the index over the periods before the cutoff.
+query rowsort
+SELECT view FROM system.parts WHERE table = 'visits'
+----
+view
+20260105
+_column
+_column
+_standard
+_standard
+_standard
+
+## A column that is not a time quantum has no per-period index to trim, and answering zero would
+## read exactly like a retention that had nothing left to drop.
+
+error
+ALTER TABLE visits DROP DAYS BEFORE '2026-01-02' ON country
+----
+error: wrong_field_kind
+
+## A column the table has not got, judged with the other changes before any of them is applied.
+
+error
+ALTER TABLE visits DROP DAYS BEFORE '2026-01-02' ON nope
+----
+error: unknown_field

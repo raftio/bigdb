@@ -62,9 +62,18 @@ fn the_catalog_questions_that_have_no_answer_here() {
     // Each of these is a surface of its own, and none is one this statement grows by accident.
     // `SHOW GRANTS` was on this list until roles arrived, and is now answered - which is why
     // the list is a list rather than a comment: the surface grows, and what it refuses shrinks.
-    for sql in ["SHOW INDEX FROM t", "SHOW PROCESSLIST", "DESCRIBE", "SHOW"] {
+    for sql in ["SHOW INDEX FROM t", "DESCRIBE", "SHOW"] {
         assert_eq!(code(sql), "parse_error", "{sql}");
     }
+    // `SHOW PROCESSLIST` was on this list until the running-query registry arrived, and is now
+    // answered - which is the list doing what the comment above says it does. It demands
+    // `Operate`, because reading somebody else's running statements is an administrative
+    // question and the text of one can name tables the reader may not read.
+    let listed = big_sql::translate("SHOW PROCESSLIST").unwrap();
+    assert_eq!(
+        listed.demands().iter().map(|d| d.privilege).collect::<Vec<_>>(),
+        vec![big_sql::Privilege::Operate]
+    );
 }
 
 /// **The test that keeps `render` and `column_type` from drifting.**

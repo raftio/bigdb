@@ -127,6 +127,23 @@ pub enum Ddl {
         /// nothing dropped rather than with an error.
         if_exists: bool,
     },
+    /// `TRUNCATE TABLE [IF EXISTS] <name>`: the records go, the table stays.
+    ///
+    /// **A schema change rather than a write, and that is not a filing decision.** It costs the
+    /// number of *fragments*, not the number of records - the pages are freed by key, the way a
+    /// `DROP TABLE` frees them - so it travels the leader-then-fan-out path every other schema
+    /// change takes rather than the shard fan-out a delete would. It is also what a bulk load
+    /// needs in order to reload a table: `big_db::bulk` refuses to write into occupied
+    /// fragments, and until this existed the only way to clear them was to drop the table and
+    /// lose its declaration with them.
+    TruncateTable {
+        database: Option<String>,
+        table: String,
+        /// `IF EXISTS`, so a setup script that empties a table before filling it is re-runnable
+        /// against a database where it has not been created yet. The same argument
+        /// [`Ddl::DropTable`] takes it for.
+        if_exists: bool,
+    },
     /// `CREATE [OR REPLACE] VIEW [IF NOT EXISTS] <name> AS <select>`.
     ///
     /// # What a body may be, and why it is that little
@@ -185,6 +202,7 @@ impl Ddl {
             Self::CreateTable { database: d, .. }
             | Self::AlterTable { database: d, .. }
             | Self::DropTable { database: d, .. }
+            | Self::TruncateTable { database: d, .. }
             // A view is *in* a database the way a table is, so it takes the request's. What its
             // body resolves in is a different question with a different answer - the view's own
             // database, applied where the body is parsed rather than here.
@@ -221,6 +239,23 @@ pub enum Alter {
     /// authorises it could not already reach over the field route - this is a second spelling,
     /// not a second capability.
     Drop(String),
+    /// `DROP DAYS BEFORE '<date>' ON <column>`: retention for one time-quantum column.
+    ///
+    /// **An `ALTER` because it changes what the table's *index* holds without changing what the
+    /// table stores** - and because `ALTER` is where clauses already compose, so it is validated
+    /// beside the adds and drops against the same simulated post-statement schema.
+    ///
+    /// It is imperative rather than a declarative `TTL` clause, and that is a decision rather
+    /// than a stage: nothing here would keep a standing promise. There is no scheduler in this
+    /// workspace, `big-embed` publishes that it spawns no threads, and a table plus a promise
+    /// nothing keeps is the object [`crate::Refused::MaterializedView`] already refuses by name.
+    /// Run it from cron.
+    DropDaysBefore {
+        /// The time-quantum column whose index is being trimmed.
+        column: String,
+        /// The date to keep from, as written. The day it falls in is **kept**.
+        before: String,
+    },
 }
 
 /// One field, declared in a column list.

@@ -166,6 +166,13 @@ pub struct Ctx<'a, P: PagerMut> {
     /// them is what it does. Borrowed rather than reached for through a global: a second
     /// server in one process - which every test that binds two ports is - must not share them.
     pub metrics: &'a ServerMetrics,
+    /// The queries running on this node, so one of them can be named and stopped.
+    ///
+    /// **This is the one thing the route holds that the cluster does not.** The cancellation
+    /// flag is minted per connection, here, so the map from an id to a flag belongs here too -
+    /// and `SHOW PROCESSLIST` and `KILL QUERY` are answered in the route rather than in
+    /// `Cluster::run` for that reason alone.
+    pub running: &'a std::sync::Arc<crate::running::Registry>,
     /// Wall-clock budget for a query. `None` lets it run to completion.
     pub query_timeout: Option<Duration>,
     /// Set by the connection's watchdog when the client hangs up. Only queries carry one.

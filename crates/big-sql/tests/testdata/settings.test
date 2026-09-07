@@ -1,0 +1,119 @@
+# What one statement may spend, written on the statement.
+#
+# **This dialect has no session, so it has no `SET`.** `USE` is refused because `POST /sql`
+# answers one statement and remembers nothing; a `SET` that stuck a limit to a connection would
+# need exactly the memory `USE` was refused for wanting. So the limit travels with the statement
+# it bounds - which is also the only spelling that survives a reconnect, a proxy that pools
+# connections, or a retry on another node.
+#
+# Three keys, because three is what exists end to end: two are `QueryLimits` and one is the
+# deadline `DbRead` checks at every fragment. A key naming a knob nothing reads is refused rather
+# than accepted and ignored.
+
+## The clause, and what each key becomes.
+
+settings
+SELECT count(*) FROM t SETTINGS max_execution_time = 30
+----
+Settings { max_execution_time: Some(30), max_memory_usage: None, max_result_rows: None, max_delete_records: None }
+
+settings
+SELECT count(*) FROM t SETTINGS max_memory_usage = 1000000, max_result_rows = 500
+----
+Settings { max_execution_time: None, max_memory_usage: Some(1000000), max_result_rows: Some(500), max_delete_records: None }
+
+# Case-insensitive, like every other keyword here: the lexer has no keyword list.
+settings
+SELECT count(*) FROM t settings MAX_RESULT_ROWS = 10
+----
+Settings { max_execution_time: None, max_memory_usage: None, max_result_rows: Some(10), max_delete_records: None }
+
+# The last one written wins. A statement is read left to right and its reader expects the same,
+# and it is what lets a query built by concatenation append an override.
+settings
+SELECT count(*) FROM t SETTINGS max_result_rows = 10, max_result_rows = 20
+----
+Settings { max_execution_time: None, max_memory_usage: None, max_result_rows: Some(20), max_delete_records: None }
+
+## The plan is not affected, which is the whole claim: a budget is what the executor gives the
+## statement, not part of what the statement asks. Both of these print one block.
+
+plan
+SELECT count(*) FROM t WHERE amount >= 500 SETTINGS max_execution_time = 30
+----
+Count t
+└── amount >= 500
+
+plan
+SELECT count(*) FROM t WHERE amount >= 500
+----
+Count t
+└── amount >= 500
+
+## Position: after `FORMAT`, and once for the whole statement.
+#
+# ClickHouse writes it before `FORMAT`; there is one position here rather than two so that a
+# statement cannot carry two of them. It is read after the last `UNION ALL` branch because a
+# union produces one answer, and a per-branch deadline would bound a part of it that nobody
+# receives on its own.
+
+settings
+SELECT count(*) FROM t FORMAT TSV SETTINGS max_result_rows = 5
+----
+Settings { max_execution_time: None, max_memory_usage: None, max_result_rows: Some(5), max_delete_records: None }
+
+settings
+SELECT count(*) FROM t UNION ALL SELECT count(*) FROM u SETTINGS max_result_rows = 5
+----
+Settings { max_execution_time: None, max_memory_usage: None, max_result_rows: Some(5), max_delete_records: None }
+
+## `SET` and `SHOW VARIABLES`: the session spelling, refused with the clause named.
+
+error
+SET max_execution_time = 30
+----
+sql_no_session_settings
+
+error
+SET SESSION max_memory_usage = 1000
+----
+sql_no_session_settings
+
+error
+SET GLOBAL max_result_rows = 1000
+----
+sql_no_session_settings
+
+error
+SHOW VARIABLES LIKE 'max%'
+----
+sql_no_session_settings
+
+error
+SHOW SETTINGS
+----
+sql_no_session_settings
+
+## A key this engine does not read is refused, not dropped.
+#
+# The opposite of what ClickHouse does, and deliberately: there are no bind parameters in this
+# dialect, so a key here was *typed*. A silently dropped `max_execution_tim = 30` is a statement
+# running without the bound its author believes it has, which reads exactly like a statement that
+# was bounded and slow.
+
+error
+SELECT count(*) FROM t SETTINGS max_execution_tim = 30
+----
+sql_unknown_setting
+
+# Named knobs this engine does not have. Each is a real ClickHouse setting, and accepting one
+# would be a promise nothing here keeps.
+error
+SELECT count(*) FROM t SETTINGS max_threads = 8
+----
+sql_unknown_setting
+
+error
+SELECT count(*) FROM t SETTINGS join_algorithm = 1
+----
+sql_unknown_setting

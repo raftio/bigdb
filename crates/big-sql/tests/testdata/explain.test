@@ -83,7 +83,7 @@ parse_error
 error
 EXPLAIN DELETE FROM t
 ----
-sql_read_only
+sql_delete_all
 
 error
 EXPLAIN SELECT * FROM t, u
@@ -99,3 +99,11 @@ CreateTable explain
 ├── explain int depth=8
 ├── plan int depth=8
 └── shape set depth=32
+
+# Every statement this dialect has is explainable, which is what `gates.rs` holds over the whole
+# corpus. A kill needs no schema to resolve - it names a query rather than an object - so it is
+# answered rather than refused.
+explain
+EXPLAIN KILL QUERY 'a/7'
+----
+kill a/7

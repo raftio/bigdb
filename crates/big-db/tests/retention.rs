@@ -129,3 +129,50 @@ fn the_pages_behind_a_dropped_day_are_freed() {
     // page that has been handed back.
     d.scrub().expect("the database has to stay consistent after a retention drop");
 }
+
+/// **A field declaring more than one granularity has all of them retained, not only its days.**
+///
+/// This is the case the day-only version got silently wrong: a field with `[Day, Month]` kept
+/// every month view for ever, so an operator who asked to keep thirty days kept thirty days of
+/// day views and an unbounded history of month views. Nothing reported it, because a listing of
+/// fragments was not a thing you could ask for and `count(*)` never changes either way.
+///
+/// The rule itself - that a view goes only when the whole period it covers is before the cutoff -
+/// is pinned as arithmetic in `catalog::retention_rule`. This is the half that says the rule is
+/// actually the one the database applies.
+#[test]
+fn a_field_with_months_has_its_months_retained_too() {
+    use big_db::Granularity;
+
+    let d = Db::in_memory().unwrap();
+    d.create_table("v").unwrap();
+    d.create_time_quantum("v", "visit", vec![Granularity::Day, Granularity::Month]).unwrap();
+
+    // Two days in December and two in January, so a cutoff inside January has a month wholly
+    // before it and a month it falls inside.
+    let december = 1_766_620_800i64; // 2025-12-25T00:00:00Z
+    let january = 1_767_225_600i64; // 2026-01-01T00:00:00Z
+    let at = [december, december + DAY, january, january + DAY];
+
+    let mut w = d.write();
+    for (i, when) in at.iter().enumerate() {
+        w.set_time("v", "visit", i as u64 + 1, "home", *when).unwrap();
+    }
+    w.commit().unwrap();
+
+    let before = d.read().fragments("v").unwrap().len();
+
+    // Keep from 2026-01-02 onwards. December's days and December's month are wholly before it;
+    // January's month is not, because it holds the days being kept.
+    let dropped = d.drop_days_before("v", "visit", january + DAY).unwrap();
+    assert!(dropped > 0, "nothing was dropped at all");
+
+    let names: Vec<String> =
+        d.read().fragments("v").unwrap().into_iter().filter_map(|(addr, _)| addr.view).collect();
+    assert!(!names.iter().any(|n| n == "202512"), "December's month survived: {names:?}");
+    assert!(names.iter().any(|n| n == "202601"), "January's month went: {names:?}");
+    assert!(!names.iter().any(|n| n.starts_with("202512")), "a December day survived: {names:?}");
+    assert!(names.iter().any(|n| n == "20260102"), "the kept day went: {names:?}");
+
+    assert!(d.read().fragments("v").unwrap().len() < before, "nothing was freed");
+}

@@ -53,6 +53,7 @@
 pub mod acl;
 pub mod ast;
 pub mod ddl;
+pub mod delete;
 pub mod error;
 pub mod explain;
 pub mod insert;
@@ -61,8 +62,10 @@ pub mod lower;
 pub mod parse;
 pub mod render;
 pub mod scalar;
+pub mod settings;
 pub mod shape;
 pub mod show;
+pub mod update;
 
 pub use acl::{Acl, AclObject};
 pub use ast::{ExplainMode, Query, Select};
@@ -70,16 +73,19 @@ pub use ast::{ExplainMode, Query, Select};
 // hands back without depending on `big-rbac` directly.
 pub use big_rbac::{Demand, Object, ObjectRef, Privilege, Privileges};
 pub use ddl::{Alter, Column, ColumnKind, Ddl, MAX_VIEW_DEPTH};
+pub use delete::Delete;
 pub use error::{Refused, Result, SqlError};
 pub use insert::{Insert, MAX_INSERT_ROWS, RECORD_COLUMN};
 pub use lower::{lower, Ask, Probe, Statement, MAX_CALLS};
 pub use parse::{parse, Parsed};
 pub use scalar::{BinOp, Func, Scalar, UnOp};
+pub use settings::Settings;
 pub use shape::{
     Absent, Answer, Cell, Columns, Cut, Format, GroupOrder, Having, JoinSide, Keying, Of, Operand,
     OrderBy, Pairing, Selected, Shape, Threshold, Units,
 };
-pub use show::{Show, Shown};
+pub use show::{Show, Shown, SystemView};
+pub use update::Update;
 
 /// One statement, translated.
 ///
@@ -116,6 +122,28 @@ pub enum Sql {
     /// Nothing is lowered: an ACL statement names no column and reads no table, so there is no
     /// plan to make. It arrives at the executor as it was written.
     Acl(Acl),
+    /// `DELETE FROM t WHERE ...`: the records a condition selects, cleared from every field.
+    ///
+    /// **A write whose first half is a read**, which is why it is not an `Insert` and not a
+    /// `Ddl`. The call it carries is resolved and fanned out exactly as a `SELECT`'s is - the
+    /// coordinator even resolves an `IN (SELECT ...)` inside it the same way - and only then does
+    /// anything get cleared. See [`crate::delete`] for what that costs and what it does not
+    /// promise.
+    Delete(Delete),
+    /// `UPDATE t SET c = v WHERE ...`: a new fact written where an old one was.
+    ///
+    /// **A write whose first half is a read**, like [`Sql::Delete`], and it demands *both*
+    /// `Insert` and `Delete`: writing the new fact and clearing the old is what an update is
+    /// here, not an implementation detail of one. See [`crate::update`] for which columns it
+    /// works on and why the others are refused rather than emulated.
+    Update(Update),
+    /// `KILL QUERY '<id>'`: one running query, named and stopped.
+    ///
+    /// **Answered at the edge rather than by the cluster**, because the flag lives where it is
+    /// minted - one per connection, in the server - and a registry any lower would be a map the
+    /// layer that makes the flag has to reach down into. That is the one place this surface
+    /// answers a statement outside `Cluster::run`, and it is deliberate.
+    Kill(String),
     /// `EXPLAIN <statement>`: what the statement would do, having done none of it.
     ///
     /// **A wrapper rather than a sixth kind of work.** The five above say what a statement
@@ -126,6 +154,18 @@ pub enum Sql {
         /// Which half was asked for.
         mode: ExplainMode,
         /// The statement being described, which is never itself an `EXPLAIN`.
+        inner: Box<Sql>,
+    },
+    /// `<statement> SETTINGS max_execution_time = 30`: what this statement may spend.
+    ///
+    /// **A wrapper, and not a seventh kind of work.** It changes nothing about what the
+    /// statement is or what it answers - only the budget the executor gives it, which is why
+    /// every match over `Sql` delegates through it rather than deciding anything of its own.
+    /// What it demands is the inner statement's demands: a limit is not an authority.
+    Settings {
+        /// The limits written on the statement, never empty.
+        settings: Settings,
+        /// The statement being bounded.
         inner: Box<Sql>,
     },
 }
@@ -204,8 +244,51 @@ impl Sql {
                     out.push(Demand::server(Privilege::Roles));
                 }
                 Shown::Grants { role: None } => {}
+                // **Nothing**, which is the same answer `SHOW TABLES` gives and for the same
+                // reason: these are listings of names, the route floor has already established
+                // that the caller is somebody, and narrowing a listing to what the reader may
+                // query is a feature this surface does not have yet. Demanding `SELECT` on every
+                // table `system.columns` names is not a stricter version of that - it is a
+                // different statement, one nobody could hold the privileges for.
+                Shown::System { .. } => {}
+                // Somebody else's running statements is an administrative question, and the text
+                // of one can name tables the reader may not read. `Operate` is the privilege
+                // that guards operating the process, which is what this is a view of.
+                Shown::Processlist => out.push(Demand::server(Privilege::Operate)),
             },
             Self::Ddl(ddl) => out.push(ddl_demand(ddl)),
+            // Stopping somebody else's query is operating the server, which is what
+            // `Privilege::Operate` guards. A rule that let a caller kill *their own* without it
+            // cannot be written here: `demands` is static and does not know whose query an id
+            // names. The simple rule is the one that can be checked before anything runs.
+            Self::Kill(_) => out.push(Demand::server(Privilege::Operate)),
+            Self::Update(update) => {
+                // **Both**, because both is what it does. An update writes the new fact and
+                // clears the old one, so a credential that may add facts but not remove them is
+                // not most of the way to being allowed - it is missing half the operation. It
+                // also avoids a ninth `Privilege`, which would change `Privilege::ALL` and with
+                // it the RBAC bitmask already stored in every catalog.
+                let object = table_ref(update.database.as_deref(), &update.table);
+                out.push(Demand::new(Privilege::Insert, object));
+                out.push(Demand::new(Privilege::Delete, object));
+                for table in &update.reads {
+                    out.push(Demand::new(Privilege::Select, object_of(table)));
+                }
+            }
+            Self::Delete(delete) => {
+                out.push(Demand::new(
+                    Privilege::Delete,
+                    table_ref(delete.database.as_deref(), &delete.table),
+                ));
+                // **A read is a read, wherever it appears.** An `IN (SELECT ... FROM other)`
+                // inside the filter reads `other` before this table is narrowed by what came
+                // back, so without this a caller could learn which ids `other` holds by deleting
+                // from a table they may delete from. The same argument `INSERT ... SELECT` makes
+                // one variant up.
+                for table in &delete.reads {
+                    out.push(Demand::new(Privilege::Select, object_of(table)));
+                }
+            }
             // Every form of it administers roles, which is one privilege held on the server or
             // nowhere - see `Privilege::Roles` for why it does not divide by database.
             Self::Acl(_) => out.push(Demand::server(Privilege::Roles)),
@@ -215,6 +298,9 @@ impl Sql {
             // something to say anything useful. This way round it fails closed, and it is what
             // ClickHouse does.
             Self::Explain { inner, .. } => inner.collect_demands(out),
+            // A budget is not an authority. Narrowing what a statement may spend cannot widen
+            // what it may reach, so the demands are exactly the inner statement's.
+            Self::Settings { inner, .. } => inner.collect_demands(out),
         }
     }
 }
@@ -233,7 +319,10 @@ fn ddl_demand(ddl: &Ddl) -> Demand<'_> {
         Ddl::AlterTable { database, table, .. } => {
             Demand::new(Privilege::Alter, table_ref(database.as_deref(), table))
         }
-        Ddl::DropTable { database, table, .. } => {
+        // `Drop` and not `Alter`, because what it costs the caller is the data. `Privilege::Drop`
+        // is documented as the one that destroys, and emptying a table destroys exactly as much
+        // as dropping it - the declaration that survives is not the part anybody minds losing.
+        Ddl::DropTable { database, table, .. } | Ddl::TruncateTable { database, table, .. } => {
             Demand::new(Privilege::Drop, table_ref(database.as_deref(), table))
         }
         Ddl::DropView { database, name, .. } => {
@@ -327,10 +416,20 @@ pub fn qualify(parsed: &mut Parsed, database: &str) {
         }
         Parsed::Show(s) => s.what.fill_database(database),
         Parsed::Ddl(d) => d.fill_database(database),
+        Parsed::Delete(d) => {
+            d.database.get_or_insert_with(|| database.to_string());
+        }
+        Parsed::Update(u) => {
+            u.database.get_or_insert_with(|| database.to_string());
+        }
+        // An id names a query, not a table, so there is no database to fill in.
+        Parsed::Kill(_) => {}
         Parsed::Acl(a) => a.fill_database(database),
         // The names an `EXPLAIN` describes are the inner statement's, and they mean what they
         // would have meant had it been run - so this is the same walk, one level down.
         Parsed::Explain { inner, .. } => qualify(inner, database),
+        // The names a bounded statement is about are its own; the clause names no table.
+        Parsed::Settings { inner, .. } => qualify(inner, database),
     }
 }
 
@@ -344,10 +443,28 @@ pub fn finish(parsed: Parsed) -> Result<Sql> {
         Parsed::Insert(i) => Sql::Insert(i),
         Parsed::Show(s) => Sql::Show(s),
         Parsed::Ddl(d) => Sql::Ddl(d),
+        Parsed::Delete(d) => Sql::Delete(lower::delete::lower(&d)),
+        Parsed::Update(u) => Sql::Update(lower::delete::update(&u)),
+        Parsed::Kill(id) => Sql::Kill(id),
         Parsed::Acl(a) => Sql::Acl(a),
         // Lowered exactly as it would have been unwrapped, so what is described is what would
         // have run - including the refusals. `EXPLAIN` of a statement this engine will not
         // answer fails with that statement's own refusal, which is the useful answer.
         Parsed::Explain { mode, inner } => Sql::Explain { mode, inner: Box::new(finish(*inner)?) },
+        // Lowered exactly as the unbounded statement would have been, because it is the same
+        // statement: what the clause changes is what the executor gives it, not what it asks.
+        Parsed::Settings { settings, inner } => {
+            let inner = finish(*inner)?;
+            // **A key that this statement has nothing to spend on is refused, not ignored.**
+            // `max_delete_records` bounds the half of a delete no deadline reaches; on a query
+            // there is no such half, so accepting it would be the silent drop `Refused::Setting`
+            // exists to prevent - said about a key that is spelled right and means nothing here.
+            // The other three bound reads, and a delete does a read, so none of them is refused
+            // the other way round.
+            if settings.max_delete_records.is_some() && !matches!(inner, Sql::Delete(_)) {
+                return Err(SqlError::Refused { what: Refused::Setting, at: 0 });
+            }
+            Sql::Settings { settings, inner: Box::new(inner) }
+        }
     })
 }

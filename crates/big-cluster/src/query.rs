@@ -95,6 +95,9 @@ impl<P: PagerMut + Sync> Cluster<P> {
             big_embed::SqlDdl::DropTable { database, table, if_exists } => {
                 ("dropped", self.sql_drop_table(&qualified(database, table), *if_exists)?)
             }
+            big_embed::SqlDdl::TruncateTable { database, table, if_exists } => {
+                ("fragments", self.sql_truncate_table(&qualified(database, table), *if_exists)?)
+            }
             big_embed::SqlDdl::CreateView { database, name, body, or_replace, if_not_exists } => (
                 "view",
                 self.create_view(&qualified(database, name), body, *or_replace, *if_not_exists)?
@@ -245,6 +248,33 @@ impl<P: PagerMut + Sync> Cluster<P> {
                         }));
                     }
                 }
+                // Judged here with the rest, so a statement that adds a column and then asks
+                // retention of a column it has not got adds nothing. Two things have to hold:
+                // the column exists at this point in the statement, and it is a time quantum -
+                // a retention on any other kind would find no views and answer zero, which reads
+                // exactly like a retention that had nothing left to drop.
+                big_embed::SqlAlter::DropDaysBefore { column, before } => {
+                    if !fields.contains(column) {
+                        return Err(local(big_db::DbError::UnknownField {
+                            table: table.to_string(),
+                            field: column.clone(),
+                        }));
+                    }
+                    let kind = info.fields.iter().find(|f| &f.name == column).map(|f| f.kind);
+                    if kind != Some(big_embed::FieldKind::TimeQuantum) {
+                        return Err(local(big_db::DbError::WrongFieldKind {
+                            field: column.clone(),
+                            expected: "time quantum",
+                        }));
+                    }
+                    // The date is read here too, so a malformed one fails before anything runs.
+                    if big_civil::parse_date(before).is_none() {
+                        return Err(local(big_db::DbError::WrongFieldKind {
+                            field: column.clone(),
+                            expected: "a date as YYYY-MM-DD",
+                        }));
+                    }
+                }
             }
         }
 
@@ -252,6 +282,13 @@ impl<P: PagerMut + Sync> Cluster<P> {
             match change {
                 big_embed::SqlAlter::Add(column) => self.create_column(table, column)?,
                 big_embed::SqlAlter::Drop(field) => self.drop_field(table, field)? as u64,
+                big_embed::SqlAlter::DropDaysBefore { column, before } => {
+                    // Validated in the loop above, so this cannot be `None` here - and the
+                    // days are turned into the instant the wire carries, because two nodes must
+                    // not each decide which day a date names.
+                    let days = big_civil::parse_date(before).unwrap_or_default();
+                    self.drop_views_before(table, column, days * 86_400)?
+                }
             };
         }
         Ok(changes.len() as u64)
@@ -344,9 +381,25 @@ impl<P: PagerMut + Sync> Cluster<P> {
         // rather than inside `plan_sql` is what keeps a `CREATE TABLE` from being applied on
         // whichever node the client happened to reach - which is the failure a schema leader
         // exists to prevent.
+        // The budget the statement wrote on itself, applied before anything is planned and
+        // never widening what the operator configured. Held in a local so that the borrowed
+        // `opts` below is the narrowed one on every path out of here.
+        let narrowed;
+        let (sql, opts, settings) = match sql {
+            big_embed::Sql::Settings { settings, inner } => {
+                narrowed = opts.narrowed_by(&settings);
+                (*inner, &narrowed, settings)
+            }
+            // The clause's own values rather than the effective ones, because the one thing that
+            // reads them below - a delete's record ceiling - bounds a *write*, and
+            // `QueryOptions` deliberately carries nothing about writes.
+            other => (other, opts, big_embed::SqlSettings::default()),
+        };
         let statement = match sql {
             big_embed::Sql::Ddl(ddl) => return self.sql_ddl(&ddl),
             big_embed::Sql::Insert(insert) => return self.sql_insert(&insert, opts),
+            big_embed::Sql::Delete(delete) => return self.sql_delete(&delete, opts, settings),
+            big_embed::Sql::Update(update) => return self.sql_update(&update, opts, settings),
             big_embed::Sql::Show(show) => return self.sql_show(&show, who),
             // Replicated through the same leader-then-fan-out a schema change takes, because a
             // grant that reached two nodes of three is an intermittent refusal - which is the
@@ -355,8 +408,22 @@ impl<P: PagerMut + Sync> Cluster<P> {
             // `EXPLAIN` reaches none of the three above and none of the fan-out below: what the
             // statement is has already been decided by the time it gets here, and writing it
             // out is the whole of the work.
-            big_embed::Sql::Explain { mode, inner } => return self.sql_explain(mode, *inner),
+            big_embed::Sql::Explain { mode, inner } => return self.sql_explain(mode, *inner, opts),
             big_embed::Sql::Query(s) => s,
+            // Unwrapped above, so reaching here would mean two clauses on one statement - which
+            // the parser cannot produce: `SETTINGS` is read once, after the last `UNION ALL`
+            // branch. Unreachable rather than unhandled, and said so here rather than folded
+            // into the arm above where it would look like a case that happens.
+            big_embed::Sql::Settings { .. } => unreachable!("SETTINGS is read once per statement"),
+            // Answered at the edge, which is where the registry of running queries lives - the
+            // cancellation flag is minted per connection, in `big-http`, so the map from an id
+            // to a flag is that crate's. Reaching it from here would put process-local state
+            // behind an interface about a distributed database.
+            big_embed::Sql::Kill(_) => {
+                return Err(ClusterError::Local(big_embed::ApiError::Sql(
+                    big_embed::SqlError::Refused { what: big_embed::Refused::KillTarget, at: 0 },
+                )))
+            }
         };
         let started = Instant::now();
         // **The semi-joins first, and they fan out like everything else - which is the whole
@@ -416,7 +483,18 @@ impl<P: PagerMut + Sync> Cluster<P> {
         &self,
         mode: big_embed::ExplainMode,
         inner: big_embed::Sql,
+        opts: &QueryOptions,
     ) -> Result<(ResultSet, Format)> {
+        // A `SETTINGS` clause sits *inside* the `EXPLAIN` - it was written on the statement
+        // being explained - so it is unwrapped here rather than in `run`. What comes back is the
+        // effective budget, which is what the extra row prints: the point of explaining a limit
+        // is to say which of the client's number and the operator's won.
+        let (inner, effective) = match inner {
+            big_embed::Sql::Settings { settings, inner } => {
+                (*inner, Some(opts.narrowed_by(&settings)))
+            }
+            other => (other, None),
+        };
         // Planned here, because a plan needs the catalog and the catalog is this side's. What
         // the plans then *say* is `big-sql`'s, which is why this function chooses no printer:
         // it resolves, and hands over.
@@ -461,6 +539,31 @@ impl<P: PagerMut + Sync> Cluster<P> {
                 );
                 (set, format)
             }
+            // **Planned and not run**, which is the whole of what makes explaining a delete
+            // worth having: the tree is the one it would select by, against the real schema, and
+            // checking a predicate before it clears records is the one time somebody cannot
+            // check afterwards. A semi-join inside it is refused for the same reason it is
+            // refused in a query - its tree is a fact about another table's contents, not about
+            // the statement.
+            big_embed::Sql::Delete(delete) => {
+                let table = delete.qualified();
+                if big_embed::has_set(&delete.rows) {
+                    return Err(ClusterError::Local(big_embed::ApiError::Sql(
+                        big_embed::SqlError::Refused {
+                            what: big_embed::Refused::ExplainSet,
+                            at: 0,
+                        },
+                    )));
+                }
+                let plan = self.api.plan_call(&table, &delete.rows).map_err(ClusterError::Local)?;
+                (
+                    big_embed::explain::result_set(
+                        mode,
+                        &big_embed::explain::Explained::Delete { table: &table, rows: &plan },
+                    ),
+                    Format::default(),
+                )
+            }
             // The three that need no schema, so nothing here is resolved for them at all.
             big_embed::Sql::Ddl(d) => (
                 big_embed::explain::result_set(mode, &big_embed::explain::Explained::Ddl(&d)),
@@ -478,10 +581,44 @@ impl<P: PagerMut + Sync> Cluster<P> {
                 big_embed::explain::result_set(mode, &big_embed::explain::Explained::Show(&s)),
                 s.format,
             ),
-            // The parser refuses a second `EXPLAIN`, so nothing constructs this. Reported rather
-            // than asserted: a panic here would take a node down over a statement a client
-            // wrote, and an unreachable state is worth exactly one error path.
-            big_embed::Sql::Explain { .. } => {
+            // The parser refuses a second `EXPLAIN`, so nothing constructs this - and a second
+            // `SETTINGS` is refused the same way, by there being one position for it. Reported
+            // rather than asserted: a panic here would take a node down over a statement a
+            // client wrote, and an unreachable state is worth exactly one error path.
+            // Planned and not run, the same as a delete - and for a sharper version of the same
+            // reason: an update rewrites values, so the tree it selects by is the last thing
+            // anybody can check before the old ones are gone.
+            big_embed::Sql::Update(update) => {
+                let table = update.qualified();
+                if big_embed::has_set(&update.rows) {
+                    return Err(ClusterError::Local(big_embed::ApiError::Sql(
+                        big_embed::SqlError::Refused {
+                            what: big_embed::Refused::ExplainSet,
+                            at: 0,
+                        },
+                    )));
+                }
+                let plan = self.api.plan_call(&table, &update.rows).map_err(ClusterError::Local)?;
+                (
+                    big_embed::explain::result_set(
+                        mode,
+                        &big_embed::explain::Explained::Update {
+                            table: &table,
+                            assignments: &update.assignments,
+                            rows: &plan,
+                        },
+                    ),
+                    Format::default(),
+                )
+            }
+            // Explaining a kill needs no schema - it names a query, not an object - so it is
+            // answered rather than refused. Every statement this dialect has is explainable,
+            // which is a property `gates.rs` holds over the whole corpus.
+            big_embed::Sql::Kill(id) => (
+                big_embed::explain::result_set(mode, &big_embed::explain::Explained::Kill(&id)),
+                Format::default(),
+            ),
+            big_embed::Sql::Explain { .. } | big_embed::Sql::Settings { .. } => {
                 return Err(ClusterError::Local(big_embed::ApiError::Sql(
                     big_embed::SqlError::Syntax {
                         at: 0,
@@ -491,7 +628,206 @@ impl<P: PagerMut + Sync> Cluster<P> {
                 )))
             }
         };
+        // Only when the statement wrote one: an explanation of an unbounded statement is the
+        // same rows it has always been, which is what keeps every existing corpus case pinning
+        // the block it already pins.
+        let planned = match &effective {
+            Some(opts) => big_embed::explain::with_settings(planned, opts),
+            None => planned,
+        };
         Ok((planned, format))
+    }
+
+    /// `TRUNCATE TABLE`, answering with how many fragments went.
+    ///
+    /// **A count of fragments and not of records**, which is the honest number: the pages are
+    /// freed by key the way a `DROP TABLE` frees them, and nothing here reads the existence field
+    /// to find out what was in them. A caller who wants the record count asks for it before.
+    ///
+    /// `IF EXISTS` is answered here rather than at the leader, for the reason every other one is:
+    /// a table that is not there is a request already satisfied, and it must not become a
+    /// fan-out that reports a partial change on the way to answering nothing.
+    fn sql_truncate_table(&self, table: &str, if_exists: bool) -> Result<u64> {
+        // Written as `DROP TABLE`'s is, including the half that reports the missing table.
+        // Without it `IF EXISTS` would say nothing: `Db::truncate_table` answers `None` for a
+        // table it has not got, and letting that become a count of zero would make
+        // `TRUNCATE TABLE typo` a statement that succeeds at emptying nothing.
+        if !self.schema().iter().any(|t| t.name == table) {
+            if if_exists {
+                return Ok(0);
+            }
+            return Err(local(big_db::DbError::UnknownTable(table.to_string())));
+        }
+        self.truncate_table(table)
+    }
+
+    /// `DELETE FROM t WHERE ...`: select across every owner, then clear.
+    ///
+    /// **Two steps, and the order is the whole of the design.** The predicate is planned, fanned
+    /// out and merged into one `Matches` before a single bit is cleared - the same way
+    /// `INSERT ... SELECT` runs its query whole before writing - because a per-node share of the
+    /// selection would clear a fraction of what the statement named on each node, which is a
+    /// smaller deletion that looks exactly like a correct one.
+    ///
+    /// **What bounds each half is different, and neither bounds the other.** The selection is a
+    /// read: it runs under the statement's deadline and `checkpoint` aborts it. The clearing is
+    /// one transaction and nothing interrupts one, so it is bounded by the count - a popcount of
+    /// the merged set, known before an id is materialised.
+    ///
+    /// **The gap this does not close.** There is no snapshot between selecting and clearing. A
+    /// record written after the merge survives; one deleted concurrently was never counted. That
+    /// is the same non-atomicity `INSERT ... SELECT` lives with, and it is said out loud rather
+    /// than papered over - see [`big_embed::Refused::InsertSelfRead`] for the published sentence.
+    fn sql_delete(
+        &self,
+        delete: &big_embed::SqlDelete,
+        opts: &QueryOptions,
+        settings: big_embed::SqlSettings,
+    ) -> Result<(ResultSet, Format)> {
+        let table = delete.qualified();
+        let started = Instant::now();
+
+        // The selection, resolved exactly as a `SELECT`'s is - including an `IN (SELECT ...)`
+        // inside it, which is one more fan-out and is why this goes through `resolve_sets` rather
+        // than straight to the planner.
+        let mut calls = vec![big_embed::Ask { table: table.clone(), call: delete.rows.clone() }];
+        big_embed::resolve_sets(
+            &mut calls,
+            |t, c| self.api.plan_call(t, c).map_err(ClusterError::Local),
+            |p| self.execute(p, &big_embed::remaining(opts, started)),
+            |_, _| {
+                ClusterError::Local(big_embed::ApiError::Sql(big_embed::SqlError::Refused {
+                    what: big_embed::Refused::SetTooLarge,
+                    at: 0,
+                }))
+            },
+        )?;
+        let plan = self.api.plan_call(&table, &calls[0].call).map_err(ClusterError::Local)?;
+        let selected = self.execute(&plan, &big_embed::remaining(opts, started))?;
+        let Some(matched) = selected.as_rows() else {
+            // The planner turns a bare row set into `Plan::Rows`, which answers with a set. Any
+            // other value would mean the lowering had produced something that is not a selection,
+            // which is a bug here rather than a statement anybody wrote.
+            unreachable!("a delete's filter plans to a row set")
+        };
+
+        // **Counted before anything is cleared.** A popcount over the merged set, so the refusal
+        // costs nothing and arrives while the table is still whole.
+        let ceiling = settings
+            .max_delete_records
+            .map_or(big_embed::MAX_DELETE, |asked| asked.min(big_embed::MAX_DELETE));
+        let selected = matched.cardinality();
+        if selected > ceiling {
+            return Err(ClusterError::Local(big_embed::ApiError::Sql(
+                big_embed::SqlError::Refused { what: big_embed::Refused::DeleteTooLarge, at: 0 },
+            )));
+        }
+
+        let ids: Vec<u64> = matched.records().collect();
+        let deleted = self.delete(&table, &ids)?;
+        Ok((
+            big_embed::one_cell("deleted", big_embed::Datum::Int(deleted.count.into())),
+            Format::default(),
+        ))
+    }
+
+    /// `UPDATE t SET c = v WHERE ...`: select, then write the new facts over the old.
+    ///
+    /// **The field kinds are checked before anything is selected**, which is the same ordering
+    /// `sql_alter_table` follows and for the same reason: what fails must fail while nothing has
+    /// happened. A statement naming one `SET` column among five good ones must not write four of
+    /// them and then refuse.
+    ///
+    /// The write itself is an ordinary import. On the kinds this accepts, writing a value *is* a
+    /// replacement - `Bsi::set` emits the set and the clear in one tree pass, `MutexField::put`
+    /// reads the old row and clears it - so there is no new engine verb here and no second way
+    /// for a fact to be written. That is also why it demands `Insert` and `Delete` both.
+    fn sql_update(
+        &self,
+        update: &big_embed::SqlUpdate,
+        opts: &QueryOptions,
+        settings: big_embed::SqlSettings,
+    ) -> Result<(ResultSet, Format)> {
+        let name = update.qualified();
+        let schema = self.schema();
+        let table = schema
+            .iter()
+            .find(|t| t.name == name)
+            .ok_or_else(|| local(big_db::DbError::UnknownTable(name.clone())))?;
+
+        // Every column resolved and judged first, before the selection runs and long before a
+        // fact is written.
+        let mut fields = Vec::with_capacity(update.assignments.len());
+        for (column, _) in &update.assignments {
+            let info = table.fields.iter().find(|f| &f.name == column).ok_or_else(|| {
+                local(big_db::DbError::UnknownField { table: name.clone(), field: column.clone() })
+            })?;
+            // The kinds where a record holds *every* value it was given. Writing a new one adds
+            // it, and there is no per-value unset below to remove the old.
+            if matches!(info.kind, big_embed::FieldKind::Set | big_embed::FieldKind::TimeQuantum) {
+                return Err(ClusterError::Local(big_embed::ApiError::Sql(
+                    big_embed::SqlError::Refused { what: big_embed::Refused::UpdateColumn, at: 0 },
+                )));
+            }
+            fields.push(info);
+        }
+
+        let started = Instant::now();
+        let mut calls = vec![big_embed::Ask { table: name.clone(), call: update.rows.clone() }];
+        big_embed::resolve_sets(
+            &mut calls,
+            |t, c| self.api.plan_call(t, c).map_err(ClusterError::Local),
+            |p| self.execute(p, &big_embed::remaining(opts, started)),
+            |_, _| {
+                ClusterError::Local(big_embed::ApiError::Sql(big_embed::SqlError::Refused {
+                    what: big_embed::Refused::SetTooLarge,
+                    at: 0,
+                }))
+            },
+        )?;
+        let plan = self.api.plan_call(&name, &calls[0].call).map_err(ClusterError::Local)?;
+        let selected = self.execute(&plan, &big_embed::remaining(opts, started))?;
+        let Some(matched) = selected.as_rows() else {
+            unreachable!("an update's filter plans to a row set")
+        };
+
+        // The same ceiling a delete meets, and for the same reason: the writing half is a
+        // transaction that nothing interrupts.
+        let ceiling = settings
+            .max_delete_records
+            .map_or(big_embed::MAX_DELETE, |asked| asked.min(big_embed::MAX_DELETE));
+        if matched.cardinality() > ceiling {
+            return Err(ClusterError::Local(big_embed::ApiError::Sql(
+                big_embed::SqlError::Refused { what: big_embed::Refused::DeleteTooLarge, at: 0 },
+            )));
+        }
+
+        let records: Vec<u64> = matched.records().collect();
+        let mut facts = Vec::with_capacity(records.len() * fields.len());
+        for record in &records {
+            for (info, (_, value)) in fields.iter().zip(update.assignments.iter()) {
+                facts.push(
+                    big_embed::fact::from_literal(&info.name, info, *record, value).map_err(
+                        |e| {
+                            ClusterError::Local(
+                                e.into_error(&info.name, &big_embed::fact::written(value)),
+                            )
+                        },
+                    )?,
+                );
+            }
+        }
+        let outcome = if self.writes_alone() {
+            self.import_borrowed(&name, &facts)?
+        } else {
+            let owned: Vec<_> = facts.iter().map(OwnedFact::from_fact).collect();
+            self.import(&name, &owned)?
+        };
+        let _ = outcome;
+        Ok((
+            big_embed::one_cell("updated", big_embed::Datum::Int(records.len() as i128)),
+            Format::default(),
+        ))
     }
 
     /// `INSERT`, which is `POST /table/{t}/import` with the facts written as a statement.
@@ -743,6 +1079,15 @@ impl<P: PagerMut + Sync> Cluster<P> {
             big_embed::SqlShown::Databases => {
                 Ok(big_embed::introspect::show_databases(&self.api.database_names(), &schema))
             }
+            // Answered in the route, beside `KILL`, for the reason that arm gives. Reaching
+            // here means a caller went through `Cluster::run` directly with a statement the
+            // edge answers - which the HTTP surface never does.
+            big_embed::SqlShown::Processlist => {
+                Err(big_embed::ApiError::Sql(big_embed::SqlError::Refused {
+                    what: big_embed::Refused::KillTarget,
+                    at: 0,
+                }))
+            }
             big_embed::SqlShown::Roles => Ok(big_embed::introspect::show_roles(&self.api.roles())),
             // A bare `SHOW GRANTS` is about the caller's own role, which is why it needs no
             // privilege: reading what you hold tells you nothing you could not find out by
@@ -757,6 +1102,54 @@ impl<P: PagerMut + Sync> Cluster<P> {
                 Ok(big_embed::introspect::show_grants(
                     &named.map(|r| self.api.grants_of(&r)).unwrap_or_default(),
                 ))
+            }
+            // The catalog under `system.`, which is the same snapshot every listing above reads
+            // - so none of these reaches storage and none of them can disagree with `SHOW`.
+            big_embed::SqlShown::System { view, database, table, columns } => {
+                let columns = columns.as_deref();
+                let database = database.as_deref();
+                Ok(match view {
+                    big_embed::SystemView::Tables => {
+                        big_embed::introspect::system_tables(&schema, &views, database, columns)
+                    }
+                    big_embed::SystemView::Columns => big_embed::introspect::system_columns(
+                        &schema,
+                        database,
+                        table.as_deref(),
+                        columns,
+                    ),
+                    big_embed::SystemView::Databases => big_embed::introspect::system_databases(
+                        &self.api.database_names(),
+                        &schema,
+                        database,
+                        columns,
+                    ),
+                    // The one that has to walk the tables rather than read a snapshot, because a
+                    // fragment list is per table. Bounded by the schema, which is already in
+                    // memory, and by this node's own ranges - a fragment it does not hold is not
+                    // its to report.
+                    big_embed::SystemView::Parts => {
+                        let mut parts = Vec::new();
+                        for t in &schema {
+                            let qualified = qualified(&Some(t.database.clone()), &t.name);
+                            // A table whose fragments cannot be read is skipped rather than
+                            // failing the listing: this view is how somebody finds the table that
+                            // is wrong, so it must not be what that table breaks.
+                            if let Ok(found) = self.api.fragments(&qualified) {
+                                parts.extend(
+                                    found.into_iter().map(|(a, n)| (qualified.clone(), a, n)),
+                                );
+                            }
+                        }
+                        big_embed::introspect::system_parts(
+                            &self.config.this().name,
+                            &parts,
+                            database,
+                            table.as_deref(),
+                            columns,
+                        )
+                    }
+                })
             }
             big_embed::SqlShown::Create { database, table, view } => {
                 big_embed::introspect::show_create(

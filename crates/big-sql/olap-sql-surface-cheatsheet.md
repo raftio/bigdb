@@ -19,15 +19,15 @@ Toàn bộ bề mặt SQL mà một OLAP database "nên có", kèm cột ưu ti�
 | DDL | CREATE CATALOG (external: Iceberg/Hive/JDBC) | P3 | |
 | DML | INSERT VALUES / INSERT SELECT | P0 | ✅ xong. `INSERT SELECT` nhận **projection** — dạng duy nhất đọc ra giá trị theo record. Câu nguồn chạy trọn vẹn qua đúng đường một `SELECT` thường trước khi ghi fact đầu tiên |
 | DML | INSERT OVERWRITE (partition/table) | P2 | |
-| DML | UPDATE / DELETE theo predicate | P1 | append-only → sinh delete bitmap |
+| DML | UPDATE / DELETE theo predicate | P1 | ✅ cả hai. `DELETE` **không** sinh delete bitmap — bit xoá thật, id tái dùng được. `UPDATE` chỉ trên cột mà một record giữ **một** giá trị (int/decimal/float/`MUTEX`/`BOOL`); `SET`/`TIMEQUANTUM` bị từ chối vì ghi thêm chứ không thay |
 | DML | MERGE INTO / upsert | P3 | |
-| DML | TRUNCATE, LOAD/COPY INTO, STREAM LOAD | P1 | |
+| DML | TRUNCATE, LOAD/COPY INTO, STREAM LOAD | P1 | ✅ `TRUNCATE TABLE [IF EXISTS]` xong — là **DDL** chứ không phải write: giải phóng fragment theo khoá, đi đường leader-rồi-fanout. `COPY INTO` chưa; stream load đã có ở `POST /table/{t}/import` |
 | DQL | SELECT (đầy đủ, mục 4) | P0 | |
 | Utility | EXPLAIN | done | `EXPLAIN [PLAN\|SHAPE] <statement>`; ANALYZE still P2 |
-| Utility | SHOW, DESCRIBE, system tables | P1 | |
+| Utility | SHOW, DESCRIBE, system tables | P1 | ✅ `SHOW`/`DESCRIBE` xong; `system.tables/columns/databases/parts` xong — xem §11 |
 | Utility | ANALYZE TABLE (statistics) | P2 | |
 | Utility | OPTIMIZE / COMPACT | P2 | |
-| Session | SET, SHOW VARIABLES, KILL QUERY | P1 | |
+| Session | SET, SHOW VARIABLES, KILL QUERY | P1 | `SET`/`SHOW VARIABLES` ✗ (`SETTINGS` thay thế, §12). `KILL QUERY '<node>/<n>'` ✅ và `SHOW PROCESSLIST` ✅ — cả hai **node-local**, trả lời ở edge vì cờ huỷ được tạo ở đó |
 | TCL | BEGIN/COMMIT/ROLLBACK | P3 | OLAP thường auto-commit per statement |
 | DCL | GRANT/REVOKE, CREATE/DROP ROLE, SHOW ROLES/GRANTS | ✅ | `CREATE USER` refused: người dùng nằm trong users file, ghi bằng `big passwd`. Xem `docs/access-control.md` |
 
@@ -64,7 +64,7 @@ COMMENT      '...';
 | `PARTITION BY` | ✗ | shard = `record_id >> 20`, ẩn |
 | `ORDER BY` / sort key | ✗ | không có row order; record_id là thứ tự |
 | `DISTRIBUTED BY ... BUCKETS` | P2 | shard là đơn vị phân tán tự nhiên |
-| `TTL` | P1 | drop fragment theo time view |
+| `TTL` | ✗ | **Từ chối có tên** (`sql_declarative_ttl`): không có scheduler, và `big-embed` không tạo thread. Thay bằng `ALTER TABLE t DROP DAYS BEFORE '<date>' ON <col>` ✅ — và nó bỏ *chỉ mục* theo chu kỳ, không bỏ record |
 | `SAMPLE BY` | P2 | rẻ với bitmap: subset container |
 
 ### 2.2 Biến thể CREATE TABLE
@@ -81,16 +81,16 @@ CREATE TABLE t (...) ENGINE = MySQL(...)     -- external table                P3
 
 | Lệnh | Chi phí thật | P |
 |---|---|---|
-| `ADD COLUMN c TYPE [AFTER x]` | metadata | P0 |
-| `DROP COLUMN c` | metadata + GC | P0 |
+| `ADD COLUMN c TYPE [AFTER x]` | metadata | ✅ |
+| `DROP COLUMN c` | metadata + GC | ✅ |
 | `RENAME COLUMN a TO b` | metadata (nếu path theo id) | P1 |
 | `MODIFY COLUMN c TYPE` | **rewrite toàn bộ** | P2 |
 | `MODIFY COLUMN c COMMENT/DEFAULT/CODEC` | metadata | P2 |
 | `ADD/DROP PARTITION` | metadata + GC | P1 |
-| `MODIFY TTL` | metadata + background drop | P1 |
+| `MODIFY TTL` | metadata + background drop | ✗ `sql_declarative_ttl` |
 | `ADD INDEX` / `MATERIALIZE INDEX` | build async | ✗ |
-| `UPDATE ... WHERE` (mutation) | async rewrite part | P1 |
-| `DELETE WHERE` (lightweight) | ghi delete bitmap | P1 |
+| `UPDATE ... WHERE` (mutation) | ghi fact mới + xoá fact cũ, đồng bộ | ✅ |
+| `DELETE WHERE` | xoá bit thật, không delete bitmap | ✅ |
 | `ADD PROJECTION` | build async | P3 |
 | `RENAME TO` | metadata | P1 |
 | `EXCHANGE TABLES a AND b` | atomic swap — rất hữu ích cho rebuild | P2 |
@@ -142,8 +142,8 @@ INSERT INTO t FORMAT JSONEachRow / Parquet / CSV                      -- P1
 INSERT OVERWRITE TABLE t PARTITION (dt='2026-09-01') SELECT ...       -- P2
 
 UPDATE t SET a = a+1 WHERE tenant = 5;                                -- P1
-DELETE FROM t WHERE ts < '2026-01-01';                                -- P1
-TRUNCATE TABLE t;                                                     -- P1
+DELETE FROM t WHERE ts < '2026-01-01';                                -- ✅ xong
+TRUNCATE TABLE t;                                                     -- ✅ xong
 
 MERGE INTO tgt USING src ON tgt.id = src.id
   WHEN MATCHED THEN UPDATE SET ...
@@ -201,10 +201,11 @@ FROM/JOIN → PREWHERE → WHERE → GROUP BY → HAVING → WINDOW → QUALIFY
 | `GROUP BY` + aggregate | P0 | ✅ xong, **tới 4 cột**, và trên hai loại cột chứ không phải một. Cột keyed thì group bằng cách đi hết từ điển; cột `DATE`/`DATETIME` **không có từ điển**, nên `GROUP BY date_trunc('month', ts)` là một plan riêng: bucket lấy từ *lịch*, mỗi bucket là một range trên mặt phẳng bit. Bucket rỗng không phải một nhóm, và record không có giá trị thì **không nằm trong bucket nào** — nên tổng các count ở đây là số record *có* giá trị, không phải `count(*)`. Trần là **số lượt đi**, kiểm ở đầu mỗi tầng: frontier sau tầng một chính là số lượt của tầng hai, nên một ngân sách chặn luôn cả tích |
 | `ORDER BY` | P0 | ✅ xong trên grouped **và** trên projection. Trên projection cái giá là thật và đã nói rõ: sort phải thấy mọi hàng trước khi biết mười hàng nào sống, nên `LIMIT` rời khỏi plan và câu lệnh đọc mọi record khớp `WHERE`. Chặn bởi đúng trần `max_records` mà mọi phép đọc không giới hạn khác chịu. `NULL` xếp cuối ở cả hai chiều |
 | `HAVING` | P0 | ✅ xong, **có hay không có `GROUP BY`**. Không nằm trong plan: ngưỡng kiểm ở coordinator sau merge, vì một tổng dưới ngưỡng ở một node có thể vượt khi cộng đủ. Chỉ được gọi tên con số mà select list đã hỏi |
-| CTE (`WITH`) không đệ quy | P1 | |
-| Subquery (scalar, IN, EXISTS) | P1 | |
-| `UNION ALL` | P1 | |
-| `JOIN` (mục 5) | P1 | |
+| `DISTINCT` | P0 | ✅ xong, và không phải bằng một đường riêng: `SELECT DISTINCT a, b` **là** `GROUP BY a, b`, lower ra đúng cái cây đó. Nên nó thừa hưởng luôn trần 4 cột |
+| CTE (`WITH`) không đệ quy | P1 | `WITH <hằng> AS <tên>` ✅ (buộc một giá trị); `WITH x AS (SELECT …)` thì `sql_unsupported` |
+| Subquery (scalar, IN, EXISTS) | P1 | ✅ **đúng một dạng**: `IN (SELECT _record_id FROM t [WHERE …])` và `NOT IN` — semi/anti join. Còn lại từ chối |
+| `UNION ALL` | P1 | ✅ xong, kể cả nhánh grouped và nhánh có join. `UNION`/`UNION DISTINCT` thì `sql_union`: bỏ trùng ở đây là so chuỗi đã render |
+| `JOIN` (mục 5) | P1 | ✅ xong — xem mục 5 |
 | Window function (mục 7) | P2 | |
 | `WITH ROLLUP/CUBE/GROUPING SETS` | P2 | cực hợp bitmap — chia sẻ intermediate |
 | `QUALIFY` | P3 | |
@@ -220,9 +221,10 @@ FROM/JOIN → PREWHERE → WHERE → GROUP BY → HAVING → WINDOW → QUALIFY
 
 | Loại | Cú pháp | P | Ghi chú |
 |---|---|---|---|
-| INNER / LEFT / RIGHT / FULL | chuẩn ANSI | P1 | |
-| CROSS | `CROSS JOIN` | P1 | |
-| SEMI / ANTI | `LEFT SEMI JOIN`, `LEFT ANTI JOIN` | P1 | **map thẳng sang bitmap AND / ANDNOT** — làm sớm |
+| INNER / LEFT / RIGHT | chuẩn ANSI | ✅ | Nhiều bảng cũng được, miễn là một **sao** quanh một khoá chung. Không có `Plan` variant mới và không có merge arm mới — một join là một plan thường mỗi bảng, cộng một `Shape::Join` |
+| FULL | `FULL [OUTER] JOIN` | ✅ | Chỉ khi **mọi** join trong câu đều là `FULL`; trộn với loại khác thì `sql_no_outer_joins` |
+| CROSS | `CROSS JOIN` | ✗ | `sql_no_joins` — không gọi tên khoá nào để ghép |
+| SEMI / ANTI | `IN (SELECT _record_id FROM …)` / `NOT IN` | ✅ | **Ngữ nghĩa đã có, cú pháp `LEFT SEMI JOIN` thì chưa.** Đúng là bitmap AND / ANDNOT như dự đoán. Chặn bởi `sql_set_too_large` |
 | ASOF | `ASOF LEFT JOIN ... ON a.id=b.id AND a.t >= b.t` | P3 | time-series |
 | ARRAY JOIN / LATERAL / UNNEST | `ARRAY JOIN arr` | P2 | |
 | Colocated / bucket-shuffle | hint | P3 | |
@@ -280,12 +282,12 @@ func() OVER (
 | String | `String`, `FixedString(n)`, `LowCardinality(String)` | P0 | ✅ `TEXT/VARCHAR/CHAR/STRING` → `Set`, và `LowCardinality(String)` cũng vậy: đó đúng là thứ một `SET` vốn đã là, một key intern một lần và một bitmap cho mỗi key. Chỉ trên chuỗi — `LowCardinality(Int64)` bị từ chối, vì một con số là mặt phẳng bit và không có từ điển nào để mà "ít giá trị". `FixedString` thì không — key lưu nguyên, không có gì để cắt hay đệm |
 | Bool | `Bool` | P0 | ✅ xong |
 | Date/Time | `Date`, `DateTime`, `DateTime64(p, tz)` | P0 | ✅ `DATE` (số ngày) và `DATETIME`/`TIMESTAMP` (số giây) là kiểu vô hướng có thứ tự: `WHERE d >= '2024-01-01'`, `ORDER BY`, `min`/`max` đều hỏi được. `TIMEQUANTUM` vẫn là field keyed theo view ngày, và giờ là tên riêng của nó — trước đây cả bốn cách viết đều là time quantum. Không timezone, không `DateTime64(p)`; `sum` bị từ chối vì tổng hai ngày không phải một ngày |
-| Nullable | `Nullable(T)` | P1 | |
+| Nullable | `Nullable(T)` | ✗ | **Từ chối có tên** (`sql_nullable_type`) — xem §15. Vắng mặt vốn đã là cách một cột trả lời ở đây |
 | Enum | `Enum8/16` | P2 | |
 | Composite | `Array(T)`, `Map(K,V)`, `Tuple(...)`, `Nested` | P2 | |
 | Semi-structured | `JSON` / `Variant` / `Dynamic` | P3 | |
 | UUID / IP | `UUID`, `IPv4`, `IPv6` | P2 | |
-| **Bitmap** | `BITMAP` / `AggregateFunction(groupBitmap, UInt64)` | **P1** | |
+| **Bitmap** | `BITMAP` / `AggregateFunction(groupBitmap, UInt64)` | ✗ | **Từ chối có tên** (`sql_bitmap_type`) — mọi cột ở đây vốn đã là bitmap; xem §10 và §15 |
 | Sketch | `HLL`, `AggregateFunction(uniq, ...)`, `QUANTILE_STATE` | P2 | |
 | Geo | `Point`, `Polygon` | P3 | |
 
@@ -301,7 +303,7 @@ func() OVER (
 | ~~Aggregate cần xem lại giá trị~~ | `any, argMin, argMax, stddev*, var*, corr` | ✗ | **Không phải P0, và không phải việc chưa làm.** Cả năm cần xem lại giá trị từng record đối chiếu một tổng đang chạy; engine giữ bit ở `(row, record)` chứ không giữ giá trị để xem lại, và `stddev`/`var`/`corr` còn cần tổng bình phương mà mặt phẳng bit không cộng được. `argMin(a, b)` viết được bằng `SELECT a, b FROM t ORDER BY b LIMIT 1` — cùng câu trả lời, và nói rõ nó tốn gì. Phải kể cả `b` trong select list, vì `ORDER BY` chỉ được gọi tên cột mà projection đã đọc |
 | Conditional agg | `sumIf, countIf, avgIf` / `FILTER (WHERE ...)` | P1 | ✅ xong (khai thiếu ở bản trước) |
 | Distinct | `count(DISTINCT x)`, `uniqExact` | P0 | ✅ xong, và **exact** — `uniq`, `uniqExact`, `uniqCombined`, `uniqHLL12` và `uniqTheta` đều nhận và đều trả về con số đúng, vì cardinality của bitmap không cần sketch |
-| **Approx distinct** | `uniq, uniqHLL12, approx_count_distinct, DISTINCTCOUNTBITMAP` | P1 | |
+| **Approx distinct** | `uniq, uniqHLL12, approx_count_distinct` | P1 | ✅ xong, và **exact**. `approx_count_distinct`/`approxCountDistinct` giờ nằm cùng danh sách với `uniq*`: một cái tên hứa xấp xỉ được trả lời chính xác là một lời hứa được giữ, không phải bị phá |
 | Quantile | `quantile, quantileTDigest, median, percentile_approx` | P1 | ✅ `quantile`, `quantileExact`, `median` — và **exact**, như `count(DISTINCT)` |
 | Top-K | `topK, topKWeighted, TOPN` | P1 | ✅ `topK` xong |
 | Aggregate state | `-State` / `-Merge` combinator, `HLL_UNION_AGG`, `BITMAP_UNION` | P2 | |
@@ -336,20 +338,28 @@ SELECT bitmapCardinality(bitmapAnd(groupBitmapState(uid), ...));
 SELECT bitmapSubsetInRange(bm, 100, 200);
 ```
 
-| Hàm | Ý nghĩa | Bitlas map | P |
-|---|---|---|---|
-| `to_bitmap(x)` / `groupBitmapState` | dựng bitmap từ cột | build fragment row | P1 |
-| `bitmap_and / or / xor / andnot` | tập hợp | intersect/union container-wise | **P1** |
-| `bitmap_count / cardinality` | đếm | popcount, đã có sẵn trong container header | **P1** |
-| `bitmap_contains(bm, x)` | membership | 1 container lookup | P1 |
-| `bitmap_subset_in_range` | slice | range scan container | P2 |
-| `bitmap_union` (agg) | union nhiều nhóm | merge fragment | P1 |
-| `bitmap_to_array` / `bitmap_from_array` | I/O boundary | Arrow list | P2 |
-| `bitmap_has_any / has_all` | short-circuit | dừng sớm | P2 |
-| `intersect_count(bm, col, v1, v2)` | funnel | multi-AND | P2 |
-| BSI: `bsi_sum / bsi_range / bsi_topk` | agg trên int field | bit-slice arithmetic | **P1** |
-| `approx_count_distinct` | HLL | với bitmap thì **exact** vẫn rẻ → mặc định exact | P1 |
-| `windowFunnel / retention` | phân tích hành vi | chuỗi AND/ANDNOT theo time view | P2 |
+**Quyết định: không thêm một hàm nào trong số này, và không thiếu gì cả.** Doris và ClickHouse cần
+họ hàm này vì chúng lưu *hàng* và phải với tới một bitmap; ở đây không có cách lưu nào khác, nên
+những phép chúng gọi tên chính là toán tử thường của dialect. Một cột `BITMAP` sẽ là một bitmap
+nằm trong một bitmap.
+
+Bảng ánh xạ — cũng chính là câu mà `sql_bitmap_function` nói khi một trong các tên này được gõ:
+
+| Viết ở nơi khác | Viết ở đây | Vì sao là cùng một thứ |
+|---|---|---|
+| `bitmap_count(x)`, `bitmapCardinality(x)` | `count(DISTINCT x)` | cardinality của bitmap là một popcount → **exact** |
+| `approx_count_distinct(x)`, `uniqHLL12(x)` | ✅ **nhận nguyên như đã viết** | cùng popcount đó; trả lời exact chứ không từ chối |
+| `bsi_sum(x)` | `sum(x)` | một fold trên mặt phẳng bit |
+| `bsi_range(x, a, b)` | `x BETWEEN a AND b` | BSI range, `O(bit_depth × container)` |
+| `bsi_topk(x)` | `topK(n)(x)` | đúng cái ranking mà `TopN` đã mang |
+| `bitmap_and(a, b)` | `a AND b` trong `WHERE` | intersect container-wise |
+| `bitmap_or(a, b)` | `OR`, hoặc `IN (a, b)` | union |
+| `bitmap_andnot(a, b)` | `NOT IN (SELECT _record_id FROM b …)` | difference |
+| `to_bitmap(x)`, `groupBitmapState(x)` | khai `x` là cột `SET` | bitmap đã được dựng lúc ghi fact |
+
+Thứ duy nhất trong danh sách không có cách viết ở đây là **một bitmap nằm trong một cột** và được
+truyền giữa các lời gọi — đó là `sql_bitmap_type`, và nó là một quyết định chứ không phải việc chưa
+làm (§15).
 
 Chú ý: `count(DISTINCT x)` trong bitlas không cần sketch — cardinality của bitmap là exact và O(số container). Đây là điểm bán hàng, viết vào docs.
 
@@ -373,7 +383,30 @@ OPTIMIZE TABLE t FINAL;      -- compaction thủ công                -- P2
 KILL QUERY WHERE query_id = '...';                                 -- P1
 ```
 
-`system.*` nên có từ sớm — cùng một SELECT engine đọc metadata, không tốn code path riêng, mà lại là công cụ debug chính của mày.
+**`system.*` ✅ xong — bốn view.** Nhưng không phải "cùng một SELECT engine" như dự đoán: chúng parse
+thành một `Shown`, **không** phải một query. Không plan nào sinh ra chúng, câu trả lời đã nằm sẵn trong
+catalog mỗi node giữ — nên chúng nhập vào họ `SHOW` thay vì trở thành `Statement` đầu tiên có `calls`
+rỗng dưới một shape gọi tên những plan không tồn tại. Đúng luật "một `Plan` variant mới là một câu trả
+lời phân tán sai chứ không phải thiếu".
+
+| View | Nội dung | Ghi chú |
+|---|---|---|
+| `system.tables` | mọi bảng và view, **mọi database** | Khác `SHOW TABLES` (chỉ database của request) — đó là lý do nó là variant riêng, và cột `database` là chỗ nhìn ra khác biệt |
+| `system.columns` | mọi cột của mọi bảng | View cố ý vắng mặt: cột của view là cột bảng gốc dưới tên khác, đếm ở đây là đếm đôi |
+| `system.databases` | mọi database | |
+| `system.parts` | **mọi fragment** `(table, field, view, shard)` | **Cái duy nhất không lặp lại thứ gì.** Hai dòng mỗi field của bảng `bitmap+columnar` là đúng chứ không phải trùng: cột `view` ghi `_standard` cho bitmap và `_column` cho segment |
+
+Chỉ nhận đúng một mệnh đề: `WHERE database = '…'`, và trên `system.columns`/`system.parts` thêm
+`WHERE table = '…'`, nối bằng `AND` — vì hai cái đó **vốn đã là tham số** mà `SHOW TABLES FROM d` và
+`DESCRIBE t` truyền xuống. Join, group, order, limit, `SETTINGS` đều bị từ chối (`sql_system_clause`):
+câu trả lời là các dòng đọc từ catalog chứ không phải một shape trên các plan, nên lọc nó nghĩa là dựng
+bộ lọc thứ hai trên rows.
+
+`CREATE DATABASE system` bị từ chối cùng mã `sql_system_table` — một bảng trong đó không bao giờ đọc
+được, vì `SELECT * FROM system.t` được đọc là system view trước khi được đọc là bảng.
+
+`system.query_log` và `system.processlist` bị từ chối **theo tên**: một query log là một sink bền chưa
+tồn tại, và một process list cần sổ đăng ký query đang chạy cũng chưa có (M3 phase 8).
 
 ---
 
@@ -388,12 +421,35 @@ GRANT SELECT ON db.* TO role;
 CREATE RESOURCE GROUP / WORKLOAD GROUP ...;      -- multi-tenant isolation
 ```
 
-| Nhóm setting cần có | Ví dụ | P |
+**Quyết định: không có session, nên không có `SET`.** Giới hạn được viết *lên câu lệnh* bằng mệnh
+đề `SETTINGS`, cùng lý do đã từ chối `USE`: `POST /sql` trả lời một câu rồi quên sạch, nên không có
+chỗ nào cho một `SET` gắn giới hạn vào. Cách viết này cũng là cách duy nhất sống sót qua một lần
+reconnect, một proxy pool connection, hay một lần retry ở node khác.
+
+```sql
+SELECT count(*) FROM tx WHERE amount >= 500 SETTINGS max_execution_time = 30
+```
+
+| Nhóm setting | Ví dụ | Trạng thái |
 |---|---|---|
-| Giới hạn tài nguyên | `max_memory_usage`, `max_execution_time`, `max_result_rows` | P1 |
-| Song song | `max_threads`, `max_block_size` | P1 |
-| Hành vi | `join_algorithm`, `use_index`, `allow_experimental_*` | P2 |
-| Output | `output_format`, timezone | P1 |
+| Giới hạn tài nguyên | `max_execution_time` (giây), `max_memory_usage` (byte), `max_result_rows` | ✅ **xong** — ba khoá này có đường đi trọn vẹn xuống `QueryLimits`/deadline của `DbRead` |
+| Song song | `max_threads`, `max_block_size` | ✗ `sql_unknown_setting` — không có gì ở đây đọc chúng, nhận vào là hứa suông |
+| Hành vi | `join_algorithm`, `use_index`, `allow_experimental_*` | ✗ như trên |
+| Output | `output_format`, timezone | `FORMAT` đã có; timezone thì không (§8: không có timezone) |
+| `SET`, `SET SESSION`, `SHOW VARIABLES` | | ✗ `sql_no_session_settings`, có chỉ sang `SETTINGS` |
+
+Ba chỗ đáng ghi vì lệch chuẩn:
+
+1. **`SETTINGS` đứng sau `FORMAT`**, không phải trước như ClickHouse. Một vị trí duy nhất, đọc một
+   lần **sau nhánh `UNION ALL` cuối** — vì một union cho ra *một* câu trả lời, và một deadline
+   theo nhánh sẽ chặn một phần mà không ai nhận riêng phần đó.
+2. **Khoá lạ thì từ chối, không bỏ qua** — ngược với ClickHouse. Dialect này không có bind
+   parameter, nên khoá đó do người gõ; một `max_execution_tim = 30` bị âm thầm bỏ là một câu chạy
+   vô hạn trong khi tác giả tin nó có chặn, và đọc y hệt một câu có chặn mà chạy chậm.
+3. **Giá trị chỉ được siết xuống, không nới lên.** Xin nhiều hơn mức operator cấu hình không phải
+   câu sai — người viết query không có cách nào biết server được khởi động với gì — nên nó bị kẹp
+   im lặng. Kẹp im lặng chỉ chấp nhận được vì `EXPLAIN` in ra một dòng `settings` với **con số
+   thực sự được áp**; đó là chỗ người ta biết bên nào thắng.
 
 ---
 
@@ -443,7 +499,7 @@ Nguyên tắc: mọi predicate quy được về Union/Intersect/Difference thì
 | **M2 — hữu ích** ✅ | `GROUP BY` + count/sum, BSI range, `count(DISTINCT)`, `ORDER BY`, `LIMIT`, INSERT SELECT | Thay được một dashboard thật |
 | **M2.5 — biểu thức** ✅ | Biểu thức vô hướng trong select list (số học, string, `CASE`, cast, date), `LIKE`/`ILIKE` trong `WHERE` | Không phải viết lại truy vấn ở tầng ứng dụng nữa |
 | **M2.6 — chiều thời gian** ✅ | `GROUP BY date_trunc(...)`, `GROUP BY` tới 4 cột, key cạnh bucket, phép làm tròn trong `WHERE`, `LowCardinality(String)` | "Đếm theo tháng" và "theo nước, theo tháng" — hai chiều của mọi dashboard |
-| **M3 — tin được** | DELETE/UPDATE theo predicate, TTL, `EXPLAIN`, `system.*`, SET limits, KILL | Dám cho người khác dùng |
+| **M3 — tin được** ✅ | DELETE/UPDATE theo predicate, TRUNCATE, retention, `EXPLAIN`, `system.*`, `SETTINGS` limits, KILL | Dám cho người khác dùng |
 | **M4 — cạnh tranh** | JOIN (semi/anti trước), window function, ROLLUP/CUBE, bitmap function expose ra SQL, MV | So được với Doris ở use case đếm tập hợp |
 | **M5 — quy mô** | Phân tán theo shard, resource group, time travel, external catalog | |
 
@@ -496,3 +552,18 @@ không có gì trong tháng đó.
 **Bucket rỗng không phải một nhóm, và record không có giá trị không nằm trong bucket nào.** Cái
 thứ hai là chỗ dễ hiểu sai nhất về grouping theo lịch: tổng các count là số record *có* giá trị,
 không phải `count(*)`. Có một property test sinh vị từ để giữ đúng điều đó.
+
+**`Nullable(T)` bị từ chối, và đó là nửa còn lại của việc không có null.** Vắng mặt vốn đã là cách
+một cột trả lời ở đây — một record hoặc có bit được đặt hoặc không, và `SELECT *` nói điều đó bằng
+cách bỏ trống ô. Khai thêm một wrapper sẽ tạo ra *cách vắng mặt thứ hai* mà không tầng nào bên dưới
+phân biệt được với cách thứ nhất. Cùng một quyết định mà `IS NULL` (`sql_no_nulls`) đang tựa vào.
+Từ chối ngay tại chữ `Nullable`, nên `Nullable(Decimal(10,2))` nói đúng câu đó thay vì báo lỗi cú
+pháp về cái ngoặc bên trong.
+
+**Type `BITMAP` bị từ chối vì mọi cột ở đây vốn đã là bitmap.** Một cột `SET` là một bitmap mỗi key
+đã intern, một cột số là một bitmap mỗi mặt phẳng bit — nên `BITMAP` sẽ là một bitmap nằm trong một
+bitmap. Cùng với nó, cả họ hàm `bitmap_*`/`bsi_*` bị từ chối **không phải vì thiếu**, mà vì mỗi cái
+đã có câu trả lời dưới một cách viết khác; §10 là bảng ánh xạ, và cũng chính là câu mà
+`sql_bitmap_function` nói ra. Ngoại lệ đáng ghi: `approx_count_distinct` **không** nằm trong danh
+sách từ chối đó — nó đi cùng `uniq*` và được trả lời chính xác, vì một cái tên hứa xấp xỉ mà được
+trả lời đúng là một lời hứa được giữ.

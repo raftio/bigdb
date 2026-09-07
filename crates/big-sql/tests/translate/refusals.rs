@@ -135,8 +135,10 @@ fn every_refusal_names_itself() {
     // fill - refused where it is declared rather than where it silently answers nothing.
     assert_eq!(code("CREATE TABLE t (_record_id UINT(32), a SET)"), "sql_id_column");
     assert_eq!(code("ALTER TABLE t ADD COLUMN _record_id UINT(32)"), "sql_id_column");
-    assert_eq!(code("DELETE FROM t"), "sql_read_only");
-    assert_eq!(code("DELETE FROM t WHERE amount > 5"), "sql_read_only");
+    // A `DELETE` with a `WHERE` is answered now, so what is left refused is the one that names
+    // every record - which `TRUNCATE TABLE` says by freeing the fragments instead.
+    assert_eq!(code("DELETE FROM t"), "sql_delete_all");
+    assert!(big_sql::translate("DELETE FROM t WHERE amount > 5").is_ok());
     // A column list is answered now - see `schema` - so what is refused is a type name that
     // names nothing this engine stores, and the SQL that comes attached to one.
     assert_eq!(code("CREATE TABLE t (a BLOB)"), "sql_unknown_column_type");
@@ -290,4 +292,53 @@ fn schema_failures_keep_the_codes_they_have_in_the_other_language() {
     let s = translate("SELECT sum(category) FROM t").unwrap();
     let e = big_plan::plan(&s.calls[0].table, &s.calls[0].call, &Stub).unwrap_err();
     assert_eq!(e.code(), "operator_not_allowed");
+}
+
+/// The refusal whose whole value is the sentence.
+///
+/// **A bitmap function here is not a missing feature, and the message is the only thing that
+/// says so.** Every name on that list has an answer under a different word, so a refusal that
+/// merely said "unsupported" would send somebody to build what they already have. This asserts
+/// the mapping is actually in the sentence - the one refusal in the dialect where the prose is
+/// the deliverable rather than the decoration.
+#[test]
+fn the_bitmap_refusal_names_the_spelling_that_works_here() {
+    let e = translate("SELECT bitmap_count(uid) FROM t").unwrap_err();
+    let SqlError::Refused { what, .. } = e else { panic!("expected a refusal, got {e:?}") };
+    assert_eq!(what, Refused::BitmapFunction);
+
+    let why = what.why();
+    for spelling in ["count(DISTINCT x)", "sum(x)", "BETWEEN", "NOT IN (SELECT _record_id"] {
+        assert!(why.contains(spelling), "the mapping is missing `{spelling}`: {why}");
+    }
+
+    // Both dialects reach it, which is the point of listing both.
+    assert_eq!(code("SELECT bitmapAnd(a, b) FROM t"), "sql_bitmap_function");
+    assert_eq!(code("SELECT bsi_range(amount, 1, 9) FROM t"), "sql_bitmap_function");
+
+    // And the approximate-distinct names are *not* on it: they are answered, exactly, which is
+    // the same published decision `uniqHLL12` already rests on. A refusal here would contradict
+    // the sentence above, which tells people cardinality is a popcount.
+    assert!(translate("SELECT approx_count_distinct(country) FROM t").is_ok());
+    assert!(translate("SELECT uniqHLL12(country) FROM t").is_ok());
+}
+
+/// The two types the engine understands and declines, which is why they do not share a code with
+/// the names it simply does not know.
+#[test]
+fn a_declined_type_is_told_apart_from_an_unknown_one() {
+    // Understood and declined.
+    assert_eq!(code("CREATE TABLE t (a Nullable(String))"), "sql_nullable_type");
+    assert_eq!(code("CREATE TABLE t (a BITMAP)"), "sql_bitmap_type");
+    // Not understood.
+    assert_eq!(code("CREATE TABLE t (a JSON)"), "sql_unknown_column_type");
+
+    // The nested form says the same sentence. `wrapped_type` could not read this one, so
+    // refusing at the word rather than after the bracket is what keeps it a refusal instead of
+    // a syntax error about an inner `(`.
+    assert_eq!(code("CREATE TABLE t (a Nullable(Decimal(10, 2)))"), "sql_nullable_type");
+
+    // Each names what to write instead, which is the whole claim of the list.
+    assert!(Refused::NullableType.why().contains("SELECT *"), "no answer named");
+    assert!(Refused::BitmapType.why().contains("SET"), "no column kind named");
 }

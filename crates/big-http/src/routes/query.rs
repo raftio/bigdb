@@ -123,6 +123,56 @@ pub(super) fn sql<P: PagerMut + Sync>(
     //
     // Nothing is re-verified here. The principal was resolved once by `refuse`, and re-running
     // the credential check would mean a second argon2 verification on every statement.
+    // **Two statements are answered here rather than by the cluster**, and it is the one place
+    // this route decides anything about what a statement means. The reason is where the state
+    // lives: the cancellation flag is minted per connection in this crate, so the map from an id
+    // to a flag is this crate's too - and reaching down into it from `Cluster::run` would put a
+    // process-local registry behind an interface that is about a distributed database.
+    match &sql {
+        big_embed::Sql::Kill(id) => {
+            if let Some(denied) = refuse_unauthorised(ctx, &principal.who(), &sql) {
+                return denied;
+            }
+            let killed = u64::from(ctx.running.kill(id));
+            let set = big_embed::one_cell("killed", big_embed::Datum::Int(killed.into()));
+            return stamp(
+                ctx,
+                Response::text(
+                    big_embed::Format::default().content_type(),
+                    json::result_set(big_embed::Format::default(), &set),
+                ),
+            );
+        }
+        big_embed::Sql::Show(show) if matches!(show.what, big_embed::SqlShown::Processlist) => {
+            if let Some(denied) = refuse_unauthorised(ctx, &principal.who(), &sql) {
+                return denied;
+            }
+            let set = processlist(ctx);
+            return stamp(
+                ctx,
+                Response::text(show.format.content_type(), json::result_set(show.format, &set)),
+            );
+        }
+        _ => {}
+    }
+
+    // **Registered here, and only for the statements that can run long enough to be worth
+    // stopping.** The flag is already in `opts`; what this adds is the address. The guard forgets
+    // the entry on every path out of this function including a panic, which is what keeps a
+    // finished query from staying in the listing for ever and being "killed" without effect.
+    let _running = ctx.cancel.as_ref().map(|cancel| {
+        ctx.running.register(
+            ctx.cluster.node_name(),
+            std::sync::Arc::clone(cancel),
+            match principal.who() {
+                big_rbac::Who::Role(r) => Some(r.clone()),
+                big_rbac::Who::Trusted => None,
+            },
+            opts.database().to_string(),
+            text.to_string(),
+        )
+    });
+
     match ctx.cluster.run(sql, &principal.who(), &opts) {
         // The statement's `FORMAT` decides both the bytes and the type they are declared as: a
         // client that asked for TSV and was told `application/json` was answered twice, once
@@ -662,6 +712,60 @@ pub(super) fn delete<P: PagerMut + Sync>(ctx: &Ctx<'_, P>, req: &Request, table:
         Ok(outcome) => stamp(ctx, Response::ok(json::wrote("deleted", &outcome))),
         Err(e) => from_cluster(&e),
     }
+}
+
+/// `SHOW PROCESSLIST`: the queries running on this node, oldest first.
+///
+/// **Node-local, and the `node` column says so.** A coordinator holds the ranges it owns; a
+/// cluster-wide listing would be a fan-out, and one that showed peers' legs of a fanned-out query
+/// as separate rows would be more confusing than the honest local answer.
+fn processlist<P: PagerMut + Sync>(ctx: &Ctx<'_, P>) -> big_embed::ResultSet {
+    let columns =
+        ["id", "elapsed_ms", "role", "database", "statement"].map(str::to_string).to_vec();
+    let rows = ctx
+        .running
+        .running()
+        .into_iter()
+        .map(|r| {
+            vec![
+                big_embed::Datum::Text(r.id.clone()),
+                big_embed::Datum::Int(i128::from(
+                    u64::try_from(r.started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                )),
+                r.role.clone().map_or(big_embed::Datum::Null, big_embed::Datum::Text),
+                big_embed::Datum::Text(r.database.clone()),
+                big_embed::Datum::Text(r.text.clone()),
+            ]
+        })
+        .collect();
+    big_embed::ResultSet { columns, rows }
+}
+
+/// The denial a statement earns, if it earns one.
+///
+/// **The same check `Cluster::run` makes, and reported as the same error.** The two statements
+/// this route answers itself would otherwise be the two with their own authorisation path, which
+/// is how a fence comes to be enforced in one place and written in two. Asking `Sql::demands` and
+/// building the identical `Denied` keeps the rule where the variants are.
+fn refuse_unauthorised<P: PagerMut + Sync>(
+    ctx: &Ctx<'_, P>,
+    who: &big_rbac::Who,
+    sql: &big_embed::Sql,
+) -> Option<Response> {
+    for demand in sql.demands() {
+        if !ctx.cluster.local().allows(who, demand) {
+            let denied = big_embed::ApiError::Denied(Box::new(big_rbac::Denied {
+                role: match who {
+                    big_rbac::Who::Role(r) => Some(r.clone()),
+                    big_rbac::Who::Trusted => None,
+                },
+                privilege: demand.privilege,
+                on: demand.on.to_owned(),
+            }));
+            return Some(from_cluster(&big_cluster::ClusterError::Local(denied)));
+        }
+    }
+    None
 }
 
 #[cfg(test)]

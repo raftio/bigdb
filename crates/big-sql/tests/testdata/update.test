@@ -1,0 +1,96 @@
+# `UPDATE t SET c = v WHERE ...`: a new fact written where an old one was.
+#
+# **There is no row to change, and this statement is not a workaround for that.** A fact is a bit
+# at `(row, record)`, so changing a value means writing the new fact and clearing the old - which
+# is what `Bsi::set` and `MutexField::put` already do in one pass on the kinds where a record
+# holds one value. This is the spelling for it, not a mechanism.
+#
+# Which columns it works on is a question about the schema, so `sql_update_column` is raised where
+# the field kinds are and is pinned in `big-cluster/tests/logic/update.test`.
+
+## One column, and several.
+
+update
+UPDATE t SET amount = 1 WHERE country = 'GB'
+----
+update t set amount = 1
+Rows t
+└── country = 'GB'
+
+update
+UPDATE t SET amount = 1, price = 12.50 WHERE amount < 100
+----
+update t set amount = 1, price = 12.50
+Rows t
+└── amount < 100
+
+## The `WHERE` is the same `WHERE` a delete takes, lowered by the same function.
+
+update
+UPDATE t SET amount = 0 WHERE amount >= 500 AND country = 'GB'
+----
+update t set amount = 0
+Rows t
+└── intersect
+    ├── amount >= 500
+    └── country = 'GB'
+
+delete
+DELETE FROM t WHERE amount >= 500 AND country = 'GB'
+----
+delete t
+Rows t
+└── intersect
+    ├── amount >= 500
+    └── country = 'GB'
+
+## A qualified table, and a boolean value - which is a word at the value position and still a
+## literal, which is why a bare word there cannot simply be refused.
+
+update
+UPDATE sales.orders SET active = true WHERE amount > 5
+----
+did not resolve: no table `sales.orders`
+
+## Literals only. `SET amount = amount + 1` needs each record's current value read back and
+## arithmetic done on it, which is a read-modify-write per record and not a plan this engine has.
+
+error
+UPDATE t SET amount = amount + 1 WHERE country = 'GB'
+----
+sql_unsupported
+
+error
+UPDATE t SET amount = 1 + 1 WHERE country = 'GB'
+----
+sql_unsupported
+
+## No `WHERE` rewrites every record without saying so.
+
+error
+UPDATE t SET amount = 1
+----
+sql_delete_all
+
+error
+UPDATE t SET amount = 1 WHERE country = 'GB' LIMIT 10
+----
+sql_delete_all
+
+## The record id is the address a fact is written to, not a value in a column: moving a record to
+## another id is writing a different record.
+
+error
+UPDATE t SET _record_id = 9 WHERE country = 'GB'
+----
+sql_id_column
+
+## `EXPLAIN` resolves the tree and runs none of it - the last chance to check a predicate before
+## the old values are gone.
+
+explain
+EXPLAIN UPDATE t SET amount = 1 WHERE country = 'GB'
+----
+update t set amount = 1
+Rows t
+└── country = 'GB'

@@ -101,9 +101,12 @@ fn a_refusal_and_a_schema_mistake_get_different_statuses() {
     assert!(body.contains(r#""code":"sql_no_joins""#), "{body}");
     assert!(body.contains("comma between tables"), "{body}");
 
+    // A `DELETE` with a `WHERE` is answered now, so the refusal left here is the one that names
+    // every record - pointed at the statement that frees the fragments instead.
     let (status, body) = send(addr, "POST", "/sql", "DELETE FROM tx");
     assert_eq!(status, 400);
-    assert!(body.contains(r#""code":"sql_read_only""#), "{body}");
+    assert!(body.contains(r#""code":"sql_delete_all""#), "{body}");
+    assert!(body.contains("TRUNCATE TABLE"), "{body}");
 
     let (status, body) = send(addr, "POST", "/sql", "SELECT count(*) FROM nope");
     assert_eq!(status, 404, "{body}");
@@ -1927,4 +1930,91 @@ fn a_grouped_answer_can_be_written_into_a_table_and_read_back_as_one() {
         send(addr, "POST", "/sql", "INSERT INTO by_country (country) SELECT * FROM orders");
     assert_eq!(status, 400, "{body}");
     assert!(body.contains("sql_unsupported"), "{body}");
+}
+
+/// The delete ceiling, which no statement can reach without a table to count.
+///
+/// `sql_delete_too_large` is excused from `big-sql`'s corpus gate because how many records a
+/// predicate selects is a fact about a table's contents, not about the text — so this is where
+/// the promise that excuse makes is kept. The claim is the pair: the ceiling refuses, **and the
+/// records are still there afterwards**. A bound that reported a refusal after clearing half the
+/// set would pass an assertion about the code alone.
+#[test]
+fn a_delete_larger_than_its_ceiling_is_refused_and_removes_nothing() {
+    let addr = stocked(5);
+
+    // The key bounds a delete, so it is refused on a statement that has nothing to delete -
+    // rather than accepted and read by nothing.
+    let (status, body) =
+        send(addr, "POST", "/sql", "SELECT count(*) FROM tx SETTINGS max_delete_records = 1");
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains(r#""code":"sql_unknown_setting""#), "{body}");
+
+    // Three records - `stocked` counts requests, not rows - and a ceiling of one.
+    let (status, body) = send(
+        addr,
+        "POST",
+        "/sql",
+        "DELETE FROM tx WHERE amount >= 0 SETTINGS max_delete_records = 1",
+    );
+    // `400` and not `422`, which is the rule every refusal follows here and is argued in
+    // `status::sql`: a refusal says this request cannot be made of this server, and the code in
+    // the body says which construct. The fix is to rewrite the statement, which is 400-shaped.
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains(r#""code":"sql_delete_too_large""#), "{body}");
+    // The sentence has to name the way out, which is the whole point of the refusal list.
+    assert!(body.contains("max_delete_records"), "{body}");
+
+    // Nothing went. This is the half that matters: a ceiling checked after the clearing would
+    // answer with the same code and an emptied table.
+    let (status, body) = send(addr, "POST", "/sql", "SELECT count(*) FROM tx");
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains("[[3]]"), "the delete was refused but records went: {body}");
+
+    // And under a ceiling that admits them, the same statement runs.
+    let (status, body) = send(
+        addr,
+        "POST",
+        "/sql",
+        "DELETE FROM tx WHERE amount >= 0 SETTINGS max_delete_records = 100",
+    );
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains("[[3]]"), "{body}");
+}
+
+/// `SHOW PROCESSLIST` lists this node's running queries, and `KILL QUERY` stops one by its id.
+///
+/// **The two halves are one feature**: an id nobody can learn is not an address, and a listing
+/// nothing acts on is a curiosity. So both are asserted here, together, over a real socket -
+/// which is what this needs, because the flag a query is stopped by is minted per connection.
+#[test]
+fn a_running_query_can_be_listed_and_killed_by_id() {
+    let addr = stocked(12);
+
+    // With nothing running but this request itself, the listing has the shape it will have when
+    // something is - the columns are the claim here, since the rows are a race.
+    let (status, body) = send(addr, "POST", "/sql", "SHOW PROCESSLIST");
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains(r#""id""#), "{body}");
+    assert!(body.contains(r#""elapsed_ms""#), "{body}");
+    assert!(body.contains(r#""statement""#), "{body}");
+
+    // An id nothing is running under. Answering `0` rather than failing is the honest answer: a
+    // query that finished a moment ago is not an error to have named, and the caller wanted it
+    // not running either way.
+    let (status, body) = send(addr, "POST", "/sql", "KILL QUERY 'a/999999'");
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains("[[0]]"), "{body}");
+
+    // ClickHouse's spelling of the same statement.
+    let (status, body) = send(addr, "POST", "/sql", "KILL QUERY WHERE query_id = 'a/999999'");
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains("[[0]]"), "{body}");
+
+    // A predicate over anything but the id kills a set nobody named.
+    let (status, body) = send(addr, "POST", "/sql", "KILL QUERY WHERE user = 'analyst'");
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains(r#""code":"sql_kill_target""#), "{body}");
+    // The sentence has to name how the ids are learned, which is the other half of the feature.
+    assert!(body.contains("SHOW PROCESSLIST"), "{body}");
 }

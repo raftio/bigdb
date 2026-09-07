@@ -80,6 +80,9 @@ impl Parser<'_> {
             let (database, table) = self.table_ref("a table or view name")?;
             return Ok(Shown::Create { database, table, view });
         }
+        if self.eat_word("PROCESSLIST") {
+            return Ok(Shown::Processlist);
+        }
         if self.eat_word("ROLES") {
             return Ok(Shown::Roles);
         }
@@ -90,10 +93,19 @@ impl Parser<'_> {
                 if self.eat_word("FOR") { Some(self.bare_ident("a role name")?) } else { None };
             return Ok(Shown::Grants { role });
         }
-        // `SHOW INDEX`, `SHOW PROCESSLIST`: each is a surface of its own, and neither is one
-        // this statement can grow by accident.
+        // The session half of `SET`, reached through `SHOW`. Refused rather than left to the
+        // syntax error below, because somebody asking what the limits are has a real question -
+        // it is just one about the server rather than about a session this surface does not
+        // keep.
+        if self.word_is("VARIABLES") || self.word_is("SETTINGS") || self.word_is("SESSION") {
+            return Err(self.refuse(Refused::SessionSetting));
+        }
+        // `SHOW INDEX` is still a surface of its own. `SHOW PROCESSLIST` used to be here with
+        // it and is answered now, because the flag a query is stopped by already existed - what
+        // was missing was an address for it.
         Err(self.syntax(
-            "TABLES, VIEWS, DATABASES, ROLES, GRANTS, COLUMNS FROM a table, or CREATE TABLE",
+            "TABLES, VIEWS, DATABASES, ROLES, GRANTS, PROCESSLIST, COLUMNS FROM a table, or \
+             CREATE TABLE",
         ))
     }
 

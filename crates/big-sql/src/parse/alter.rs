@@ -64,6 +64,11 @@ impl Parser<'_> {
         // Refused before `ADD` and `DROP` are looked for, so that each names the construct that
         // was written rather than "expected ADD or DROP". Somebody who wrote `MODIFY` knows
         // what they meant; what they need is why this engine will not do it.
+        // `ALTER TABLE t MODIFY TTL ...` would otherwise be caught by `AlterKind` below, whose
+        // sentence is about column kinds and says nothing about retention.
+        if (self.word_is("MODIFY") || self.word_is("SET")) && self.word_at_is(1, "TTL") {
+            return Err(self.refuse(Refused::DeclarativeTtl));
+        }
         if self.word_is("MODIFY") || self.word_is("CHANGE") {
             return Err(self.refuse(Refused::AlterKind));
         }
@@ -74,6 +79,23 @@ impl Parser<'_> {
             return Err(self.refuse(Refused::AlterEngine));
         }
 
+        // `DROP DAYS BEFORE '<date>' ON <column>` before the plain `DROP`, because both start
+        // with the same word and only this one continues with `DAYS`.
+        if self.word_is("DROP") && self.word_at_is(1, "DAYS") {
+            self.i += 2;
+            self.expect_word("BEFORE", "BEFORE after DAYS")?;
+            let before = match self.peek() {
+                Some(Tok::Str(s)) => {
+                    let s = s.clone();
+                    self.i += 1;
+                    s
+                }
+                _ => return Err(self.syntax("a date in quotes after BEFORE")),
+            };
+            self.expect_word("ON", "ON and the column name")?;
+            let column = self.bare_ident("a column name")?;
+            return Ok(Alter::DropDaysBefore { column, before });
+        }
         if self.eat_word("ADD") {
             // `ADD COLUMN` and `ADD` are the same clause; the word is optional in every dialect
             // that has it. `ADD CONSTRAINT`, `ADD PRIMARY KEY`, `ADD INDEX` are not, and are
@@ -132,6 +154,11 @@ impl Parser<'_> {
             if self.peek().is_some() {
                 return Err(self.syntax("the end of the statement"));
             }
+            // Nothing created it, so nothing drops it - and a `DROP DATABASE system` that
+            // answered "nothing dropped" would read as though the views had been there and gone.
+            if name.eq_ignore_ascii_case(crate::show::SYSTEM_DATABASE) {
+                return Err(self.refuse(Refused::SystemTable));
+            }
             return Ok(crate::ddl::Ddl::DropDatabase { name, if_exists, cascade });
         }
         // `MATERIALIZED` before `VIEW`, so `DROP MATERIALIZED VIEW` gets the sentence about the
@@ -159,5 +186,31 @@ impl Parser<'_> {
             return Err(self.syntax("the end of the statement"));
         }
         Ok(crate::ddl::Ddl::DropTable { database, table, if_exists })
+    }
+}
+
+impl Parser<'_> {
+    /// `TRUNCATE [TABLE] [IF EXISTS] <name>`, with `TRUNCATE` already consumed.
+    ///
+    /// `TABLE` is optional because it is optional in MySQL and required in Postgres, and the
+    /// word decides nothing here - there is one kind of object this empties. A `TRUNCATE` of
+    /// anything else is refused at the word that named it rather than read as a table with a
+    /// strange name.
+    pub(super) fn truncate_table(&mut self) -> Result<crate::ddl::Ddl> {
+        // Named before `TABLE` is looked for, so somebody who wrote one of these is told what
+        // this engine has rather than "expected a table name".
+        if self.word_is("DATABASE") || self.word_is("SCHEMA") || self.word_is("VIEW") {
+            return Err(self.refuse(Refused::Write));
+        }
+        self.eat_word("TABLE");
+        let if_exists = self.if_exists(false)?;
+        let (database, table) = self.table_ref("a table name")?;
+        // `RESTART IDENTITY` and `CASCADE` are Postgres's, and both would be lies here: there is
+        // no sequence to restart - a record id is an address, not a counter anybody may reset -
+        // and nothing references a table for a cascade to follow.
+        if self.peek().is_some() {
+            return Err(self.syntax("the end of the statement"));
+        }
+        Ok(crate::ddl::Ddl::TruncateTable { database, table, if_exists })
     }
 }

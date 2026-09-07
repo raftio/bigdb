@@ -422,6 +422,14 @@ impl<P: PagerMut + Sync> Cluster<P> {
 
     /// The database this node holds. Everything that is not about other nodes goes here:
     /// metrics, durability, and the schema snapshot a coordinator plans against.
+    /// This node's name, which is the prefix every running-query id carries.
+    ///
+    /// Exposed because the id has to say *which node* it addresses - that is what turns routing
+    /// a `KILL` into a lookup rather than a broadcast - and the name is the cluster's to know.
+    pub fn node_name(&self) -> &str {
+        &self.config.this().name
+    }
+
     pub fn local(&self) -> &Api<P> {
         &self.api
     }

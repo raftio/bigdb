@@ -1,0 +1,113 @@
+# `system.*` against real tables, which is the half the parser corpus cannot check.
+#
+# The `show` cases in `big-sql` pin what the statement *is*; these pin what it *answers*. That
+# split matters most here, because these views are read by an operator trying to find out why
+# something is wrong - a listing that parses and reports the wrong rows would be worse than one
+# that refused.
+
+statement
+CREATE DATABASE sales
+
+statement
+CREATE TABLE tx (amount UINT(32), country SET)
+
+statement
+CREATE TABLE sales.orders (total DECIMAL(10, 2), region SET)
+
+statement
+INSERT INTO tx (_record_id, amount, country) VALUES (1, 100, 'GB'), (2, 900, 'US')
+
+statement
+INSERT INTO sales.orders (_record_id, total, region) VALUES (1, 5.00, 'EU')
+
+## Every table, in every database - which is the difference from `SHOW TABLES`, and the reason
+## this is a separate variant rather than a second spelling of one.
+
+query rowsort
+SELECT * FROM system.tables
+----
+database  name    type        engine           columns
+default   tx      BASE TABLE  bitmap+columnar  2
+sales     orders  BASE TABLE  bitmap+columnar  2
+
+query rowsort
+SHOW TABLES
+----
+name  type        engine           fields
+tx    BASE TABLE  bitmap+columnar  2
+
+## The filter, which is the parameter `SHOW TABLES FROM d` already passes.
+
+query rowsort
+SELECT * FROM system.tables WHERE database = 'sales'
+----
+database  name    type        engine           columns
+sales     orders  BASE TABLE  bitmap+columnar  2
+
+## A named column list, in the order it was written.
+
+query rowsort
+SELECT name, database FROM system.tables
+----
+name    database
+orders  sales
+tx      default
+
+## Every column of every table. Views are deliberately absent: a view's columns are the base
+## table's under other names, and counting them here would double every one a view exposes.
+
+query rowsort
+SELECT database, table, name, kind FROM system.columns
+----
+database  table   name     kind
+default   tx      amount   int
+default   tx      country  set
+sales     orders  region   set
+sales     orders  total    decimal
+
+query rowsort
+SELECT name, kind FROM system.columns WHERE database = 'sales' AND table = 'orders'
+----
+name    kind
+region  set
+total   decimal
+
+## Databases.
+
+query rowsort
+SELECT * FROM system.databases
+----
+name     tables
+default  1
+sales    1
+
+## Fragments: the one view here that repeats nothing. A fragment is `(table, field, view, shard)`
+## and no other statement on this surface shows one.
+#
+# Two rows per field is the answer being right rather than doubled: a `bitmap+columnar` table
+# writes each fact into the bitmap under the standard view *and* into a column segment, and the
+# `view` column is what tells them apart. `_exists` is the reserved existence field, reported
+# under a name nobody wrote because an operator counting fragments needs it counted.
+
+query rowsort
+SELECT table, field, view, shard FROM system.parts WHERE table = 'orders'
+----
+table   field    view       shard
+orders  _exists  _standard  0
+orders  region   _column    0
+orders  region   _standard  0
+orders  total    _column    0
+orders  total    _standard  0
+
+## A view a client asks for and this build has not got, answered with the list rather than with
+## the planner's `unknown_table` - `system` is not a database anybody created.
+
+error
+SELECT * FROM system.query_log
+----
+error: sql_system_table
+
+error
+SELECT * FROM system.tables ORDER BY name
+----
+error: sql_system_clause

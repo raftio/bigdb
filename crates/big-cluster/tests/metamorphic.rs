@@ -87,7 +87,17 @@ fn rows() -> Vec<Rec> {
 /// predicate be re-run by hand.
 fn db() -> &'static Cluster<MemPager> {
     static DB: OnceLock<Cluster<MemPager>> = OnceLock::new();
-    DB.get_or_init(|| {
+    DB.get_or_init(fresh)
+}
+
+/// The same table, in a database of its own.
+///
+/// **The shared one above cannot be used by a property that deletes.** Every other property here
+/// only reads, so one database serves all of them; a delete changes what the next case would
+/// see, and a test whose fixture depends on the order proptest happened to shrink in is a test
+/// that fails somewhere other than where the bug is.
+fn fresh() -> Cluster<MemPager> {
+    {
         let api = Api::in_memory().unwrap();
         api.create_table("t").unwrap();
         api.create_field("t", "amount", FieldKind::Int, 16).unwrap();
@@ -111,7 +121,7 @@ fn db() -> &'static Cluster<MemPager> {
             .unwrap();
         }
         Cluster::solo(api, "127.0.0.1:7654")
-    })
+    }
 }
 
 /// A `WHERE` clause, as something that can be both written and evaluated.
@@ -401,5 +411,92 @@ proptest! {
             })
             .sum();
         prop_assert_eq!(total, i128::from(count(Some(&clause))), "\n  where: {}\n", clause);
+    }
+}
+
+/// One statement through the **statement** surface, answering with its one number.
+///
+/// `Api::sql` is the query surface and answers questions only - it refuses a `DELETE` beside the
+/// DDL and the inserts, which is the same split `plan_sql_in` documents. So a property about a
+/// delete has to go through `Cluster::sql`, which is what the logic corpus uses and what a client
+/// reaches over `POST /sql`.
+fn one_number(db: &Cluster<MemPager>, sql: &str) -> u64 {
+    let (set, _) = db
+        .sql(sql, &big_rbac::Who::Trusted, &QueryOptions::default())
+        .unwrap_or_else(|e| panic!("`{sql}` was refused: {e}"));
+    match set.rows.first().and_then(|r| r.first()) {
+        Some(big_embed::Datum::Int(n)) => u64::try_from(*n).expect("a count is not negative"),
+        other => panic!("`{sql}` answered {other:?}"),
+    }
+}
+
+proptest! {
+    // Fewer cases than the read-only properties above: each one builds its own database,
+    // because it changes what it reads.
+    #![proptest_config(ProptestConfig { cases: 64, ..ProptestConfig::default() })]
+
+    /// **Deleting by a predicate removes exactly the records it selects, and nothing else.**
+    ///
+    /// The two halves are asserted separately because they fail separately. The count the
+    /// statement answers with says what it *believed* it removed; the count afterwards says what
+    /// actually went. A delete that cleared too much would agree with itself and disagree with
+    /// the arithmetic - which is the failure a hand-written case is least likely to have chosen
+    /// the right predicate to catch.
+    #[test]
+    fn deleting_by_a_predicate_removes_exactly_what_it_selects(p in pred()) {
+        let db = fresh();
+        let clause = p.sql();
+        let all = rows().len() as u64;
+        let want = rows().iter().filter(|r| p.holds(r)).count() as u64;
+
+        let deleted = one_number(&db, &format!("DELETE FROM t WHERE {clause}"));
+        prop_assert_eq!(deleted, want, "\n  the count it reported\n  where: {}\n", clause);
+
+        // What is left is what the predicate did not select. Asked of the table rather than
+        // computed from `deleted`, so a delete that reported one number and did another fails
+        // here rather than agreeing with itself.
+        let left = one_number(&db, "SELECT count(*) FROM t");
+        prop_assert_eq!(left, all - want, "\n  what was left\n  where: {}\n", clause);
+
+        // And the survivors are the ones the predicate rejects: a record that still matches it
+        // is one the delete missed, which `count(*)` alone cannot tell from one it cleared by
+        // mistake elsewhere.
+        let still = one_number(&db, &format!("SELECT count(*) FROM t WHERE {clause}"));
+        prop_assert_eq!(still, 0, "\n  records the predicate still matches\n  where: {}\n", clause);
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 64, ..ProptestConfig::default() })]
+
+    /// **An update writes the new value to exactly the records the predicate selects, and the
+    /// old value is gone from them.**
+    ///
+    /// The second half is the one a hand-written case is least likely to catch. Writing the new
+    /// fact is easy to get right; *clearing the old* is done by the engine below, and a column
+    /// where it did not would answer for both values at once - which `count(*)` cannot see.
+    #[test]
+    fn updating_by_a_predicate_replaces_the_value_in_exactly_those_records(p in pred()) {
+        let db = fresh();
+        let clause = p.sql();
+        let want = rows().iter().filter(|r| p.holds(r)).count() as u64;
+        // A value no generated row holds, so "how many records have it" is exactly "how many
+        // this statement wrote".
+        const FRESH_AMOUNT: u64 = 65_535;
+
+        let updated =
+            one_number(&db, &format!("UPDATE t SET amount = {FRESH_AMOUNT} WHERE {clause}"));
+        prop_assert_eq!(updated, want, "\n  the count it reported\n  where: {}\n", clause);
+
+        // Every selected record now holds the new value, and nothing else does.
+        let holding = one_number(
+            &db,
+            &format!("SELECT count(*) FROM t WHERE amount = {FRESH_AMOUNT}"),
+        );
+        prop_assert_eq!(holding, want, "\n  records holding the new value\n  where: {}\n", clause);
+
+        // And the table is the same size: an update writes over records rather than adding any.
+        let all = one_number(&db, "SELECT count(*) FROM t");
+        prop_assert_eq!(all, rows().len() as u64, "\n  the table changed size\n");
     }
 }

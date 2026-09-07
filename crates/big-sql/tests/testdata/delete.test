@@ -1,0 +1,135 @@
+# `DELETE FROM t WHERE ...`: the records a condition selects, cleared from every field.
+#
+# **The claim this file exists for is that a delete's `WHERE` is the same `WHERE`.** It lowers
+# through `cond::rows`, the one function that turns a condition into a set operation, so a
+# predicate cannot select one set when it is being counted and a different one when it is being
+# deleted.
+#
+# Each case is written twice - once as a delete, once as the `SELECT *` that selects the same
+# records - and what has to match is **the tree under the head line**. The roots differ because
+# they are different statements: a projection reads columns back and a delete does not read
+# anything. Below that root the two are the same set operation, character for character, and the
+# cases sit adjacent so that is readable. The machine-checked form of the same claim is
+# `a_delete_selects_by_the_same_tree_a_select_does` in `tests/translate/writes.rs`, which
+# compares the expressions rather than their printings.
+
+## A comparison.
+
+delete
+DELETE FROM t WHERE amount >= 500
+----
+delete t
+Rows t
+└── amount >= 500
+
+plan
+SELECT * FROM t WHERE amount >= 500
+----
+Project t.(amount, price, balance, category, country, device, visit, active, rate, day, seen)
+└── amount >= 500
+
+## A conjunction, which is an intersection.
+
+delete
+DELETE FROM t WHERE amount >= 500 AND country = 'GB'
+----
+delete t
+Rows t
+└── intersect
+    ├── amount >= 500
+    └── country = 'GB'
+
+plan
+SELECT * FROM t WHERE amount >= 500 AND country = 'GB'
+----
+Project t.(amount, price, balance, category, country, device, visit, active, rate, day, seen)
+└── intersect
+    ├── amount >= 500
+    └── country = 'GB'
+
+## A negation, which is a difference against the records that exist.
+
+delete
+DELETE FROM t WHERE NOT country = 'GB'
+----
+delete t
+Rows t
+└── not
+    └── country = 'GB'
+
+plan
+SELECT * FROM t WHERE NOT country = 'GB'
+----
+Project t.(amount, price, balance, category, country, device, visit, active, rate, day, seen)
+└── not
+    └── country = 'GB'
+
+## An `IN`, which is a union.
+
+delete
+DELETE FROM t WHERE country IN ('GB', 'US')
+----
+delete t
+Rows t
+└── union
+    ├── country = 'GB'
+    └── country = 'US'
+
+## A window on a time quantum column - the shape a retention delete is written in.
+
+delete
+DELETE FROM t WHERE visit BETWEEN 100 AND 200
+----
+did not resolve: `>=` is not allowed on `visit`, which is a time quantum field
+
+## A qualified table.
+
+delete
+DELETE FROM sales.orders WHERE amount > 5
+----
+did not resolve: no table `sales.orders`
+
+## No `WHERE` names every record, and clearing them id by id is the most expensive way to say
+## what `TRUNCATE TABLE` says by freeing the fragments.
+
+error
+DELETE FROM t
+----
+sql_delete_all
+
+## MySQL takes `ORDER BY` and `LIMIT` on a delete. There is no order to take the first of here -
+## a record id is an address rather than a position - so a partial delete would clear an
+## arbitrary subset while reading as though it had chosen one.
+
+error
+DELETE FROM t WHERE amount > 5 ORDER BY amount LIMIT 10
+----
+sql_delete_all
+
+error
+DELETE FROM t WHERE amount > 5 LIMIT 10
+----
+sql_delete_all
+
+## A second table in a delete selects what to remove by pairing records, which is the join this
+## engine does not do. The set form of the same question is the one that works.
+
+error
+DELETE FROM t, u WHERE t.amount > 5
+----
+sql_no_joins
+
+error
+DELETE FROM t USING u WHERE t.amount > 5
+----
+sql_no_joins
+
+## Explaining one resolves the tree it would select by and runs none of it, which is the only
+## time somebody can check a predicate before it clears records that do not come back.
+
+explain
+EXPLAIN DELETE FROM t WHERE amount >= 500
+----
+delete t
+Rows t
+└── amount >= 500

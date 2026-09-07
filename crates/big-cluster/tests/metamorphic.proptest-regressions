@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc f292249fdd487bca700ff87b0aea888db4bf2b5abaa2ba3a0f5454be592959b5 # shrinks to p = Or(And(Amount(Gt, 436), Price(Gt, 755)), Not(Between(462, 933)))
