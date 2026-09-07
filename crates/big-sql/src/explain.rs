@@ -345,6 +345,10 @@ fn of(of: Of, sides: &[JoinSide]) -> String {
         // The instant itself, not the word: two statements parsed a second apart are two
         // different questions, and a printer that hid that would print them the same.
         Of::Now { unix_seconds } => format!("now '{}'", big_civil::format_datetime(unix_seconds)),
+        // A branch of a grouping-sets answer that does not name this column. Printed as what it
+        // renders as, so an `EXPLAIN` of a rollup shows which branch is the subtotal.
+        Of::Const { value: None } => "null".to_string(),
+        Of::Const { value: Some(n) } => format!("const {n}"),
         Of::Key => "key".to_string(),
         // Axis 0 prints as the bare word, so a one-key grouping reads the way it always has and
         // only the axes above it carry a number.

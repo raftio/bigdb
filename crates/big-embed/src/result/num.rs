@@ -67,6 +67,9 @@ pub(super) fn number(of: Of, values: &[Value], row: Option<GroupAt>) -> Option<N
         // A constant, carried from the parser so that every row and every node reads the same
         // instant. No plan is consulted because there is none to consult.
         Of::Now { unix_seconds } => Some(Num::Int(i128::from(unix_seconds))),
+        // A branch of a grouping-sets answer carrying a value no plan produced. See `const_of`,
+        // which is the one definition of what it renders as.
+        Of::Const { value } => const_of(value),
         Of::Value { plan } => values.get(plan).and_then(scalar_num),
         // The counting step of `count(DISTINCT x)`, which happens here because here is after
         // the merge: a group that two nodes both hold is one group, and counting earlier would
@@ -127,6 +130,19 @@ pub(super) fn scalar_num(v: &Value) -> Option<Num> {
 /// One group's number out of one plan's answer.
 fn group_num(v: &Value, row: GroupAt) -> Option<Num> {
     v.as_groups()?.iter().find(|g| g.at == row).and_then(|g| scalar_num(&g.value))
+}
+
+/// What a cell holding a constant renders as.
+///
+/// **One definition, called from all three readers**: [`number`] here, and the two local ones in
+/// `group.rs` that a tuple grouping and a join go through. Those two end in `_ => None`, so a
+/// constant left without an arm in either renders as its number in one branch of a statement and
+/// as `null` in another - and nothing in the answer could show it. A test asserts the three agree.
+///
+/// `None` is the column a grouping set did not name, which is a `null` for the same reason every
+/// other absent number here is one: there is no value, rather than a value of zero.
+pub(super) fn const_of(value: Option<i128>) -> Option<Num> {
+    value.map(Num::Int)
 }
 
 /// A number a cell can hold: a count or a total, or the quotient an average is.

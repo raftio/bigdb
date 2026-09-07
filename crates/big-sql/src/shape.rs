@@ -548,6 +548,25 @@ pub enum Of {
         /// Seconds since the Unix epoch.
         unix_seconds: i64,
     },
+    /// A value this branch carries that no plan produced.
+    ///
+    /// **A subtotal row is what this exists for.** Under `ROLLUP`, `CUBE` or `GROUPING SETS` each
+    /// set is its own grouping, and a column the set does not name has no value in that branch -
+    /// so the cell holds `null`, and `grouping(<column>)` holds `1` to say the null is the
+    /// rollup's rather than a key this node was never told. Two spellings of one fact, so one
+    /// variant carries both: two of them could come to disagree about which branch is a subtotal,
+    /// and nothing downstream would be able to see it.
+    ///
+    /// Deliberately not [`Absent`], which already names something else here: the `0` or `null` a
+    /// plan leaves for a group it knows exists but was told nothing about. This is a branch that
+    /// never asked.
+    ///
+    /// Names no plan, so `rebase` leaves it where it is - the same as [`Of::Now`], and for the
+    /// same reason.
+    Const {
+        /// The number, or `None` for the column the set left out.
+        value: Option<i128>,
+    },
     /// The group's key.
     Key,
     /// One axis of a tuple grouping's key, counted from the outermost column.
@@ -745,6 +764,7 @@ impl Of {
             | Self::KeyAt { .. }
             | Self::Probe { .. }
             | Self::SharedKeys
+            | Self::Const { .. }
             | Self::Now { .. } => Vec::new(),
             Self::Value { plan }
             | Self::Groups { plan }
@@ -770,6 +790,7 @@ impl Of {
             | Self::KeyAt { .. }
             | Self::Probe { .. }
             | Self::SharedKeys
+            | Self::Const { .. }
             | Self::Now { .. } => None,
         }
     }
@@ -1023,9 +1044,12 @@ impl Shape {
         let driving = match self {
             Self::Groups { keys, .. } | Self::Tuples { keys, .. } => keys.clone(),
             Self::Join { sides, .. } => sides.iter().flat_map(|s| s.keyed.plans()).collect(),
-            Self::Row { .. } | Self::Records { .. } | Self::Table { .. } | Self::Union { .. } => {
-                Vec::new()
-            }
+            // A union's rows are its branches', so the plans driving them are too - and a
+            // grouping-sets answer is branches of key-only groupings, whose `keys` are named
+            // nowhere else. Walking only the cells would report a shape reading fewer plans
+            // than it does.
+            Self::Union { branches } => branches.iter().flat_map(Shape::plans).collect(),
+            Self::Row { .. } | Self::Records { .. } | Self::Table { .. } => Vec::new(),
         };
         driving.into_iter().chain(self.cells().iter().flat_map(|c| c.of.plans())).collect()
     }
@@ -1288,6 +1312,7 @@ impl Of {
             Self::Ratio { plan, over } => Self::Ratio { plan: plan + by, over: over + by },
             // A constant points at no plan, so nothing moves.
             Self::Now { unix_seconds } => Self::Now { unix_seconds },
+            Self::Const { value } => Self::Const { value },
             // `side` is a position in the join's own keys rather than in the statement's
             // calls, so it stays where it is while the plan it points past moves along.
             Self::Paired { plan, side, how } => Self::Paired { plan: plan + by, side, how },

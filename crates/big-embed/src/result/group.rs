@@ -25,7 +25,7 @@ use crate::{
     Pairing, TimeUnit, Tuple, Value,
 };
 
-use super::num::{as_f64, cmp_num, int_of, number, scalar_num, Num};
+use super::num::{as_f64, cmp_num, const_of, int_of, number, scalar_num, Num};
 
 /// The rows of a grouped answer, joined across every plan the statement made.
 ///
@@ -381,6 +381,9 @@ impl<'a> Reader<'a> {
                 }
                 Some(Num::Real(as_f64(sum(top)?) / over))
             }
+            // A constant, through `const_of` rather than spelled out here - see it on why all
+            // three readers must agree.
+            Of::Const { value } => const_of(value),
             // No other cell is reachable through a shape the lowering produces for a join.
             _ => None,
         }
@@ -578,6 +581,9 @@ pub(super) fn tupled(
                     },
                 }
             }
+            // A column this branch's grouping set does not name. Through `const_of`, which is
+            // where the reason all three readers must agree is written down.
+            Of::Const { value } => const_of(value),
             _ => None,
         }
     };
