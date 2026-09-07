@@ -315,6 +315,13 @@ fn statement(p: &mut Parser<'_>, explainable: bool) -> Result<Parsed> {
         // the grammar, because `SET max_execution_time = 30` is perfectly good SQL somewhere
         // and what its author needs is where to put it here.
         "SET" => return Err(p.refuse(Refused::SessionSetting)),
+        // `ANALYZE TABLE`, and with it `EXPLAIN ANALYZE` - which reaches this by recursion, and
+        // is the reading that makes the sentence worth writing: what somebody wanted was
+        // timings, and what exists is `EXPLAIN` without them.
+        "ANALYZE" => return Err(p.refuse(Refused::Analyze)),
+        // Compaction exists and is a server operation rather than a statement, because it needs
+        // the file's exclusive lock. Named here rather than left to fall off the grammar.
+        "OPTIMIZE" => return Err(p.refuse(Refused::Optimize)),
         // `TRUNCATE` has an operation behind it here - freeing a table's fragments by key,
         // which is `DROP TABLE`'s second half without its first - so it left the refusal above
         // and became a statement.

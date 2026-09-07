@@ -188,8 +188,9 @@ SELECT count(*) FROM p WHERE name LIKE 100
 error: parse_error
 
 # Every other string comparison is still refused: none of them is a set operation this index
-# can do, and `LIKE` is answered precisely because it is one.
+# can do, and `LIKE` is answered precisely because it is one. The regular-expression spellings
+# get their own name, which is what carries the pattern language that does exist.
 error
 SELECT count(*) FROM p WHERE name SIMILAR TO 'a%'
 ----
-error: sql_unsupported
+error: sql_no_regex

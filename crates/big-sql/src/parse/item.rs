@@ -401,6 +401,29 @@ impl Parser<'_> {
     }
 }
 
+/// Whether a call names a regular expression, in every spelling the two dialects write them in.
+///
+/// **One list, two callers**: the select list reaches it through `unsupported_call`, and a
+/// `WHERE` reaches it directly - because a `WHERE` refuses *known* scalar functions by name and
+/// these are not known ones, so without this they would fall through to a syntax error about a
+/// bracket. A named list rather than a fallthrough either way: somebody who wrote
+/// `match(c, '^a')` asked a real question, and what they need is the pattern language that *is*
+/// here rather than a sentence about there being no such function.
+pub(super) fn is_regex_call(name: &str) -> bool {
+    const REGEXES: [&str; 9] = [
+        "match",
+        "extract",
+        "extractAll",
+        "replaceRegexpOne",
+        "replaceRegexpAll",
+        "regexp_extract",
+        "regexp_replace",
+        "regexp_like",
+        "regexp_matches",
+    ];
+    REGEXES.iter().any(|c| name.eq_ignore_ascii_case(c))
+}
+
 /// The window functions that are *only* windows, by the name every dialect writes them under.
 ///
 /// `sum`, `avg`, `count`, `min` and `max` are deliberately absent: those are aggregates until an
@@ -543,11 +566,39 @@ pub(super) fn unsupported_call(name: &str) -> Refused {
         "bsi_topk",
     ];
 
+    /// Sketches, and the combinators that carry one between queries.
+    ///
+    /// Deliberately *not* the `uniq*` family, which is answered exactly - see `Which::Uniq`.
+    /// What is here are the names that ask for a sketch as a *value*: a state to merge later,
+    /// or a column holding one.
+    const SKETCHES: [&str; 8] = [
+        "uniqState",
+        "uniqMerge",
+        "quantileState",
+        "quantileMerge",
+        "hll_union_agg",
+        "hll_cardinality",
+        "hll_hash",
+        "approx_top_k",
+    ];
+
     // Checked before the casts, because `to_bitmap` reads like a conversion and is not one:
     // what it names is already how the fact was written, so the sentence it needs is the
     // mapping rather than the one about representations that do not convert.
     if BITMAPS.iter().any(|c| name.eq_ignore_ascii_case(c)) {
         return Refused::BitmapFunction;
+    }
+    // A `-State`/`-Merge` suffix on anything, plus the sketch names that carry no suffix. The
+    // suffix is checked rather than listed because it composes with every aggregate there is,
+    // and a list would be that many entries to say one thing.
+    let suffixed = ["State", "Merge", "MergeState"].iter().any(|sfx| {
+        name.len() > sfx.len() && name[name.len() - sfx.len()..].eq_ignore_ascii_case(sfx)
+    });
+    if suffixed || SKETCHES.iter().any(|c| name.eq_ignore_ascii_case(c)) {
+        return Refused::Sketch;
+    }
+    if is_regex_call(name) {
+        return Refused::Regex;
     }
     if CASTS.iter().any(|c| name.eq_ignore_ascii_case(c)) {
         return Refused::Cast;

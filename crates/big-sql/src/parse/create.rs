@@ -339,8 +339,12 @@ impl Parser<'_> {
             // `Nullable(Decimal(10, 2))`, which `wrapped_type` could not read, says the same
             // sentence as `Nullable(Int64)` rather than a syntax error about a nested `(`.
             "NULLABLE" => return Err(self.refuse_at(Refused::NullableType, at)),
-            "BITMAP" | "AGGREGATEFUNCTION" | "HLL" | "QUANTILE_STATE" => {
-                return Err(self.refuse_at(Refused::BitmapType, at))
+            "BITMAP" | "AGGREGATEFUNCTION" => return Err(self.refuse_at(Refused::BitmapType, at)),
+            // The sketch types, which are a different refusal from `BITMAP` even though both
+            // decline a column: a bitmap is refused because every column here already is one,
+            // and a sketch because there is nothing here for one to approximate.
+            "HLL" | "QUANTILE_STATE" | "QUANTILESTATE" | "SIMPLEAGGREGATEFUNCTION" => {
+                return Err(self.refuse_at(Refused::Sketch, at))
             }
             "TINYINT" | "SMALLINT" | "INT" | "INTEGER" | "BIGINT" => {
                 if self.peek() == Some(&Tok::LParen) {

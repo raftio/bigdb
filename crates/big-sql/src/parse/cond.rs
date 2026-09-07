@@ -116,6 +116,15 @@ impl Parser<'_> {
         // set out of bitmaps before a single value has been read, so there is nothing for one of
         // these to apply to. `now()` is not on this list - it is a value, and
         // `Parser::literal` has already read it as one.
+        // A regular expression, named before the general scalar refusal: these are not scalar
+        // functions here, so the check below would not see them and the statement would fail on
+        // the bracket instead. See `super::item::is_regex_call`.
+        if self.peek() == Some(&Tok::LParen)
+            && field.qualifier.is_none()
+            && super::item::is_regex_call(&field.column)
+        {
+            return Err(self.refuse_at(Refused::Regex, at));
+        }
         if self.peek() == Some(&Tok::LParen)
             && field.qualifier.is_none()
             && !field.column.eq_ignore_ascii_case("now")
@@ -196,6 +205,17 @@ impl Parser<'_> {
                 // the only kind that could mean anything here - which the planner enforces,
                 // because it is the layer that knows the field's class.
                 _ if self.ends_a_term() => Cond::Cmp { field, op: "=", value: Literal::Bool(true) },
+                // A regular-expression operator, named before the generic refusal below: what
+                // its author needs is the pattern language that *is* here, not a list of the
+                // predicates that are.
+                Some(Tok::Word(w))
+                    if matches!(
+                        w.to_ascii_uppercase().as_str(),
+                        "REGEXP" | "RLIKE" | "SIMILAR" | "MATCH"
+                    ) =>
+                {
+                    return Err(self.refuse(Refused::Regex))
+                }
                 Some(Tok::Word(_)) => return Err(self.refuse(Refused::Predicate)),
                 _ => return Err(self.syntax("a comparison after the column")),
             }

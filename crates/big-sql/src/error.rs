@@ -358,6 +358,24 @@ pub enum Refused {
     ///
     /// A second filter, over numbers that exist only after every row has been read.
     Qualify,
+    /// An approximate-distinct sketch, or a `-State`/`-Merge` combinator over one.
+    ///
+    /// Refused because there is nothing here for a sketch to approximate: a distinct count is a
+    /// popcount, and the partial result that travels between nodes is the bitmap itself.
+    Sketch,
+    /// A regular expression, in the select list or in a `WHERE`.
+    ///
+    /// The pattern language here is `LIKE`'s, and it runs over a keyed column's dictionary
+    /// rather than over records - see `big_db::like`, where the decision is written out.
+    Regex,
+    /// `ANALYZE TABLE`, and therefore `EXPLAIN ANALYZE`.
+    ///
+    /// There is no cost model for statistics to feed: the planner is purely syntactic.
+    Analyze,
+    /// `OPTIMIZE TABLE`, `ALTER TABLE ... COMPACT`, `FREEZE`.
+    ///
+    /// Compaction exists and is whole-file, because there are no parts to merge.
+    Optimize,
 }
 
 impl Refused {
@@ -371,7 +389,7 @@ impl Refused {
     /// Kept honest by [`Refused::rank`] below, whose exhaustive match will not compile until a
     /// new variant is named - and by a test asserting that every rank appears here exactly once,
     /// which is what catches naming one and forgetting to add it.
-    pub const ALL: [Self; 80] = [
+    pub const ALL: [Self; 84] = [
         Self::Joins,
         Self::OuterJoin,
         Self::JoinOn,
@@ -452,6 +470,10 @@ impl Refused {
         Self::WindowFrame,
         Self::WindowName,
         Self::Qualify,
+        Self::Sketch,
+        Self::Regex,
+        Self::Analyze,
+        Self::Optimize,
     ];
 
     /// Where this refusal sits in [`Refused::ALL`], and the reason that list can be trusted.
@@ -543,6 +565,10 @@ impl Refused {
             Self::WindowFrame => 77,
             Self::WindowName => 78,
             Self::Qualify => 79,
+            Self::Sketch => 80,
+            Self::Regex => 81,
+            Self::Analyze => 82,
+            Self::Optimize => 83,
         }
     }
 
@@ -559,6 +585,10 @@ impl Refused {
             Self::WindowFrame => "sql_window_frame",
             Self::WindowName => "sql_window_named",
             Self::Qualify => "sql_qualify",
+            Self::Sketch => "sql_sketch",
+            Self::Regex => "sql_no_regex",
+            Self::Analyze => "sql_no_analyze",
+            Self::Optimize => "sql_no_optimize",
             Self::SetTooLarge => "sql_set_too_large",
             Self::ExplainSet => "sql_explain_set",
             Self::Segment => "sql_segment_unexpanded",
@@ -947,6 +977,41 @@ impl Refused {
                  every partition has been read - so it is a second pass over the finished answer rather than \
                  anything a plan could carry. `WHERE` narrows the records the window then ranks, which is the \
                  cheap half and usually the one that was meant; filter on the ranking itself in the client"
+            }
+            Self::Sketch => {
+                "there is no sketch here because there is nothing for one to approximate: `count(DISTINCT \
+                 x)` is the cardinality of a bitmap, which is a popcount - exact, and paid per container \
+                 rather than per record. `uniq`, `uniqExact`, `uniqCombined`, `uniqCombined64`, `uniqHLL12`, \
+                 `uniqTheta` and `approx_count_distinct` are all accepted exactly as written and all answered \
+                 exactly, and `quantile`, `quantileExact` and `median` are exact too. A `-State`/`-Merge` pair \
+                 exists elsewhere to carry a partial sketch between queries; the partial result that travels \
+                 between nodes here **is** the bitmap, and the engine merges it"
+            }
+            Self::Regex => {
+                "the pattern language here is `LIKE`'s: `%` for any run of characters, `_` for exactly one, \
+                 and `ILIKE` to fold case. It runs over a keyed column's **dictionary** rather than over \
+                 records - each distinct string is stored once with the bitmap of the records holding it - so \
+                 `country LIKE 'G%'` costs the field's cardinality once where a row engine pays it per record. \
+                 A regular expression engine in that loop would be a dependency, a compile step and a class of \
+                 pathological pattern, to implement two characters. Write `LIKE` or `ILIKE`, or `IN (...)` for \
+                 a fixed set of values"
+            }
+            Self::Analyze => {
+                "there are no statistics to gather. The planner here is purely syntactic - a call resolves \
+                 against the schema, and nothing about the data changes which plan it becomes - so there is no \
+                 cost model for an `ANALYZE` to feed. What this engine keeps instead is a zone map per \
+                 fragment, `min`, `max`, `bit_depth` and whether it holds values, written as facts are and \
+                 therefore never stale; it is already readable as `SELECT * FROM system.parts`. `EXPLAIN \
+                 <statement>` is the whole of what this surface says about a statement, and it says it without \
+                 running one"
+            }
+            Self::Optimize => {
+                "compaction here is whole-file rather than per part, because there are no parts to merge: a \
+                 fragment is a range of records inside one page store, and what accumulates is free pages \
+                 rather than small files. Rewriting the store into a fresh one and swapping it in is a server \
+                 operation - `POST /admin/backup` - rather than a statement, because it needs the file's \
+                 exclusive lock, which a statement running inside a read does not hold. `SELECT * FROM \
+                 system.parts` is what says whether it is worth doing"
             }
             Self::SystemClause => {
                 "a system view answers in full, and the clause it takes is \

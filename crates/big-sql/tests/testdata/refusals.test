@@ -680,7 +680,7 @@ sql_scalar_in_filter
 error
 SELECT count(*) FROM t WHERE country SIMILAR TO 'G%'
 ----
-sql_unsupported
+sql_no_regex
 
 error
 SELECT count(*) FROM t WHERE country GLOB 'G*'
@@ -1132,3 +1132,69 @@ error
 SELECT count(*), row_number() OVER (ORDER BY amount) FROM t
 ----
 sql_unsupported
+
+## What this engine already answers under another name
+#
+# None of these four is a gap. Each is a question with an answer here, refused by name so that
+# the answer is what a client reads instead of a sentence about a missing function.
+
+# A sketch has nothing to approximate: a distinct count is a popcount, and the partial result
+# that travels between nodes is the bitmap itself.
+error
+SELECT uniqState(country) FROM t
+----
+sql_sketch
+
+error
+SELECT sumState(amount) FROM t
+----
+sql_sketch
+
+error
+SELECT quantileMerge(amount) FROM t
+----
+sql_sketch
+
+# The pattern language is `LIKE`'s, and it runs over the key dictionary rather than over records.
+error
+SELECT count(*) FROM t WHERE match(country, '^G')
+----
+sql_no_regex
+
+error
+SELECT count(*) FROM t WHERE country REGEXP 'G'
+----
+sql_no_regex
+
+error
+SELECT count(*) FROM t WHERE country RLIKE 'G'
+----
+sql_no_regex
+
+error
+SELECT replaceRegexpAll(country, 'a', 'b') FROM t
+----
+sql_no_regex
+
+# No cost model for statistics to feed. `EXPLAIN ANALYZE` reaches this by recursion, which is
+# the reading that makes the sentence worth writing.
+error
+ANALYZE TABLE t
+----
+sql_no_analyze
+
+error
+EXPLAIN ANALYZE SELECT count(*) FROM t
+----
+sql_no_analyze
+
+# Compaction is whole-file and a server operation, because it needs the file's exclusive lock.
+error
+OPTIMIZE TABLE t
+----
+sql_no_optimize
+
+error
+ALTER TABLE t COMPACT
+----
+sql_no_optimize

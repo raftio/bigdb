@@ -177,8 +177,11 @@ fn every_refusal_names_itself() {
     assert_eq!(code("SELECT stddevPop(amount) FROM t"), "sql_unsupported");
     assert_eq!(code("SELECT corr(amount, price) FROM t"), "sql_unsupported");
     // `LIKE` is answered now - a pattern over a keyed column is a union of the keys that match.
-    // Every other string comparison is still refused, because none of them is a set operation.
-    assert_eq!(code("SELECT count(*) FROM t WHERE country SIMILAR TO 'G%'"), "sql_unsupported");
+    // Every other string comparison is still refused, because none of them is a set operation -
+    // and the regular-expression spellings are refused by their own name, which is what carries
+    // the pattern language that *is* here.
+    assert_eq!(code("SELECT count(*) FROM t WHERE country SIMILAR TO 'G%'"), "sql_no_regex");
+    assert_eq!(code("SELECT count(*) FROM t WHERE match(country, '^G')"), "sql_no_regex");
     // Two aggregates are two plans, which is now answered. What is still refused is a select
     // list that is not one answer: a star beside an aggregate, or a bare column beside one.
     assert_eq!(code("SELECT *, count(*) FROM t"), "sql_unsupported");
