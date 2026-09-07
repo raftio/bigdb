@@ -1,6 +1,6 @@
 # Testing the SQL surface
 
-Four hundred statements in files, five properties over predicates nobody wrote, and three gates
+Eight hundred statements in files, five properties over predicates nobody wrote, and seven gates
 that fail when the corpus stops covering the code. This page says what each of those is for and
 where the boundaries between them are.
 
@@ -9,11 +9,11 @@ where the boundaries between them are.
 | | where | what it holds | how many |
 |---|---|---|---|
 | Claims | `crates/big-sql/tests/translate` | the arguments: two surfaces, one plan; a refusal says what exists instead | ~55 functions |
-| Translation corpus | `crates/big-sql/tests/testdata` | every clause, type name and refusal, against the tree it translates into | ~405 cases |
+| Translation corpus | `crates/big-sql/tests/testdata` | every clause, type name and refusal, against the tree it translates into | ~835 cases |
 | Logic corpus | `crates/big-cluster/tests/logic` | statements against real records, and the rows they answer with | ~150 cases |
 | HTTP configuration | `crates/big-http/tests/logic.rs` | the same corpus over a socket | the same cases |
 | Properties | `crates/big-cluster/tests/metamorphic.rs` | generated predicates against ground truth and against each other | 5 × 256 |
-| Gates | `crates/big-sql/tests/gates.rs` | that the corpus keeps covering the code | 3 |
+| Gates | `crates/big-sql/tests/gates.rs` | that the corpus keeps covering the code | 7 |
 | Fuzz | `fuzz/fuzz_targets/parse_sql.rs` | no input is a crash | unbounded |
 
 ## Why files as well as functions
@@ -103,16 +103,17 @@ that its status does not invite a retry.
 
 `big_testfile::check` is that mode: expected blocks ignored, files never rewritten.
 
-## The three gates
+## The gates
 
 A corpus decays in a way a test suite does not: nothing about it fails when a feature is added
 and no case is written for it. `crates/big-sql/tests/gates.rs` turns that from a matter of
 discipline into a matter of the build going red.
 
-1. **Every refusal is reached by a statement.** Each of the 40 `Refused` variants carries a
+1. **Every refusal is reached by a statement.** Each of the 97 `Refused` variants carries a
    sentence saying what exists instead, and that sentence is the whole reason the list is
    enumerated rather than left as free text. A refusal no statement reaches is a sentence written
-   once and never read since. One exception is listed with its reason — see below.
+   once and never read since. The exceptions are listed with their reasons in `EXCUSED` — a
+   statement that cannot be written without a catalog, or without ten thousand tuples.
 2. **Every declared table survives being written back out.** `parse::column_type` decides what a
    type name means and `render::create_table` decides how a field is written back; they are two
    directions of one table, and an inverse kept honest by nothing drifts. Every `CREATE TABLE` in
@@ -120,11 +121,23 @@ discipline into a matter of the build going red.
 3. **No statement the corpus can be cut into makes the parser panic.** Every prefix and every
    one-byte deletion of every case, which is around 60,000 inputs, in the ordinary test suite.
    `fuzz/fuzz_targets/parse_sql.rs` runs the same contract with no bound on its inputs.
+4. **`EXPLAIN` wraps every statement unchanged**, and explaining one demands exactly what the
+   statement demands. A wrapper that quietly narrowed or widened what was authorised would be a
+   way to ask a question through a keyword that avoids the check.
+5. **What a statement demands agrees with the keyword it opens with**, checked against the
+   *text* rather than against the parse tree — the one derivation `Sql::demands` refuses to use,
+   so the gate cannot pass by re-implementing the match it is checking.
+6. **No statement demands a privilege on an object it does not name.**
 
-### The excused refusal
+### The excused refusals
 
-`sql_insert_too_large` needs more than ten thousand tuples in one statement, which is a file
-nobody would read. It is checked in `tests/translate/writes.rs`, where the rows can be generated.
+Nine codes are listed in `EXCUSED` with the reason each is out of reach here, and the reasons
+fall into two kinds. `sql_insert_too_large` needs more than ten thousand tuples in one statement,
+which is a file nobody would read; it is checked in `tests/translate/writes.rs`, where the rows
+can be generated. The other eight need something this crate deliberately has not got: a stored
+view, a resolved statement, a field's kind, or a count of what another table answered. Every one
+of them names the suite that does cover it, and the gate asserts that each excuse is still for a
+code that exists.
 
 The list was two. `sql_no_time_window` was not hard to write — **nothing constructed it.** It was
 the refusal a window earned before v3 gave the planner a field class that could tell a set from a

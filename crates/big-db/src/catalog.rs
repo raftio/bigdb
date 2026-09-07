@@ -867,6 +867,41 @@ impl Catalog {
         Ok(true)
     }
 
+    /// Swaps which table each of two names resolves to.
+    ///
+    /// `Ok(false)` means one of them was not there, and then nothing moved: a swap that renamed
+    /// half of itself would leave one name pointing at data the other used to hold.
+    ///
+    /// **Not three [`Self::rename_table`] calls through a temporary name**, which is the obvious
+    /// way to write it and the wrong one. A temporary name is a name that may already have an
+    /// owner, and it is three edits with two moments in between where a name resolves somewhere
+    /// nobody asked for. This is two `insert`s over ids already read, so no intermediate state
+    /// exists to be observed or to be left behind by a failure.
+    ///
+    /// Nothing below the catalog moves, for the reason a rename moves nothing: fragments, row
+    /// keys, field ids and grants are all keyed by [`TableId`], and an id is exactly what is
+    /// staying put here. A name is the only thing either table had that the other now has.
+    pub fn exchange_tables(&mut self, database: DatabaseId, a: &str, b: &str) -> Result<bool> {
+        let by_name = self.table_ids.entry(database).or_default();
+        let (Some(&ia), Some(&ib)) = (by_name.get(a), by_name.get(b)) else {
+            return Ok(false);
+        };
+        // Exchanging a table with itself is the change it describes: none. Answered as done
+        // rather than refused, because the statement is satisfiable and already satisfied.
+        if ia == ib {
+            return Ok(true);
+        }
+        by_name.insert(a.to_string(), ib);
+        by_name.insert(b.to_string(), ia);
+        if let Some(t) = self.tables.get_mut(&ia) {
+            t.name = b.to_string();
+        }
+        if let Some(t) = self.tables.get_mut(&ib) {
+            t.name = a.to_string();
+        }
+        Ok(true)
+    }
+
     /// Removes a table, its fields, its row keys and its fragment metadata.
     ///
     /// Returns every `FragmentKey` that was registered under it, because those are exactly the

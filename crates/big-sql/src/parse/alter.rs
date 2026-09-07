@@ -45,6 +45,24 @@ impl Parser<'_> {
         self.i += 1;
         let (database, table) = self.table_ref("a table name")?;
 
+        // `RENAME TO` before the change loop, because it is not one of the changes: the loop
+        // composes clauses against one table, and this replaces the table's own name. Two of
+        // them in one list would be a list where only the last entry meant anything.
+        //
+        // `AS` is read beside `TO` for the reason `DOUBLE PRECISION` is read beside `DOUBLE` -
+        // it is a word that says what was already meant, and MySQL writes it. `RENAME COLUMN`
+        // does not reach here: it has no `TO` in second position, so it falls to `alter_change`
+        // and the refusal that is about a field's name.
+        if self.word_is("RENAME") && (self.word_at_is(1, "TO") || self.word_at_is(1, "AS")) {
+            self.i += 2;
+            // Bare, and a qualified name is a syntax error rather than a refusal: a rename that
+            // also moved the table across databases is not a construct with a sentence to write,
+            // it is a shape this grammar does not have. See `Ddl::RenameTable`.
+            let to = self.bare_ident("a new table name")?;
+            self.end_of_statement()?;
+            return Ok(crate::ddl::Ddl::RenameTable { database, table, to });
+        }
+
         let mut changes = Vec::new();
         loop {
             changes.push(self.alter_change()?);
@@ -217,5 +235,35 @@ impl Parser<'_> {
             return Err(self.syntax("the end of the statement"));
         }
         Ok(crate::ddl::Ddl::TruncateTable { database, table, if_exists })
+    }
+
+    /// `EXCHANGE TABLES <a> AND <b>`, with `EXCHANGE` already consumed.
+    ///
+    /// `TABLES` is required, unlike `TRUNCATE`'s optional `TABLE`: there the word decides
+    /// nothing because there is one kind of object, and here it is the whole of what tells
+    /// `EXCHANGE` apart from a column called `exchange`.
+    pub(super) fn exchange_tables(&mut self) -> Result<crate::ddl::Ddl> {
+        self.expect_word("TABLES", "TABLES after EXCHANGE")?;
+        let (da, a) = self.table_ref("a table name")?;
+        self.expect_word("AND", "AND between the two tables")?;
+        let (db, b) = self.table_ref("a table name")?;
+
+        // One database, and the disagreement is a syntax error rather than a refusal for the
+        // reason a qualified rename target is: swapping two names across databases is not a
+        // construct this grammar has a shape for, so there is no sentence about what to write
+        // instead beyond writing it the way it is written.
+        //
+        // Only an *explicit* pair is compared. A bare name means the request's database, which
+        // is filled in later by `fill_database` and is the same one for both.
+        let database = match (da, db) {
+            (Some(x), Some(y)) if !x.eq_ignore_ascii_case(&y) => {
+                return Err(self.syntax("both tables in one database"))
+            }
+            (Some(x), _) | (None, Some(x)) => Some(x),
+            (None, None) => None,
+        };
+
+        self.end_of_statement()?;
+        Ok(crate::ddl::Ddl::ExchangeTables { database, a, b })
     }
 }

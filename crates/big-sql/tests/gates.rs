@@ -254,6 +254,10 @@ fn what_a_statement_demands_agrees_with_the_word_it_opens_with() {
             "DROP" => demanded.contains(&Privilege::Drop) || demanded.contains(&Privilege::Roles),
             // The same privilege a drop takes, because what it costs the caller is the data.
             "TRUNCATE" => demanded.contains(&Privilege::Drop),
+            // `Drop` on *both* tables, because after the swap either one's data is unreachable
+            // under the name it was written to - which is the whole of what an exchange can cost
+            // anybody, and is why it is not the `Alter` its `ALTER TABLE` sibling takes.
+            "EXCHANGE" => demanded.iter().all(|p| *p == Privilege::Drop) && demanded.len() == 2,
             // And `Select` too when the filter reads another table, which is why this is a
             // `contains` rather than an equality.
             "DELETE" => demanded.contains(&Privilege::Delete),

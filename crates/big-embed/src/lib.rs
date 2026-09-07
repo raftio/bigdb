@@ -1179,6 +1179,24 @@ impl<P: PagerMut + Sync> Api<P> {
         Ok(self.db.truncate_table(table)?)
     }
 
+    /// Gives a table a different name, moving nothing else.
+    ///
+    /// `Ok(false)` means there was no such table. See [`big_db::Db::rename_table`]: a name is a
+    /// key in the catalog and an id is what everything below resolves by, so this costs one
+    /// record whatever the table holds.
+    pub fn rename_table(&self, table: &str, to: &str) -> Result<bool> {
+        Ok(self.db.rename_table(table, to)?)
+    }
+
+    /// Swaps the names of two tables in one transaction.
+    ///
+    /// `Ok(false)` means one of them was not there, and then neither moved. See
+    /// [`big_db::Db::exchange_tables`] - this is the step that makes a rebuild atomic, and it
+    /// leaves the old table under the other name rather than dropping it.
+    pub fn exchange_tables(&self, a: &str, b: &str) -> Result<bool> {
+        Ok(self.db.exchange_tables(a, b)?)
+    }
+
     /// Drops a time-quantum field's index for every period wholly before an instant.
     ///
     /// **It drops the index, not the records**, and the difference is the whole reason this is

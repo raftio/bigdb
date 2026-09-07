@@ -547,6 +547,14 @@ pub fn ddl(ddl: &Ddl) -> String {
             qualified(database, table),
             if *if_exists { " if_exists" } else { "" },
         ),
+        // The new name is printed bare, because bare is what it is: it lands in the database the
+        // table is already in, and qualifying it here would print a move that cannot be written.
+        Ddl::RenameTable { database, table, to } => {
+            format!("RenameTable {} to {to}", qualified(database, table))
+        }
+        Ddl::ExchangeTables { database, a, b } => {
+            format!("ExchangeTables {} and {}", qualified(database, a), qualified(database, b))
+        }
         Ddl::AlterTable { database, table, changes } => {
             let mut out = format!("AlterTable {}", qualified(database, table));
             let kids: Vec<Line> = changes
@@ -681,6 +689,7 @@ pub fn show(show: &Show) -> String {
             None => "Views".to_string(),
         },
         Shown::Databases => "Databases".to_string(),
+        Shown::Numbers { n } => format!("Numbers {n}"),
         Shown::Processlist => "Processlist".to_string(),
         Shown::Roles => "Roles".to_string(),
         Shown::Grants { role } => match role {

@@ -26,6 +26,14 @@ construct that is refused today may be answered later, which is a widening no cl
 broken by. `big-sql` itself is an internal crate and its types are free to move; what is
 promised is the statements and the codes, not the AST behind them.
 
+**A refusal may also *narrow*, and `sql_no_rename` is the first that has.** It used to cover a
+table's name and a field's; a table is reached below the catalog by an interned id, so
+`ALTER TABLE t RENAME TO u` became a statement and the refusal kept the half that is still true.
+That is the same widening the clause above allows - a construct refused yesterday is answered
+today - and it is worth naming separately only because the code did not disappear: a client
+branching on `sql_no_rename` still gets it, for `RENAME COLUMN`, and its sentence now says which
+of the two it is about.
+
 **`bigctl`'s command surface follows `big-http`.** A subcommand that works today works next
 release, and the exit codes do not change meaning: `0` answered, `1` refused, `2` usage, `3`
 nothing listening - a script branches on those. `--format tsv` is stable because scripts parse

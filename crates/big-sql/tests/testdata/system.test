@@ -151,3 +151,99 @@ error
 SELECT * FROM system.tables WHERE database > 'a'
 ----
 sql_system_clause
+
+## `numbers(n)`: a `FROM` that names no table.
+#
+# The same fork on the same lookahead, for the same reason - `*` is the one column here, where
+# over a table it is the record id. And the same kind of answer: rows built at the coordinator
+# with no plan behind them, which is why it is a `Shown` rather than the first query whose
+# `calls` list is empty.
+
+show
+SELECT * FROM numbers(10)
+----
+Numbers 10
+
+show
+SELECT number FROM numbers(3)
+----
+Numbers 3
+
+show
+SELECT * FROM numbers(0)
+----
+Numbers 0
+
+# `FORMAT` is the one clause it takes, the way a system view does.
+show
+SELECT * FROM numbers(5) FORMAT TSV
+----
+Numbers 5 format=tsv
+
+# A ceiling and not a clamp: there is no `EXPLAIN` line here that would say which of the two
+# happened, which is the reason a `SETTINGS` value is allowed to be clamped silently and this
+# is not.
+error
+SELECT * FROM numbers(10001)
+----
+sql_numbers_too_large
+
+# Without the bracket it is a table somebody called `numbers` - see the claim
+# `a_bare_numbers_is_still_a_table_name`, which is where that is asserted: the stub schema these
+# cases resolve against has no such table, so it cannot be planned here.
+
+# Every other clause is refused at the word that names it, including `SETTINGS` - which bounds a
+# query and could not bound this, so accepting it would be the silent ignore `Refused::Setting`
+# exists to prevent.
+error
+SELECT * FROM numbers(10) WHERE number > 5
+----
+sql_system_clause
+
+error
+SELECT * FROM numbers(10) ORDER BY number
+----
+sql_system_clause
+
+error
+SELECT * FROM numbers(10) LIMIT 3
+----
+sql_system_clause
+
+error
+SELECT * FROM numbers(10) SETTINGS max_result_rows = 3
+----
+sql_system_clause
+
+# One column, and it is called `number`.
+error
+SELECT nope FROM numbers(10)
+----
+sql_system_clause
+
+error
+SELECT count(*) FROM numbers(10)
+----
+sql_system_clause
+
+## The other table functions, refused by name with the one that works named back.
+
+error
+SELECT * FROM s3('s3://bucket/x.parquet')
+----
+sql_no_table_function
+
+error
+SELECT * FROM url('https://example.com/x.csv')
+----
+sql_no_table_function
+
+error
+SELECT * FROM file('x.csv')
+----
+sql_no_table_function
+
+error
+SELECT * FROM generateRandom()
+----
+sql_no_table_function

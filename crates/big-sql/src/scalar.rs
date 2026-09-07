@@ -382,6 +382,35 @@ pub enum Func {
     ToMinute,
     /// `toSecond(ts)`
     ToSecond,
+
+    // ---- json -------------------------------------------------------------------------
+    //
+    // **These read a `TEXT` column, and there is no `JSON` type behind them.** A keyed column
+    // holds a string; this family reads a key out of that string on its way into a cell, which
+    // is what every other scalar here does with the value it is given. So no `Datum` variant is
+    // added, no storage changes, and a document stays a document.
+    //
+    // One level of key, named as a plain string - not a path. A path language is a second
+    // grammar to keep in step with somebody else's, and the argument against it is the one
+    // `sql_no_regex` makes: the scanner underneath is a few hundred bytes, and a full pointer
+    // syntax is a dependency and a class of pathological input to go with it.
+    /// `JSONExtractString(json, key)` - the key's value as text, unquoted.
+    JsonExtractString,
+    /// `JSONExtractInt(json, key)` - the key's value as a whole number.
+    JsonExtractInt,
+    /// `JSONExtractFloat(json, key)` - the key's value as a real.
+    JsonExtractFloat,
+    /// `JSONExtractRaw(json, key)` - the key's value as it was written, brackets and all.
+    ///
+    /// The one that answers for a nested object or an array: it hands back the text, which the
+    /// next call can read a key out of in turn. That is what one level of key buys without a
+    /// path language to go with it.
+    JsonExtractRaw,
+    /// `JSONHas(json, key)` - 1 when the key is there, 0 when it is not.
+    ///
+    /// A number rather than a boolean because a cell here is a [`big_plan::Literal`]-shaped
+    /// thing and there is no boolean among them, which is also what ClickHouse answers with.
+    JsonHas,
 }
 
 impl Func {
@@ -457,6 +486,19 @@ impl Func {
             ("toHour", Func::ToHour),
             ("toMinute", Func::ToMinute),
             ("toSecond", Func::ToSecond),
+            // Both the ClickHouse spelling and the lower-case one somebody will type. The
+            // `json_query` alias is the standard's name for what `JSONExtractRaw` does.
+            ("JSONExtractString", Func::JsonExtractString),
+            ("json_extract_string", Func::JsonExtractString),
+            ("JSONExtractInt", Func::JsonExtractInt),
+            ("json_extract_int", Func::JsonExtractInt),
+            ("JSONExtractFloat", Func::JsonExtractFloat),
+            ("json_extract_float", Func::JsonExtractFloat),
+            ("JSONExtractRaw", Func::JsonExtractRaw),
+            ("json_extract_raw", Func::JsonExtractRaw),
+            ("json_query", Func::JsonExtractRaw),
+            ("JSONHas", Func::JsonHas),
+            ("json_has", Func::JsonHas),
         ];
         NAMES.iter().find(|(n, _)| name.eq_ignore_ascii_case(n)).map(|(_, f)| *f)
     }
@@ -491,6 +533,12 @@ impl Func {
             | Self::ToHour
             | Self::ToMinute
             | Self::ToSecond => (1, Some(1)),
+
+            Self::JsonExtractString
+            | Self::JsonExtractInt
+            | Self::JsonExtractFloat
+            | Self::JsonExtractRaw
+            | Self::JsonHas => (2, Some(2)),
 
             Self::Round => (1, Some(2)),
 
@@ -569,6 +617,11 @@ impl Func {
             Self::ToHour => "toHour",
             Self::ToMinute => "toMinute",
             Self::ToSecond => "toSecond",
+            Self::JsonExtractString => "JSONExtractString",
+            Self::JsonExtractInt => "JSONExtractInt",
+            Self::JsonExtractFloat => "JSONExtractFloat",
+            Self::JsonExtractRaw => "JSONExtractRaw",
+            Self::JsonHas => "JSONHas",
         }
     }
 

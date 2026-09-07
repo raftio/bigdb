@@ -384,11 +384,9 @@ ALTER TABLE t CHANGE a b BIGINT
 ----
 sql_no_alter_column
 
-error
-ALTER TABLE t RENAME TO u
-----
-sql_no_rename
-
+# `ALTER TABLE t RENAME TO u` used to be here. It is a statement now - a table is reached by an
+# interned id, so its name is one catalog record - and it lives in ddl.test. What stayed is the
+# half that is still true: a field's name is what routes a fact to a bitmap.
 error
 ALTER TABLE t RENAME COLUMN a TO b
 ----
@@ -1198,3 +1196,165 @@ error
 ALTER TABLE t COMPACT
 ----
 sql_no_optimize
+
+## The P2 tier, refused by name rather than left to fall off the grammar.
+#
+# Each of these is a construct with a real question behind it, and what the sentence carries is
+# the local spelling for that question - not the news that a feature is absent. Where there is no
+# local spelling, it says which decision the absence follows from.
+
+## Sampling. There is no rank-select over a container, and the units that *are* cheap to skip
+## whole are windows of write order rather than random subsets.
+
+error
+SELECT count(*) FROM t SAMPLE 0.1
+----
+sql_no_sample
+
+error
+SELECT count(*) FROM t SAMPLE 0.1 WHERE amount > 5
+----
+sql_no_sample
+
+error
+CREATE TABLE t (a SET) SAMPLE BY a
+----
+sql_no_sample
+
+## Writes that are two operations wearing one word.
+
+error
+INSERT OVERWRITE TABLE t SELECT a FROM u
+----
+sql_no_overwrite
+
+error
+INSERT OVERWRITE t VALUES (1)
+----
+sql_no_overwrite
+
+error
+COPY INTO t FROM 's3://bucket/x.parquet'
+----
+sql_no_copy_into
+
+## A table with no session to be temporary to.
+
+error
+CREATE TEMPORARY TABLE t (a SET)
+----
+sql_no_temporary_table
+
+error
+CREATE TEMP TABLE t (a SET)
+----
+sql_no_temporary_table
+
+## Layout clauses. A shard is `record_id >> 20`, so distribution is computed rather than declared.
+
+error
+CREATE TABLE t (a SET) PARTITION BY a
+----
+sql_no_distribution
+
+error
+CREATE TABLE t (a SET) DISTRIBUTED BY HASH(a) BUCKETS 32
+----
+sql_no_distribution
+
+error
+CREATE TABLE t (a SET) CLUSTER BY a
+----
+sql_no_distribution
+
+## Computed columns, which are computed at two different moments and have two different answers.
+
+error
+CREATE TABLE t (a SET, b SET MATERIALIZED a)
+----
+sql_computed_column
+
+error
+CREATE TABLE t (a SET, b SET ALIAS a)
+----
+sql_computed_column
+
+## Types. A composite has nowhere to live; an enum has somewhere already.
+
+error
+CREATE TABLE t (a Array(String))
+----
+sql_composite_type
+
+error
+CREATE TABLE t (a Map(String, Int64))
+----
+sql_composite_type
+
+error
+CREATE TABLE t (a Tuple(String, Int64))
+----
+sql_composite_type
+
+# Refused at the word, so a bracket this parser could not read still says the sentence about
+# arrays rather than a syntax error about what is inside one.
+error
+CREATE TABLE t (a Array(Decimal(10, 2)))
+----
+sql_composite_type
+
+error
+CREATE TABLE t (a Enum8('a' = 1, 'b' = 2))
+----
+sql_enum_type
+
+error
+CREATE TABLE t (a Enum16('a' = 1))
+----
+sql_enum_type
+
+## Expanding a repeated column, which a keyed column already does under `GROUP BY`.
+
+error
+SELECT count(*) FROM t ARRAY JOIN country
+----
+sql_no_array_join
+
+error
+SELECT count(*) FROM t LATERAL VIEW explode(country) x
+----
+sql_no_array_join
+
+error
+SELECT count(*) FROM t UNNEST(country)
+----
+sql_no_array_join
+
+## The array function family, each with a spelling over a `SET`.
+
+error
+SELECT arrayMap(x -> x * 2, country) FROM t
+----
+sql_array_function
+
+error
+SELECT arraySum(country) FROM t
+----
+sql_array_function
+
+error
+SELECT arrayDistinct(country) FROM t
+----
+sql_array_function
+
+error
+SELECT has(country, 'GB') FROM t
+----
+sql_array_function
+
+# `groupArray` is deliberately *not* in this family: it asks for a list of values as one cell,
+# which is a row, and that is the refusal it already carries above.
+error
+SELECT groupArray(country) FROM t
+----
+sql_unsupported

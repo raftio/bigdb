@@ -84,7 +84,7 @@ pub use shape::{
     Absent, Answer, Cell, Columns, Cut, Format, Frame, GroupOrder, Having, JoinSide, Keying, Of,
     Operand, OrderBy, Pairing, Selected, Selection, Shape, Threshold, Units, WinFunc,
 };
-pub use show::{Show, Shown, SystemView};
+pub use show::{Show, Shown, SystemView, MAX_NUMBERS};
 pub use update::Update;
 
 /// One statement, translated.
@@ -238,7 +238,11 @@ impl Sql {
                     out.push(Demand::new(Privilege::Select, table_ref(database.as_deref(), table)));
                 }
                 // Listings of names. See the note above.
-                Shown::Tables { .. } | Shown::Views { .. } | Shown::Databases => {}
+                // Listings of names, and one sequence that reads no schema at all.
+                Shown::Tables { .. }
+                | Shown::Views { .. }
+                | Shown::Databases
+                | Shown::Numbers { .. } => {}
                 // Somebody else's privileges is an administrative question; your own is not.
                 Shown::Grants { role: Some(_) } | Shown::Roles => {
                     out.push(Demand::server(Privilege::Roles));
@@ -256,7 +260,7 @@ impl Sql {
                 // that guards operating the process, which is what this is a view of.
                 Shown::Processlist => out.push(Demand::server(Privilege::Operate)),
             },
-            Self::Ddl(ddl) => out.push(ddl_demand(ddl)),
+            Self::Ddl(ddl) => ddl_demands(ddl, out),
             // Stopping somebody else's query is operating the server, which is what
             // `Privilege::Operate` guards. A rule that let a caller kill *their own* without it
             // cannot be written here: `demands` is static and does not know whose query an id
@@ -305,28 +309,53 @@ impl Sql {
     }
 }
 
-/// The object a `Ddl` is about, and the privilege it needs over it.
-fn ddl_demand(ddl: &Ddl) -> Demand<'_> {
+/// The objects a `Ddl` is about, and the privilege it needs over each.
+///
+/// Almost every variant is one demand over one object. The two that are not are the two that
+/// name a second name: a rename creates one, and an exchange changes what both of them resolve
+/// to. Writing them as several demands rather than inventing a privilege for them is the same
+/// choice `UPDATE` makes one enum up - `Privilege::ALL` is a bitmask already stored in every
+/// catalog, so a ninth entry is a format change and two demands are not.
+fn ddl_demands<'a>(ddl: &'a Ddl, out: &mut Vec<Demand<'a>>) {
     match ddl {
         // A database is not *in* a database, so creating or dropping one is about the server.
-        Ddl::CreateDatabase { .. } => Demand::server(Privilege::Create),
-        Ddl::DropDatabase { .. } => Demand::server(Privilege::Drop),
+        Ddl::CreateDatabase { .. } => out.push(Demand::server(Privilege::Create)),
+        Ddl::DropDatabase { .. } => out.push(Demand::server(Privilege::Drop)),
         // Creating is granted a level up from the thing created: there is no table yet to hold
         // the privilege, so it is held over the database that will hold the table.
         Ddl::CreateTable { database, .. } | Ddl::CreateView { database, .. } => {
-            Demand::new(Privilege::Create, database_ref(database.as_deref()))
+            out.push(Demand::new(Privilege::Create, database_ref(database.as_deref())));
         }
         Ddl::AlterTable { database, table, .. } => {
-            Demand::new(Privilege::Alter, table_ref(database.as_deref(), table))
+            out.push(Demand::new(Privilege::Alter, table_ref(database.as_deref(), table)));
         }
         // `Drop` and not `Alter`, because what it costs the caller is the data. `Privilege::Drop`
         // is documented as the one that destroys, and emptying a table destroys exactly as much
         // as dropping it - the declaration that survives is not the part anybody minds losing.
         Ddl::DropTable { database, table, .. } | Ddl::TruncateTable { database, table, .. } => {
-            Demand::new(Privilege::Drop, table_ref(database.as_deref(), table))
+            out.push(Demand::new(Privilege::Drop, table_ref(database.as_deref(), table)));
         }
         Ddl::DropView { database, name, .. } => {
-            Demand::new(Privilege::Drop, table_ref(database.as_deref(), name))
+            out.push(Demand::new(Privilege::Drop, table_ref(database.as_deref(), name)));
+        }
+        // **Both, because both is what it does.** A rename gives the table a name that did not
+        // exist, which is a creation in that database, and it takes away the one it had, which
+        // is the alteration. Holding `Alter` alone would let a caller move a table out from
+        // under every statement that reads it by name without ever being granted the right to
+        // put a name into the database.
+        Ddl::RenameTable { database, table, .. } => {
+            out.push(Demand::new(Privilege::Alter, table_ref(database.as_deref(), table)));
+            out.push(Demand::new(Privilege::Create, database_ref(database.as_deref())));
+        }
+        // `Drop` on **both**, and it is the honest reading rather than the strict one. After the
+        // swap each name resolves to the other table, so whoever runs it can make either
+        // table's data unreachable under the name it was written to - which is what `Drop`
+        // guards, and it is the whole of what this can cost anybody. Demanding it on both is
+        // what stops a caller with rights over their own table swapping it against one they may
+        // only read.
+        Ddl::ExchangeTables { database, a, b } => {
+            out.push(Demand::new(Privilege::Drop, table_ref(database.as_deref(), a)));
+            out.push(Demand::new(Privilege::Drop, table_ref(database.as_deref(), b)));
         }
     }
 }

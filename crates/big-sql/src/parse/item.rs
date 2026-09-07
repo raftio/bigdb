@@ -430,7 +430,7 @@ pub(super) fn is_regex_call(name: &str) -> bool {
 /// `OVER` follows, and are converted where that `OVER` is read. Splitting the two lists is what
 /// keeps `sum(amount)` parsing exactly as it always did.
 fn ranking_of(name: &str) -> Option<WinFunc> {
-    const NAMES: [(&str, WinFunc); 11] = [
+    const NAMES: [(&str, WinFunc); 13] = [
         ("row_number", WinFunc::RowNumber),
         ("rank", WinFunc::Rank),
         ("dense_rank", WinFunc::DenseRank),
@@ -442,6 +442,11 @@ fn ranking_of(name: &str) -> Option<WinFunc> {
         ("first_value", WinFunc::FirstValue),
         ("last_value", WinFunc::LastValue),
         ("nth_value", WinFunc::NthValue),
+        // A difference against two of a column's values, so it reads a column and needs the
+        // order the difference is taken along - which puts it in this list rather than among
+        // the aggregates, whose `OVER` must *not* carry one.
+        ("runningDifference", WinFunc::RunningDifference),
+        ("running_difference", WinFunc::RunningDifference),
     ];
     NAMES.iter().find(|(n, _)| name.eq_ignore_ascii_case(n)).map(|(_, f)| *f)
 }
@@ -582,6 +587,38 @@ pub(super) fn unsupported_call(name: &str) -> Refused {
         "approx_top_k",
     ];
 
+    /// The row-sequence family: one that has a local spelling, three that need a frame.
+    ///
+    /// `runningDifference` is deliberately absent - it is a window function here, and putting
+    /// it on this list would refuse the thing that works.
+    const SEQUENCES: [&str; 6] = [
+        "neighbor",
+        "sequenceMatch",
+        "sequence_match",
+        "windowFunnel",
+        "window_funnel",
+        "retention",
+    ];
+
+    if SEQUENCES.iter().any(|c| name.eq_ignore_ascii_case(c)) {
+        return Refused::SequenceFunction;
+    }
+    /// The array family, whose members all have a spelling over a keyed column.
+    ///
+    /// The `array*` prefix is checked rather than listed, because it composes with every
+    /// higher-order name there is and a list would be that many entries saying one thing. What
+    /// is listed are the ones that do not carry it.
+    ///
+    /// **`groupArray` is deliberately not here.** It asks for a *row* - a list of values as one
+    /// cell - which is the refusal `Refused::Unsupported` already carries and the one the
+    /// corpus header names it under. `explode` and `unnest` are the `ARRAY JOIN` clause and are
+    /// refused where that clause is.
+    const ARRAYS: [&str; 4] = ["has", "hasAll", "hasAny", "indexOf"];
+    if name.len() > 5 && name[..5].eq_ignore_ascii_case("array")
+        || ARRAYS.iter().any(|c| name.eq_ignore_ascii_case(c))
+    {
+        return Refused::ArrayFunction;
+    }
     // Checked before the casts, because `to_bitmap` reads like a conversion and is not one:
     // what it names is already how the fact was written, so the sentence it needs is the
     // mapping rather than the one about representations that do not convert.

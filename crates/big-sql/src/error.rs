@@ -218,8 +218,14 @@ pub enum Refused {
     /// `MODIFY`, `ALTER COLUMN` or `CHANGE`: a field's kind and depth are what its bit planes
     /// are, and there is no operation below that changes either.
     AlterKind,
-    /// `RENAME`, on a table or a column. Names are what resolve a fact all the way down, and
-    /// nothing below renames one.
+    /// `RENAME COLUMN`. A field's name is what routes a fact to a bitmap, and nothing below
+    /// renames one.
+    ///
+    /// **A table's name is not the same case, and this used to say it was.** A table is reached
+    /// through an interned id - fragments, row keys, field ids and grants are all keyed by it -
+    /// so its name is one catalog record and `ALTER TABLE t RENAME TO u` changes that record.
+    /// This refusal narrowed to the half that is still true rather than disappearing, which is
+    /// the widening `docs/versioning.md` allows.
     Rename,
     /// `ALTER TABLE ... ENGINE =`, which asks a table to store something else than it does.
     AlterEngine,
@@ -376,6 +382,79 @@ pub enum Refused {
     ///
     /// Compaction exists and is whole-file, because there are no parts to merge.
     Optimize,
+    /// `s3(...)`, `url(...)`, `file(...)`, `generateRandom()` in a `FROM`.
+    ///
+    /// Reading an external source is a catalog this build has not got, and generating typed
+    /// rows needs a generator it has not got either. `numbers(n)` is the one table function
+    /// here, and it is named in the sentence so the refusal points at what does work.
+    TableFunction,
+    /// `numbers(n)` for an `n` past [`crate::MAX_NUMBERS`].
+    ///
+    /// **Refused with the number rather than clamped**, unlike a `SETTINGS` value. The clamp is
+    /// allowed to be silent there because `EXPLAIN` prints the figure actually applied; a
+    /// `Show` has no such line, so a quiet ceiling would be a different answer wearing the
+    /// right shape.
+    NumbersTooLarge,
+    /// `neighbor`, `sequenceMatch`, `windowFunnel`, `retention`: the row-sequence family.
+    ///
+    /// One code with a mapping in the sentence, the way [`Self::BitmapFunction`] carries one:
+    /// these are one family of questions, and what each needs is a different local spelling
+    /// rather than a different kind of answer.
+    SequenceFunction,
+    /// `SAMPLE 0.1` after a `FROM`, or `SAMPLE BY expr` in a `CREATE TABLE`.
+    ///
+    /// There is no rank-select over a roaring container, so there is no way to take every tenth
+    /// matching record without decoding the ones in between. What is cheap is a *container* or a
+    /// shard, and neither is a random subset: record ids are handed out in write order, so a
+    /// container is a window of time wearing the shape of a sample.
+    Sample,
+    /// `INSERT OVERWRITE`.
+    ///
+    /// It is a truncate and an insert, and nothing here wraps two of those in one transaction -
+    /// so a statement that looked atomic would not be, which is worse than two that do not.
+    Overwrite,
+    /// `COPY INTO t FROM 's3://...'`.
+    CopyInto,
+    /// `CREATE TEMPORARY TABLE`.
+    ///
+    /// There is no session for one to be temporary *to*: `POST /sql` answers a statement and
+    /// forgets everything, which is the decision [`Self::SessionUse`] and
+    /// [`Self::SessionSetting`] both rest on.
+    TemporaryTable,
+    /// `PARTITION BY`, `DISTRIBUTED BY ... BUCKETS n`, `CLUSTER BY`.
+    ///
+    /// Distribution here is not declared, it is computed: a shard is `record_id >> 20`, so it
+    /// falls out of the id a record was written under. A bucket count nothing reads would be the
+    /// empty promise [`Self::Setting`] refuses a setting for.
+    Distribution,
+    /// A column declared as `MATERIALIZED expr` or `ALIAS expr`.
+    ///
+    /// Both are computed columns, and they are computed at opposite ends: one at write time,
+    /// which is the materialised view this build has not got, and one at read time, which is
+    /// what a `VIEW` here already is.
+    ComputedColumn,
+    /// `Array(T)`, `Map(K, V)`, `Tuple(...)`, `Nested(...)`.
+    ///
+    /// Every stored value here is a `u64` from the write path down to the codec. But a keyed
+    /// column already holds *many* values for one record, which is the thing an array of strings
+    /// is for - so the sentence points there rather than reporting an absence.
+    CompositeType,
+    /// `Enum8(...)`, `Enum16(...)`.
+    ///
+    /// The storage an enum wants is what `MUTEX` already is: one value per record over an
+    /// interned dictionary. What is missing is the declared list of members, and nothing below
+    /// the catalog could enforce one.
+    EnumType,
+    /// `ARRAY JOIN`, `LATERAL VIEW explode(...)`, `UNNEST(...)`.
+    ///
+    /// The row-per-element shape it produces is what `GROUP BY <keyed column>` already produces,
+    /// and by walking a dictionary rather than multiplying rows.
+    ArrayJoin,
+    /// `arrayMap`, `has`, `arrayExists`, and the lambdas that go inside them.
+    ///
+    /// One code with a mapping in the sentence, the way [`Self::BitmapFunction`] carries one:
+    /// each of these names a question a keyed column answers under a different word.
+    ArrayFunction,
 }
 
 impl Refused {
@@ -389,7 +468,7 @@ impl Refused {
     /// Kept honest by [`Refused::rank`] below, whose exhaustive match will not compile until a
     /// new variant is named - and by a test asserting that every rank appears here exactly once,
     /// which is what catches naming one and forgetting to add it.
-    pub const ALL: [Self; 84] = [
+    pub const ALL: [Self; 97] = [
         Self::Joins,
         Self::OuterJoin,
         Self::JoinOn,
@@ -474,6 +553,19 @@ impl Refused {
         Self::Regex,
         Self::Analyze,
         Self::Optimize,
+        Self::TableFunction,
+        Self::NumbersTooLarge,
+        Self::SequenceFunction,
+        Self::Sample,
+        Self::Overwrite,
+        Self::CopyInto,
+        Self::TemporaryTable,
+        Self::Distribution,
+        Self::ComputedColumn,
+        Self::CompositeType,
+        Self::EnumType,
+        Self::ArrayJoin,
+        Self::ArrayFunction,
     ];
 
     /// Where this refusal sits in [`Refused::ALL`], and the reason that list can be trusted.
@@ -569,6 +661,19 @@ impl Refused {
             Self::Regex => 81,
             Self::Analyze => 82,
             Self::Optimize => 83,
+            Self::TableFunction => 84,
+            Self::NumbersTooLarge => 85,
+            Self::SequenceFunction => 86,
+            Self::Sample => 87,
+            Self::Overwrite => 88,
+            Self::CopyInto => 89,
+            Self::TemporaryTable => 90,
+            Self::Distribution => 91,
+            Self::ComputedColumn => 92,
+            Self::CompositeType => 93,
+            Self::EnumType => 94,
+            Self::ArrayJoin => 95,
+            Self::ArrayFunction => 96,
         }
     }
 
@@ -589,6 +694,19 @@ impl Refused {
             Self::Regex => "sql_no_regex",
             Self::Analyze => "sql_no_analyze",
             Self::Optimize => "sql_no_optimize",
+            Self::TableFunction => "sql_no_table_function",
+            Self::NumbersTooLarge => "sql_numbers_too_large",
+            Self::SequenceFunction => "sql_no_sequence_function",
+            Self::Sample => "sql_no_sample",
+            Self::Overwrite => "sql_no_overwrite",
+            Self::CopyInto => "sql_no_copy_into",
+            Self::TemporaryTable => "sql_no_temporary_table",
+            Self::Distribution => "sql_no_distribution",
+            Self::ComputedColumn => "sql_computed_column",
+            Self::CompositeType => "sql_composite_type",
+            Self::EnumType => "sql_enum_type",
+            Self::ArrayJoin => "sql_no_array_join",
+            Self::ArrayFunction => "sql_array_function",
             Self::SetTooLarge => "sql_set_too_large",
             Self::ExplainSet => "sql_explain_set",
             Self::Segment => "sql_segment_unexpanded",
@@ -1003,7 +1121,10 @@ impl Refused {
                  fragment, `min`, `max`, `bit_depth` and whether it holds values, written as facts are and \
                  therefore never stale; it is already readable as `SELECT * FROM system.parts`. `EXPLAIN \
                  <statement>` is the whole of what this surface says about a statement, and it says it without \
-                 running one"
+                 running one. And `EXPLAIN ANALYZE` in the other sense - run it, then report \
+                 what it cost - is absent for a second reason worth separating from the first: \
+                 the numbers exist per node, but nothing carries them back beside the answer \
+                 and nothing says how two nodes' would merge"
             }
             Self::Optimize => {
                 "compaction here is whole-file rather than per part, because there are no parts to merge: a \
@@ -1012,6 +1133,101 @@ impl Refused {
                  operation - `POST /admin/backup` - rather than a statement, because it needs the file's \
                  exclusive lock, which a statement running inside a read does not hold. `SELECT * FROM \
                  system.parts` is what says whether it is worth doing"
+            }
+            Self::TableFunction => {
+                "the one table function here is `numbers(n)`, which counts. Reading an external \
+                 source needs a catalog this build has not got - `s3`, `url` and `file` are the \
+                 external-catalog milestone - and loading data is `POST /table/{t}/import`, \
+                 which streams it in without a statement having to name a path"
+            }
+            Self::NumbersTooLarge => {
+                "`numbers(n)` builds every row at the coordinator before any of them is written \
+                 out, so the count is the only bound there is: `SETTINGS max_result_rows` \
+                 bounds a query, and this is answered from the catalog side without ever \
+                 reaching a read. Ask for fewer, or write the rows into a table and select from \
+                 that"
+            }
+            Self::SequenceFunction => {
+                "`neighbor(x, n)` is `lag(x, n)` backwards and `lead(x, n)` forwards, and this \
+                 dialect writes it as whichever one was meant - one spelling per operation, so \
+                 two cannot come to disagree about which direction a sign means. \
+                 `runningDifference(x)` is here and is `x - lag(x, 1)`. `sequenceMatch`, \
+                 `windowFunnel` and `retention` are not: each is a pattern over a *sliding \
+                 window* of rows, which is the frame `sql_window_frame` refuses, plus a pattern \
+                 language over them. Counting by period is `GROUP BY date_trunc(...)`"
+            }
+            Self::Sample => {
+                "a roaring container has no rank-select, so there is no way to take every tenth \
+                 matching record without decoding the nine in between - and the units that are \
+                 cheap to skip whole, a container and a shard, are not random subsets: record \
+                 ids are handed out in write order, so either one is a window of *time* wearing \
+                 the shape of a sample, and a number drawn from it would be biased in the \
+                 direction nobody checks. For fewer rows write `LIMIT`; for a defined subset \
+                 write a `WHERE` over a column that means something"
+            }
+            Self::Overwrite => {
+                "`TRUNCATE TABLE t` and then `INSERT INTO t SELECT ...` - two statements, \
+                 because they are two operations and nothing here wraps a pair of them in one \
+                 transaction. A single word that read as atomic and was not would be worse than \
+                 the two that admit it. To replace a table's contents *atomically*, write the \
+                 new rows into a second table and `EXCHANGE TABLES` them, which swaps two names \
+                 in one change and leaves the old rows under the other name"
+            }
+            Self::CopyInto => {
+                "loading data is `POST /table/{t}/import`, which streams rows in without a \
+                 statement having to name a path the server can reach. Reading object storage \
+                 from inside a query is an external catalog, and that is a milestone of its own \
+                 rather than a clause"
+            }
+            Self::TemporaryTable => {
+                "there is no session for a table to be temporary to: `POST /sql` answers one \
+                 statement and forgets everything about the caller, which is the same decision \
+                 that refuses `USE` and `SET`. An ordinary `CREATE TABLE` and a `DROP TABLE` \
+                 when you are done is the pair that survives a reconnect, a proxied connection \
+                 and a retry against another node"
+            }
+            Self::Distribution => {
+                "distribution here is computed rather than declared: a shard is `record_id >> \
+                 20`, so which one a record lands in follows from the id it was written under \
+                 and there is nothing for a clause to choose. A bucket count nothing reads would \
+                 be a promise this engine does not keep - the objection `sql_unknown_setting` \
+                 makes to `max_threads`. `SELECT * FROM system.parts` is where the distribution \
+                 that actually happened can be seen"
+            }
+            Self::ComputedColumn => {
+                "a computed column is computed at one of two moments, and each has its own \
+                 answer here. `ALIAS expr` is computed when the column is read, which is what a \
+                 view already is: `CREATE VIEW v AS SELECT <expr> AS <name>, ... FROM t`. \
+                 `MATERIALIZED expr` is computed when the row is written, which is a \
+                 materialised view - and that one this build has not got (`sql_no_materialized \
+                 _views`)"
+            }
+            Self::CompositeType => {
+                "every value stored here is one number wide, from the fact that is written to \
+                 the codec that packs it, so there is nowhere to put a list or a pair. But a \
+                 keyed column already holds *many* values for one record - that is what `SET` \
+                 is - so `Array(String)` is `SET` under another name, and it arrives indexed: \
+                 `has(arr, x)` is `WHERE c = 'x'`, and one row per element is `GROUP BY c`. A \
+                 `Map` or a `Tuple` is two columns"
+            }
+            Self::EnumType => {
+                "`MUTEX` is the storage an enum is asking for: one value per record, interned \
+                 once into a dictionary, so a comparison is a bitmap and not a string. What is \
+                 not here is the declared list of members - nothing below the catalog would \
+                 check a value against one - so the column takes the values it is given"
+            }
+            Self::ArrayJoin => {
+                "one row per element of a repeated column is `GROUP BY <the column>`, which is \
+                 what a keyed column already gives: the elements are its keys, and walking them \
+                 is a walk of the dictionary rather than a multiplication of rows. There is no \
+                 array-valued column here for the clause to expand - see `sql_composite_type`"
+            }
+            Self::ArrayFunction => {
+                "a repeated column here is a `SET`, and each of these has a spelling over one: \
+                 `has(c, x)` is `c = 'x'` in a `WHERE`, `arrayExists` is the same, \
+                 `arrayDistinct`/`arrayUniq` is `count(DISTINCT c)`, `arraySum` is `sum(c)`, \
+                 and one row per element is `GROUP BY c`. A lambda has no collection to walk \
+                 for the same reason - there is no array-valued column (`sql_composite_type`)"
             }
             Self::SystemClause => {
                 "a system view answers in full, and the clause it takes is \
@@ -1107,17 +1323,22 @@ impl Refused {
                  how many bitmaps hold a value, so neither can change without rewriting every \
                  fact ever written to it. Add a second field, copy into it, and drop the first \
                  - which is three statements because it is three changes, not one hidden \
-                 inside a `MODIFY` that would look free"
+                 inside a `MODIFY` that would look free. To rebuild the whole table instead, \
+                 create it beside this one and `EXCHANGE TABLES` them"
             }
             Self::Rename => {
-                "names are what resolve a fact from a client all the way to a bitmap, and \
-                 nothing below this renames one. A new name means a new field or table, the \
-                 facts copied into it, and the old one dropped"
+                "a field's name is what routes a fact to a bitmap, and nothing below this \
+                 renames one: a new name means a new field, the facts copied into it, and the \
+                 old one dropped. A *table* is not reached by name below the catalog - it is \
+                 reached by an interned id, which is why `ALTER TABLE t RENAME TO u` costs one \
+                 record and is a statement this surface has"
             }
             Self::AlterEngine => {
                 "the engine a table stores under is fixed when it is created: it decides what \
                  is written for every fact, and the facts already written were written under \
-                 the old one. Create a second table under the engine you want and copy into it"
+                 the old one. Create a second table under the engine you want, copy into it, \
+                 then `EXCHANGE TABLES old AND new` - which puts it in place in one change and \
+                 leaves the old one under the other name"
             }
             Self::TruncUnit => {
                 "`date_trunc` rounds a moment back to a boundary, and the boundary has to be \
@@ -1168,7 +1389,11 @@ impl Refused {
                  them takes a width in brackets that its name does not \
                  already carry: `FLOAT(10, 2)` is a `DECIMAL(10, 2)`, which keeps those digits \
                  exactly where a float would not. There is nothing here a blob or a JSON \
-                 document lands in"
+                 document lands in - a document is a `TEXT` column, and `JSONExtractString(c, \
+                 'k')` reads a key out of one. Three more names map rather than missing: \
+                 `IPv4` is a `UINT(32)`, which is what an address is; `UUID` and `IPv6` are 128 \
+                 bits where a bit-sliced value stops at 64, so they are `TEXT` - interned once \
+                 and compared as bitmaps, but without the ordering a number would have"
             }
             Self::Constraint => {
                 "a column list here declares fields and nothing else: there are no rows for \

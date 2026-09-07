@@ -76,6 +76,13 @@ impl Parser<'_> {
         }
         let joins = self.joins()?;
 
+        // `FROM t SAMPLE 0.1`. Refused at the word, after the joins so that `SAMPLE` on either
+        // side of one lands here rather than as "expected WHERE". `at_clause_keyword` is what
+        // stops it being eaten as the table's alias before this is reached.
+        if self.word_is("SAMPLE") {
+            return Err(self.refuse(Refused::Sample));
+        }
+
         // `PREWHERE` is ClickHouse's hint to filter on a cheap column before reading the rest
         // of the row. **Here it selects exactly the set `WHERE` would**, because there is no
         // row to read: a record is a set of bits, and an intersection is an intersection
@@ -251,7 +258,15 @@ impl Parser<'_> {
 
     /// One table in `FROM`, with the alias the rest of the statement calls it by.
     pub(super) fn source(&mut self, want: &'static str) -> Result<Source> {
+        let at = self.at();
         let (database, table) = self.table_ref(want)?;
+        // A bracket after an unqualified name in `FROM` position is a table function call, not a
+        // table. `numbers(n)` never reaches here - it forks before the select list is read - so
+        // every call that does is one this build has no source for, and it is refused at the
+        // name rather than left to fail as "expected the end of the statement".
+        if database.is_none() && self.peek() == Some(&Tok::LParen) {
+            return Err(self.refuse_at(Refused::TableFunction, at));
+        }
         // `AS` is optional in SQL and `FROM tx a` is the common spelling. A word here is an
         // alias unless it is a keyword that continues the statement - a table called `where`
         // has to be quoted, which is true of every dialect.
@@ -267,7 +282,15 @@ impl Parser<'_> {
 
     /// Whether the current word begins a clause rather than being an alias.
     pub(super) fn at_clause_keyword(&self) -> bool {
-        const KEYWORDS: [&str; 21] = [
+        const KEYWORDS: [&str; 25] = [
+            // Three that are refused rather than answered, and they have to be *here* as well
+            // as at their refusal: a word this list does not know is read as the table's alias,
+            // so `FROM t SAMPLE 0.1` would take `SAMPLE` for the alias of `t` and then fail on
+            // the number. That is the bug `SETTINGS` had.
+            "SAMPLE",
+            "ARRAY",
+            "LATERAL",
+            "UNNEST",
             "JOIN",
             "INNER",
             "LEFT",
@@ -329,6 +352,15 @@ impl Parser<'_> {
     /// One `JOIN`, or nothing when the next word does not begin one.
     fn join(&mut self) -> Result<Option<Join>> {
         let at = self.at();
+        // Before the join kinds, because `ARRAY JOIN arr` would otherwise read as a table
+        // called `array` and the sentence would be about joins in general rather than about
+        // the clause that was written.
+        if (self.word_is("ARRAY") && self.word_at_is(1, "JOIN"))
+            || (self.word_is("LATERAL") && self.word_at_is(1, "VIEW"))
+            || self.word_is("UNNEST")
+        {
+            return Err(self.refuse(Refused::ArrayJoin));
+        }
         for kw in ["CROSS", "NATURAL"] {
             if self.word_is(kw) {
                 return Err(self.refuse(Refused::Joins));

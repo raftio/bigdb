@@ -314,6 +314,49 @@ TRUNCATE TABLE sales.orders
 ----
 TruncateTable sales.orders
 
+## Renaming a table, and swapping two of them.
+#
+# Both cost catalog records and no data: everything below the catalog is keyed by an interned
+# table id, and the id is exactly what does not move. That is why these are statements while
+# `RENAME COLUMN` is still refused - a field's name is what routes a fact to a bitmap.
+
+ddl
+ALTER TABLE events RENAME TO archive
+----
+RenameTable events to archive
+
+# `AS` beside `TO`, the way MySQL writes it: a word that says what was already meant.
+ddl
+ALTER TABLE events RENAME AS archive
+----
+RenameTable events to archive
+
+# The new name is bare and lands in the database the table is already in. A qualified one is a
+# syntax error rather than a refusal - a rename that moved a table is a shape this grammar does
+# not have, not a construct with something to write instead.
+ddl
+ALTER TABLE sales.orders RENAME TO orders_v2
+----
+RenameTable sales.orders to orders_v2
+
+ddl
+EXCHANGE TABLES events AND archive
+----
+ExchangeTables events and archive
+
+ddl
+EXCHANGE TABLES sales.orders AND sales.orders_v2
+----
+ExchangeTables sales.orders and sales.orders_v2
+
+# One database. Written twice and agreeing is fine; written twice and disagreeing is not a
+# statement this grammar has - so it is `parse_error` and not a refusal, because there is no
+# other way to write what it asked for.
+error
+EXCHANGE TABLES sales.orders AND ops.orders
+----
+parse_error
+
 ## Retention: `DROP DAYS BEFORE`, which is an `ALTER` because it changes what the table's index
 ## holds without changing what the table stores.
 #
