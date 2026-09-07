@@ -680,7 +680,7 @@ sql_scalar_in_filter
 error
 SELECT count(*) FROM t WHERE country SIMILAR TO 'G%'
 ----
-sql_unsupported
+sql_no_regex
 
 error
 SELECT count(*) FROM t WHERE country GLOB 'G*'
@@ -720,12 +720,12 @@ sql_unsupported
 error
 SELECT row_number() OVER () FROM t
 ----
-sql_unsupported
+sql_window_frame
 
 error
 SELECT count(*) OVER (PARTITION BY category) FROM t
 ----
-sql_unsupported
+accepted
 
 error
 SELECT DISTINCT ON (category) category FROM t
@@ -1029,3 +1029,172 @@ error
 KILL QUERY
 ----
 sql_kill_target
+
+## Grouping sets
+#
+# `WITH TOTALS` puts the total beside the rows rather than among them, and a result set here is
+# columns and rows. The ordering and the cut go together because they fail for one reason: the
+# rows are several groupings stacked, so there is no single list to sort or to cut.
+
+error
+SELECT category, count(*) FROM t GROUP BY category WITH TOTALS
+----
+sql_with_totals
+
+error
+SELECT category, country, count(*) FROM t GROUP BY category, country, device, active WITH CUBE
+----
+sql_too_many_grouping_sets
+
+error
+SELECT category, count(*) FROM t GROUP BY category WITH ROLLUP ORDER BY count(*) DESC
+----
+sql_rollup_order
+
+error
+SELECT category, count(*) FROM t GROUP BY category WITH ROLLUP LIMIT 10
+----
+sql_rollup_order
+
+error
+SELECT category, count(*) FROM t GROUP BY GROUPING SETS ((category), (category))
+----
+sql_unsupported
+
+# PostgreSQL's function-call spelling of the same clause, named as a grouping term this surface
+# does not have rather than as a call to a function nobody defined.
+error
+SELECT category, count(*) FROM t GROUP BY ROLLUP(category)
+----
+sql_group_expression
+
+## Window functions
+#
+# The shape refusals come first: a window is over the rows a projection read, and a grouped
+# answer, a tuple grouping and a join are numbers about sets rather than rows.
+
+error
+SELECT category, row_number() OVER (ORDER BY amount) FROM t GROUP BY category
+----
+sql_window_shape
+
+error
+SELECT t.category, row_number() OVER (ORDER BY t.amount) FROM t JOIN u ON t.category = u.category
+----
+sql_window_shape
+
+error
+SELECT *, row_number() OVER (ORDER BY amount) FROM t
+----
+sql_window_shape
+
+# A ranking with nothing to rank by is not a ranking, and an aggregate *with* an ordering is the
+# running total - a frame this surface does not have.
+error
+SELECT row_number() OVER () FROM t
+----
+sql_window_frame
+
+error
+SELECT sum(amount) OVER (PARTITION BY country ORDER BY seen) FROM t
+----
+sql_window_frame
+
+error
+SELECT row_number() OVER (ORDER BY amount ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t
+----
+sql_window_frame
+
+error
+SELECT row_number() OVER (ORDER BY amount RANGE UNBOUNDED PRECEDING) FROM t
+----
+sql_window_frame
+
+# The clause is written where it is used, and there is nowhere else to put it.
+error
+SELECT row_number() OVER w FROM t WINDOW w AS (ORDER BY amount)
+----
+sql_window_named
+
+error
+SELECT country, count(*) FROM t GROUP BY country QUALIFY count(*) > 1
+----
+sql_qualify
+
+# A window name with no `OVER` is a window missing its clause, not a function nobody defined.
+error
+SELECT rank() FROM t
+----
+sql_window_shape
+
+# Numbers about the set beside numbers about rows is two answers of different heights.
+error
+SELECT count(*), row_number() OVER (ORDER BY amount) FROM t
+----
+sql_unsupported
+
+## What this engine already answers under another name
+#
+# None of these four is a gap. Each is a question with an answer here, refused by name so that
+# the answer is what a client reads instead of a sentence about a missing function.
+
+# A sketch has nothing to approximate: a distinct count is a popcount, and the partial result
+# that travels between nodes is the bitmap itself.
+error
+SELECT uniqState(country) FROM t
+----
+sql_sketch
+
+error
+SELECT sumState(amount) FROM t
+----
+sql_sketch
+
+error
+SELECT quantileMerge(amount) FROM t
+----
+sql_sketch
+
+# The pattern language is `LIKE`'s, and it runs over the key dictionary rather than over records.
+error
+SELECT count(*) FROM t WHERE match(country, '^G')
+----
+sql_no_regex
+
+error
+SELECT count(*) FROM t WHERE country REGEXP 'G'
+----
+sql_no_regex
+
+error
+SELECT count(*) FROM t WHERE country RLIKE 'G'
+----
+sql_no_regex
+
+error
+SELECT replaceRegexpAll(country, 'a', 'b') FROM t
+----
+sql_no_regex
+
+# No cost model for statistics to feed. `EXPLAIN ANALYZE` reaches this by recursion, which is
+# the reading that makes the sentence worth writing.
+error
+ANALYZE TABLE t
+----
+sql_no_analyze
+
+error
+EXPLAIN ANALYZE SELECT count(*) FROM t
+----
+sql_no_analyze
+
+# Compaction is whole-file and a server operation, because it needs the file's exclusive lock.
+error
+OPTIMIZE TABLE t
+----
+sql_no_optimize
+
+error
+ALTER TABLE t COMPACT
+----
+sql_no_optimize

@@ -74,24 +74,7 @@ pub(super) fn tuples(
     }
 
     let mut calls = Calls::new(at);
-    let mut measures: Vec<(Measure, Of)> = Vec::new();
-    for item in aggregates {
-        let rows = rows_of(rows, item);
-        let mut args = tuple_args(by, rows);
-        match &item.proj {
-            // A count needs no aggregate argument: a grouping counts its records anyway.
-            Proj::Count => {}
-            Proj::Agg { func, field } => {
-                args.push(named("aggregate", as_expr(call_of(func.call(), vec![field_arg(field)]))))
-            }
-            // Everything else is a second question about the combination rather than a measure
-            // of it: an average is a ratio of two, a distinct count is another column to group
-            // by, and a ranking is one more.
-            _ => return Err(SqlError::Refused { what: Refused::Shape, at: item.at }),
-        }
-        let plan = calls.push(table, call_of("GroupByTuple", args))?;
-        measures.push((measure_of(item), Of::Group { plan, absent: absent_of(item) }));
-    }
+    let measures = tuple_measures(table, rows, by, aggregates, &mut calls)?;
     // Only the keys were asked for: the counts the grouping produces anyway are what a
     // `HAVING count(*)` reads.
     if measures.is_empty() {
@@ -159,12 +142,45 @@ pub(super) fn tuples(
     })
 }
 
+/// What each aggregate in the select list measures over a combination, and which plan answers it.
+///
+/// The pair-grouping counterpart of `grouped::measures_of`, and `pub(super)` for the same reason:
+/// a grouping set of two or more columns *is* this grouping, so `sets` builds one of these per
+/// set against a shared `Calls` rather than keeping a second copy of the rules.
+pub(super) fn tuple_measures(
+    table: &str,
+    rows: &Expr,
+    by: &[Grouping],
+    aggregates: &[&Item],
+    calls: &mut Calls,
+) -> Result<Vec<(Measure, Of)>> {
+    let mut measures: Vec<(Measure, Of)> = Vec::new();
+    for item in aggregates {
+        let rows = rows_of(rows, item);
+        let mut args = tuple_args(by, rows);
+        match &item.proj {
+            // A count needs no aggregate argument: a grouping counts its records anyway.
+            Proj::Count => {}
+            Proj::Agg { func, field } => {
+                args.push(named("aggregate", as_expr(call_of(func.call(), vec![field_arg(field)]))))
+            }
+            // Everything else is a second question about the combination rather than a measure
+            // of it: an average is a ratio of two, a distinct count is another column to group
+            // by, and a ranking is one more.
+            _ => return Err(SqlError::Refused { what: Refused::Shape, at: item.at }),
+        }
+        let plan = calls.push(table, call_of("GroupByTuple", args))?;
+        measures.push((measure_of(item), Of::Group { plan, absent: absent_of(item) }));
+    }
+    Ok(measures)
+}
+
 /// The bitmap, the levels and the budget: everything a `GroupByTuple` takes but its aggregate.
 ///
 /// A repeating `by=`, so the arity is a number rather than a shape. A bucket level is a nested
 /// `Bucket(...)` because it carries a boundary and a budget of its own, and a bare name cannot
 /// say either.
-fn tuple_args(by: &[Grouping], rows: Expr) -> Vec<Expr> {
+pub(super) fn tuple_args(by: &[Grouping], rows: Expr) -> Vec<Expr> {
     let mut args = vec![rows];
     for g in by {
         args.push(named(

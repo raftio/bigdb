@@ -15,10 +15,11 @@
 //! One entry of the select list: a star, a column, or an aggregate with its `FILTER` and alias.
 
 use super::Parser;
-use crate::ast::{Agg, Cond, Item, Proj};
+use crate::ast::{Agg, Cond, Item, Name, Over, Proj};
 use crate::error::{Refused, Result};
 use crate::lex::Tok;
 use crate::scalar::Scalar;
+use crate::shape::WinFunc;
 use big_plan::Literal;
 
 impl Parser<'_> {
@@ -31,6 +32,15 @@ impl Parser<'_> {
     /// an aggregate is one plan producing one number. See [`crate::scalar::Scalar::leaves`].
     pub(super) fn item(&mut self) -> Result<Item> {
         let at = self.at();
+        // **A ranking or an offset is parsed whole, here, before anything else looks at it.**
+        // `row_number` and its family are not expressions and not aggregates - there is no
+        // reading of `rank(x)` that means anything without the `OVER` that follows - so they are
+        // taken in one piece rather than parsed as a call and repaired afterwards. An aggregate
+        // window is the other way round: `sum(amount)` is a complete entry until an `OVER`
+        // follows it, so that one is converted below, where the `OVER` is seen.
+        if let Some(item) = self.ranking_entry()? {
+            return Ok(item);
+        }
         // Filled in when the aggregate carried an `-If`, which is the same clause as a trailing
         // `FILTER (WHERE ...)` and must not be written twice.
         let mut from_aggregate = None;
@@ -84,9 +94,27 @@ impl Parser<'_> {
             }
         };
 
-        if self.word_is("OVER") {
-            return Err(self.refuse(Refused::Window));
-        }
+        // `sum(amount) OVER (PARTITION BY country)`: the same fold, over the rows a projection
+        // read rather than over a bitmap. Everything else beside an `OVER` is refused by name -
+        // a window is about a row's place among others, and a bare column or a `topK` has none.
+        let proj = if self.word_is("OVER") {
+            if from_aggregate.is_some() {
+                // A `FILTER` narrows an aggregate's own row set, and a window has none to
+                // narrow - it sees the rows the projection already read.
+                return Err(self.refuse(Refused::Shape));
+            }
+            let (func, arg) = match proj {
+                Proj::Count => (WinFunc::Count, None),
+                Proj::Agg { func: Agg::Sum, field } => (WinFunc::Sum, Some(field)),
+                Proj::Agg { func: Agg::Min, field } => (WinFunc::Min, Some(field)),
+                Proj::Agg { func: Agg::Max, field } => (WinFunc::Max, Some(field)),
+                Proj::Avg(field) => (WinFunc::Avg, Some(field)),
+                _ => return Err(self.refuse_at(Refused::Window, at)),
+            };
+            Proj::Window(Box::new(self.over(func, arg, 1, at)?))
+        } else {
+            proj
+        };
 
         // `FILTER (WHERE ...)` narrows one aggregate. On a star or a bare column there is no
         // aggregate to narrow: `WHERE` is where that condition goes, and a second spelling of
@@ -245,6 +273,179 @@ impl Parser<'_> {
 const DEFAULT_TOP_K: u64 = 10;
 
 /// One parsed aggregate and the condition an `-If` suffix gave it.
+impl Parser<'_> {
+    /// `row_number() OVER (...)`, `lag(x, 2) OVER (...)`: the families that are only ever windows.
+    ///
+    /// `Ok(None)` when the select list entry is not one of them, which is every entry this
+    /// grammar had before windows existed - so nothing that parsed before reaches any of this.
+    ///
+    /// A name from this list *without* an `OVER` is refused rather than left to fall through to
+    /// `unsupported_call`. `rank(x)` is not a function nobody defined; it is a window missing the
+    /// clause that says which rows it ranks, and that is the sentence worth printing.
+    fn ranking_entry(&mut self) -> Result<Option<Item>> {
+        let at = self.at();
+        let Some(name) = self.word() else { return Ok(None) };
+        let Some(func) = ranking_of(name) else { return Ok(None) };
+        // `rank` and `lag` are legal column names right up until a `(` follows them, exactly as
+        // `count` and `sum` are.
+        if self.t.get(self.i + 1).map(|t| &t.tok) != Some(&Tok::LParen) {
+            return Ok(None);
+        }
+        self.i += 2;
+
+        // The argument, and the offset that rides beside it. `ntile(4)` writes its bucket count
+        // where the others write a column, which is why the two are read together.
+        let (arg, offset) = match func {
+            WinFunc::NTile => (None, Some(self.window_number()?)),
+            f if f.needs_arg() => {
+                let column = self.name("a column for the window function to read")?;
+                let offset = match self.eat(&Tok::Comma) {
+                    true => Some(self.window_number()?),
+                    false => None,
+                };
+                (Some(column), offset)
+            }
+            _ => (None, None),
+        };
+        self.expect(&Tok::RParen, ") to close the window function")?;
+
+        // `nth_value(x, 2)` counts from one and `lag(x, 2)` steps back two, so one is the
+        // default for both - and `lag(x, 0)` is this row, which is a way of writing `x`.
+        let offset = offset.unwrap_or(1);
+        if offset == 0 && matches!(func, WinFunc::NTile | WinFunc::NthValue) {
+            return Err(self.refuse_at(Refused::Window, at));
+        }
+
+        if !self.word_is("OVER") {
+            return Err(self.refuse_at(Refused::Window, at));
+        }
+        let over = self.over(func, arg, offset, at)?;
+        let alias =
+            if self.eat_word("AS") { Some(self.bare_ident("a name after AS")?) } else { None };
+        Ok(Some(Item { proj: Proj::Window(Box::new(over)), filter: None, alias, at }))
+    }
+
+    /// The `OVER (...)` clause: which rows the function sees, and in what order.
+    ///
+    /// Refuses a frame at the keyword rather than accepting and ignoring one, and takes opposite
+    /// answers about an `ORDER BY` from the two families - see [`Refused::WindowFrame`], which is
+    /// where that reasoning is written down.
+    fn over(&mut self, func: WinFunc, arg: Option<Name>, offset: u32, at: usize) -> Result<Over> {
+        self.expect_word("OVER", "OVER after a window function")?;
+        // `OVER w`, naming a `WINDOW` clause this grammar does not have.
+        if !matches!(self.peek(), Some(&Tok::LParen)) {
+            return Err(self.refuse(Refused::WindowName));
+        }
+        self.i += 1;
+
+        let mut partition = Vec::new();
+        if self.eat_word("PARTITION") {
+            self.expect_word("BY", "BY after PARTITION")?;
+            partition.push(self.name("a column to partition by")?);
+            while self.eat(&Tok::Comma) {
+                partition.push(self.name("a column to partition by")?);
+            }
+        }
+
+        let mut order = Vec::new();
+        if self.eat_word("ORDER") {
+            self.expect_word("BY", "BY after ORDER")?;
+            loop {
+                let column = self.name("a column to order the window by")?;
+                let desc = match () {
+                    () if self.eat_word("DESC") => true,
+                    () => {
+                        self.eat_word("ASC");
+                        false
+                    }
+                };
+                order.push((column, desc));
+                if !self.eat(&Tok::Comma) {
+                    break;
+                }
+            }
+        }
+
+        // A frame, refused at the word. Checked before the ordering rules below so that
+        // `sum(x) OVER (ORDER BY t ROWS BETWEEN ...)` is named as the frame it wrote rather than
+        // as the ordering that implies one.
+        if matches!(self.word(), Some(w) if matches!(w.to_ascii_uppercase().as_str(),
+            "ROWS" | "RANGE" | "GROUPS" | "EXCLUDE"))
+        {
+            return Err(self.refuse(Refused::WindowFrame));
+        }
+        self.expect(&Tok::RParen, ") to close OVER")?;
+
+        // **The two families take opposite answers, and each has its own reason.** A ranking or
+        // an offset with nothing to order by is not a ranking - `row_number()` over an unordered
+        // partition is a number nobody can predict or reproduce. An aggregate *with* an ordering
+        // is the running total, which is a frame this surface does not have.
+        match (func.is_aggregate(), order.is_empty()) {
+            (false, true) => return Err(self.refuse_at(Refused::WindowFrame, at)),
+            (true, false) => return Err(self.refuse_at(Refused::WindowFrame, at)),
+            _ => {}
+        }
+        Ok(Over { func, arg, offset, partition, order, at })
+    }
+
+    /// A whole number written inside a window function: `lag(x, 2)`, `ntile(4)`.
+    fn window_number(&mut self) -> Result<u32> {
+        match self.peek() {
+            Some(Tok::Num(Literal::Int(n))) => {
+                let n = *n;
+                self.i += 1;
+                u32::try_from(n).map_err(|_| self.syntax("a small whole number"))
+            }
+            _ => Err(self.syntax("a whole number")),
+        }
+    }
+}
+
+/// Whether a call names a regular expression, in every spelling the two dialects write them in.
+///
+/// **One list, two callers**: the select list reaches it through `unsupported_call`, and a
+/// `WHERE` reaches it directly - because a `WHERE` refuses *known* scalar functions by name and
+/// these are not known ones, so without this they would fall through to a syntax error about a
+/// bracket. A named list rather than a fallthrough either way: somebody who wrote
+/// `match(c, '^a')` asked a real question, and what they need is the pattern language that *is*
+/// here rather than a sentence about there being no such function.
+pub(super) fn is_regex_call(name: &str) -> bool {
+    const REGEXES: [&str; 9] = [
+        "match",
+        "extract",
+        "extractAll",
+        "replaceRegexpOne",
+        "replaceRegexpAll",
+        "regexp_extract",
+        "regexp_replace",
+        "regexp_like",
+        "regexp_matches",
+    ];
+    REGEXES.iter().any(|c| name.eq_ignore_ascii_case(c))
+}
+
+/// The window functions that are *only* windows, by the name every dialect writes them under.
+///
+/// `sum`, `avg`, `count`, `min` and `max` are deliberately absent: those are aggregates until an
+/// `OVER` follows, and are converted where that `OVER` is read. Splitting the two lists is what
+/// keeps `sum(amount)` parsing exactly as it always did.
+fn ranking_of(name: &str) -> Option<WinFunc> {
+    const NAMES: [(&str, WinFunc); 11] = [
+        ("row_number", WinFunc::RowNumber),
+        ("rank", WinFunc::Rank),
+        ("dense_rank", WinFunc::DenseRank),
+        ("ntile", WinFunc::NTile),
+        ("percent_rank", WinFunc::PercentRank),
+        ("cume_dist", WinFunc::CumeDist),
+        ("lag", WinFunc::Lag),
+        ("lead", WinFunc::Lead),
+        ("first_value", WinFunc::FirstValue),
+        ("last_value", WinFunc::LastValue),
+        ("nth_value", WinFunc::NthValue),
+    ];
+    NAMES.iter().find(|(n, _)| name.eq_ignore_ascii_case(n)).map(|(_, f)| *f)
+}
+
 pub(super) struct Aggregate {
     pub proj: Proj,
     pub filter: Option<Cond>,
@@ -365,11 +566,39 @@ pub(super) fn unsupported_call(name: &str) -> Refused {
         "bsi_topk",
     ];
 
+    /// Sketches, and the combinators that carry one between queries.
+    ///
+    /// Deliberately *not* the `uniq*` family, which is answered exactly - see `Which::Uniq`.
+    /// What is here are the names that ask for a sketch as a *value*: a state to merge later,
+    /// or a column holding one.
+    const SKETCHES: [&str; 8] = [
+        "uniqState",
+        "uniqMerge",
+        "quantileState",
+        "quantileMerge",
+        "hll_union_agg",
+        "hll_cardinality",
+        "hll_hash",
+        "approx_top_k",
+    ];
+
     // Checked before the casts, because `to_bitmap` reads like a conversion and is not one:
     // what it names is already how the fact was written, so the sentence it needs is the
     // mapping rather than the one about representations that do not convert.
     if BITMAPS.iter().any(|c| name.eq_ignore_ascii_case(c)) {
         return Refused::BitmapFunction;
+    }
+    // A `-State`/`-Merge` suffix on anything, plus the sketch names that carry no suffix. The
+    // suffix is checked rather than listed because it composes with every aggregate there is,
+    // and a list would be that many entries to say one thing.
+    let suffixed = ["State", "Merge", "MergeState"].iter().any(|sfx| {
+        name.len() > sfx.len() && name[name.len() - sfx.len()..].eq_ignore_ascii_case(sfx)
+    });
+    if suffixed || SKETCHES.iter().any(|c| name.eq_ignore_ascii_case(c)) {
+        return Refused::Sketch;
+    }
+    if is_regex_call(name) {
+        return Refused::Regex;
     }
     if CASTS.iter().any(|c| name.eq_ignore_ascii_case(c)) {
         return Refused::Cast;

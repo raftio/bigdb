@@ -135,3 +135,22 @@ Union
 │   └── count = product(#0, #1)
 └── Join keys=(#2, #3)
     └── max = greatest(#4, #2)
+
+# A grouping-sets answer as a branch of a `UNION ALL`, which is a `Union` inside a `Union`.
+#
+# Nothing special happens: `Shape::rebase` recurses through a nested union, so the inner
+# branches' plan indices move along the flat list exactly as a leaf shape's would.
+shape
+SELECT category, count(*) FROM t GROUP BY category WITH ROLLUP UNION ALL SELECT category, count(*) FROM u GROUP BY category
+----
+Union
+├── Union
+│   ├── Groups keys=[#0]
+│   │   ├── category = key
+│   │   └── count = group #0 else 0
+│   └── Row
+│       ├── category = null
+│       └── count = #1
+└── Groups keys=[#2]
+    ├── category = key
+    └── count = group #2 else 0

@@ -385,6 +385,9 @@ impl<'a> Sides<'a> {
             // Seen through by `Item::leaf`, so a scalar never arrives here as itself: the
             // expression rides on the item and is applied where the cell is written.
             Proj::Scalar { .. } => unreachable!("leaf() sees through the expression"),
+            // A window over a join is refused by name before this - a join answers with numbers
+            // about sets of keys, and there are no rows for a partition to be a partition of.
+            Proj::Window(_) => unreachable!("refused above"),
             // Every record on one side pairs with every record on every other, under each key.
             // Counted from the first side, which is as good as any: the product is over all of
             // them and the shape names them in `keys`.
@@ -772,7 +775,9 @@ fn proj_names<'a>(proj: &'a Proj, at: usize, out: &mut Vec<(&'a Name, usize)>) {
             out.push((field, at))
         }
         Proj::Scalar { inner, .. } => proj_names(inner, at, out),
-        Proj::Star | Proj::Count | Proj::Now { .. } => {}
+        // A window names its columns in its own clause, and a join refuses one outright, so
+        // there is nothing here for the scope resolution to collect.
+        Proj::Window(_) | Proj::Star | Proj::Count | Proj::Now { .. } => {}
     }
 }
 

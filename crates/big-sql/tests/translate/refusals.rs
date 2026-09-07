@@ -86,8 +86,15 @@ fn every_refusal_names_itself() {
     // And the shapes that hold no aggregate at all for one to be about.
     assert_eq!(code("SELECT amount FROM t HAVING count(*) > 5"), "sql_unsupported");
     assert_eq!(code("SELECT * FROM t HAVING count(*) > 5"), "sql_unsupported");
-    assert_eq!(code("SELECT row_number() OVER () FROM t"), "sql_unsupported");
     assert_eq!(code("SELECT count(*) FROM t LIMIT 1 OFFSET 5"), "sql_unsupported");
+    // A window used to be refused outright and share `sql_unsupported` with everything else
+    // this surface had no answer for. It has one now, so what is left are the two mistakes a
+    // window can be: no ordering to rank by, and a shape that holds no rows to rank.
+    assert_eq!(code("SELECT row_number() OVER () FROM t"), "sql_window_frame");
+    assert_eq!(
+        code("SELECT category, row_number() OVER (ORDER BY amount) FROM t GROUP BY category"),
+        "sql_window_shape"
+    );
     // Arithmetic is answered now; what is refused is an expression that is not about one
     // column - two of them in a cell, or none at all.
     assert_eq!(code("SELECT concat(country, category) FROM t"), "sql_unsupported");
@@ -170,8 +177,11 @@ fn every_refusal_names_itself() {
     assert_eq!(code("SELECT stddevPop(amount) FROM t"), "sql_unsupported");
     assert_eq!(code("SELECT corr(amount, price) FROM t"), "sql_unsupported");
     // `LIKE` is answered now - a pattern over a keyed column is a union of the keys that match.
-    // Every other string comparison is still refused, because none of them is a set operation.
-    assert_eq!(code("SELECT count(*) FROM t WHERE country SIMILAR TO 'G%'"), "sql_unsupported");
+    // Every other string comparison is still refused, because none of them is a set operation -
+    // and the regular-expression spellings are refused by their own name, which is what carries
+    // the pattern language that *is* here.
+    assert_eq!(code("SELECT count(*) FROM t WHERE country SIMILAR TO 'G%'"), "sql_no_regex");
+    assert_eq!(code("SELECT count(*) FROM t WHERE match(country, '^G')"), "sql_no_regex");
     // Two aggregates are two plans, which is now answered. What is still refused is a select
     // list that is not one answer: a star beside an aggregate, or a bare column beside one.
     assert_eq!(code("SELECT *, count(*) FROM t"), "sql_unsupported");

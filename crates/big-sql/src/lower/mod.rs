@@ -44,6 +44,7 @@ mod grouped;
 mod join;
 mod measure;
 mod pql;
+mod sets;
 mod tuples;
 mod ungrouped;
 
@@ -251,6 +252,10 @@ fn lower_one(select: &Select) -> Result<Statement> {
     let mut stars = Vec::new();
     let mut columns = Vec::new();
     let mut aggregates = Vec::new();
+    // **A fourth bucket, because a window is a fourth thing.** It is not an aggregate: an
+    // aggregate is a plan and a window is arithmetic over the rows a projection already read.
+    // Bucketing it here is what lets the paths that cannot answer one refuse it by name.
+    let mut windows = Vec::new();
     // **Bucketed by the leaf, not by the entry.** The plan reads the column or folds the
     // aggregate; an expression around it is applied where the answer is written and changes
     // nothing about which bucket the entry belongs in. So `date_trunc('month', ts)` is a
@@ -259,7 +264,18 @@ fn lower_one(select: &Select) -> Result<Statement> {
         match item.leaf() {
             Proj::Star => stars.push(item),
             Proj::Column(name) => columns.push((item, name.clone())),
+            Proj::Window(_) => windows.push(item),
             _ => aggregates.push(item),
+        }
+    }
+
+    // **Where a window cannot go, refused by name before anything is planned.** A grouped
+    // answer, a tuple grouping and a join are numbers about sets rather than rows, so there is
+    // nothing for a partition to be a partition of. See `Refused::Window`, which names the
+    // rankings those shapes do carry.
+    if let Some(item) = windows.first() {
+        if !select.joins.is_empty() || !select.group_by.is_empty() || !stars.is_empty() {
+            return Err(SqlError::Refused { what: Refused::Window, at: item.at });
         }
     }
 
@@ -268,8 +284,14 @@ fn lower_one(select: &Select) -> Result<Statement> {
     }
 
     let table = &select.from.qualified();
+    // `WITH ROLLUP`, `WITH CUBE` and `GROUPING SETS` before the arity dispatch, because they are
+    // *several* of those arities rather than one: the sets are the answer's branches, and each
+    // is lowered by whichever of the three below its own width calls for.
+    if let Some(sets) = &select.grouping_sets {
+        return sets::sets(select, table, &rows, sets, &stars, &columns, &aggregates);
+    }
     match select.group_by.as_slice() {
-        [] => ungrouped::ungrouped(select, table, &rows, &stars, &columns, &aggregates),
+        [] => ungrouped::ungrouped(select, table, &rows, &stars, &columns, &aggregates, &windows),
         [one] => grouped::grouped(select, table, &rows, one, &stars, &columns, &aggregates),
         // Two or more: one pass over the next column per combination of the ones before it.
         // See `tuples`. Total, which is the point - there is no arity left for an `unreachable!`

@@ -1,0 +1,133 @@
+# `WITH ROLLUP`, `WITH CUBE` and `GROUPING SETS` over real records.
+#
+# **The claim these exist to check is arithmetic, not shape.** A rollup is several groupings
+# stacked, each planned, fanned out to the shards and merged on its own - so the subtotal row is
+# a genuinely separate question from the detail rows above it, and the only thing making them
+# agree is that both counted the same records. If a set were planned or merged wrongly, the
+# subtotal would not be the sum of its detail and these cases would say so.
+#
+# The row order is the contract, because there is no `ORDER BY` allowed here: sets longest first,
+# each branch in its own key order. That is what lets these be written down at all.
+
+statement
+CREATE TABLE tx (amount UINT(32), country SET, city SET)
+
+statement
+INSERT INTO tx (_record_id, amount, country, city) VALUES
+  (1, 100, 'GB', 'LDN'),
+  (2, 900, 'US', 'NYC'),
+  (3, 500, 'GB', 'LDN'),
+  (4, 700, 'FR', 'PAR'),
+  (5, 200, 'US', 'SFO'),
+  (6, 300, 'GB', 'MAN')
+
+# One column: the three countries, then the grand total. 3 + 1 + 2 = 6, which is every record.
+query
+SELECT country, count(*) FROM tx GROUP BY country WITH ROLLUP
+----
+country  count
+FR       1
+GB       3
+US       2
+NULL     6
+
+# Two columns. The detail pairs come first, then one row per country with the city blanked, then
+# the total with both blanked - and each subtotal is the sum of the pairs above it.
+query
+SELECT country, city, count(*) FROM tx GROUP BY country, city WITH ROLLUP
+----
+country  city  count
+FR       PAR   1
+GB       LDN   2
+GB       MAN   1
+US       NYC   1
+US       SFO   1
+FR       NULL  1
+GB       NULL  3
+US       NULL  2
+NULL     NULL  6
+
+# A sum rolls up the same way a count does.
+query
+SELECT country, city, sum(amount) FROM tx GROUP BY country, city WITH ROLLUP
+----
+country  city  sum
+FR       PAR   700
+GB       LDN   600
+GB       MAN   300
+US       NYC   900
+US       SFO   200
+FR       NULL  700
+GB       NULL  900
+US       NULL  1100
+NULL     NULL  2700
+
+# `CUBE` adds the sets `ROLLUP` leaves out - here, city alone.
+query
+SELECT country, city, count(*) FROM tx GROUP BY country, city WITH CUBE
+----
+country  city  count
+FR       PAR   1
+GB       LDN   2
+GB       MAN   1
+US       NYC   1
+US       SFO   1
+FR       NULL  1
+GB       NULL  3
+US       NULL  2
+NULL     LDN   2
+NULL     MAN   1
+NULL     NYC   1
+NULL     PAR   1
+NULL     SFO   1
+NULL     NULL  6
+
+# Written out, and the same two sets as a rollup of one column.
+query
+SELECT country, city, count(*) FROM tx GROUP BY GROUPING SETS ((country, city), (country), ())
+----
+country  city  count
+FR       PAR   1
+GB       LDN   2
+GB       MAN   1
+US       NYC   1
+US       SFO   1
+FR       NULL  1
+GB       NULL  3
+US       NULL  2
+NULL     NULL  6
+
+# Under a `WHERE`: every set narrows to the same records, so the grand total is the size of the
+# filtered set rather than of the table.
+query
+SELECT country, count(*) FROM tx WHERE amount >= 300 GROUP BY country WITH ROLLUP
+----
+country  count
+FR       1
+GB       2
+US       1
+NULL     4
+
+# `HAVING` per branch, including the grand total's own row - which is dropped when the whole set
+# fails the threshold, leaving the branches above it.
+query
+SELECT country, count(*) FROM tx GROUP BY country WITH ROLLUP HAVING count(*) > 2
+----
+country  count
+GB       3
+NULL     6
+
+query
+SELECT country, count(*) FROM tx GROUP BY country WITH ROLLUP HAVING count(*) > 100
+----
+country  count
+
+# Two aggregates over a rollup: two calls per set, joined on the group after both are merged.
+query
+SELECT country, count(*), sum(amount) FROM tx GROUP BY country WITH ROLLUP
+----
+country  count  sum
+FR       1      700
+GB       3      900
+US       2      1100
+NULL     6      2700

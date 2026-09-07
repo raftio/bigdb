@@ -162,7 +162,10 @@ fn refuse_what_a_grouping_cannot_hold(
 ///
 /// Worked out once, so that `HAVING` and `ORDER BY` name a number by matching against this
 /// rather than by repeating the rules for what a number is.
-fn measures_of(
+///
+/// `pub(super)` for `sets`, which builds one of these per grouping set against a shared `Calls`.
+/// A grouping set of one column is this grouping, so it had better be this function.
+pub(super) fn measures_of(
     table: &str,
     rows: &Expr,
     group: &Grouping,
@@ -212,6 +215,9 @@ fn measures_of(
                 )?,
                 over: count_plan(calls, table, &rows, group)?,
             },
+            // A window is bucketed on its own by `lower_one` and refused by name wherever
+            // the answer is numbers about sets rather than rows. See `Refused::Window`.
+            Proj::Window(_) => unreachable!("refused above"),
             Proj::Star
             | Proj::Column(_)
             | Proj::CountDistinct(_)

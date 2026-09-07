@@ -29,9 +29,10 @@
 mod group;
 mod num;
 mod scalar;
+mod window;
 
 use crate::{Answer, Cell, Shape, Units, Value};
-use big_sql::Scalar;
+use big_sql::{Scalar, Selection};
 use group::{grouped, joined, tupled};
 use num::{int_of, number, scalar_cell, Num};
 pub use scalar::eval;
@@ -88,12 +89,22 @@ impl Datum {
     /// what lets the evaluator work on `12.50` rather than on the `1250` a decimal field
     /// stores, and what lets `toDate` tell a day count from a second count without being told
     /// which it was handed. See [`mod@scalar`].
-    fn projected(p: &big_exec::Projection, units: &Units, apply: Option<&Scalar>) -> Self {
+    pub(super) fn projected(
+        p: &big_exec::Projection,
+        units: &Units,
+        apply: Option<&Scalar>,
+    ) -> Self {
         let value = Self::read(p, units);
         match apply {
             None => value,
             Some(expr) => scalar::eval(expr, &value),
         }
+    }
+
+    /// A projected value in plain units, for comparing two values of one field against each
+    /// other rather than answering with either.
+    pub(super) fn read_plain(p: &big_exec::Projection) -> Self {
+        Self::read(p, &Units::PLAIN)
     }
 
     /// The cell a projected value is before any expression has been applied to it.
@@ -193,6 +204,30 @@ fn order_cells(a: &Datum, b: &Datum, desc: bool) -> core::cmp::Ordering {
         true => ord.reverse(),
         false => ord,
     }
+}
+
+/// Two rows in the order a list of keys puts them, each key with its own direction.
+///
+/// **The one ordering this crate did not have.** An `ORDER BY` over a projection is a single
+/// column by name - the parser refuses a comma outright - and that was enough while the only
+/// ordering was the answer's own. A window's is a list: `row_number() OVER (PARTITION BY country
+/// ORDER BY ts, amount)` is a numbering nobody can predict without the second key.
+///
+/// Absent sorts last in every key and in both directions, which is [`order_cells`]' rule and has
+/// to be the same rule: a window that buried its nulls differently from the ordering underneath
+/// it would number rows in an order the answer is not in.
+pub(super) fn order_by_keys(
+    a: &[Datum],
+    b: &[Datum],
+    keys: &[(usize, bool)],
+) -> core::cmp::Ordering {
+    keys.iter()
+        .map(|(at, desc)| match (a.get(*at), b.get(*at)) {
+            (Some(x), Some(y)) => order_cells(x, y, *desc),
+            _ => core::cmp::Ordering::Equal,
+        })
+        .find(|o| o.is_ne())
+        .unwrap_or(core::cmp::Ordering::Equal)
 }
 
 /// A cell as the literal that would have written it, for `INSERT ... SELECT`.
@@ -333,22 +368,36 @@ fn rows_of(shape: &Shape, values: &[Value], probes_at: usize) -> Vec<Row> {
         // projection's cost is a point read per record per column and a cut applied here would
         // be one applied after paying for it.
         Shape::Table { columns, order, cut } => {
-            let mut out: Vec<Row> = values
-                .first()
-                .and_then(Value::as_table)
-                .unwrap_or(&[])
+            let table = values.first().and_then(Value::as_table).unwrap_or(&[]);
+            // **A column names the field it reads, rather than sitting opposite it.** The two
+            // lists were the same one until windows: a window reads a column to partition,
+            // order or fold by and that column need not be in the header, so the plan reads
+            // more fields than the answer shows and the positions no longer line up.
+            //
+            // Every shape a projected cell can be already has a `Datum`: the result set was
+            // built to carry keys and lists of keys because a grouping answers with them, and a
+            // projected keyed column is the same string arriving by a different route.
+            let mut out: Vec<Row> = table
                 .iter()
-                // Every shape a projected cell can be already has a `Datum`: the result set was
-                // built to carry keys and lists of keys because a grouping answers with them, and a
-                // projected keyed column is the same string arriving by a different route.
                 .map(|p| {
-                    p.values
+                    columns
+                        .named()
                         .iter()
-                        .zip(columns.named())
-                        .map(|(v, c)| Datum::projected(v, &c.units, c.apply.as_ref()))
+                        .map(|c| match c.of {
+                            Selection::Read { at } => p
+                                .values
+                                .get(at)
+                                .map(|v| Datum::projected(v, &c.units, c.apply.as_ref()))
+                                .unwrap_or(Datum::Null),
+                            // Filled by `window::fill`, which needs every row before it can
+                            // answer for any one of them.
+                            Selection::Over { .. } => Datum::Null,
+                        })
                         .collect()
                 })
                 .collect();
+
+            window::fill(&mut out, table, columns.named());
 
             // **Sorted here, after every value has been read, because there is nowhere else.**
             // A projection's rows are values reconstructed a record at a time, in record order,

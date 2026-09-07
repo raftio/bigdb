@@ -69,6 +69,11 @@ impl Parser<'_> {
         if (self.word_is("MODIFY") || self.word_is("SET")) && self.word_at_is(1, "TTL") {
             return Err(self.refuse(Refused::DeclarativeTtl));
         }
+        // Named before `AlterKind`, whose sentence is about column kinds and says nothing about
+        // where compaction actually lives.
+        if self.word_is("COMPACT") || self.word_is("FREEZE") {
+            return Err(self.refuse(Refused::Optimize));
+        }
         if self.word_is("MODIFY") || self.word_is("CHANGE") {
             return Err(self.refuse(Refused::AlterKind));
         }

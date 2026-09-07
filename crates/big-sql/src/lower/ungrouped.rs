@@ -19,7 +19,7 @@ use super::pql::{as_call, call_of, field_arg, named};
 use super::{answer, rows_of, Ask, Calls, Probe, Statement};
 use crate::ast::{Item, Name, OrderKey, Proj, Select};
 use crate::error::{Refused, Result, SqlError};
-use crate::shape::{Cell, Columns, Of, RowOrder, Selected, Shape, Units};
+use crate::shape::{Cell, Columns, Frame, Of, RowOrder, Selected, Selection, Shape, Units};
 use big_plan::ast::{Expr, Literal};
 
 /// `SELECT *`, or aggregates over the whole filtered set.
@@ -30,6 +30,7 @@ pub(super) fn ungrouped(
     stars: &[&Item],
     columns: &[(&Item, Name)],
     aggregates: &[&Item],
+    windows: &[&Item],
 ) -> Result<Statement> {
     // A `HAVING` names an aggregate, and the two shapes below answer with values rather than
     // with aggregates - so there is no number in either for one to be about. Refused here, once,
@@ -41,8 +42,9 @@ pub(super) fn ungrouped(
         }
     }
 
-    if let Some((first, _)) = columns.first() {
-        // A projection: the stored values of some columns, for the records the `WHERE` selects.
+    if let Some(first) = columns.first().map(|(i, _)| *i).or_else(|| windows.first().copied()) {
+        // A projection: the stored values of some columns, for the records the `WHERE` selects,
+        // and any window arithmetic over the rows that come back.
         if !aggregates.is_empty() || !stars.is_empty() {
             // Values beside a number about the whole set is two answers of different heights.
             return Err(SqlError::Refused { what: Refused::Shape, at: first.at });
@@ -50,12 +52,56 @@ pub(super) fn ungrouped(
         if select.offset.is_some() {
             return Err(SqlError::Refused { what: Refused::Offset, at: first.at });
         }
-        let named_columns: Vec<Selected> = columns
+        // **The fields the plan reads, which is no longer the same list as the columns it
+        // answers with.** A window reads a column to partition, order or fold by, and that
+        // column need not be in the header: `SELECT country, row_number() OVER (PARTITION BY
+        // city)` reads `city` per record and does not show it - a cost the statement asked for
+        // by writing it, and one `EXPLAIN` prints. Deduplicated, so a column named twice - once
+        // as output, once inside a window - is read once.
+        //
+        // The output columns come first, so a statement with no window reads its fields in
+        // exactly the order it always did and its plan is unchanged.
+        let mut fields: Vec<Name> = Vec::new();
+        for (_, name) in columns {
+            intern_field(&mut fields, name);
+        }
+        for item in windows {
+            let Proj::Window(w) = item.leaf() else { unreachable!("the window bucket") };
+            for name in w.arg.iter().chain(&w.partition).chain(w.order.iter().map(|(n, _)| n)) {
+                intern_field(&mut fields, name);
+            }
+        }
+
+        // In select-list order, which is the only order the caller asked for.
+        let named_columns: Vec<Selected> = select
+            .items
             .iter()
-            .map(|(item, name)| Selected {
-                column: item.column(),
-                units: Units::Written { table: table.to_string(), field: name.column.clone() },
-                apply: item.apply().cloned(),
+            .map(|item| match item.leaf() {
+                Proj::Window(w) => Selected {
+                    column: item.column(),
+                    units: window_units(table, w),
+                    apply: item.apply().cloned(),
+                    of: Selection::Over {
+                        func: w.func,
+                        arg: w.arg.as_ref().map(|n| at_of(&fields, n)),
+                        offset: w.offset,
+                        window: Frame {
+                            partition: w.partition.iter().map(|n| at_of(&fields, n)).collect(),
+                            order: w
+                                .order
+                                .iter()
+                                .map(|(n, desc)| (at_of(&fields, n), *desc))
+                                .collect(),
+                        },
+                    },
+                },
+                Proj::Column(name) => Selected::read(
+                    item.column(),
+                    Units::Written { table: table.to_string(), field: name.column.clone() },
+                    item.apply().cloned(),
+                    at_of(&fields, name),
+                ),
+                _ => unreachable!("a projection holds columns and windows"),
             })
             .collect();
 
@@ -72,17 +118,18 @@ pub(super) fn ungrouped(
         // than a view of the answer, because it bounds the reads rather than trimming them
         // afterwards.
         //
-        // **Under an `ORDER BY` it cannot be.** A sort has to see every row before it knows
-        // which ten survive, so the plan reads them all and the cut moves into the shape - the
-        // real cost of this clause, stated where it is paid. What bounds the read is then the
-        // record ceiling every other unbounded read answers to.
-        let limit = match order {
-            Some(_) => None,
-            None => select.limit,
-        };
+        // **Under an `ORDER BY` or a window it cannot be.** Both have to see every row before
+        // they know which ten survive - a sort to order them, a window to number them - so the
+        // plan reads them all and the cut moves into the shape. That is the real cost of either
+        // clause, stated where it is paid: `SELECT c, row_number() OVER (ORDER BY c) FROM t
+        // LIMIT 10` reads every matching record where the same statement without the window
+        // reads ten. What bounds the read is then the record ceiling every other unbounded read
+        // answers to.
+        let materialised = order.is_some() || !windows.is_empty();
+        let limit = if materialised { None } else { select.limit };
 
         let mut args = vec![rows.clone()];
-        args.extend(columns.iter().map(|(_, name)| field_arg(name)));
+        args.extend(fields.iter().map(field_arg));
         if let Some(limit) = limit {
             args.push(named("n", Expr::Literal(Literal::Int(limit))));
         }
@@ -93,7 +140,7 @@ pub(super) fn ungrouped(
                 select,
                 Shape::Table {
                     columns: Columns::Named(named_columns),
-                    cut: order.as_ref().and(select.limit.map(|n| n as usize)),
+                    cut: materialised.then_some(select.limit).flatten().map(|n| n as usize),
                     order,
                 },
             ),
@@ -201,7 +248,9 @@ pub(super) fn ungrouped(
                 Of::Probe { probe: probes.len() - 1 }
             }
             Proj::Now { unix_seconds } => Of::Now { unix_seconds: *unix_seconds },
-            Proj::Star | Proj::Column(_) => unreachable!("sorted into the other two buckets"),
+            Proj::Star | Proj::Column(_) | Proj::Window(_) => {
+                unreachable!("sorted into the other buckets")
+            }
             // Seen through by `Item::leaf`, so a scalar never arrives here as itself: the
             // expression rides on the item and is applied where the cell is written.
             Proj::Scalar { .. } => unreachable!("leaf() sees through the expression"),
@@ -217,6 +266,46 @@ pub(super) fn ungrouped(
 
     let having = having_of(select, table, &measures)?;
     Ok(Statement { calls: calls.out, probes, answer: answer(select, Shape::Row { cells, having }) })
+}
+
+/// The position of a column in the list of fields the plan reads, adding it if it is not there.
+///
+/// One list, deduplicated by name, because a field read twice would be read twice: `SELECT
+/// amount, row_number() OVER (ORDER BY amount)` names `amount` as an output column and again
+/// inside the window, and the plan should read it once.
+fn intern_field(fields: &mut Vec<Name>, name: &Name) -> usize {
+    match fields.iter().position(|f| f.column == name.column) {
+        Some(at) => at,
+        None => {
+            fields.push(name.clone());
+            fields.len() - 1
+        }
+    }
+}
+
+/// Where a column already interned by [`intern_field`] sits.
+///
+/// Every name a window mentions is interned before the columns are built, so a miss here is a
+/// bug in this file rather than anything a statement can write.
+fn at_of(fields: &[Name], name: &Name) -> usize {
+    fields
+        .iter()
+        .position(|f| f.column == name.column)
+        .expect("every column a projection mentions was interned")
+}
+
+/// What a window column's numbers are measured in.
+///
+/// A ranking counts rows and is a plain number whatever it ranked; a fold or an offset answers
+/// with a value out of the column it read, and carries that column's scale for the reason every
+/// other cell does - a decimal read back unscaled is off by a factor of its scale.
+fn window_units(table: &str, w: &crate::ast::Over) -> Units {
+    match (w.func.counts_rows(), &w.arg) {
+        (false, Some(field)) => {
+            Units::Written { table: table.to_string(), field: field.column.clone() }
+        }
+        _ => Units::PLAIN,
+    }
 }
 
 /// The `ORDER BY` a projection carries, checked against the columns it reads.

@@ -19,7 +19,7 @@
 //! otherwise arrive as one: the text is not a statement, the statement is not one this engine
 //! answers, and the statement names something that does not exist.
 
-use crate::shape::Format;
+use crate::shape::{Format, WinFunc};
 use big_plan::Literal;
 
 /// A column, and the table it was written against.
@@ -193,6 +193,17 @@ pub struct Select {
     /// and which this engine answers with the same plan. The parser normalises one into the
     /// other so the lowering has a single path to `Distinct`.
     pub group_by: Vec<Grouping>,
+    /// Which combinations of [`Select::group_by`] the answer has a row for.
+    ///
+    /// **Normalised where it is written**, into positions in `group_by`: `WITH ROLLUP`, `WITH
+    /// CUBE` and `GROUPING SETS ((a,b),(a),())` are three spellings of a list somebody could
+    /// have written out by hand, and the lowering should not have to know which one was typed.
+    /// The same decision `SELECT DISTINCT` is normalised by, for the same reason - one path to
+    /// the plans instead of three that have to agree.
+    ///
+    /// `None` for a plain `GROUP BY`, which is the single set naming every column and is left
+    /// unwritten so that nothing existing changes shape.
+    pub grouping_sets: Option<GroupingSets>,
     /// `HAVING count(*) <op> <n>`, absent when every group is kept.
     pub having: Option<Having>,
     /// `ORDER BY`, at most one key.
@@ -213,6 +224,28 @@ pub struct Select {
     pub offset: Option<u64>,
     /// `FORMAT`, which says how the answer is written rather than what it is.
     pub format: Format,
+}
+
+/// A window function and the rows it sees: `row_number() OVER (PARTITION BY a ORDER BY b)`.
+///
+/// **Pre-schema, so the columns are names.** The lowering turns each into a position in the list
+/// of fields the projection reads, which is what makes "a window may only read a column the
+/// projection reads" a fact about the type rather than a check somebody has to remember - see
+/// [`crate::Selection::Over`].
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Over {
+    /// Which function.
+    pub func: WinFunc,
+    /// The column it reads. `None` for the ranking family, and for `count(*)`.
+    pub arg: Option<Name>,
+    /// `lag(x, 2)`, `nth_value(x, 2)`, `ntile(4)`. One where none was written.
+    pub offset: u32,
+    /// `PARTITION BY`, empty for one partition of every row.
+    pub partition: Vec<Name>,
+    /// The window's own `ORDER BY`: the column and whether it descends, in the order written.
+    pub order: Vec<(Name, bool)>,
+    /// Byte offset of the entry, for the refusals it earns.
+    pub at: usize,
 }
 
 /// One entry in the select list, with the name its column will carry.
@@ -275,6 +308,9 @@ impl Item {
                 Proj::TopKeys { .. } => "topK".to_string(),
                 Proj::Quantile { .. } => "quantile".to_string(),
                 Proj::Now { .. } => "now()".to_string(),
+                // The function's name, which is how ClickHouse and Postgres both name an
+                // unaliased window column.
+                Proj::Window(w) => w.func.name().to_string(),
             },
         }
     }
@@ -283,6 +319,13 @@ impl Item {
 /// What one select-list entry asks for.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Proj {
+    /// A window function, which is a number about this row rather than about the whole set.
+    ///
+    /// Its own variant rather than an aggregate wearing a clause, because it lowers nowhere near
+    /// one: an aggregate is a plan and this is arithmetic over the rows a projection already
+    /// read. `lower_one` buckets it on its own for exactly that reason, and the grouped paths
+    /// refuse it by name.
+    Window(Box<Over>),
     /// `*`: every column the table declares — see [`crate::Columns::All`], which is where the
     /// list is filled in, because nothing at this level knows the table.
     Star,
@@ -645,6 +688,24 @@ pub enum Cond {
         /// The value the rounded column is compared against, exactly as written.
         value: Literal,
     },
+}
+
+/// The sets a `ROLLUP`, `CUBE` or `GROUPING SETS` clause names.
+///
+/// Each entry is a subset of [`Select::group_by`], and a row of the answer belongs to exactly one
+/// of them - so a statement carrying this is several groupings whose rows are stacked, which is
+/// what lets it need no plan the engine did not already have.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct GroupingSets {
+    /// One entry per set: positions in [`Select::group_by`], ascending and without repeats.
+    ///
+    /// **Longest first**, and lexicographic within a length. That is the answer's row order, so
+    /// it is fixed where the clause is read rather than left to whatever order a set builder
+    /// happened to produce - and it puts the branch where every key column is a real key first,
+    /// which is the branch [`crate::Shape::columns`] names the answer after.
+    pub of: Vec<Vec<usize>>,
+    /// Byte offset of the clause, for the refusals it earns.
+    pub at: usize,
 }
 
 /// One `GROUP BY` term.

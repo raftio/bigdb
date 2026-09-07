@@ -16,8 +16,8 @@
 
 use super::Parser;
 use crate::ast::{
-    Cond, Grouping, Having, HavingAgg, HavingOperand, Join, JoinKind, Order, OrderKey, Proj,
-    Select, Source,
+    Cond, Grouping, GroupingSets, Having, HavingAgg, HavingOperand, Join, JoinKind, Order,
+    OrderKey, Proj, Select, Source,
 };
 use crate::error::{Refused, Result, SqlError};
 use crate::lex::Tok;
@@ -31,6 +31,20 @@ use crate::scalar::{Func, Scalar};
 /// the shape can carry in a byte, and so a statement naming twenty columns is refused at the
 /// text rather than after building a frontier.
 pub const MAX_GROUP_COLUMNS: usize = 4;
+
+/// How many grouping sets one statement may name.
+///
+/// **A bound on the fan-out, not a taste in rollups.** Every set is its own grouping - a call
+/// planned, sent to every owner and merged on its own - so the number of sets multiplied by the
+/// aggregates in the select list is the number of round trips, against the one budget
+/// `lower::MAX_CALLS` holds. `CUBE` over four columns is sixteen sets, which is that whole budget
+/// with nothing left for a second aggregate; `CUBE` over three is eight and `ROLLUP` over four is
+/// five, which are the two shapes a dashboard writes.
+///
+/// Checked here, at the text, so `CUBE(a,b,c,d)` is named as what it is rather than surfacing
+/// three sets later as `sql_too_many_aggregates`. The `Calls` budget stays the real ceiling and
+/// still fires for a statement that is under this one and asks too much of each set.
+pub const MAX_GROUPING_SETS: usize = 8;
 use big_plan::Literal;
 
 impl Parser<'_> {
@@ -76,16 +90,45 @@ impl Parser<'_> {
         };
 
         let group_at = self.at();
+        let mut grouping_sets = None;
         let group_by = if self.eat_word("GROUP") {
             self.expect_word("BY", "BY after GROUP")?;
-            let mut by = vec![self.grouping()?];
-            while self.eat(&Tok::Comma) {
-                by.push(self.grouping()?);
+            // `GROUPING SETS` is the whole clause rather than a term of it, so it forks here
+            // instead of inside `grouping`: what follows is a list of lists, and a bare column
+            // among them is the one-column set rather than a column of a bigger one.
+            if self.word_is("GROUPING") {
+                let (by, sets) = self.grouping_sets(group_at)?;
+                grouping_sets = Some(sets);
+                by
+            } else {
+                let mut by = vec![self.grouping()?];
+                while self.eat(&Tok::Comma) {
+                    by.push(self.grouping()?);
+                }
+                if by.len() > MAX_GROUP_COLUMNS {
+                    return Err(self.refuse_at(Refused::Shape, group_at));
+                }
+                // `WITH ROLLUP` / `WITH CUBE`, which name a list of subsets of what was just
+                // read. Unambiguous here: the other `WITH` this grammar has follows `LIMIT`,
+                // which cannot appear before a `GROUP BY`.
+                if self.eat_word("WITH") {
+                    let at = self.at();
+                    let of = if self.eat_word("ROLLUP") {
+                        rollup(by.len())
+                    } else if self.eat_word("CUBE") {
+                        cube(by.len())
+                    } else if self.word_is("TOTALS") {
+                        return Err(self.refuse_at(Refused::WithTotals, at));
+                    } else {
+                        return Err(self.syntax("ROLLUP, CUBE or TOTALS after WITH"));
+                    };
+                    if of.len() > MAX_GROUPING_SETS {
+                        return Err(self.refuse_at(Refused::GroupingSets, at));
+                    }
+                    grouping_sets = Some(GroupingSets { of, at });
+                }
+                by
             }
-            if by.len() > MAX_GROUP_COLUMNS {
-                return Err(self.refuse_at(Refused::Shape, group_at));
-            }
-            by
         } else {
             Vec::new()
         };
@@ -128,6 +171,16 @@ impl Parser<'_> {
         };
 
         let having = if self.eat_word("HAVING") { Some(self.having()?) } else { None };
+
+        // `QUALIFY` and a named `WINDOW` clause, refused where they are written. Both sit
+        // between `HAVING` and `ORDER BY`, so a statement carrying either would otherwise fail
+        // at `ORDER BY` with a syntax error about a word that is not the problem.
+        if self.word_is("QUALIFY") {
+            return Err(self.refuse(Refused::Qualify));
+        }
+        if self.word_is("WINDOW") {
+            return Err(self.refuse(Refused::WindowName));
+        }
 
         let order_by = if self.eat_word("ORDER") {
             self.expect_word("BY", "BY after ORDER")?;
@@ -186,6 +239,7 @@ impl Parser<'_> {
             joins,
             filter,
             group_by,
+            grouping_sets,
             having,
             order_by,
             limit,
@@ -476,6 +530,15 @@ impl Parser<'_> {
     /// this only has to decide whether the shape is one there is a plan for.
     pub(super) fn grouping(&mut self) -> Result<Grouping> {
         let at = self.at();
+        // `GROUP BY ROLLUP(a, b)` is PostgreSQL's spelling of what this surface writes as
+        // `GROUP BY a, b WITH ROLLUP`. Caught here rather than left to `expr`, which would read
+        // it as a call to a function nobody defined and say so - a true sentence about the wrong
+        // problem, when the statement is one word away from being answered.
+        if matches!(self.word(), Some(w) if matches!(w.to_ascii_uppercase().as_str(),
+            "ROLLUP" | "CUBE" | "GROUPINGSETS"))
+        {
+            return Err(self.refuse_at(Refused::GroupExpression, at));
+        }
         let parsed = self.expr()?;
         let [leaf] = parsed.leaves.as_slice() else {
             // No column, or two of them: `GROUP BY 1 + 1` groups by nothing, and
@@ -495,6 +558,126 @@ impl Parser<'_> {
             },
         }
     }
+
+    /// `GROUPING SETS ((a, b), (a), ())`: the columns it names, and the sets it names them in.
+    ///
+    /// Two things come back because the clause says two: the union of every column mentioned,
+    /// which is the `GROUP BY` list a plain statement would have written, and which of those
+    /// each set holds. The union is built in first-seen order, so a set is a list of positions
+    /// into it and `MAX_GROUP_COLUMNS` bounds the widest set by bounding the union.
+    ///
+    /// A bare term is the one-column set, which is what every dialect that has this reads
+    /// `GROUPING SETS (a, (a, b))` as.
+    fn grouping_sets(&mut self, group_at: usize) -> Result<(Vec<Grouping>, GroupingSets)> {
+        let at = self.at();
+        self.expect_word("GROUPING", "GROUPING SETS")?;
+        self.expect_word("SETS", "SETS after GROUPING")?;
+        self.expect(&Tok::LParen, "( after GROUPING SETS")?;
+
+        let mut by: Vec<Grouping> = Vec::new();
+        let mut of: Vec<Vec<usize>> = Vec::new();
+        loop {
+            let set_at = self.at();
+            let mut set: Vec<usize> = Vec::new();
+            match self.eat(&Tok::LParen) {
+                // `()` is the empty set - the grand total - and is the reason this is a `match`
+                // rather than a loop that insists on one term.
+                true => {
+                    if !self.eat(&Tok::RParen) {
+                        loop {
+                            set.push(self.intern_grouping(&mut by)?);
+                            if !self.eat(&Tok::Comma) {
+                                break;
+                            }
+                        }
+                        self.expect(&Tok::RParen, ") after a grouping set")?;
+                    }
+                }
+                false => set.push(self.intern_grouping(&mut by)?),
+            }
+            // `(a, a)` is one column written twice, and the combination of a column with itself
+            // is every record paired with itself. The same argument `GROUP BY c, c` gets.
+            let mut sorted = set.clone();
+            sorted.sort_unstable();
+            let deduped = {
+                let mut d = sorted.clone();
+                d.dedup();
+                d
+            };
+            if deduped.len() != sorted.len() {
+                return Err(self.refuse_at(Refused::Shape, set_at));
+            }
+            // A set written twice is one set, and answering it twice would double every row it
+            // holds. Refused rather than folded, so the statement says what it means.
+            if of.contains(&deduped) {
+                return Err(self.refuse_at(Refused::Shape, set_at));
+            }
+            of.push(deduped);
+            if !self.eat(&Tok::Comma) {
+                break;
+            }
+        }
+        self.expect(&Tok::RParen, ") after GROUPING SETS")?;
+
+        if by.len() > MAX_GROUP_COLUMNS {
+            return Err(self.refuse_at(Refused::Shape, group_at));
+        }
+        if of.len() > MAX_GROUPING_SETS {
+            return Err(self.refuse_at(Refused::GroupingSets, at));
+        }
+        sort_sets(&mut of);
+        Ok((by, GroupingSets { of, at }))
+    }
+
+    /// One term of a grouping set, as a position in the list of columns the clause names.
+    ///
+    /// Interning rather than pushing, because the sets overlap by design: `((a, b), (a))` names
+    /// `a` twice and is one column grouped two ways, not two columns. Two terms naming one
+    /// column with *different* boundaries - `date_trunc('day', ts)` in one set and
+    /// `date_trunc('month', ts)` in another - are two different groupings of one column and
+    /// have no single axis to be, so they are refused rather than silently folded onto the
+    /// boundary that happened to be read first.
+    fn intern_grouping(&mut self, by: &mut Vec<Grouping>) -> Result<usize> {
+        let g = self.grouping()?;
+        match by.iter().position(|held| held.name.column == g.name.column) {
+            Some(at) if by[at].bucket == g.bucket => Ok(at),
+            Some(_) => Err(self.refuse_at(Refused::Shape, g.at)),
+            None => {
+                by.push(g);
+                Ok(by.len() - 1)
+            }
+        }
+    }
+}
+
+/// `ROLLUP(a, b, c)`: every prefix, longest first.
+///
+/// `[[0,1,2], [0,1], [0], []]` - the detail, then each subtotal in decreasing detail, then the
+/// grand total. `n + 1` sets for `n` columns.
+fn rollup(n: usize) -> Vec<Vec<usize>> {
+    (0..=n).rev().map(|len| (0..len).collect()).collect()
+}
+
+/// `CUBE(a, b, c)`: every subset. `2^n` sets for `n` columns.
+///
+/// Ordered by [`sort_sets`] rather than by the bit pattern that generated them, because the order
+/// is the answer's row order and a reader should not have to know how the subsets were counted.
+fn cube(n: usize) -> Vec<Vec<usize>> {
+    let mut out: Vec<Vec<usize>> =
+        (0..1u32 << n).map(|mask| (0..n).filter(|i| mask >> i & 1 == 1).collect()).collect();
+    sort_sets(&mut out);
+    out
+}
+
+/// The order a grouping-sets answer's rows come out in: longest set first, and lexicographic by
+/// position within a length.
+///
+/// **Written down because there is no `ORDER BY` to override it.** An answer whose rows are one
+/// grouping per set has no single list to sort - see [`Refused::RollupOrder`] - so the order the
+/// branches are built in is the order the client gets, and it has to be a property of the
+/// statement rather than of whichever loop happened to produce the sets.
+fn sort_sets(of: &mut [Vec<usize>]) {
+    of.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
 }
 
 /// The column and boundary a `date_trunc` over a bare column names, when that is what it is.

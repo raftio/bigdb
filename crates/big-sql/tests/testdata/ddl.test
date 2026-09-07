@@ -334,3 +334,15 @@ ALTER TABLE visits ADD COLUMN region TEXT, DROP DAYS BEFORE '2026-01-01' ON visi
 AlterTable visits
 ├── add region set depth=32
 └── drop days before 2026-01-01 on visit
+
+# The sketch types, refused separately from `BITMAP`: a bitmap is declined because every column
+# here already is one, a sketch because there is nothing here for one to approximate.
+error
+CREATE TABLE t (u HLL)
+----
+sql_sketch
+
+error
+CREATE TABLE t (q QUANTILE_STATE)
+----
+sql_sketch
