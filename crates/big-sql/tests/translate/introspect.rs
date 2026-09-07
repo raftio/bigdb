@@ -119,6 +119,7 @@ fn a_decimal_that_came_from_the_field_route_renders_wide_enough() {
         kind: ColumnKind::Decimal,
         bit_depth: 20,
         scale: Some(2),
+        members: Vec::new(),
     };
     let written = big_sql::render::create_table("t", None, &[column]);
     let read_back = columns(&written);

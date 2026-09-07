@@ -621,11 +621,21 @@ fn qualified(database: &Option<String>, table: &str) -> String {
 /// statement does.
 fn column(column: &Column) -> String {
     format!(
-        "{} {} depth={}{}",
+        "{} {} depth={}{}{}",
         column.name,
         column.kind.as_str(),
         column.bit_depth,
-        opt(" scale=", column.scale.as_ref())
+        opt(" scale=", column.scale.as_ref()),
+        // **Printed, because the kind alone cannot tell an enum from the mutex it is stored
+        // as.** Without this an explained `ENUM('a','b')` and an explained `MUTEX` are the same
+        // line, and a corpus case about the members would be checking nothing.
+        match column.members.is_empty() {
+            true => String::new(),
+            false => format!(
+                " members=[{}]",
+                column.members.iter().map(|m| format!("'{m}'")).collect::<Vec<_>>().join(", ")
+            ),
+        }
     )
 }
 

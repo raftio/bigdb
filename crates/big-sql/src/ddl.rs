@@ -323,6 +323,13 @@ pub struct Column {
     pub bit_depth: u32,
     /// Digits after the point, and `Some` exactly when the kind is [`ColumnKind::Decimal`].
     pub scale: Option<i8>,
+    /// The values an `ENUM` may hold, in the order written. Empty for every other kind.
+    ///
+    /// **Metadata beside a `MUTEX`, not a kind of its own below the catalog.** One value per
+    /// record over an interned dictionary is what a mutex already is; what the list adds is a
+    /// value outside it being refused on the way in, and the declared type surviving
+    /// `SHOW CREATE TABLE`.
+    pub members: Vec<String>,
 }
 
 /// What a field stores, as a column list may name it.
@@ -338,6 +345,12 @@ pub struct Column {
 /// what `BIGINT` has always been.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ColumnKind {
+    /// `ENUM('a', 'b')`: a `MUTEX` that also declares which values it may hold.
+    ///
+    /// A `ColumnKind` rather than a flag on [`Column`] so that the layers that match on a kind
+    /// have to say what they do with it - which is how `SHOW CREATE TABLE` came to print the
+    /// declared type rather than the storage one.
+    Enum,
     Set,
     Mutex,
     Bool,
@@ -358,6 +371,10 @@ impl ColumnKind {
     /// written.
     pub fn as_str(self) -> &'static str {
         match self {
+            // **The storage spelling, which is a mutex.** This is the word the field route
+            // takes, and that route has no way to carry a member list - so a field created
+            // through it is the plain mutex an enum is stored as, which is exactly right.
+            Self::Enum => "mutex",
             Self::Set => "set",
             Self::Mutex => "mutex",
             Self::Bool => "bool",

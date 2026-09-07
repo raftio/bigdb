@@ -21,6 +21,27 @@
 
 use super::*;
 
+/// Everything about a field except which table it is in and what it is called.
+///
+/// A struct rather than five more parameters, because five is where a reader stops being able to
+/// tell which positional argument is which - and because every kind leaves most of them at their
+/// default. [`Declared::of`] is that default, so a caller names only the part its kind actually
+/// carries.
+struct Declared {
+    kind: FieldKind,
+    bit_depth: u32,
+    scale: i8,
+    granularity: Vec<Granularity>,
+    members: Vec<String>,
+}
+
+impl Declared {
+    /// A field of this kind carrying nothing else: no depth, no scale, no views, no members.
+    fn of(kind: FieldKind) -> Self {
+        Self { kind, bit_depth: 0, scale: 0, granularity: Vec::new(), members: Vec::new() }
+    }
+}
+
 impl<P: PagerMut> Db<P> {
     /// Runs one transaction against the catalog, committing only if the closure succeeds.
     ///
@@ -169,7 +190,16 @@ impl<P: PagerMut> Db<P> {
         scale: i8,
     ) -> Result<FieldId> {
         let table = table.into();
-        self.declare(table, name, FieldKind::Decimal, bit_depth, scale, Vec::new())
+        self.declare(
+            table,
+            name,
+            Declared {
+                kind: FieldKind::Decimal,
+                bit_depth,
+                scale,
+                ..Declared::of(FieldKind::Decimal)
+            },
+        )
     }
 
     /// A signed integer field.
@@ -187,7 +217,7 @@ impl<P: PagerMut> Db<P> {
         bit_depth: u32,
     ) -> Result<FieldId> {
         let table = table.into();
-        self.declare(table, name, FieldKind::SignedInt, bit_depth, 0, Vec::new())
+        self.declare(table, name, Declared { bit_depth, ..Declared::of(FieldKind::SignedInt) })
     }
 
     /// A time quantum field: a keyed field that also writes into one view per granularity.
@@ -198,7 +228,7 @@ impl<P: PagerMut> Db<P> {
         granularity: Vec<Granularity>,
     ) -> Result<FieldId> {
         let table = table.into();
-        self.declare(table, name, FieldKind::TimeQuantum, 0, 0, granularity)
+        self.declare(table, name, Declared { granularity, ..Declared::of(FieldKind::TimeQuantum) })
     }
 
     pub fn create_field<'a>(
@@ -209,17 +239,31 @@ impl<P: PagerMut> Db<P> {
         bit_depth: u32,
     ) -> Result<FieldId> {
         let table = table.into();
-        self.declare(table, name, kind, bit_depth, 0, Vec::new())
+        self.declare(table, name, Declared { bit_depth, ..Declared::of(kind) })
+    }
+
+    /// A `MUTEX` field that also declares which values it may hold - what SQL spells `ENUM`.
+    ///
+    /// **The kind is `MUTEX` and the members are metadata beside it**, which is the whole reason
+    /// an enum costs no engine change: one value per record over an interned dictionary is what
+    /// a mutex already is, and what a declared list adds is a check on the way in and a name on
+    /// the way out. A field with an empty list is a plain mutex, which is what every field
+    /// written before this existed reads back as.
+    pub fn create_enum<'a>(
+        &self,
+        table: impl Into<TableRef<'a>>,
+        name: &str,
+        members: Vec<String>,
+    ) -> Result<FieldId> {
+        let table = table.into();
+        self.declare(table, name, Declared { members, ..Declared::of(FieldKind::Mutex) })
     }
 
     fn declare<'a>(
         &self,
         table: impl Into<TableRef<'a>>,
         name: &str,
-        kind: FieldKind,
-        bit_depth: u32,
-        scale: i8,
-        granularity: Vec<Granularity>,
+        d: Declared,
     ) -> Result<FieldId> {
         let table = table.into();
         let mut w = self.write();
@@ -228,10 +272,11 @@ impl<P: PagerMut> Db<P> {
             id: 0,
             table: table_id,
             name: name.to_string(),
-            kind,
-            bit_depth,
-            scale,
-            granularity,
+            kind: d.kind,
+            bit_depth: d.bit_depth,
+            scale: d.scale,
+            granularity: d.granularity,
+            members: d.members,
         })?;
         w.commit()?;
         Ok(id)

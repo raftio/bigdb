@@ -327,6 +327,11 @@ impl<P: PagerMut + Sync> Cluster<P> {
             big_embed::FieldKind::TimeQuantum => {
                 self.create_time_quantum(table, &column.name, Vec::new())
             }
+            // Decided on the declaration rather than on the kind, because an enum and a plain
+            // mutex are one `FieldKind` and only the member list tells them apart.
+            _ if !column.members.is_empty() => {
+                self.create_enum(table, &column.name, column.members.clone())
+            }
             _ => self.create_field(table, &column.name, kind, column.bit_depth),
         }
     }

@@ -445,3 +445,60 @@ error
 EXCHANGE TABLES live AND typo
 ----
 error: unknown_table
+
+## `ENUM`: the declaration is enforced, and it survives.
+#
+# Two claims, and neither is visible in translation. First that a value outside the list is
+# refused on the way in — which is the whole of what declaring the members buys, because the
+# mutex underneath would take any string. Second that `SHOW CREATE TABLE` says `ENUM(...)` and
+# not `MUTEX`: the members live in the catalog beside the field, so the declared type is still
+# there to print.
+
+statement
+CREATE TABLE orders (status ENUM('new', 'paid', 'shipped'), amount UINT(32))
+
+statement
+INSERT INTO orders (_record_id, status, amount) VALUES (1, 'new', 10), (2, 'paid', 20)
+
+query
+SELECT count(*) FROM orders WHERE status = 'paid'
+----
+count
+1
+
+# A value the column was not declared to hold. The mutex underneath would have taken it.
+error
+INSERT INTO orders (_record_id, status, amount) VALUES (3, 'refunded', 30)
+----
+error: malformed_line
+
+# And nothing was written: the statement failed before the first fact went out.
+query
+SELECT count(*) FROM orders
+----
+count
+2
+
+# The declared type comes back, not the storage one.
+query
+SHOW CREATE TABLE orders
+----
+statement
+CREATE TABLE orders (
+    status ENUM('new', 'paid', 'shipped'),
+    amount UINT(32)
+) ENGINE = 'bitmap+columnar'
+
+# A plain mutex still takes anything, which is what says the check belongs to the declaration
+# rather than to the kind.
+statement
+CREATE TABLE loose (status MUTEX)
+
+statement
+INSERT INTO loose (_record_id, status) VALUES (1, 'anything at all')
+
+query
+SELECT count(*) FROM loose WHERE status = 'anything at all'
+----
+count
+1

@@ -411,3 +411,54 @@ error
 CREATE TABLE t (client IPv6)
 ----
 sql_unknown_column_type
+
+## `ENUM`: a `MUTEX` that also declares which values it may hold.
+#
+# The kind stored is a mutex — one value per record over an interned dictionary, which is exactly
+# what an enum wants — and the member list travels beside it as metadata. That is what makes this
+# free below the catalog: no new `FieldKind`, no engine change, no storage format for a value.
+#
+# What the list buys is the two things a mutex cannot say: a write outside it is refused, and the
+# declared type survives `SHOW CREATE TABLE` instead of coming back as `MUTEX`.
+
+ddl
+CREATE TABLE t (status ENUM('new', 'paid', 'shipped'))
+----
+CreateTable t
+└── status mutex depth=32 members=['new', 'paid', 'shipped']
+
+# `Enum8` and `Enum16` are the same declaration. The width names how many members fit, and the
+# dictionary underneath has no such ceiling — so it is read and dropped, the way `INT UNSIGNED`'s
+# word is.
+ddl
+CREATE TABLE t (status Enum8('a', 'b'))
+----
+CreateTable t
+└── status mutex depth=32 members=['a', 'b']
+
+ddl
+CREATE TABLE t (status Enum16('a'))
+----
+CreateTable t
+└── status mutex depth=32 members=['a']
+
+# **The numbers are refused, not ignored.** `Enum8('a' = 1)` says which integer the value is
+# stored as, and here the dictionary assigns that — so an accepted `= 1` would be a promise about
+# storage that nothing keeps.
+error
+CREATE TABLE t (status Enum8('a' = 1, 'b' = 2))
+----
+sql_enum_type
+
+# A duplicate member would be unreachable, and would make `SHOW CREATE TABLE` disagree with what
+# was typed.
+error
+CREATE TABLE t (status ENUM('a', 'a'))
+----
+sql_enum_type
+
+# An enum of nothing is a column that can hold nothing.
+error
+CREATE TABLE t (status ENUM())
+----
+parse_error

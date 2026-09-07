@@ -699,6 +699,14 @@ impl<P: PagerMut + Sync> Api<P> {
         Ok(self.db.create_time_quantum(table, field, granularity)?)
     }
 
+    /// A `MUTEX` field that also declares which values it may hold - what SQL spells `ENUM`.
+    ///
+    /// See [`big_db::Db::create_enum`]: the kind stored is a mutex and the members are metadata
+    /// beside it, which is what keeps an enum free of any engine change.
+    pub fn create_enum(&self, table: &str, field: &str, members: Vec<String>) -> Result<FieldId> {
+        Ok(self.db.create_enum(table, field, members)?)
+    }
+
     /// A snapshot of the schema, owned outright.
     ///
     /// The catalog lives behind a lock; handing out a guard would let a caller hold it while

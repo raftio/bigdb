@@ -250,6 +250,31 @@ The new name is bare and both tables are in one database. A rename that also mov
 changes wearing one name, and it is a syntax error rather than a refusal — there is nothing to
 write instead of it.
 
+## A column with a closed set of values
+
+```sql
+CREATE TABLE orders (status ENUM('new', 'paid', 'shipped'))
+```
+
+**Stored as a `MUTEX`, with the members as metadata beside it.** One value per record over an
+interned dictionary is what a mutex already is, so an enum costs no new `FieldKind`, no engine
+change and no storage format — the list travels in the catalog next to the field, in its own
+record kind because it does not fit in one.
+
+What the list buys is the two things a mutex cannot say. A value outside it is refused on the way
+in, naming the values that are allowed; and `SHOW CREATE TABLE` answers `ENUM('new', 'paid',
+'shipped')` rather than `MUTEX`, because the declaration is still there to print. A field that
+declares no members is a plain mutex and takes anything, which is what says the check belongs to
+the declaration rather than to the kind — and is also what every field written before this
+existed reads back as.
+
+`Enum8` and `Enum16` are the same declaration; the width names how many members fit and the
+dictionary has no such ceiling. The `'a' = 1` form is refused (`sql_enum_type`): the number says
+which integer the value is stored as, and here the dictionary assigns that, so keeping it would
+be a promise nothing honours. A repeated member is refused too — the second is unreachable, and a
+list holding fewer values than it names would make `SHOW CREATE TABLE` disagree with what was
+typed.
+
 ## Sampling, and replacing a table's contents
 
 ```sql
@@ -423,7 +448,7 @@ declared. `MATERIALIZED` and `ALIAS` columns (`sql_computed_column`): one is a v
 materialised one. `Array`, `Map`, `Tuple` (`sql_composite_type`) and `ARRAY JOIN`
 (`sql_no_array_join`) and the `array*` functions (`sql_array_function`): a keyed column already
 holds many values per record, so `has(c, x)` is `c = 'x'` and one row per element is
-`GROUP BY c`. `Enum8` (`sql_enum_type`): `MUTEX` is that storage already. `neighbor`,
+`GROUP BY c`. `neighbor`,
 `windowFunnel` and `retention` (`sql_no_sequence_function`). And `s3`, `url`, `file` and
 `generateRandom` (`sql_no_table_function`), where `numbers(n)` is the one that works.
 

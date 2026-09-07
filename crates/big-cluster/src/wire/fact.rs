@@ -210,6 +210,16 @@ pub enum Ddl {
         field: String,
         granularity: Vec<Granularity>,
     },
+    /// A `MUTEX` field that also declares which values it may hold.
+    ///
+    /// Its own variant rather than a `CreateField` with a list bolted on, for the reason
+    /// [`Ddl::CreateDecimal`] is one: the extra thing it carries is not optional, and a shape
+    /// where it might be absent is a shape where a peer can create the field without it.
+    CreateEnum {
+        table: String,
+        field: String,
+        members: Vec<String>,
+    },
     DropTable {
         table: String,
     },
@@ -346,6 +356,15 @@ impl Ddl {
                 put_u8(&mut out, 13);
                 put_str(&mut out, table);
             }
+            Self::CreateEnum { table, field, members } => {
+                put_u8(&mut out, 17);
+                put_str(&mut out, table);
+                put_str(&mut out, field);
+                put_count(&mut out, members.len());
+                for m in members {
+                    put_str(&mut out, m);
+                }
+            }
             Self::RenameTable { table, to } => {
                 put_u8(&mut out, 15);
                 put_str(&mut out, table);
@@ -452,6 +471,18 @@ impl Ddl {
             10 => Self::CreateRole { role: r.str()? },
             11 => Self::DropRole { role: r.str()? },
             13 => Self::TruncateTable { table: r.str()? },
+            17 => Self::CreateEnum {
+                table: r.str()?,
+                field: r.str()?,
+                members: {
+                    let n = r.count()?;
+                    let mut out = Vec::with_capacity(n.min(1024));
+                    for _ in 0..n {
+                        out.push(r.str()?);
+                    }
+                    out
+                },
+            },
             15 => Self::RenameTable { table: r.str()?, to: r.str()? },
             16 => Self::ExchangeTables { a: r.str()?, b: r.str()? },
             14 => Self::DropViewsBefore {

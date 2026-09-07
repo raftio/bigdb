@@ -442,11 +442,12 @@ pub enum Refused {
     /// column already holds *many* values for one record, which is the thing an array of strings
     /// is for - so the sentence points there rather than reporting an absence.
     CompositeType,
-    /// `Enum8(...)`, `Enum16(...)`.
+    /// An `ENUM` declared in a shape this dialect does not keep.
     ///
-    /// The storage an enum wants is what `MUTEX` already is: one value per record over an
-    /// interned dictionary. What is missing is the declared list of members, and nothing below
-    /// the catalog could enforce one.
+    /// **The type itself is answered now.** What is refused is the `'a' = 1` form, whose number
+    /// says which integer the value is stored as - here the dictionary assigns that, so keeping
+    /// the number would be a promise nothing honours - and a duplicate member, which would be
+    /// unreachable and would make `SHOW CREATE TABLE` disagree with what was typed.
     EnumType,
     /// `ARRAY JOIN`, `LATERAL VIEW explode(...)`, `UNNEST(...)`.
     ///
@@ -1214,10 +1215,13 @@ impl Refused {
                  `Map` or a `Tuple` is two columns"
             }
             Self::EnumType => {
-                "`MUTEX` is the storage an enum is asking for: one value per record, interned \
-                 once into a dictionary, so a comparison is a bitmap and not a string. What is \
-                 not here is the declared list of members - nothing below the catalog would \
-                 check a value against one - so the column takes the values it is given"
+                "an enum is written `ENUM('a', 'b')` - the values, and nothing else. The \
+                 `'a' = 1` form says which integer each value is stored as, and here a mutex \
+                 interns each one into the dictionary and the *dictionary* decides that number, \
+                 so a written `= 1` would be a promise about storage that nothing keeps. A \
+                 repeated value is refused for a nearer reason: the second one is unreachable, \
+                 and a list holding fewer values than it names would make `SHOW CREATE TABLE` \
+                 disagree with what was typed"
             }
             Self::ArrayJoin => {
                 "one row per element of a repeated column is `GROUP BY <the column>`, which is \

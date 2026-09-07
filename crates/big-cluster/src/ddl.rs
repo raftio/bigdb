@@ -108,6 +108,15 @@ impl<P: PagerMut + Sync> Cluster<P> {
         })
     }
 
+    /// A mutex field that also declares which values it may hold.
+    ///
+    /// Travels the same leader-then-fan-out path every schema change takes, and it has to: a
+    /// node that missed the member list would accept a write the others refuse, which is the
+    /// kind of disagreement that shows up as a record existing on some nodes and not others.
+    pub fn create_enum(&self, table: &str, field: &str, members: Vec<String>) -> Result<u64> {
+        self.ddl(&Ddl::CreateEnum { table: table.to_string(), field: field.to_string(), members })
+    }
+
     pub fn create_database(&self, name: &str) -> Result<bool> {
         self.ddl(&Ddl::CreateDatabase { name: name.to_string() }).map(|n| n == 1)
     }
@@ -326,6 +335,9 @@ pub fn apply_ddl<P: PagerMut + Sync>(api: &Api<P>, op: &Ddl) -> big_embed::Resul
         }
         Ddl::CreateTimeQuantum { table, field, granularity } => {
             api.create_time_quantum(table, field, granularity.clone())? as u64
+        }
+        Ddl::CreateEnum { table, field, members } => {
+            api.create_enum(table, field, members.clone())? as u64
         }
         Ddl::DropTable { table } => api.drop_table(table)? as u64,
         // A table that is not here counts as nothing truncated rather than as a failure: the

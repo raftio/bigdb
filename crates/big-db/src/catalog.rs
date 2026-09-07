@@ -60,6 +60,7 @@ pub const KIND_SAVED_QUERY: u8 = kind::SAVED_QUERY;
 pub const KIND_SAVED_QUERY_TEXT: u8 = kind::SAVED_QUERY_TEXT;
 pub const KIND_ROLE: u8 = kind::ROLE;
 pub const KIND_GRANT: u8 = kind::GRANT;
+pub const KIND_FIELD_ENUM: u8 = kind::FIELD_ENUM;
 
 const NAME_AT: usize = 24;
 
@@ -254,6 +255,18 @@ pub struct FieldDef {
     /// Fixed scale for a decimal, so it can be stored as an integer.
     pub scale: i8,
     pub granularity: Vec<Granularity>,
+    /// The values an `ENUM` column was declared with, in the order written. Empty for every
+    /// other kind, and for a `MUTEX` that was declared as one.
+    ///
+    /// **Metadata, not storage.** The field is a `MUTEX` underneath and stores an interned row
+    /// id exactly as it would without this - which is the whole reason an enum costs no engine
+    /// change. What the list buys is the two things a `MUTEX` cannot say: a write outside it is
+    /// refused, and `SHOW CREATE TABLE` can name the type that was declared.
+    ///
+    /// The declared *numbers* of `Enum8('a' = 1)` are deliberately absent. They promise which
+    /// integer a value is stored as, and here the dictionary assigns that - so the parser
+    /// refuses the form rather than keeping a number nothing honours.
+    pub members: Vec<String>,
 }
 
 /// A `SELECT` kept under a name, in the database that name is unique within.
@@ -402,6 +415,27 @@ mod seq_of {
     pub const DATABASE: u8 = 3;
     pub const SAVED_QUERY: u8 = 4;
     pub const ROLE: u8 = 5;
+}
+
+/// The separator between enum members on disk.
+///
+/// NUL, because it is the one byte a member may not contain - checked where a column list is
+/// read, so a member holding one never reaches this file. Any printable separator would be a
+/// character somebody could legitimately put in a value.
+const MEMBER_SEP: char = '\0';
+
+/// The members as one string, for chunking into records.
+fn join_members(members: &[String]) -> String {
+    members.join(&MEMBER_SEP.to_string())
+}
+
+/// The inverse. An empty string is no members rather than one empty member, which is what
+/// distinguishes a field that declared none from one that declared `''`.
+fn split_members(text: &str) -> Vec<String> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    text.split(MEMBER_SEP).map(str::to_string).collect()
 }
 
 /// Panics rather than truncating if a name got this far over-long: every public entry point
@@ -1146,8 +1180,24 @@ impl Catalog {
             b[12..16].copy_from_slice(&f.bit_depth.to_le_bytes());
             b[16] = f.scale as u8;
             b[17] = gran_mask(&f.granularity);
+            // The total byte length of the member blob, in the header's free word - what lets
+            // the decoder tell a complete set of chunks from a torn one, exactly as a saved
+            // query's header carries its text length. Zero for every field that declares none,
+            // which is what an unwritten word already reads as.
+            let members = join_members(&f.members);
+            b[18..22].copy_from_slice(&(members.len() as u32).to_le_bytes());
             put_name(&mut b, &f.name);
             out.push(b);
+            for (i, chunk) in members.as_bytes().chunks(TEXT_CHUNK_BYTES).enumerate() {
+                let mut b = vec![0u8; CATALOG_ENTRY_BYTES];
+                b[0] = KIND_FIELD_ENUM;
+                b[2..4].copy_from_slice(&(chunk.len() as u16).to_le_bytes());
+                b[4..8].copy_from_slice(&f.table.to_le_bytes());
+                b[8..12].copy_from_slice(&f.id.to_le_bytes());
+                b[12..16].copy_from_slice(&(i as u32).to_le_bytes());
+                b[NAME_AT..NAME_AT + chunk.len()].copy_from_slice(chunk);
+                out.push(b);
+            }
         }
         for (k, m) in &self.fragments {
             let mut b = vec![0u8; CATALOG_ENTRY_BYTES];
@@ -1227,6 +1277,11 @@ impl Catalog {
         // were written in.
         let mut query_headers: BTreeMap<QueryId, (DatabaseId, String, usize)> = BTreeMap::new();
         let mut query_text: BTreeMap<(QueryId, u32), Vec<u8>> = BTreeMap::new();
+        // A field's declared enum members, staged the same way and for the same reason: the
+        // chunks and the header that says how many bytes they add up to arrive in whatever
+        // order the chain holds them.
+        let mut member_text: BTreeMap<(TableId, FieldId, u32), Vec<u8>> = BTreeMap::new();
+        let mut member_len: BTreeMap<(TableId, FieldId), usize> = BTreeMap::new();
 
         // Grants are staged for the same reason, one relation over: a grant names a role by id,
         // and nothing orders the chain so that the role record comes first. Collected here and
@@ -1286,6 +1341,14 @@ impl Catalog {
                     }
                     query_text.insert((rd32(4), rd32(8)), e[NAME_AT..NAME_AT + n].to_vec());
                 }
+                KIND_FIELD_ENUM => {
+                    let n = u16::from_le_bytes(e[2..4].try_into().unwrap()) as usize;
+                    if n > TEXT_CHUNK_BYTES {
+                        continue;
+                    }
+                    member_text
+                        .insert((rd32(4), rd32(8), rd32(12)), e[NAME_AT..NAME_AT + n].to_vec());
+                }
                 KIND_FIELD => {
                     let Some(name) = get_name(e) else { continue };
                     let Some(kind) = FieldKind::from_u8(e[1]) else {
@@ -1303,7 +1366,13 @@ impl Catalog {
                         bit_depth: rd32(12),
                         scale: e[16] as i8,
                         granularity: gran_from_mask(e[17]),
+                        // Filled in after the pass, when every chunk has been seen: the records
+                        // arrive in whatever order the chain holds them, so a field's members
+                        // cannot be assembled at the record that announces how many bytes they
+                        // are. The length is kept here to check against.
+                        members: Vec::new(),
                     };
+                    member_len.insert((def.table, def.id), rd32(18) as usize);
                     c.field_ids.entry(def.table).or_default().insert(name, def.id);
                     c.fields.insert((def.table, def.id), def);
                 }
@@ -1384,6 +1453,33 @@ impl Catalog {
             }
             c.saved_query_ids.entry(database).or_default().insert(name.clone(), id);
             c.saved_queries.insert(id, SavedQuery { id, database, name, text });
+        }
+
+        // The enum members, reassembled. A field whose chunks do not add up to the length its
+        // header announced keeps **no** members rather than a truncated list, and that is
+        // fail-closed in the direction that matters: an empty list means "not an enum", so the
+        // column reads back as the `MUTEX` it is stored as and every value in it is still
+        // readable. A half-decoded list would refuse writes that were always legal.
+        for ((table, field), len) in member_len {
+            if len == 0 {
+                continue;
+            }
+            let mut bytes = Vec::with_capacity(len);
+            for ((_, _, _), chunk) in
+                member_text.range((table, field, 0)..=(table, field, u32::MAX))
+            {
+                bytes.extend_from_slice(chunk);
+            }
+            if bytes.len() != len {
+                continue;
+            }
+            // Joined first, validated once, for the reason a saved query's text is: a chunk
+            // boundary falls mid-character often enough that per-record validation would reject
+            // ordinary names.
+            let Ok(text) = String::from_utf8(bytes) else { continue };
+            if let Some(def) = c.fields.get_mut(&(table, field)) {
+                def.members = split_members(&text);
+            }
         }
 
         // The grants, now that every role record has gone past. One whose role is not there is

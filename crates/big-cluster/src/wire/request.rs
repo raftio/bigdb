@@ -637,6 +637,13 @@ pub fn put_schema(
             for g in &field.granularity {
                 put_u8(out, g.as_char() as u8);
             }
+            // The declared enum members, which a repair needs for the same reason it needs the
+            // scale: without them the field comes back as the mutex it is stored as, and the
+            // check on the way in would be gone.
+            put_count(out, field.members.len());
+            for m in &field.members {
+                put_str(out, m);
+            }
         }
     }
     put_count(out, views.len());
@@ -675,7 +682,19 @@ pub fn get_schema(bytes: &[u8]) -> Result<(Vec<big_embed::TableInfo>, Vec<big_em
                     granularity_of(c).ok_or(WireError::BadTag { what: "granularity", tag: c })?,
                 );
             }
-            fields.push(big_embed::FieldInfo { name: field, kind, bit_depth, scale, granularity });
+            let n = r.count()?;
+            let mut members = reserve(n);
+            for _ in 0..n {
+                members.push(r.str()?);
+            }
+            fields.push(big_embed::FieldInfo {
+                name: field,
+                kind,
+                bit_depth,
+                scale,
+                granularity,
+                members,
+            });
         }
         let r = big_db::TableRef::parse(&name);
         tables.push(big_embed::TableInfo {

@@ -1440,3 +1440,80 @@ fn exchanging_against_a_missing_table_moves_neither() {
     assert_eq!(d.catalog().lookup("a").unwrap().id, before);
     assert!(d.catalog().lookup("typo").is_none());
 }
+
+/// **A declared enum member list survives a reopen, and is metadata beside a `MUTEX`.**
+///
+/// The two halves worth pinning. First that the list comes back at all: it does not fit in a
+/// catalog record, so it is chunked under its own record kind and reassembled on load, and a
+/// chunk lost off the end has to be detectable — which is what the length in the field's header
+/// is for. Second that the field is a plain mutex underneath, so an enum costs no engine change
+/// and a reader that predates the record kind sees a working column rather than a broken one.
+#[cfg(unix)]
+#[test]
+fn enum_members_survive_a_reopen_and_the_field_is_still_a_mutex() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("e.big");
+
+    // Long enough to span several 104-byte chunks, so the reassembly is actually exercised
+    // rather than fitting in one record by accident.
+    let members: Vec<String> = (0..40).map(|i| format!("member_number_{i:03}")).collect();
+
+    {
+        let d = Db::open_path(&path).unwrap();
+        d.create_table("t").unwrap();
+        d.create_enum("t", "status", members.clone()).unwrap();
+        let mut w = d.write();
+        w.set_key("t", "status", 1, "member_number_007").unwrap();
+        w.commit().unwrap();
+    }
+
+    let d = Db::open_path(&path).unwrap();
+    let catalog = d.catalog();
+    let def = catalog.field(0, "status").expect("the field is there");
+    assert_eq!(def.members, members, "every member came back, in order");
+    // Stored as a mutex, which is what makes this free below the catalog.
+    assert_eq!(def.kind, FieldKind::Mutex);
+    assert_eq!(d.read().by_key("t", "status", "member_number_007").unwrap(), vec![1]);
+}
+
+/// A field that declares no members reads back with none — not one empty one.
+#[test]
+fn a_field_with_no_members_is_not_a_field_with_one_empty_member() {
+    let d = Db::in_memory().unwrap();
+    d.create_table("t").unwrap();
+    d.create_field("t", "plain", FieldKind::Mutex, 0).unwrap();
+    assert!(d.catalog().field(0, "plain").unwrap().members.is_empty());
+}
+
+/// **A file written before enums existed still opens, and its mutex fields still work.**
+///
+/// The backward half of the format change, and the one that cannot be checked by writing and
+/// reading back with the same code. A `FIELD` record written by an older build carries zero in
+/// the word that now holds the member-blob length, and no `FIELD_ENUM` records follow it — which
+/// is exactly the shape a field declaring no members has today. So the test is that a field
+/// whose header says zero reads back as a working mutex rather than as a broken enum.
+#[cfg(unix)]
+#[test]
+fn a_field_written_without_members_reads_back_as_a_plain_mutex() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("old.big");
+
+    {
+        let d = Db::open_path(&path).unwrap();
+        d.create_table("t").unwrap();
+        // The call an older build had: no members, so the header word is zero and no member
+        // records are written.
+        d.create_field("t", "status", FieldKind::Mutex, 0).unwrap();
+        let mut w = d.write();
+        w.set_key("t", "status", 1, "anything at all").unwrap();
+        w.commit().unwrap();
+    }
+
+    let d = Db::open_path(&path).unwrap();
+    let catalog = d.catalog();
+    let def = catalog.field(0, "status").expect("the field is there");
+    assert!(def.members.is_empty(), "no members declared means no members read back");
+    assert_eq!(def.kind, FieldKind::Mutex);
+    // And it still takes any value, which is what a mutex has always done.
+    assert_eq!(d.read().by_key("t", "status", "anything at all").unwrap(), vec![1]);
+}
