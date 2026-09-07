@@ -24,4 +24,5 @@ mod common;
 mod absence;
 mod cuts;
 mod joins;
+mod sets;
 mod shapes;

@@ -44,6 +44,7 @@ mod grouped;
 mod join;
 mod measure;
 mod pql;
+mod sets;
 mod tuples;
 mod ungrouped;
 
@@ -268,6 +269,12 @@ fn lower_one(select: &Select) -> Result<Statement> {
     }
 
     let table = &select.from.qualified();
+    // `WITH ROLLUP`, `WITH CUBE` and `GROUPING SETS` before the arity dispatch, because they are
+    // *several* of those arities rather than one: the sets are the answer's branches, and each
+    // is lowered by whichever of the three below its own width calls for.
+    if let Some(sets) = &select.grouping_sets {
+        return sets::sets(select, table, &rows, sets, &stars, &columns, &aggregates);
+    }
     match select.group_by.as_slice() {
         [] => ungrouped::ungrouped(select, table, &rows, &stars, &columns, &aggregates),
         [one] => grouped::grouped(select, table, &rows, one, &stars, &columns, &aggregates),

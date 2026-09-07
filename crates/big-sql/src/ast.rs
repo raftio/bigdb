@@ -193,6 +193,17 @@ pub struct Select {
     /// and which this engine answers with the same plan. The parser normalises one into the
     /// other so the lowering has a single path to `Distinct`.
     pub group_by: Vec<Grouping>,
+    /// Which combinations of [`Select::group_by`] the answer has a row for.
+    ///
+    /// **Normalised where it is written**, into positions in `group_by`: `WITH ROLLUP`, `WITH
+    /// CUBE` and `GROUPING SETS ((a,b),(a),())` are three spellings of a list somebody could
+    /// have written out by hand, and the lowering should not have to know which one was typed.
+    /// The same decision `SELECT DISTINCT` is normalised by, for the same reason - one path to
+    /// the plans instead of three that have to agree.
+    ///
+    /// `None` for a plain `GROUP BY`, which is the single set naming every column and is left
+    /// unwritten so that nothing existing changes shape.
+    pub grouping_sets: Option<GroupingSets>,
     /// `HAVING count(*) <op> <n>`, absent when every group is kept.
     pub having: Option<Having>,
     /// `ORDER BY`, at most one key.
@@ -645,6 +656,24 @@ pub enum Cond {
         /// The value the rounded column is compared against, exactly as written.
         value: Literal,
     },
+}
+
+/// The sets a `ROLLUP`, `CUBE` or `GROUPING SETS` clause names.
+///
+/// Each entry is a subset of [`Select::group_by`], and a row of the answer belongs to exactly one
+/// of them - so a statement carrying this is several groupings whose rows are stacked, which is
+/// what lets it need no plan the engine did not already have.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct GroupingSets {
+    /// One entry per set: positions in [`Select::group_by`], ascending and without repeats.
+    ///
+    /// **Longest first**, and lexicographic within a length. That is the answer's row order, so
+    /// it is fixed where the clause is read rather than left to whatever order a set builder
+    /// happened to produce - and it puts the branch where every key column is a real key first,
+    /// which is the branch [`crate::Shape::columns`] names the answer after.
+    pub of: Vec<Vec<usize>>,
+    /// Byte offset of the clause, for the refusals it earns.
+    pub at: usize,
 }
 
 /// One `GROUP BY` term.

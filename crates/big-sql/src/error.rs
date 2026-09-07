@@ -325,6 +325,24 @@ pub enum Refused {
     /// It holds everything without being stored, which is what a database whose catalog is empty
     /// is recovered through - so it must not be creatable, droppable or narrowable.
     ReservedRole,
+    /// `GROUP BY a WITH TOTALS`: a grand total beside the rows rather than among them.
+    ///
+    /// Refused because a result set here is columns and rows, one definition every format
+    /// renders from - there is no second place to put a number. The same number *as a row* is
+    /// `WITH ROLLUP`, whose last row is the empty grouping set.
+    WithTotals,
+    /// More sets than one statement may name - see `parse::select::MAX_GROUPING_SETS`.
+    ///
+    /// A bound on the fan-out rather than a taste in rollups: every set is its own grouping,
+    /// planned and merged on its own, so sets multiplied by aggregates is what the statement
+    /// costs in round trips.
+    GroupingSets,
+    /// `ORDER BY`, `LIMIT` or `OFFSET` over a `ROLLUP`, `CUBE` or `GROUPING SETS` answer.
+    ///
+    /// Those rows are one grouping per set rendered one after the other - the stacking
+    /// `UNION ALL` is - so there is no single list to sort or to cut. Ordering each set on its
+    /// own would look sorted and not be, and a `LIMIT 10` would answer ten rows *per set*.
+    RollupOrder,
 }
 
 impl Refused {
@@ -338,7 +356,7 @@ impl Refused {
     /// Kept honest by [`Refused::rank`] below, whose exhaustive match will not compile until a
     /// new variant is named - and by a test asserting that every rank appears here exactly once,
     /// which is what catches naming one and forgetting to add it.
-    pub const ALL: [Self; 74] = [
+    pub const ALL: [Self; 77] = [
         Self::Joins,
         Self::OuterJoin,
         Self::JoinOn,
@@ -413,6 +431,9 @@ impl Refused {
         Self::AclPublic,
         Self::GrantOption,
         Self::ReservedRole,
+        Self::WithTotals,
+        Self::GroupingSets,
+        Self::RollupOrder,
     ];
 
     /// Where this refusal sits in [`Refused::ALL`], and the reason that list can be trusted.
@@ -498,6 +519,9 @@ impl Refused {
             Self::Setting => 67,
             Self::SystemTable => 68,
             Self::SystemClause => 69,
+            Self::WithTotals => 74,
+            Self::GroupingSets => 75,
+            Self::RollupOrder => 76,
         }
     }
 
@@ -508,6 +532,9 @@ impl Refused {
     /// the same rule `PlanError` applies to its four parse variants.
     pub fn code(self) -> &'static str {
         match self {
+            Self::WithTotals => "sql_with_totals",
+            Self::GroupingSets => "sql_too_many_grouping_sets",
+            Self::RollupOrder => "sql_rollup_order",
             Self::SetTooLarge => "sql_set_too_large",
             Self::ExplainSet => "sql_explain_set",
             Self::Segment => "sql_segment_unexpanded",
@@ -841,6 +868,30 @@ impl Refused {
                  not a database anybody creates, so a name here is a question about this engine \
                  rather than about your schema - `system.query_log` and `system.processlist` \
                  would each need state this build does not keep"
+            }
+            Self::WithTotals => {
+                "`WITH TOTALS` puts the grand total outside the rows, in a `totals` field beside them - \
+                 and a result set here is columns and rows, one definition all five formats render \
+                 from, so there is nowhere for it to go. The same number as a *row* is `GROUP BY a WITH \
+                 ROLLUP`, whose last row is the empty grouping set; `grouping(a)` is what tells that row \
+                 from a group whose key this node was never told"
+            }
+            Self::GroupingSets => {
+                "`ROLLUP`, `CUBE` and `GROUPING SETS` are one grouping per set - a call planned, fanned \
+                 out to every owner and merged on its own - so the number of sets multiplied by the \
+                 aggregates in the select list is what the statement costs in round trips, against the \
+                 same budget every select list answers to. `CUBE` over four columns is sixteen sets, \
+                 which is that whole budget before a second aggregate is named. `WITH ROLLUP` is one set \
+                 per prefix - five for four columns - and `GROUPING SETS ((a,b),(a),())` names exactly \
+                 the ones you want, up to eight"
+            }
+            Self::RollupOrder => {
+                "a `ROLLUP`, `CUBE` or `GROUPING SETS` answer is one grouping per set, rendered one \
+                 after the other - the same stacking `UNION ALL` is - so there is no single list for an \
+                 `ORDER BY` to sort or a `LIMIT` to cut. Ordering each set on its own would look sorted \
+                 and not be, and a `LIMIT 10` would answer with ten rows per set. The rows do arrive in \
+                 a fixed order - the sets longest first, each in its own key order - so order and cut \
+                 them in the client, or write the one set you want ordered as its own `GROUP BY`"
             }
             Self::SystemClause => {
                 "a system view answers in full, and the clause it takes is \

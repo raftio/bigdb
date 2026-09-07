@@ -238,3 +238,90 @@ fn a_decimal_is_resolved_against_the_field_scale_by_the_planner() {
     ));
     same("SELECT count(*) FROM t WHERE balance > -5", "Count(Row(balance > -5))");
 }
+
+/// A rollup adds no `Plan` variant, which is the law this whole feature is built to keep.
+///
+/// Asserted rather than commented: every call a grouping-sets statement makes is a call the
+/// planner already resolved before the clause existed, so the claim is checkable by planning
+/// each one and seeing that it plans. A statement needing a variant nobody had would fail here
+/// rather than in a review.
+#[test]
+fn a_rollup_is_one_grouping_per_set_and_adds_no_plan_variant() {
+    let s = translate(
+        "SELECT category, country, count(*) FROM t GROUP BY category, country WITH ROLLUP",
+    )
+    .expect("a rollup translates");
+
+    // Three sets, three calls: the pair, the left column alone, and the whole set.
+    assert_eq!(s.calls.len(), 3);
+    for i in 0..s.calls.len() {
+        // Panics if the planner has no plan for it, which is the assertion.
+        resolved(
+            "SELECT category, country, count(*) FROM t GROUP BY category, country WITH ROLLUP",
+            i,
+        );
+    }
+
+    let Shape::Union { branches } = &s.answer.shape else { panic!("a rollup is a union of sets") };
+    assert_eq!(branches.len(), 3);
+    assert!(matches!(branches[0], Shape::Tuples { axes: 2, .. }), "detail first");
+    assert!(matches!(branches[1], Shape::Groups { .. }), "then the subtotal");
+    assert!(matches!(branches[2], Shape::Row { .. }), "then the grand total");
+}
+
+/// A column a set does not name is carried by the shape, not left out of it.
+///
+/// The alternative would be branches of different widths, which is not one answer.
+#[test]
+fn a_column_a_set_does_not_name_is_a_null_the_shape_carries() {
+    let s = translate(
+        "SELECT category, country, count(*) FROM t GROUP BY category, country WITH ROLLUP",
+    )
+    .expect("a rollup translates");
+    let Shape::Union { branches } = &s.answer.shape else { panic!("a union") };
+
+    for branch in branches {
+        assert_eq!(branch.cells().len(), 3, "every branch is as wide as the answer");
+    }
+    // The subtotal blanks the second column; the grand total blanks both.
+    assert_eq!(branches[1].cells()[1].of, big_sql::Of::Const { value: None });
+    assert_eq!(branches[2].cells()[0].of, big_sql::Of::Const { value: None });
+    assert_eq!(branches[2].cells()[1].of, big_sql::Of::Const { value: None });
+}
+
+/// The sets come out longest first, which is the answer's row order.
+///
+/// It matters because `ORDER BY` is refused over a grouping-sets answer: this order is the whole
+/// of what a client is promised, so it is a property of the statement rather than of whichever
+/// loop produced the subsets.
+#[test]
+fn the_sets_of_a_cube_are_ordered_longest_first() {
+    let s =
+        translate("SELECT category, country, count(*) FROM t GROUP BY category, country WITH CUBE")
+            .expect("a cube translates");
+    let Shape::Union { branches } = &s.answer.shape else { panic!("a union") };
+
+    let arity = |b: &Shape| match b {
+        Shape::Tuples { axes, .. } => usize::from(*axes),
+        Shape::Groups { .. } => 1,
+        Shape::Row { .. } => 0,
+        other => panic!("a cube branch is a grouping, not {other:?}"),
+    };
+    assert_eq!(branches.iter().map(arity).collect::<Vec<_>>(), vec![2, 1, 1, 0]);
+    // The two one-column sets are `(category)` then `(country)`: lexicographic by position
+    // within a length, so the left column's set comes first.
+    assert_eq!(branches[1].cells()[0].of, big_sql::Of::Key);
+    assert_eq!(branches[2].cells()[1].of, big_sql::Of::Key);
+}
+
+/// A bare column that no set names is still refused - the rule is relaxed, not dropped.
+///
+/// `GROUP BY a WITH ROLLUP` may render `a` as null in the subtotal, but `b` was never grouped by
+/// anything and has no single value per row in any branch.
+#[test]
+fn a_column_no_grouping_set_could_name_is_still_refused() {
+    assert_eq!(
+        code("SELECT category, country FROM t GROUP BY category WITH ROLLUP"),
+        "sql_unsupported"
+    );
+}

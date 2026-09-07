@@ -1029,3 +1029,41 @@ error
 KILL QUERY
 ----
 sql_kill_target
+
+## Grouping sets
+#
+# `WITH TOTALS` puts the total beside the rows rather than among them, and a result set here is
+# columns and rows. The ordering and the cut go together because they fail for one reason: the
+# rows are several groupings stacked, so there is no single list to sort or to cut.
+
+error
+SELECT category, count(*) FROM t GROUP BY category WITH TOTALS
+----
+sql_with_totals
+
+error
+SELECT category, country, count(*) FROM t GROUP BY category, country, device, active WITH CUBE
+----
+sql_too_many_grouping_sets
+
+error
+SELECT category, count(*) FROM t GROUP BY category WITH ROLLUP ORDER BY count(*) DESC
+----
+sql_rollup_order
+
+error
+SELECT category, count(*) FROM t GROUP BY category WITH ROLLUP LIMIT 10
+----
+sql_rollup_order
+
+error
+SELECT category, count(*) FROM t GROUP BY GROUPING SETS ((category), (category))
+----
+sql_unsupported
+
+# PostgreSQL's function-call spelling of the same clause, named as a grouping term this surface
+# does not have rather than as a call to a function nobody defined.
+error
+SELECT category, count(*) FROM t GROUP BY ROLLUP(category)
+----
+sql_group_expression

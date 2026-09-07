@@ -1,0 +1,253 @@
+# `WITH ROLLUP`, `WITH CUBE` and `GROUP BY GROUPING SETS`: one grouping per set, stacked.
+#
+# **No plan variant and no merge arm.** Every call below is one the planner already had before
+# this clause existed - a `Distinct`, a `GroupBy`, a `GroupByTuple`, or the whole-set aggregate
+# an ungrouped statement makes. What is new is only that the answer is several of them written
+# one after the other, which is the `Union` a `UNION ALL` already was.
+#
+# Two contracts this file pins, because there is no `ORDER BY` allowed to override either:
+#
+#   * **Row order** is the set order: longest set first, and lexicographic by position within a
+#     length. So the answer reads detail, then subtotals in decreasing detail, then the grand
+#     total. `ROLLUP(a,b)` is `(a,b), (a), ()`; `CUBE(a,b)` is `(a,b), (a), (b), ()`.
+#   * **A column a set does not name renders `null`** - that is what a subtotal row is. The
+#     shape carries it as a constant, naming no plan, because no plan ran for it.
+
+## ROLLUP
+
+plan
+SELECT category, count(*) FROM t GROUP BY category WITH ROLLUP
+----
+GroupBy t.category -> count
+└── all
+Count t
+└── all
+
+shape
+SELECT category, count(*) FROM t GROUP BY category WITH ROLLUP
+----
+Union
+├── Groups keys=[#0]
+│   ├── category = key
+│   └── count = group #0 else 0
+└── Row
+    ├── category = null
+    └── count = #1
+
+plan
+SELECT category, country, count(*) FROM t GROUP BY category, country WITH ROLLUP
+----
+GroupByTuple t.(category, country) max_passes=1000 -> count
+└── all
+GroupBy t.category -> count
+└── all
+Count t
+└── all
+
+shape
+SELECT category, country, count(*) FROM t GROUP BY category, country WITH ROLLUP
+----
+Union
+├── Tuples axes=2 keys=[#0]
+│   ├── category = key
+│   ├── country = key #1
+│   └── count = group #0 else 0
+├── Groups keys=[#1]
+│   ├── category = key
+│   ├── country = null
+│   └── count = group #1 else 0
+└── Row
+    ├── category = null
+    ├── country = null
+    └── count = #2
+
+## CUBE
+
+plan
+SELECT category, country, count(*) FROM t GROUP BY category, country WITH CUBE
+----
+GroupByTuple t.(category, country) max_passes=1000 -> count
+└── all
+GroupBy t.category -> count
+└── all
+GroupBy t.country -> count
+└── all
+Count t
+└── all
+
+shape
+SELECT category, country, count(*) FROM t GROUP BY category, country WITH CUBE
+----
+Union
+├── Tuples axes=2 keys=[#0]
+│   ├── category = key
+│   ├── country = key #1
+│   └── count = group #0 else 0
+├── Groups keys=[#1]
+│   ├── category = key
+│   ├── country = null
+│   └── count = group #1 else 0
+├── Groups keys=[#2]
+│   ├── category = null
+│   ├── country = key
+│   └── count = group #2 else 0
+└── Row
+    ├── category = null
+    ├── country = null
+    └── count = #3
+
+## GROUPING SETS, written out
+
+plan
+SELECT category, country, count(*) FROM t GROUP BY GROUPING SETS ((category, country), (category), ())
+----
+GroupByTuple t.(category, country) max_passes=1000 -> count
+└── all
+GroupBy t.category -> count
+└── all
+Count t
+└── all
+
+shape
+SELECT category, country, count(*) FROM t GROUP BY GROUPING SETS ((category, country), (category), ())
+----
+Union
+├── Tuples axes=2 keys=[#0]
+│   ├── category = key
+│   ├── country = key #1
+│   └── count = group #0 else 0
+├── Groups keys=[#1]
+│   ├── category = key
+│   ├── country = null
+│   └── count = group #1 else 0
+└── Row
+    ├── category = null
+    ├── country = null
+    └── count = #2
+
+# A bare term is the one-column set, which is what every dialect that has this reads it as.
+plan
+SELECT category, country, count(*) FROM t GROUP BY GROUPING SETS (category, (category, country))
+----
+GroupByTuple t.(category, country) max_passes=1000 -> count
+└── all
+GroupBy t.category -> count
+└── all
+
+# The sets are reordered into the answer's row order, longest first - so this and the statement
+# above it are the same two sets and produce the same branches.
+shape
+SELECT category, country, count(*) FROM t GROUP BY GROUPING SETS (category, (category, country))
+----
+Union
+├── Tuples axes=2 keys=[#0]
+│   ├── category = key
+│   ├── country = key #1
+│   └── count = group #0 else 0
+└── Groups keys=[#1]
+    ├── category = key
+    ├── country = null
+    └── count = group #1 else 0
+
+## A calendar bucket inside a rollup
+#
+# Free: a set is a list of positions into the written `GROUP BY` list, and the boundary rides
+# along on the term. The `date_trunc` is in the plan for the sets that name it and gone from the
+# ones that do not, which is exactly what a subtotal over every month is.
+
+plan
+SELECT country, date_trunc('month', seen), count(*) FROM t GROUP BY country, date_trunc('month', seen) WITH ROLLUP
+----
+GroupByTuple t.(country, seen by month) max_passes=1000 -> count
+└── all
+GroupBy t.country -> count
+└── all
+Count t
+└── all
+
+shape
+SELECT country, date_trunc('month', seen), count(*) FROM t GROUP BY country, date_trunc('month', seen) WITH ROLLUP
+----
+Union
+├── Tuples axes=2 keys=[#0]
+│   ├── country = key
+│   ├── date_trunc('month', seen) = key #1
+│   └── count = group #0 else 0
+├── Groups keys=[#1]
+│   ├── country = key
+│   ├── date_trunc('month', seen) = null
+│   └── count = group #1 else 0
+└── Row
+    ├── country = null
+    ├── date_trunc('month', seen) = null
+    └── count = #2
+
+## Two aggregates
+#
+# Two calls per set, and the count plan of the empty set is shared with nothing - the sets ask
+# different questions, which is the fan-out `MAX_GROUPING_SETS` bounds.
+
+plan
+SELECT category, count(*), sum(amount) FROM t GROUP BY category WITH ROLLUP
+----
+GroupBy t.category -> count
+└── all
+GroupBy t.category -> sum(amount)
+└── all
+Count t
+└── all
+Sum t.amount
+└── all
+
+shape
+SELECT category, count(*), sum(amount) FROM t GROUP BY category WITH ROLLUP
+----
+Union
+├── Groups keys=[#0, #1]
+│   ├── category = key
+│   ├── count = group #0 else 0
+│   └── sum = group #1 else 0
+└── Row
+    ├── category = null
+    ├── count = #2
+    └── sum = #3
+
+## HAVING
+#
+# Applied per branch, which is right per branch and right on the grand total too: a `Shape::Row`
+# tests its one row and answers with no row at all when it fails. Checked after the merge in
+# every branch, for the reason a plain grouping's is - a total under the threshold on one node
+# can be over it once every node has contributed.
+
+shape
+SELECT category, count(*) FROM t GROUP BY category WITH ROLLUP HAVING count(*) > 10
+----
+Union
+├── Groups keys=[#0]
+│   ├── category = key
+│   ├── count = group #0 else 0
+│   └── having: group #0 else 0 > 10
+└── Row
+    ├── category = null
+    ├── count = #1
+    └── having: #1 > 10
+
+## An aggregate with no grouped column in the select list
+
+plan
+SELECT count(*) FROM t GROUP BY category WITH ROLLUP
+----
+GroupBy t.category -> count
+└── all
+Count t
+└── all
+
+## Under a WHERE
+
+plan
+SELECT category, count(*) FROM t WHERE amount > 100 GROUP BY category WITH ROLLUP
+----
+GroupBy t.category -> count
+└── amount > 100
+Count t
+└── amount > 100
