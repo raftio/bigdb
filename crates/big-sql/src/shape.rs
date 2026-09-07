@@ -617,6 +617,14 @@ pub enum WinFunc {
     Min,
     /// `max(x) OVER (...)`.
     Max,
+    /// `runningDifference(x)`: this row's value minus the previous row's, absent on the first.
+    ///
+    /// **Defined as `x - lag(x, 1)` and evaluated as exactly that**, which is why it is here
+    /// rather than among the scalars: it needs an ordered partition, and a scalar runs on one
+    /// value with nothing around it. ClickHouse gives it no `OVER` clause at all and reads the
+    /// block order instead; here it takes the same clause `lag` takes, because a difference
+    /// against an order nobody wrote down is a number nobody can reproduce.
+    RunningDifference,
 }
 
 impl WinFunc {
@@ -639,6 +647,7 @@ impl WinFunc {
             Self::Count => "count",
             Self::Min => "min",
             Self::Max => "max",
+            Self::RunningDifference => "runningDifference",
         }
     }
 
@@ -658,6 +667,7 @@ impl WinFunc {
                 | Self::Avg
                 | Self::Min
                 | Self::Max
+                | Self::RunningDifference
         )
     }
 
@@ -689,7 +699,10 @@ impl WinFunc {
             | Self::Sum
             | Self::Avg
             | Self::Min
-            | Self::Max => false,
+            | Self::Max
+            // A difference between two of a column's values is in that column's units, and a
+            // neighbour *is* one of them.
+            | Self::RunningDifference => false,
         }
     }
 }

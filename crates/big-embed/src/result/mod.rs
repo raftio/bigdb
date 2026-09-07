@@ -27,6 +27,7 @@
 //! it directly.
 
 mod group;
+mod json;
 mod num;
 mod scalar;
 mod window;

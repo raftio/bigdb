@@ -40,7 +40,7 @@
 //! here answers `Null` for a `Null` argument. The exceptions are the ones whose whole job is to
 //! be about absence - `coalesce`, `ifNull`, and a `CASE` whose condition is false.
 
-use super::{fixed, Datum};
+use super::{fixed, json, Datum};
 use big_civil::Unit;
 use big_plan::Literal;
 use big_sql::scalar::{BinOp, Func, Scalar, UnOp};
@@ -168,7 +168,12 @@ pub(super) fn compare_numbers(l: &Datum, r: &Datum) -> Option<core::cmp::Orderin
     as_real(l).zip(as_real(r)).and_then(|(a, b)| a.partial_cmp(&b))
 }
 
-fn binary(op: BinOp, l: &Datum, r: &Datum) -> Datum {
+/// Two cells under an operator.
+///
+/// `pub(super)` for `runningDifference`, which is a subtraction of two of a column's values and
+/// has no business being a second one: a decimal's scales meet here, and two places doing that
+/// is two places for them to meet differently.
+pub(super) fn binary(op: BinOp, l: &Datum, r: &Datum) -> Datum {
     match op {
         // Short-circuiting is not observable here - both sides are already evaluated, and
         // neither can fail or cost anything - so these are written as the boolean they are.
@@ -364,6 +369,31 @@ fn computed(func: Func, args: &[Datum]) -> Datum {
     let some = |o: Option<Datum>| o.unwrap_or(Datum::Null);
 
     match func {
+        // ---- json ---------------------------------------------------------------------
+        //
+        // A document that cannot be read, and a key that is not in one that can, are the same
+        // answer: absent. See `super::json` for why that is the honest one rather than an error.
+        Func::JsonExtractRaw => {
+            some(text(0).and_then(|d| json::raw(&d, &text(1)?).map(|v| Datum::Text(v.to_string()))))
+        }
+        Func::JsonExtractString => {
+            some(text(0).and_then(|d| json::text(&d, &text(1)?).map(Datum::Text)))
+        }
+        // Parsed out of the raw text rather than out of the unescaped string, so that a number
+        // written as a number is read as one and a number written in quotes is not.
+        Func::JsonExtractInt => some(text(0).and_then(|d| {
+            json::raw(&d, &text(1)?)?.parse::<i64>().ok().map(|v| Datum::Int(i128::from(v)))
+        })),
+        Func::JsonExtractFloat => some(
+            text(0).and_then(|d| json::raw(&d, &text(1)?)?.parse::<f64>().ok().map(Datum::Real)),
+        ),
+        // 1 and 0, because a cell here has no boolean among its shapes - which is also what
+        // ClickHouse answers with.
+        Func::JsonHas => some(
+            text(0)
+                .map(|d| Datum::Int(i128::from(text(1).and_then(|k| json::raw(&d, &k)).is_some()))),
+        ),
+
         // ---- arithmetic ---------------------------------------------------------------
         Func::Abs => match args.first() {
             Some(Datum::Int(v)) => Datum::Int(v.abs()),

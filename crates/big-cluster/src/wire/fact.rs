@@ -238,6 +238,26 @@ pub enum Ddl {
         field: String,
         unix_seconds: i64,
     },
+    /// `ALTER TABLE ... RENAME TO`: one catalog record, no data.
+    ///
+    /// Both names qualified, and the database in them is the same one - a rename that moved a
+    /// table is not a change this carries. The **new name travels rather than being derived**,
+    /// for the reason [`Ddl::DropViewsBefore`] sends an instant rather than a day name: two
+    /// nodes deriving it separately is two chances to derive it differently.
+    RenameTable {
+        table: String,
+        to: String,
+    },
+    /// `EXCHANGE TABLES a AND b`: the two names swap which table they resolve to.
+    ///
+    /// A variant of its own rather than two renames, and for the reason [`Ddl::TruncateTable`]
+    /// is not a drop and a create: two renames need a name nobody holds to pass through, and a
+    /// peer that applied one of them and not the other would disagree with every other node
+    /// about what both names mean. One operation everywhere, or it is not the same operation.
+    ExchangeTables {
+        a: String,
+        b: String,
+    },
     CreateDatabase {
         name: String,
     },
@@ -325,6 +345,16 @@ impl Ddl {
             Self::TruncateTable { table } => {
                 put_u8(&mut out, 13);
                 put_str(&mut out, table);
+            }
+            Self::RenameTable { table, to } => {
+                put_u8(&mut out, 15);
+                put_str(&mut out, table);
+                put_str(&mut out, to);
+            }
+            Self::ExchangeTables { a, b } => {
+                put_u8(&mut out, 16);
+                put_str(&mut out, a);
+                put_str(&mut out, b);
             }
             Self::DropTable { table } => {
                 put_u8(&mut out, 4);
@@ -422,6 +452,8 @@ impl Ddl {
             10 => Self::CreateRole { role: r.str()? },
             11 => Self::DropRole { role: r.str()? },
             13 => Self::TruncateTable { table: r.str()? },
+            15 => Self::RenameTable { table: r.str()?, to: r.str()? },
+            16 => Self::ExchangeTables { a: r.str()?, b: r.str()? },
             14 => Self::DropViewsBefore {
                 table: r.str()?,
                 field: r.str()?,

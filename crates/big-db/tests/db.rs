@@ -1391,3 +1391,52 @@ fn a_view_body_past_the_ceiling_is_refused() {
     assert_eq!(e.unwrap_err().code(), "view_too_long");
     assert_eq!(c.saved_queries().count(), 0);
 }
+
+/// **An exchange swaps two names and moves no data**, which is what makes it a rebuild's last
+/// step rather than a copy.
+///
+/// The assertion that matters is the one about fragment roots: the pages each table's facts live
+/// on are the same pages afterwards, because a fragment is addressed by an interned table id and
+/// an id is exactly what does not move here.
+#[test]
+fn exchanging_two_tables_swaps_names_and_rewrites_nothing() {
+    let d = db();
+    d.create_table("other").unwrap();
+    d.create_field("other", "amount", FieldKind::Int, 37).unwrap();
+    let mut w = d.write();
+    w.set_int("other", "amount", 1, 111).unwrap();
+    w.set_int("tx", "amount", 9, 777).unwrap();
+    w.commit().unwrap();
+
+    let ids = (d.catalog().lookup("tx").unwrap().id, d.catalog().lookup("other").unwrap().id);
+    let field = d.catalog().field(ids.0, "amount").expect("field exists").id;
+    let key = FragmentKey::new(ids.0, field, 0, 0);
+    let root_before = d.store().roots().get(&key).expect("the write created a fragment");
+
+    assert!(d.exchange_tables("tx", "other").unwrap());
+
+    // The names now resolve to each other's tables...
+    assert_eq!(d.catalog().lookup("tx").unwrap().id, ids.1);
+    assert_eq!(d.catalog().lookup("other").unwrap().id, ids.0);
+    // ...so the values follow the data, not the name.
+    assert_eq!(d.read().get_int("tx", "amount", 1).unwrap(), Some(111));
+    assert_eq!(d.read().get_int("other", "amount", 9).unwrap(), Some(777));
+    // And nothing was rewritten to do it.
+    assert_eq!(d.store().roots().get(&key), Some(root_before), "no data pages rewritten");
+
+    // Running it again is the undo, which is the property that makes it safe to reach for.
+    assert!(d.exchange_tables("tx", "other").unwrap());
+    assert_eq!(d.read().get_int("tx", "amount", 9).unwrap(), Some(777));
+}
+
+/// A table that is not there means nothing moved - not half a swap.
+#[test]
+fn exchanging_against_a_missing_table_moves_neither() {
+    let d = Db::in_memory().unwrap();
+    d.create_table("a").unwrap();
+    let before = d.catalog().lookup("a").unwrap().id;
+
+    assert!(!d.exchange_tables("a", "typo").unwrap());
+    assert_eq!(d.catalog().lookup("a").unwrap().id, before);
+    assert!(d.catalog().lookup("typo").is_none());
+}

@@ -197,6 +197,22 @@ pub fn show_databases(names: &[String], tables: &[TableInfo]) -> ResultSet {
     }
 }
 
+/// `SELECT * FROM numbers(n)`: the integers `0 .. n`, under one column.
+///
+/// **The one answer in this module that reads nothing at all** - not the catalog, not a fragment,
+/// not a grant. It is here rather than in the query path because it is the same kind of thing
+/// every other function here is: rows built at the coordinator, from something already in hand,
+/// with no plan behind them and nothing to merge.
+///
+/// Bounded before it arrives: `big_sql::MAX_NUMBERS` is checked in the parser, so `n` here is
+/// already a count this is willing to allocate.
+pub fn numbers(n: u64) -> ResultSet {
+    ResultSet {
+        columns: vec!["number".to_string()],
+        rows: (0..n).map(|i| vec![Datum::Int(i128::from(i))]).collect(),
+    }
+}
+
 /// `SHOW ROLES`: one row per role.
 ///
 /// The reserved role is prepended rather than stored, exactly as `default` appears in

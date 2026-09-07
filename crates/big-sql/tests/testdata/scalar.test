@@ -212,3 +212,88 @@ error
 SELECT stddevPop(amount) FROM t
 ----
 sql_unsupported
+
+## JSON, read out of a keyed column.
+#
+# There is no `JSON` type behind these and there does not need to be: a keyed column holds a
+# string, and these read one key out of that string on the way into a cell - which is what every
+# other scalar here does with the value it is given. So no `Datum` shape is added and nothing
+# about storage changes.
+#
+# One level of key, spelled as a name rather than a path. `JSONExtractRaw` hands a nested value
+# back as text, and the next call reads a key out of that - which is the composition a path
+# syntax would otherwise buy, without a second grammar to keep in step with somebody else's.
+
+shape
+SELECT JSONExtractString(country, 'name') FROM t
+----
+Table
+└── JSONExtractString(country, 'name') apply=JSONExtractString(_, 'name')
+
+shape
+SELECT JSONExtractInt(country, 'n') AS n FROM t
+----
+Table
+└── n apply=JSONExtractInt(_, 'n')
+
+shape
+SELECT JSONExtractFloat(country, 'f') FROM t
+----
+Table
+└── JSONExtractFloat(country, 'f') apply=JSONExtractFloat(_, 'f')
+
+shape
+SELECT JSONHas(country, 'k') FROM t
+----
+Table
+└── JSONHas(country, 'k') apply=JSONHas(_, 'k')
+
+# Two calls are a path, which is what one level composes into.
+shape
+SELECT JSONExtractString(JSONExtractRaw(country, 'o'), 'b') FROM t
+----
+Table
+└── JSONExtractString(JSONExtractRaw(country, 'o'), 'b') apply=JSONExtractString(JSONExtractRaw(_, 'o'), 'b')
+
+# `json_query` is the standard's name for what `JSONExtractRaw` does, and the snake spellings
+# are what somebody will type. All of them land on one variant, which is what the canonical name
+# in the printed column shows.
+shape
+SELECT json_query(country, 'o') FROM t
+----
+Table
+└── json_query(country, 'o') apply=JSONExtractRaw(_, 'o')
+
+shape
+SELECT json_extract_string(country, 'k') FROM t
+----
+Table
+└── json_extract_string(country, 'k') apply=JSONExtractString(_, 'k')
+
+# Both arguments, always: a key that was not written is not a key of nothing.
+error
+SELECT JSONExtractString(country) FROM t
+----
+sql_unsupported
+
+## The row-sequence family, refused by name with the local spelling given.
+
+error
+SELECT neighbor(amount, 1) FROM t
+----
+sql_no_sequence_function
+
+error
+SELECT windowFunnel(3600)(seen, amount = 1) FROM t
+----
+sql_no_sequence_function
+
+error
+SELECT sequenceMatch('(?1)(?2)')(seen, amount = 1) FROM t
+----
+sql_no_sequence_function
+
+error
+SELECT retention(amount > 1, amount > 2) FROM t
+----
+sql_no_sequence_function

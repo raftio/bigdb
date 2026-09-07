@@ -98,6 +98,17 @@ impl<P: PagerMut + Sync> Cluster<P> {
             big_embed::SqlDdl::TruncateTable { database, table, if_exists } => {
                 ("fragments", self.sql_truncate_table(&qualified(database, table), *if_exists)?)
             }
+            // The new name is qualified here rather than at the parser, which took it bare: the
+            // database a rename lands in is the one the table is already in, and that is a fact
+            // about this statement's own table ref rather than about the word that was typed.
+            big_embed::SqlDdl::RenameTable { database, table, to } => (
+                "renamed",
+                self.sql_rename_table(&qualified(database, table), &qualified(database, to))?,
+            ),
+            big_embed::SqlDdl::ExchangeTables { database, a, b } => (
+                "exchanged",
+                self.sql_exchange_tables(&qualified(database, a), &qualified(database, b))?,
+            ),
             big_embed::SqlDdl::CreateView { database, name, body, or_replace, if_not_exists } => (
                 "view",
                 self.create_view(&qualified(database, name), body, *or_replace, *if_not_exists)?
@@ -661,6 +672,41 @@ impl<P: PagerMut + Sync> Cluster<P> {
         self.truncate_table(table)
     }
 
+    /// `ALTER TABLE ... RENAME TO`, answering with 1.
+    ///
+    /// Both halves are judged here, before the leader is asked, because both are questions the
+    /// schema already answers and a fan-out that failed half way through would answer neither:
+    /// a table that is not there is `UnknownTable`, and a new name somebody already holds is
+    /// refused rather than silently overwriting them.
+    fn sql_rename_table(&self, table: &str, to: &str) -> Result<u64> {
+        let schema = self.schema();
+        if !schema.iter().any(|t| t.name == table) {
+            return Err(local(big_db::DbError::UnknownTable(table.to_string())));
+        }
+        // A rename onto the name it already has is the change it describes: none. It is let
+        // through rather than short-circuited, so the count a client sees does not depend on
+        // whether they happened to pick the current name.
+        if table != to && schema.iter().any(|t| t.name == to) {
+            return Err(local(big_db::DbError::NameTaken(to.to_string())));
+        }
+        self.rename_table(table, to).map(u64::from)
+    }
+
+    /// `EXCHANGE TABLES a AND b`, answering with 1.
+    ///
+    /// Both tables have to exist, and the failure names the one that does not: an exchange
+    /// against a typo would otherwise report "nothing exchanged", which reads exactly like a
+    /// swap that happened to be a no-op.
+    fn sql_exchange_tables(&self, a: &str, b: &str) -> Result<u64> {
+        let schema = self.schema();
+        for name in [a, b] {
+            if !schema.iter().any(|t| t.name == name) {
+                return Err(local(big_db::DbError::UnknownTable(name.to_string())));
+            }
+        }
+        self.exchange_tables(a, b).map(u64::from)
+    }
+
     /// `DELETE FROM t WHERE ...`: select across every owner, then clear.
     ///
     /// **Two steps, and the order is the whole of the design.** The predicate is planned, fanned
@@ -1089,6 +1135,10 @@ impl<P: PagerMut + Sync> Cluster<P> {
                 }))
             }
             big_embed::SqlShown::Roles => Ok(big_embed::introspect::show_roles(&self.api.roles())),
+            // Reads nothing - not this node's catalog, not another node's. Which is why it is
+            // answered here beside the listings rather than fanned out: there is no share of it
+            // any owner could hold.
+            big_embed::SqlShown::Numbers { n } => Ok(big_embed::introspect::numbers(*n)),
             // A bare `SHOW GRANTS` is about the caller's own role, which is why it needs no
             // privilege: reading what you hold tells you nothing you could not find out by
             // trying. A `Trusted` caller holds everything and has no role to name, so it gets

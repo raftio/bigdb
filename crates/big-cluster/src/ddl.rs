@@ -190,6 +190,25 @@ impl<P: PagerMut + Sync> Cluster<P> {
         self.ddl(&Ddl::TruncateTable { table: table.to_string() })
     }
 
+    /// `ALTER TABLE ... RENAME TO`: the table keeps everything but its name, everywhere.
+    ///
+    /// `Ok(false)` means there was no such table at the leader. It has to reach every node for
+    /// the reason a `TRUNCATE` does and then some: a node still holding the old name answers a
+    /// statement written against the new one with "unknown table", and a node holding both
+    /// would answer two different questions with one table's data.
+    pub fn rename_table(&self, table: &str, to: &str) -> Result<bool> {
+        self.ddl(&Ddl::RenameTable { table: table.to_string(), to: to.to_string() }).map(|n| n == 1)
+    }
+
+    /// `EXCHANGE TABLES a AND b`: the two names swap everywhere, or the change is partial.
+    ///
+    /// `Ok(false)` means one of them was not there at the leader, and then nothing moved on any
+    /// node - the leader refuses before the fan-out begins, which is the whole reason the
+    /// decision is made in one place.
+    pub fn exchange_tables(&self, a: &str, b: &str) -> Result<bool> {
+        self.ddl(&Ddl::ExchangeTables { a: a.to_string(), b: b.to_string() }).map(|n| n == 1)
+    }
+
     /// Retention, cluster-wide: drop a time-quantum field's index before an instant.
     ///
     /// **This is the spelling `big-bin`'s offline tool said belonged with the other DDL.** Its
@@ -313,6 +332,12 @@ pub fn apply_ddl<P: PagerMut + Sync>(api: &Api<P>, op: &Ddl) -> big_embed::Resul
         // leader has already ruled on whether it exists, so a peer without it is a peer that
         // never had the data this is removing.
         Ddl::TruncateTable { table } => api.truncate_table(table)?.unwrap_or(0),
+        // A table that is not here counts as nothing renamed, for the reason a truncate does:
+        // the leader has already ruled on whether it exists, and a peer without it has no name
+        // to change. The same holds for an exchange, where a peer missing either table has
+        // neither name to swap.
+        Ddl::RenameTable { table, to } => u64::from(api.rename_table(table, to)?),
+        Ddl::ExchangeTables { a, b } => u64::from(api.exchange_tables(a, b)?),
         Ddl::DropViewsBefore { table, field, unix_seconds } => {
             api.drop_days_before(table, field, *unix_seconds)? as u64
         }

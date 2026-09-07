@@ -213,7 +213,12 @@ fn the_sql_a_column_list_does_not_answer() {
     assert_eq!(code("CREATE TABLE t (a BIGINT(20))"), "sql_unknown_column_type");
     // Still every other schema change, by name.
     assert_eq!(code("CREATE INDEX i ON t (a)"), "sql_read_only");
-    assert_eq!(code("CREATE TEMPORARY TABLE t (a SET)"), "sql_read_only");
+    // `TEMPORARY` used to fall into that same generic refusal. It has its own now, because what
+    // somebody who wrote it needs to hear is not "this surface does not create that" but that
+    // there is no session for a table to be temporary *to* - the decision `USE` and `SET` rest
+    // on too.
+    assert_eq!(code("CREATE TEMPORARY TABLE t (a SET)"), "sql_no_temporary_table");
+    assert_eq!(code("CREATE TEMP TABLE t (a SET)"), "sql_no_temporary_table");
 }
 
 /// The list is punctuation like any other, and a malformed one is a syntax error rather than a
@@ -318,8 +323,9 @@ fn the_alters_the_engine_cannot_make() {
     ] {
         assert_eq!(code(sql), "sql_no_alter_column", "{sql}");
     }
-    // Nothing below renames a field or a table.
-    assert_eq!(code("ALTER TABLE t RENAME TO u"), "sql_no_rename");
+    // Nothing below renames a *field*: its name is what routes a fact to a bitmap. A table's
+    // name is a catalog record, so `RENAME TO` is a statement - see `a_table_is_renamed_and_two
+    // _are_exchanged` below, which is the other half of this claim.
     assert_eq!(code("ALTER TABLE t RENAME COLUMN a TO b"), "sql_no_rename");
     // The engine is fixed when the table is created.
     assert_eq!(code("ALTER TABLE t ENGINE = columnar"), "sql_no_alter_engine");
@@ -418,4 +424,57 @@ fn if_not_exists_is_part_of_the_statement() {
     // clause, and neither is read as the one that was meant.
     assert_eq!(code("CREATE TABLE IF EXISTS events (a SET)"), "parse_error");
     assert_eq!(code("DROP TABLE IF NOT EXISTS events"), "parse_error");
+}
+
+/// **A table's name is a catalog record, so it can change; a field's name is not.**
+///
+/// The claim worth having next to [`the_alters_the_engine_cannot_make`], because the two are one
+/// decision seen from both sides. Everything below the catalog resolves a table by an interned
+/// id - fragments, row keys, field ids, grants - so a rename moves one record and no data, and
+/// an exchange moves two. A field is the other case, and stays refused.
+#[test]
+fn a_table_is_renamed_and_two_are_exchanged() {
+    let Ddl::RenameTable { database: None, table, to } = ddl("ALTER TABLE events RENAME TO old")
+    else {
+        panic!("a RENAME TO is a RenameTable")
+    };
+    assert_eq!((table.as_str(), to.as_str()), ("events", "old"));
+
+    // `AS` is the same statement, the way `DOUBLE PRECISION` is the same type.
+    assert_eq!(ddl("ALTER TABLE events RENAME AS old"), ddl("ALTER TABLE events RENAME TO old"));
+
+    let Ddl::ExchangeTables { database: Some(db), a, b } =
+        ddl("EXCHANGE TABLES sales.orders AND sales.rebuilt")
+    else {
+        panic!("an EXCHANGE is an ExchangeTables")
+    };
+    assert_eq!((db.as_str(), a.as_str(), b.as_str()), ("sales", "orders", "rebuilt"));
+
+    // One database. Qualifying the rename's destination, or naming two databases in an
+    // exchange, is a shape this grammar does not have rather than a construct with a sentence -
+    // so both are syntax errors and not refusals.
+    assert_eq!(code("ALTER TABLE sales.orders RENAME TO ops.orders"), "parse_error");
+    assert_eq!(code("EXCHANGE TABLES sales.orders AND ops.orders"), "parse_error");
+    // `TABLES` is what tells the statement apart from a column called `exchange`.
+    assert_eq!(code("EXCHANGE sales.orders AND sales.rebuilt"), "parse_error");
+}
+
+/// **What each of the two new schema changes may cost you, and therefore demands.**
+///
+/// A rename is `Alter` on the table plus `Create` in the database, because it takes one name
+/// away and puts another there. An exchange is `Drop` on *both*, because afterwards either
+/// table's data is unreachable under the name it was written to - which is the whole of what it
+/// can cost anybody, and is what stops a caller swapping their own table against one they may
+/// only read.
+#[test]
+fn renaming_creates_a_name_and_exchanging_can_lose_one() {
+    use big_sql::Privilege;
+
+    let rename = big_sql::translate("ALTER TABLE events RENAME TO old").unwrap();
+    let got: Vec<Privilege> = rename.demands().iter().map(|d| d.privilege).collect();
+    assert_eq!(got, [Privilege::Alter, Privilege::Create]);
+
+    let exchange = big_sql::translate("EXCHANGE TABLES events AND rebuilt").unwrap();
+    let got: Vec<Privilege> = exchange.demands().iter().map(|d| d.privilege).collect();
+    assert_eq!(got, [Privilege::Drop, Privilege::Drop]);
 }

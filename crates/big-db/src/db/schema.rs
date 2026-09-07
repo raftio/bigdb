@@ -280,6 +280,55 @@ impl<P: PagerMut> Db<P> {
         Ok(Some(dropped))
     }
 
+    /// Gives a table a different name. Nothing else about it moves.
+    ///
+    /// `Ok(false)` means there was no such table; renaming onto a name already taken is an error
+    /// rather than an overwrite. See [`crate::catalog::Catalog::rename_table`] for why this costs
+    /// one record: everything below the catalog is keyed by [`TableId`], and the id does not
+    /// change. In particular the **row keys stay**, for the reason a truncate keeps them - a row
+    /// id interned under this table is still interned under this table.
+    pub fn rename_table<'a>(&self, name: impl Into<TableRef<'a>>, to: &str) -> Result<bool> {
+        let name = name.into();
+        let mut w = self.write();
+        let database = w.catalog.database_of(name)?;
+        if !w.catalog.rename_table(database, name.table, to)? {
+            return Ok(false);
+        }
+        w.commit()?;
+        Ok(true)
+    }
+
+    /// Swaps the names of two tables in one transaction.
+    ///
+    /// `Ok(false)` means one of them was not there, and then neither moved.
+    ///
+    /// **The atomic half of a rebuild.** Building a replacement table and putting it in place is
+    /// otherwise a drop and a rename with a window in between where the name resolves to nothing;
+    /// this closes the window, and it leaves the old table under the other name so the rebuild
+    /// can be undone by running the same statement again.
+    ///
+    /// Both names are in one database, because a swap that also moved a table across databases
+    /// would be two changes wearing one name - the same line [`Self::rename_table`] draws.
+    pub fn exchange_tables<'a>(
+        &self,
+        a: impl Into<TableRef<'a>>,
+        b: impl Into<TableRef<'a>>,
+    ) -> Result<bool> {
+        let (a, b) = (a.into(), b.into());
+        let mut w = self.write();
+        let database = w.catalog.database_of(a)?;
+        // Judged here rather than in the catalog, which is handed one database id and could not
+        // see the difference: two names in two databases are two tables this cannot swap.
+        if w.catalog.database_of(b)? != database {
+            return Err(DbError::UnknownTable(b.to_string()));
+        }
+        if !w.catalog.exchange_tables(database, a.table, b.table)? {
+            return Ok(false);
+        }
+        w.commit()?;
+        Ok(true)
+    }
+
     /// Removes one field of a table, its row keys, and the pages holding it.
     /// Drops every per-day view of a time quantum field older than `unix_seconds`, and returns
     /// how many fragments went.

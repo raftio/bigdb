@@ -365,3 +365,83 @@ error
 ALTER TABLE visits DROP DAYS BEFORE '2026-01-02' ON nope
 ----
 error: unknown_field
+
+## `RENAME TO` and `EXCHANGE TABLES`: catalog records, against real records.
+#
+# The claim worth running here rather than only in translation is that the *data* follows the
+# table and not the name. Both statements move an interned id between two names and rewrite
+# nothing below the catalog, so what a name resolves to afterwards is the only thing that
+# changed - and that is not visible until there are facts on both sides to tell apart.
+
+statement
+CREATE TABLE live (amount UINT(32))
+
+statement
+INSERT INTO live (_record_id, amount) VALUES (1, 10), (2, 20)
+
+statement
+CREATE TABLE rebuilt (amount UINT(32))
+
+statement
+INSERT INTO rebuilt (_record_id, amount) VALUES (1, 700)
+
+query
+SELECT sum(amount) FROM live
+----
+sum
+30
+
+# One change, and afterwards each name reads the other table's facts.
+statement
+EXCHANGE TABLES live AND rebuilt
+
+query
+SELECT sum(amount) FROM live
+----
+sum
+700
+
+query
+SELECT sum(amount) FROM rebuilt
+----
+sum
+30
+
+# Running it again is the undo - which is what makes it safe to reach for during a rebuild.
+statement
+EXCHANGE TABLES live AND rebuilt
+
+query
+SELECT sum(amount) FROM live
+----
+sum
+30
+
+# A rename keeps everything but the name, including the facts and the fields.
+statement
+ALTER TABLE rebuilt RENAME TO archive
+
+query
+SELECT sum(amount) FROM archive
+----
+sum
+700
+
+error
+SELECT sum(amount) FROM rebuilt
+----
+error: unknown_table
+
+# Renaming onto a name somebody already holds would leave one of the two unreachable, so it is
+# refused rather than overwriting them.
+error
+ALTER TABLE archive RENAME TO live
+----
+error: name_taken
+
+# An exchange against a name that is not there is `unknown_table` and not "nothing exchanged",
+# which would read exactly like a swap that happened to be a no-op.
+error
+EXCHANGE TABLES live AND typo
+----
+error: unknown_table

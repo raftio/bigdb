@@ -111,3 +111,29 @@ error
 SELECT * FROM system.tables ORDER BY name
 ----
 error: sql_system_clause
+
+## `numbers(n)`: rows from nothing.
+#
+# Worth running against a live node rather than only in translation, because the claim is that
+# it needs no table, no fact and no plan - which is only visible when something actually answers.
+
+query
+SELECT * FROM numbers(4)
+----
+number
+0
+1
+2
+3
+
+query
+SELECT number FROM numbers(1)
+----
+number
+0
+
+# Zero rows is an answer, with the header still there.
+query
+SELECT * FROM numbers(0)
+----
+number

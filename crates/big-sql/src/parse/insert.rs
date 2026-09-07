@@ -29,6 +29,12 @@ impl Parser<'_> {
     /// that caused it: a missing column list at the table name, a missing `id` at the closing
     /// bracket of the list that should have held one, and a `SELECT` at the `SELECT`.
     pub(super) fn insert(&mut self) -> Result<Insert> {
+        // Before `INTO`, because `INSERT OVERWRITE TABLE t` writes neither word in the place
+        // this expects one. It is a truncate and an insert, and nothing wraps two of those in
+        // one transaction - so the sentence offers the two statements, and the atomic spelling.
+        if self.word_is("OVERWRITE") {
+            return Err(self.refuse(Refused::Overwrite));
+        }
         self.eat_word("INTO");
         let (database, table) = self.table_ref("a table name")?;
 

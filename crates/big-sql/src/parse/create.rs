@@ -107,6 +107,16 @@ impl Parser<'_> {
         if self.word_is("TTL") {
             return Err(self.refuse(Refused::DeclarativeTtl));
         }
+        // The layout clauses, each refused at the word that writes it rather than as "expected
+        // the end of the statement". Every one of them is a decision this engine makes for
+        // itself: a shard is a function of the record id, an order is the record id, and a
+        // sample is not something a column can define here.
+        if self.word_is("PARTITION") || self.word_is("DISTRIBUTED") || self.word_is("CLUSTER") {
+            return Err(self.refuse(Refused::Distribution));
+        }
+        if self.word_is("SAMPLE") {
+            return Err(self.refuse(Refused::Sample));
+        }
         if self.peek().is_some() {
             return Err(self.syntax("the end of the statement"));
         }
@@ -339,6 +349,15 @@ impl Parser<'_> {
             // `Nullable(Decimal(10, 2))`, which `wrapped_type` could not read, says the same
             // sentence as `Nullable(Int64)` rather than a syntax error about a nested `(`.
             "NULLABLE" => return Err(self.refuse_at(Refused::NullableType, at)),
+            // The composite types, refused at the word rather than after the bracket, for the
+            // reason `NULLABLE` is: `Array(Decimal(10, 2))` should say the sentence about
+            // arrays, not a syntax error about the bracket inside one.
+            "ARRAY" | "MAP" | "TUPLE" | "NESTED" => {
+                return Err(self.refuse_at(Refused::CompositeType, at))
+            }
+            // Its own sentence rather than the composite one, because what it needs is a
+            // different rewrite: `MUTEX` is already the storage an enum wants.
+            "ENUM" | "ENUM8" | "ENUM16" => return Err(self.refuse_at(Refused::EnumType, at)),
             "BITMAP" | "AGGREGATEFUNCTION" => return Err(self.refuse_at(Refused::BitmapType, at)),
             // The sketch types, which are a different refusal from `BITMAP` even though both
             // decline a column: a bitmap is refused because every column here already is one,
@@ -380,6 +399,12 @@ impl Parser<'_> {
             _ => return Err(self.refuse_at(Refused::ColumnType, at)),
         };
 
+        // Named before the constraints, because these two are not constraints: they say where
+        // the column's value comes from rather than what it may be, and the answer to each is a
+        // different statement.
+        if self.word_is("MATERIALIZED") || self.word_is("ALIAS") {
+            return Err(self.refuse(Refused::ComputedColumn));
+        }
         // Constraints are refused after the type rather than at the type, so that the refusal
         // points at `NOT NULL` and says what is wrong with it - and not at a `DECIMAL` that was
         // written perfectly well.

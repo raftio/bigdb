@@ -118,7 +118,36 @@ pub enum Shown {
         /// statement this is from the `FROM` before it reads the select list at all.
         columns: Option<Vec<String>>,
     },
+    /// `SELECT * FROM numbers(<n>)`: the integers `0 .. n`, under a column called `number`.
+    ///
+    /// **A `Shown` rather than a query, for the reason [`Shown::System`] is one**: no plan
+    /// produces these rows. A system view's answer is already in the catalog; this one is not
+    /// anywhere, which is the same thing as far as the query path is concerned - there is
+    /// nothing to fan out, nothing to merge, and no `Plan` variant that could describe it.
+    ///
+    /// It exists because it is what every example in every OLAP tutorial opens with, and
+    /// because it makes this engine answerable before a single fact has been written to it.
+    ///
+    /// # Why it carries its own ceiling
+    ///
+    /// `SETTINGS max_result_rows` cannot bound it: settings attach to a query, and a `Show`
+    /// builds its rows without ever reaching `DbRead`, so the clause is refused here along with
+    /// every other one. That leaves the count in the statement as the only bound there is, and
+    /// an unbounded one would let a typed digit allocate rows until the process died. See
+    /// [`MAX_NUMBERS`] and [`crate::Refused::NumbersTooLarge`].
+    Numbers { n: u64 },
 }
+
+/// How many rows `numbers(n)` may be asked for.
+///
+/// **A ceiling and not a clamp.** Asking for more is refused with the number rather than
+/// quietly answered with fewer, because there is no `EXPLAIN` line here that would tell anybody
+/// which of the two happened - the reason the `SETTINGS` clamp is allowed to be silent is that
+/// `EXPLAIN` prints the figure actually applied, and a `Show` has no such line.
+///
+/// Ten thousand is the same order as `lower::MAX_BUCKETS`, which is the other place this surface
+/// decides how many rows one answer may be built from at the coordinator.
+pub const MAX_NUMBERS: u64 = 10_000;
 
 /// The database name this build's own views live under.
 ///
@@ -194,7 +223,13 @@ impl Shown {
             }
             // Neither is about one database: a role is server-wide, which is what lets one
             // grant reach across two of them.
-            Self::Databases | Self::Roles | Self::Grants { .. } | Self::Processlist => {}
+            // Neither is about one database: a role is server-wide, which is what lets one
+            // grant reach across two of them. `numbers(n)` is about no schema at all.
+            Self::Databases
+            | Self::Roles
+            | Self::Grants { .. }
+            | Self::Processlist
+            | Self::Numbers { .. } => {}
             // **Deliberately untouched, and this is the whole reason it is its own variant.** A
             // system view is a question about the server, not about the request's database, so
             // filling one in would silently turn `SELECT * FROM system.tables` into a listing of

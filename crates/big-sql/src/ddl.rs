@@ -144,6 +144,48 @@ pub enum Ddl {
         /// [`Ddl::DropTable`] takes it for.
         if_exists: bool,
     },
+    /// `ALTER TABLE <name> RENAME TO <new>`: the table keeps everything but its name.
+    ///
+    /// **The one `ALTER` that changes a table rather than its fields**, and it is here rather
+    /// than in [`Alter`] for that reason: the others compose in a list against one table, and
+    /// two renames of one table in one statement would be a list where only the last entry
+    /// meant anything.
+    ///
+    /// It costs one catalog record. Everything below the catalog is keyed by an interned table
+    /// id - fragments, row keys, field ids, grants - and the id is exactly what does not change,
+    /// so no fact is rewritten and no row id is reissued. That is why this is a rename and not
+    /// the create-copy-drop that [`crate::Refused::Rename`] still prescribes for a *field*,
+    /// whose name is what routes a fact to a bitmap.
+    ///
+    /// One database: `ALTER TABLE a.t RENAME TO b.t` is a move as well as a rename, which is two
+    /// changes under one name, so the new name is bare.
+    RenameTable {
+        /// `sales` in `sales.orders`. `None` means the request's default database.
+        database: Option<String>,
+        table: String,
+        /// The new name, unqualified - it lands in the database the table is already in.
+        to: String,
+    },
+    /// `EXCHANGE TABLES <a> AND <b>`: the two names swap which table they resolve to.
+    ///
+    /// **The statement that makes a rebuild atomic**, which is what the rest of this surface
+    /// has been telling people to do without giving them the last step. `ALTER TABLE ... MODIFY
+    /// COLUMN` and `ALTER TABLE ... ENGINE` are both refused with "create a second table and
+    /// copy into it" ([`crate::Refused::AlterKind`], [`crate::Refused::AlterEngine`]), and until
+    /// this existed the way to put the copy in place was a drop and a rename with a window
+    /// between them where the name resolved to nothing.
+    ///
+    /// Two `insert`s into one map inside one transaction, so there is no such window - and the
+    /// old table is still there under the other name, which makes the statement its own undo.
+    ///
+    /// Both names in one database, for the reason [`Self::RenameTable`] takes a bare new name.
+    ExchangeTables {
+        /// `sales` in `sales.orders`. `None` means the request's default database, and it is
+        /// the database **both** tables are read in.
+        database: Option<String>,
+        a: String,
+        b: String,
+    },
     /// `CREATE [OR REPLACE] VIEW [IF NOT EXISTS] <name> AS <select>`.
     ///
     /// # What a body may be, and why it is that little
@@ -203,6 +245,8 @@ impl Ddl {
             | Self::AlterTable { database: d, .. }
             | Self::DropTable { database: d, .. }
             | Self::TruncateTable { database: d, .. }
+            | Self::RenameTable { database: d, .. }
+            | Self::ExchangeTables { database: d, .. }
             // A view is *in* a database the way a table is, so it takes the request's. What its
             // body resolves in is a different question with a different answer - the view's own
             // database, applied where the body is parsed rather than here.

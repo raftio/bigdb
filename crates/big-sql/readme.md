@@ -222,6 +222,50 @@ this empties. Postgres's `RESTART IDENTITY` and `CASCADE` are not read — there
 restart, because a record id is an address rather than a counter, and nothing references a table
 for a cascade to follow.
 
+## Renaming a table, and swapping two
+
+```sql
+ALTER TABLE t RENAME TO u
+EXCHANGE TABLES live AND rebuilt
+```
+
+**One catalog record each, and no data moves.** Below the catalog a table is reached by an
+interned `TableId` — fragments, row keys, field ids and grants are all keyed by it — so a name is
+a key in one map and changing it costs what changing a key costs. That is the whole difference
+from a *field* name, which is what routes a fact to a bitmap and is still refused
+(`sql_no_rename`).
+
+An exchange is two inserts into that map inside one transaction, so there is no moment where
+either name resolves to nothing. It is the step every "create a second table and copy into it"
+was missing: `sql_no_alter_column` and `sql_no_alter_engine` both prescribe that rebuild, and
+until this existed the way to put the copy in place was a drop and a rename with a window in
+between. It is also its own undo — the old table is still there, under the other name.
+
+A rename demands `ALTER` on the table and `CREATE` in the database, because it takes one name
+away and puts another there. An exchange demands `DROP` on **both**: afterwards either table's
+data is unreachable under the name it was written to, which is what `DROP` guards, and demanding
+it on both is what stops a caller swapping their own table against one they may only read.
+
+The new name is bare and both tables are in one database. A rename that also moved a table is two
+changes wearing one name, and it is a syntax error rather than a refusal — there is nothing to
+write instead of it.
+
+## Rows from nothing
+
+```sql
+SELECT * FROM numbers(10)
+```
+
+**A `Shown`, not a query**, for the reason `system.*` is one: no plan produces these rows, so
+there is nothing to fan out and nothing to merge. The fork happens on a lookahead to the `FROM`
+before the select list is read, because `*` means the one column here and the record id over a
+table — and a bare `numbers` with no bracket is still an ordinary table name.
+
+It carries its own ceiling, `MAX_NUMBERS`, and **refuses past it rather than clamping**
+(`sql_numbers_too_large`). A `SETTINGS` value is clamped silently, which is bearable only because
+`EXPLAIN` prints the figure actually applied; a `Shown` has no such line, so a quiet ceiling here
+would be a different answer wearing the right shape.
+
 ## The catalog, under `system.`
 
 ```sql
@@ -323,10 +367,11 @@ or a condition that is not one equality between the table being joined in and on
 (`sql_join_filter`); and `avg` or a select of joined values over a join — a pair of records has
 no identity this engine stores.
 
-**Everything else that has no set operation behind it** — subqueries, CTEs, `INTERSECT`,
-`EXCEPT`, window functions, arithmetic in the select list, `LIKE`, `IS NULL` and `= NULL`. A
-plain `UNION` and `UNION DISTINCT` have their own code (`sql_union`): removing duplicate rows
-here would mean comparing rendered strings.
+**Everything else that has no set operation behind it** — a CTE whose body is a select,
+`INTERSECT`, `EXCEPT`, `IS NULL` and `= NULL`. A subquery is answered in exactly one shape,
+`IN (SELECT _record_id FROM …)`, which is a semi-join and therefore an intersection. A plain
+`UNION` and `UNION DISTINCT` have their own code (`sql_union`): removing duplicate rows here
+would mean comparing rendered strings.
 
 **The computation this dialect has no evaluator for**, each named by what was asked for rather
 than by the evaluator that is missing: `CASE WHEN`, `if` and `coalesce` choose between two
@@ -335,8 +380,28 @@ condition selects a *set*, and `count(*) FILTER (WHERE …)` is how one statemen
 several. `CAST`, `toInt64` and `toString` convert between representations that do not convert: a
 keyed column is a string in a dictionary and an integer column is bit planes. `argMin`, `argMax`,
 `stddev`, `varPop` and `corr` need each record's value revisited against a running total, and
-this engine holds bits at `(row, record)` rather than values to revisit. A `UUID`, `JSON` or
-`BLOB` column names nothing this engine stores (`sql_unknown_column_type`).
+this engine holds bits at `(row, record)` rather than values to revisit. A `JSON` or `BLOB`
+column names nothing this engine stores (`sql_unknown_column_type`) — though a document held in
+a `TEXT` column is read with `JSONExtractString(c, 'k')` and its family. Three names in that
+refusal *map* rather than missing, and the sentence says so: `IPv4` is a `UINT(32)`, and `UUID`
+and `IPv6` are 128 bits where a bit-sliced value stops at 64, so they are `TEXT` — interned once
+and compared as bitmaps, but without a number's ordering.
+
+**The P2 tier of the OLAP surface**, each with the local spelling in its sentence rather than the
+news that a feature is absent. `SAMPLE` (`sql_no_sample`): there is no rank-select over a
+container, and the units that are cheap to skip whole are windows of write order rather than
+random subsets. `INSERT OVERWRITE` (`sql_no_overwrite`): a truncate and an insert, which nothing
+wraps in one transaction — so two statements, or `EXCHANGE TABLES` for an atomic replacement.
+`COPY INTO` (`sql_no_copy_into`): loading is `POST /table/{t}/import`. `CREATE TEMPORARY TABLE`
+(`sql_no_temporary_table`): there is no session for one to be temporary to. `PARTITION BY` and
+`DISTRIBUTED BY` (`sql_no_distribution`): a shard is `record_id >> 20`, computed rather than
+declared. `MATERIALIZED` and `ALIAS` columns (`sql_computed_column`): one is a view, the other a
+materialised one. `Array`, `Map`, `Tuple` (`sql_composite_type`) and `ARRAY JOIN`
+(`sql_no_array_join`) and the `array*` functions (`sql_array_function`): a keyed column already
+holds many values per record, so `has(c, x)` is `c = 'x'` and one row per element is
+`GROUP BY c`. `Enum8` (`sql_enum_type`): `MUTEX` is that storage already. `neighbor`,
+`windowFunnel` and `retention` (`sql_no_sequence_function`). And `s3`, `url`, `file` and
+`generateRandom` (`sql_no_table_function`), where `numbers(n)` is the one that works.
 
 **The two type names it understands and declines**, which is why neither shares a code with the
 names above — those were not recognised, and these were. `Nullable(T)` (`sql_nullable_type`): a

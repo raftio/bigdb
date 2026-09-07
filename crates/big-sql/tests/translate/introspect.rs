@@ -134,3 +134,39 @@ fn columns_of(sql: &str) -> Vec<Column> {
     };
     columns
 }
+
+/// **`numbers(n)` is a `Shown`, and the bracket is what makes it one.**
+///
+/// The claim worth asserting rather than commenting: this adds no plan, so a statement that
+/// reached the query path would be the first one with an empty `calls` list under a shape naming
+/// plans that do not exist. And the fork is on the bracket, so an ordinary table called `numbers`
+/// is still an ordinary table - a name does not become unusable because a function borrowed it.
+#[test]
+fn numbers_is_a_shown_and_the_bracket_is_what_decides() {
+    assert_eq!(show("SELECT * FROM numbers(10)").what, big_sql::Shown::Numbers { n: 10 });
+    assert_eq!(show("SELECT number FROM numbers(3)").what, big_sql::Shown::Numbers { n: 3 });
+    // Zero rows is a count somebody may legitimately compute, not an empty statement.
+    assert_eq!(show("SELECT * FROM numbers(0)").what, big_sql::Shown::Numbers { n: 0 });
+    // It reads nothing, so it demands nothing - the same answer a listing of names gives.
+    assert!(big_sql::translate("SELECT * FROM numbers(10)").unwrap().demands().is_empty());
+}
+
+/// A bare `numbers` is still a table name, because the fork tests for the bracket.
+#[test]
+fn a_bare_numbers_is_still_a_table_name() {
+    let big_sql::Sql::Query(s) = big_sql::translate("SELECT count(*) FROM numbers").unwrap() else {
+        panic!("a table called `numbers` is a query")
+    };
+    assert_eq!(s.calls[0].table, "numbers");
+}
+
+/// The ceiling is refused with the number rather than clamped to it.
+///
+/// A `SETTINGS` value is clamped silently, and that is only bearable because `EXPLAIN` prints
+/// the figure actually applied. A `Show` has no such line, so a quiet ceiling here would be a
+/// different answer wearing the right shape.
+#[test]
+fn asking_for_more_numbers_than_the_ceiling_is_refused_not_trimmed() {
+    assert_eq!(show("SELECT * FROM numbers(10000)").what, big_sql::Shown::Numbers { n: 10_000 });
+    assert_eq!(code("SELECT * FROM numbers(10001)"), "sql_numbers_too_large");
+}

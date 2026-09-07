@@ -29,8 +29,9 @@
 //! total - see `sql_window_frame`.
 
 use super::num::Num;
-use super::{order_by_keys, Datum, Row};
+use super::{order_by_keys, scalar, Datum, Row};
 use big_exec::Projected;
+use big_sql::scalar::BinOp;
 use big_sql::{Frame, Selected, Selection, Units, WinFunc};
 
 /// Fills every window column of a projection, in place.
@@ -181,6 +182,18 @@ fn values(
                 WinFunc::Lead => match i + step < n {
                     true => read(i + step),
                     false => Datum::Null,
+                },
+                // `x - lag(x, 1)`, and that is the definition rather than an implementation of
+                // one: the first row of a partition has nothing behind it, so it is absent -
+                // not zero, which would read as "no change" where the truth is "no previous
+                // row". A subtraction and not a fold, so it is exact on a decimal for the
+                // reason every other subtraction here is.
+                WinFunc::RunningDifference => match i.checked_sub(1) {
+                    Some(j) => match (read(i), read(j)) {
+                        (Datum::Null, _) | (_, Datum::Null) => Datum::Null,
+                        (now, before) => scalar::binary(BinOp::Sub, &now, &before),
+                    },
+                    None => Datum::Null,
                 },
                 WinFunc::FirstValue => read(0),
                 // **The partition's last row, which is the whole point of having no frame.**

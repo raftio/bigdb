@@ -158,3 +158,44 @@ shape
 SELECT country, row_number() OVER (ORDER BY amount) * 10 FROM t
 ----
 error: parse_error
+
+## `runningDifference(x)`: `x - lag(x, 1)`, and defined as exactly that.
+#
+# A window rather than a scalar, because it needs the order the difference is taken along - a
+# scalar runs on one value with nothing around it. So it joins the ranking and offset family,
+# which is the family whose `OVER` must carry an `ORDER BY`, and it reads a column, which is why
+# its cell carries that column's units rather than being a plain count.
+
+shape
+SELECT amount, runningDifference(amount) OVER (ORDER BY amount) FROM t
+----
+Table
+├── amount
+└── runningDifference = runningDifference(@0) by @0
+
+shape
+SELECT country, runningDifference(amount) OVER (PARTITION BY category ORDER BY amount) FROM t
+----
+Table
+├── country
+└── runningDifference = runningDifference(@1) over (@2) by @1
+
+# The snake spelling is the same function, not a second one.
+shape
+SELECT running_difference(amount) OVER (ORDER BY amount) FROM t
+----
+Table
+└── runningDifference = runningDifference(@0) by @0
+
+# It reads a column, so it must be given one.
+error
+SELECT runningDifference() OVER (ORDER BY amount) FROM t
+----
+parse_error
+
+# And it needs an order: a difference against a sequence nobody wrote down is a number nobody
+# can reproduce - the same rule `lag` and `row_number` are held to.
+error
+SELECT runningDifference(amount) OVER (PARTITION BY category) FROM t
+----
+sql_window_frame

@@ -239,6 +239,12 @@ fn statement(p: &mut Parser<'_>, explainable: bool) -> Result<Parsed> {
             p.i += 1;
             return p.system_select().map(Parsed::Show);
         }
+        // The same fork, on the same lookahead, for the same reason: `numbers(n)` has one
+        // column and `*` means it, where over a table `*` is the record id.
+        "SELECT" if p.names_numbers() => {
+            p.i += 1;
+            return p.numbers_select().map(Parsed::Show);
+        }
         "SELECT" => {}
         // Each of these rules on its second word, so that `CREATE DATABASE` and `CREATE VIEW`
         // get the sentence that is about them rather than the one about writes in general: a
@@ -253,6 +259,11 @@ fn statement(p: &mut Parser<'_>, explainable: bool) -> Result<Parsed> {
             }
             if p.word_is("USER") {
                 return Err(p.refuse(Refused::CreateUser));
+            }
+            // Named before `TABLE` is looked for, so somebody who wrote it is told there is no
+            // session for a table to be temporary to rather than "expected a table name".
+            if p.word_is("TEMPORARY") || p.word_is("TEMP") {
+                return Err(p.refuse(Refused::TemporaryTable));
             }
             return p.create_table().map(Parsed::Ddl);
         }
@@ -322,12 +333,22 @@ fn statement(p: &mut Parser<'_>, explainable: bool) -> Result<Parsed> {
         // Compaction exists and is a server operation rather than a statement, because it needs
         // the file's exclusive lock. Named here rather than left to fall off the grammar.
         "OPTIMIZE" => return Err(p.refuse(Refused::Optimize)),
+        // Reading a path from inside a statement is an external catalog. Loading data has a
+        // route already, and the sentence names it.
+        "COPY" => return Err(p.refuse(Refused::CopyInto)),
         // `TRUNCATE` has an operation behind it here - freeing a table's fragments by key,
         // which is `DROP TABLE`'s second half without its first - so it left the refusal above
         // and became a statement.
         "TRUNCATE" => {
             p.i += 1;
             return p.truncate_table().map(Parsed::Ddl);
+        }
+        // Its own leading word rather than a second `ALTER` clause, because it is about two
+        // tables and an `ALTER TABLE` names one. It is also the step the refusals for `MODIFY
+        // COLUMN` and `ENGINE` have been prescribing without providing - see `Ddl::ExchangeTables`.
+        "EXCHANGE" => {
+            p.i += 1;
+            return p.exchange_tables().map(Parsed::Ddl);
         }
 
         // `UPDATE` has an operation behind it on the columns where one record holds one value:
@@ -730,4 +751,5 @@ pub(crate) use select::bucket_of;
 mod settings;
 mod show;
 mod system;
+mod tablefn;
 mod update;

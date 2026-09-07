@@ -136,3 +136,33 @@ SELECT amount, row_number() OVER (ORDER BY amount DESC) FROM tx LIMIT 2
 amount  row_number
 100     6
 900     1
+
+## `runningDifference(x)`: the difference against the previous row of the partition.
+#
+# Worth running here rather than only in translation because the claim is about the *partition*
+# being whole: the previous row is the previous row of every shard's contribution merged, not of
+# the share one node happened to hold. A per-node difference would restart at each shard, and the
+# first row of each would be blank instead of just the first row overall.
+
+query
+SELECT amount, runningDifference(amount) OVER (ORDER BY amount) FROM tx
+----
+amount  runningDifference
+100     NULL
+900     200
+500     200
+700     200
+200     100
+300     100
+
+# Partitioned, so each partition's first row is the blank one.
+query
+SELECT country, amount, runningDifference(amount) OVER (PARTITION BY country ORDER BY amount) FROM tx
+----
+country  amount  runningDifference
+GB       100     NULL
+US       900     700
+GB       500     200
+FR       700     NULL
+US       200     NULL
+GB       300     200
