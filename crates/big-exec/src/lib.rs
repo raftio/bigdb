@@ -24,6 +24,8 @@
 
 #![deny(unsafe_code)]
 
+use std::collections::BTreeMap;
+
 use big_db::catalog::{Catalog, FieldKind};
 use big_db::{DbRead, Matches, RangeOp, RecordId, RowId};
 use big_pager::Pager;
@@ -768,7 +770,66 @@ fn eval<P: Pager + Sync>(db: &DbRead<'_, P>, table: &str, rows: &Rows) -> Result
         // both would silently drop every part after the first empty one.
         Rows::Intersect(parts) => fold(db, table, parts, Matches::and, StopWhenEmpty::Yes)?,
         Rows::Union(parts) => fold(db, table, parts, Matches::or, StopWhenEmpty::No)?,
+
+        // **One AND per container, and never a record decoded.** A container holds 65,536
+        // consecutive record ids, so "every `stride`th id" is the same pattern in every
+        // container - built once here and intersected with each one the inner set touches.
+        //
+        // That is also why the stride is a power of two: the pattern only repeats when it
+        // divides the container, and a stride that did not would be right in one container and
+        // wrong in the next. `big_plan` refuses the rest at the call.
+        Rows::Sample { inner, stride } => sample(eval(db, table, inner)?, *stride),
     })
+}
+
+/// One record in every `stride`, by record id.
+///
+/// **The unit is the id's low bits, not a block of ids**, and that is the whole of why this is
+/// a sample rather than a slice. Ids are handed out in write order, so every eighth *container*
+/// would be every eighth window of time - a subset that leans whichever way the data drifted.
+/// Every eighth *id* is spread evenly through each of those windows.
+///
+/// Costs one container-sized AND per container the set touches. Nothing is decoded, so a
+/// sampled count is as cheap as the count it came from.
+fn sample(matches: Matches, stride: u32) -> Matches {
+    // A container is addressed by a `u16` offset, so this is its width - written from the type
+    // rather than as a literal, because the two cannot then drift apart.
+    const WIDTH: u64 = u16::MAX as u64 + 1;
+    let stride = u64::from(stride.max(2));
+
+    // **Keyed by phase, not by container.** A container beginning at id `c * 65536` starts
+    // part-way through the repeating pattern unless the stride divides the width, and the
+    // offset into it is arithmetic. There are at most `stride` distinct phases and usually far
+    // fewer, so this caches what would otherwise be rebuilt per container - and the common case
+    // of a stride that does divide the width has exactly one entry.
+    let mut masks: BTreeMap<u64, big_db::Container> = BTreeMap::new();
+
+    let mut out = Matches::new();
+    // Collected first because the loop reads the same `matches` it is iterating the shards of.
+    let shards: Vec<_> = matches.shards().collect();
+    for shard in shards {
+        let Some(rows) = matches.get(shard) else { continue };
+        let mut per_shard = big_db::RowSet::new();
+        for (slot, _) in rows.iter() {
+            // The id of this container's first record, modulo the stride: where in the pattern
+            // it begins. `slot` is the container's index within the shard, and a shard is
+            // `SHARD_WIDTH` records, so the two together give the record id.
+            let first = shard.wrapping_mul(big_db::SHARD_WIDTH).wrapping_add(slot * WIDTH);
+            let phase = first % stride;
+            // The first offset inside this container that is on the pattern.
+            let start = (stride - phase) % stride;
+            let mask = masks.entry(phase).or_insert_with(|| {
+                big_db::Container::from_values(
+                    (start..WIDTH).step_by(stride as usize).map(|v| v as u16),
+                )
+            });
+            per_shard.insert(slot, mask.clone());
+        }
+        // `RowSet::insert` drops an empty container, so a shard that samples to nothing
+        // contributes nothing - the same shape `Matches` already holds for an empty shard.
+        out.insert(shard, rows.and(&per_shard));
+    }
+    out
 }
 
 /// Whether an empty accumulator can still be changed by what is left.

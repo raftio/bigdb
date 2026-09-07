@@ -150,6 +150,7 @@ fn unfolded_aggregate(plan: &Plan) -> Option<&Plan> {
 fn rows_head(rows: &Rows) -> String {
     match rows {
         Rows::All => "all".to_string(),
+        Rows::Sample { stride, .. } => format!("sample 1 in {stride}"),
         Rows::Compare { field, op, value } => format!("{field} {} {value}", cmp(*op)),
         // The marker is not decoration. A signed field's bound is an `i64` all the way down and
         // a positive one prints identically to an unsigned bound, so without it two different
@@ -187,6 +188,7 @@ fn rows_head(rows: &Rows) -> String {
 fn rows_kids(rows: &Rows) -> Vec<&Rows> {
     match rows {
         Rows::Intersect(parts) | Rows::Union(parts) => parts.iter().collect(),
+        Rows::Sample { inner, .. } => vec![inner.as_ref()],
         Rows::Difference(a, b) => vec![a, b],
         Rows::Not(inner) => vec![inner],
         _ => Vec::new(),

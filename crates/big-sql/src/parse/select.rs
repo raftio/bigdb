@@ -76,12 +76,10 @@ impl Parser<'_> {
         }
         let joins = self.joins()?;
 
-        // `FROM t SAMPLE 0.1`. Refused at the word, after the joins so that `SAMPLE` on either
-        // side of one lands here rather than as "expected WHERE". `at_clause_keyword` is what
-        // stops it being eaten as the table's alias before this is reached.
-        if self.word_is("SAMPLE") {
-            return Err(self.refuse(Refused::Sample));
-        }
+        // `FROM t SAMPLE 0.1`, read after the joins so it belongs to the statement rather than
+        // to whichever table it happened to follow. `at_clause_keyword` is what stops it being
+        // eaten as the table's alias before this is reached.
+        let sample = if self.eat_word("SAMPLE") { Some(self.sample_stride()?) } else { None };
 
         // `PREWHERE` is ClickHouse's hint to filter on a cheap column before reading the rest
         // of the row. **Here it selects exactly the set `WHERE` would**, because there is no
@@ -241,6 +239,7 @@ impl Parser<'_> {
         let format = self.format()?;
 
         Ok(Select {
+            sample,
             items,
             from,
             joins,
@@ -278,6 +277,52 @@ impl Parser<'_> {
             None
         };
         Ok(Source { database, table, alias })
+    }
+
+    /// The `n` of `SAMPLE`, however it was written: `1/10`, `0.1` and `10` are one stride.
+    ///
+    /// **Three spellings, and each is exact.** `SAMPLE 10` is one record in ten. `SAMPLE 1/10`
+    /// says the same thing the way a ratio is written. `SAMPLE 0.1` is ClickHouse's spelling and
+    /// is read through the decimal it already parsed as - `units` and `scale`, not a float - so
+    /// `0.1` is exactly one in ten rather than one in 9.999999.
+    ///
+    /// A fraction that is not one over a whole number is refused rather than rounded. `SAMPLE
+    /// 0.3` would be one in 3.33, and answering it as one in three is a tenth more data than was
+    /// asked for under the name that was asked for.
+    fn sample_stride(&mut self) -> Result<u32> {
+        let at = self.at();
+        let bad = |p: &Self| p.refuse_at(Refused::Sample, at);
+
+        // `SAMPLE 1/10`: a ratio, and the numerator has to be one - `2/10` is a fraction this
+        // would have to reduce, and a reduction is a second place for it to disagree with what
+        // was written.
+        if let Some(Tok::Num(Literal::Int(1))) = self.peek() {
+            if self.tok_at_is(1, &Tok::Arith("/")) {
+                self.i += 2;
+                let n = self.small_number("how many records to take one of")?;
+                return u32::try_from(n).ok().filter(|n| *n >= 2).ok_or_else(|| bad(self));
+            }
+        }
+        match self.peek() {
+            // `SAMPLE 10`.
+            Some(Tok::Num(Literal::Int(n))) => {
+                let n = *n;
+                self.i += 1;
+                u32::try_from(n).ok().filter(|n| *n >= 2).ok_or_else(|| bad(self))
+            }
+            // `SAMPLE 0.1`. Exact, because a decimal here is an integer and a scale: the stride
+            // is `10^scale / units`, and it exists only when that divides.
+            Some(Tok::Num(Literal::Dec { units, scale })) => {
+                let (units, scale) = (*units, *scale);
+                self.i += 1;
+                let whole = 10u64.checked_pow(u32::from(scale)).ok_or_else(|| bad(self))?;
+                if units == 0 || whole % units != 0 {
+                    return Err(bad(self));
+                }
+                u32::try_from(whole / units).ok().filter(|n| *n >= 2).ok_or_else(|| bad(self))
+            }
+            _ => Err(self.syntax("how much to sample")),
+        }
     }
 
     /// Whether the current word begins a clause rather than being an alias.

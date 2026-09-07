@@ -217,6 +217,16 @@ impl Sql {
                     Privilege::Insert,
                     table_ref(insert.database.as_deref(), &insert.table),
                 ));
+                // **An overwrite destroys what was there, so it demands the privilege that
+                // guards destroying.** The same argument `UPDATE` makes for demanding both:
+                // a credential that may add rows but not remove them is not most of the way to
+                // being allowed here - it is missing the half that empties the table.
+                if insert.overwrite {
+                    out.push(Demand::new(
+                        Privilege::Delete,
+                        table_ref(insert.database.as_deref(), &insert.table),
+                    ));
+                }
                 // `INSERT ... SELECT` reads before it writes, and the read is a read: without
                 // this the refusal would land after the coordinator had already taken a run of
                 // record ids from the leader.

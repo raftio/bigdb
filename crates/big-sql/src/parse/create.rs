@@ -389,6 +389,16 @@ impl Parser<'_> {
             // The two native spellings, which exist because the SQL names carry a fixed width
             // and a bit-sliced field is cheaper the narrower it is: every plane is one more
             // bitmap a range query intersects.
+            // **An IPv4 address is a 32-bit number, and nothing is lost by saying so.** It
+            // compares, sorts, ranges and zone-maps exactly as `UINT(32)` does, because that is
+            // what it is - so this joins `TIMESTAMP` -> `DATETIME` and `BIGINT` -> `UINT(64)`
+            // as a spelling this dialect reads and writes back under its canonical name.
+            //
+            // `UUID` and `IPv6` are deliberately *not* here. Both are 128 bits where a
+            // bit-sliced value stops at 64, so the only column they could land in is a keyed
+            // one - and a keyed column answers `=` but not `<`. Accepting them would take an
+            // ordering away silently; refusing them says so (`sql_unknown_column_type`).
+            "IPV4" => Column { name, kind: Int, bit_depth: 32, scale: None },
             "UINT" => Column { name, kind: Int, bit_depth: self.bit_depth()?, scale: None },
             "SIGNED" => {
                 let bit_depth =

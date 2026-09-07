@@ -206,3 +206,54 @@ error
 INSERT INTO floaty2 (temp) SELECT temp FROM floaty
 ----
 error: engine_cannot_answer
+
+## `INSERT OVERWRITE`: the rows that were there are gone, and only these are left.
+#
+# The claim worth running against real records is the *order*. The source is read whole and
+# merged before anything is cleared, so the count below is the source's count and not the sum of
+# both — and a table that was not empty beforehand does not contribute a single record.
+
+statement
+CREATE TABLE ow_src (amount UINT(32))
+
+statement
+INSERT INTO ow_src (_record_id, amount) VALUES (1, 7), (2, 8)
+
+statement
+CREATE TABLE ow_dst (amount UINT(32))
+
+statement
+INSERT INTO ow_dst (_record_id, amount) VALUES (1, 100), (2, 200), (3, 300)
+
+query
+SELECT count(*), sum(amount) FROM ow_dst
+----
+count  sum
+3      600
+
+statement
+INSERT OVERWRITE ow_dst (amount) SELECT amount FROM ow_src
+
+# Three rows went, two arrived. A statement that wrote without emptying would say 5 and 615.
+query
+SELECT count(*), sum(amount) FROM ow_dst
+----
+count  sum
+2      15
+
+# The source is untouched.
+query
+SELECT count(*) FROM ow_src
+----
+count
+2
+
+# Overwriting with literals empties just as much.
+statement
+INSERT OVERWRITE TABLE ow_dst (amount) VALUES (1)
+
+query
+SELECT count(*), sum(amount) FROM ow_dst
+----
+count  sum
+1      1

@@ -389,3 +389,25 @@ error
 CREATE TABLE t (q QUANTILE_STATE)
 ----
 sql_sketch
+
+# `IPv4` is a 32-bit number, so it is read as one - the same way `TIMESTAMP` is read as
+# `DATETIME` and `BIGINT` as `UINT(64)`. Nothing is lost: it compares, sorts and zone-maps as
+# what it is, and it writes back under the canonical spelling.
+ddl
+CREATE TABLE t (client IPv4)
+----
+CreateTable t
+└── client int depth=32
+
+# `UUID` and `IPv6` are not, and the difference is what would be lost. Both are 128 bits where a
+# bit-sliced value stops at 64, so the only column they could land in is keyed - which answers
+# `=` but not `<`. Refused rather than accepted with the ordering quietly gone.
+error
+CREATE TABLE t (id UUID)
+----
+sql_unknown_column_type
+
+error
+CREATE TABLE t (client IPv6)
+----
+sql_unknown_column_type

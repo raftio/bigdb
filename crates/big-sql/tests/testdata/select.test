@@ -312,3 +312,50 @@ Row
 ├── count = #0
 ├── sum = #1
 └── having: #0 > 1000 and #1 > 500
+
+## `SAMPLE`: one record in every n, by record id.
+#
+# **The unit is the id's low bits, not a block of them**, and that is what makes it a sample
+# rather than a slice: ids are handed out in write order, so every tenth *container* would be
+# every tenth window of time. Every tenth *id* is spread evenly through each of those windows.
+#
+# It wraps the filter rather than sitting beside it, because that is the order the two clauses
+# mean: a tenth of the records over five, not a tenth of every record of which some are over
+# five.
+
+plan
+SELECT count(*) FROM t SAMPLE 10
+----
+Count t
+└── sample 1 in 10
+    └── all
+
+# Three spellings, one stride. `0.1` is read through the decimal it parsed as - units and scale,
+# never a float - so it is exactly one in ten.
+plan
+SELECT count(*) FROM t SAMPLE 1/10
+----
+Count t
+└── sample 1 in 10
+    └── all
+
+plan
+SELECT count(*) FROM t SAMPLE 0.1
+----
+Count t
+└── sample 1 in 10
+    └── all
+
+plan
+SELECT count(*) FROM t SAMPLE 0.5 WHERE amount > 5
+----
+Count t
+└── sample 1 in 2
+    └── amount > 5
+
+shape
+SELECT country, count(*) FROM t SAMPLE 4 GROUP BY country
+----
+Groups keys=[#0]
+├── country = key
+└── count = group #0 else 0

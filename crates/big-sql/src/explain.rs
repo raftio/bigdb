@@ -632,7 +632,10 @@ fn column(column: &Column) -> String {
 /// A write, as its columns and its rows.
 pub fn insert(insert: &Insert) -> String {
     let mut out = format!(
-        "Insert {} ({}){}",
+        "Insert{} {} ({}){}",
+        // Printed because it is the difference between writing rows and replacing every row -
+        // which is the one thing somebody explaining this statement most needs to see.
+        if insert.overwrite { " overwrite" } else { "" },
         qualified(&insert.database, &insert.table),
         insert.columns.join(", "),
         // Which column is the record id is the whole difference between the two forms of this

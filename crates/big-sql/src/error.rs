@@ -401,17 +401,20 @@ pub enum Refused {
     /// these are one family of questions, and what each needs is a different local spelling
     /// rather than a different kind of answer.
     SequenceFunction,
-    /// `SAMPLE 0.1` after a `FROM`, or `SAMPLE BY expr` in a `CREATE TABLE`.
+    /// A `SAMPLE` fraction that names no whole stride, or `SAMPLE BY` in a `CREATE TABLE`.
     ///
-    /// There is no rank-select over a roaring container, so there is no way to take every tenth
-    /// matching record without decoding the ones in between. What is cheap is a *container* or a
-    /// shard, and neither is a random subset: record ids are handed out in write order, so a
-    /// container is a window of time wearing the shape of a sample.
+    /// **The clause itself is answered** - one record in every `n`, masked on the id's low bits.
+    /// What is refused is a fraction that is not one over a whole number, because rounding it
+    /// would answer a different question under the name of this one, and `SAMPLE BY`, which
+    /// names the column a sample is drawn on: here the unit is the record id, which is not a
+    /// column and cannot be chosen.
     Sample,
-    /// `INSERT OVERWRITE`.
+    /// `INSERT OVERWRITE ... PARTITION (...)`.
     ///
-    /// It is a truncate and an insert, and nothing here wraps two of those in one transaction -
-    /// so a statement that looked atomic would not be, which is worse than two that do not.
+    /// **The statement itself is answered now**; what stays refused is the clause that aims it
+    /// at a partition, because a shard here is a function of the record id and there is nothing
+    /// for one to name. Narrowed rather than removed, which is the widening
+    /// `docs/versioning.md` allows.
     Overwrite,
     /// `COPY INTO t FROM 's3://...'`.
     CopyInto,
@@ -1157,21 +1160,21 @@ impl Refused {
                  language over them. Counting by period is `GROUP BY date_trunc(...)`"
             }
             Self::Sample => {
-                "a roaring container has no rank-select, so there is no way to take every tenth \
-                 matching record without decoding the nine in between - and the units that are \
-                 cheap to skip whole, a container and a shard, are not random subsets: record \
-                 ids are handed out in write order, so either one is a window of *time* wearing \
-                 the shape of a sample, and a number drawn from it would be biased in the \
-                 direction nobody checks. For fewer rows write `LIMIT`; for a defined subset \
-                 write a `WHERE` over a column that means something"
+                "`SAMPLE` takes one record in every `n`, written as `SAMPLE 10`, `SAMPLE 1/10` \
+                 or `SAMPLE 0.1` - three spellings of one stride. A fraction that is not one \
+                 over a whole number has no stride: `0.3` would be one in 3.33, and answering it \
+                 as one in three is a tenth more data than was asked for under the name that was \
+                 asked for. `SAMPLE BY` is a different thing again - it names the column a \
+                 sample is drawn on, and here the unit is the record id, which is not a column"
             }
             Self::Overwrite => {
-                "`TRUNCATE TABLE t` and then `INSERT INTO t SELECT ...` - two statements, \
-                 because they are two operations and nothing here wraps a pair of them in one \
-                 transaction. A single word that read as atomic and was not would be worse than \
-                 the two that admit it. To replace a table's contents *atomically*, write the \
-                 new rows into a second table and `EXCHANGE TABLES` them, which swaps two names \
-                 in one change and leaves the old rows under the other name"
+                "`INSERT OVERWRITE` is answered, but not at a partition: a shard here is \
+                 `record_id >> 20`, computed from the id a record was written under, so there is \
+                 nothing for `PARTITION (...)` to name. Write the statement without it. Note \
+                 what the plain form does and does not promise - it empties and then writes, and \
+                 nothing wraps those two in one transaction, so a crash between them leaves the \
+                 table empty. For a replacement that is genuinely atomic, write into a second \
+                 table and `EXCHANGE TABLES` them"
             }
             Self::CopyInto => {
                 "loading data is `POST /table/{t}/import`, which streams rows in without a \
@@ -1390,10 +1393,11 @@ impl Refused {
                  already carry: `FLOAT(10, 2)` is a `DECIMAL(10, 2)`, which keeps those digits \
                  exactly where a float would not. There is nothing here a blob or a JSON \
                  document lands in - a document is a `TEXT` column, and `JSONExtractString(c, \
-                 'k')` reads a key out of one. Three more names map rather than missing: \
-                 `IPv4` is a `UINT(32)`, which is what an address is; `UUID` and `IPv6` are 128 \
-                 bits where a bit-sliced value stops at 64, so they are `TEXT` - interned once \
-                 and compared as bitmaps, but without the ordering a number would have"
+                 'k')` reads a key out of one. `IPv4` is not on this list at all: it is read as \
+                 the `UINT(32)` an address is. `UUID` and `IPv6` are, and the difference is what \
+                 would be lost - both are 128 bits where a bit-sliced value stops at 64, so the \
+                 only column they could land in is a keyed one, which answers `=` but not `<`. \
+                 Declare them `TEXT` if equality is all you need, and know that is what you have"
             }
             Self::Constraint => {
                 "a column list here declares fields and nothing else: there are no rows for \
