@@ -113,7 +113,7 @@ fn records_answer_with_one_id_per_row() {
 #[test]
 fn a_projection_renders_the_values_the_plan_already_cut() {
     let shape = Shape::Table {
-        columns: Columns::Named(vec![plain_column("amount"), plain_column("score")]),
+        columns: Columns::Named(vec![plain_column("amount", 0), plain_column("score", 1)]),
         order: None,
         cut: None,
     };
@@ -136,7 +136,7 @@ fn a_projection_renders_the_values_the_plan_already_cut() {
 #[test]
 fn a_decimal_column_is_rendered_with_the_point_its_field_keeps() {
     let shape = Shape::Table {
-        columns: Columns::Named(vec![scaled_column("price", 2), plain_column("qty")]),
+        columns: Columns::Named(vec![scaled_column("price", 2, 0), plain_column("qty", 1)]),
         order: None,
         cut: None,
     };

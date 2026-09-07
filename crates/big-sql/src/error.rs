@@ -55,7 +55,11 @@ pub enum Refused {
     Subquery,
     /// A `HAVING` that names an aggregate the answer does not carry.
     Having,
-    /// A window function, or `OVER`.
+    /// A window where the answer is numbers about sets rather than rows.
+    ///
+    /// **Repurposed rather than retired.** This used to mean "window functions are not
+    /// supported"; they are now, over a projection - so what is left is the shapes a window
+    /// cannot be over, and the entries that name one without saying which rows it sees.
     Window,
     /// `ORDER BY` something the answer holds no number or key for.
     Order,
@@ -343,6 +347,17 @@ pub enum Refused {
     /// `UNION ALL` is - so there is no single list to sort or to cut. Ordering each set on its
     /// own would look sorted and not be, and a `LIMIT 10` would answer ten rows *per set*.
     RollupOrder,
+    /// A frame clause, or an ordering under an aggregate window - which means one.
+    ///
+    /// Every window this surface answers is over the whole partition in the order given. A
+    /// frame that is silently the default is a different answer wearing the right syntax.
+    WindowFrame,
+    /// `WINDOW w AS (...)` and `OVER w`: the clause written somewhere other than where it is used.
+    WindowName,
+    /// `QUALIFY`: a `HAVING` over a window function's own output.
+    ///
+    /// A second filter, over numbers that exist only after every row has been read.
+    Qualify,
 }
 
 impl Refused {
@@ -356,7 +371,7 @@ impl Refused {
     /// Kept honest by [`Refused::rank`] below, whose exhaustive match will not compile until a
     /// new variant is named - and by a test asserting that every rank appears here exactly once,
     /// which is what catches naming one and forgetting to add it.
-    pub const ALL: [Self; 77] = [
+    pub const ALL: [Self; 80] = [
         Self::Joins,
         Self::OuterJoin,
         Self::JoinOn,
@@ -434,6 +449,9 @@ impl Refused {
         Self::WithTotals,
         Self::GroupingSets,
         Self::RollupOrder,
+        Self::WindowFrame,
+        Self::WindowName,
+        Self::Qualify,
     ];
 
     /// Where this refusal sits in [`Refused::ALL`], and the reason that list can be trusted.
@@ -522,6 +540,9 @@ impl Refused {
             Self::WithTotals => 74,
             Self::GroupingSets => 75,
             Self::RollupOrder => 76,
+            Self::WindowFrame => 77,
+            Self::WindowName => 78,
+            Self::Qualify => 79,
         }
     }
 
@@ -535,6 +556,9 @@ impl Refused {
             Self::WithTotals => "sql_with_totals",
             Self::GroupingSets => "sql_too_many_grouping_sets",
             Self::RollupOrder => "sql_rollup_order",
+            Self::WindowFrame => "sql_window_frame",
+            Self::WindowName => "sql_window_named",
+            Self::Qualify => "sql_qualify",
             Self::SetTooLarge => "sql_set_too_large",
             Self::ExplainSet => "sql_explain_set",
             Self::Segment => "sql_segment_unexpanded",
@@ -604,9 +628,9 @@ impl Refused {
             Self::AclPublic => "sql_no_public",
             Self::GrantOption => "sql_no_grant_option",
             Self::ReservedRole => "sql_reserved_role",
+            Self::Window => "sql_window_shape",
             Self::Subquery
             | Self::Having
-            | Self::Window
             | Self::Offset
             | Self::Expression
             | Self::MultiDistinct
@@ -699,7 +723,17 @@ impl Refused {
                  `HAVING` on a second one would filter on a number that is not there, and one \
                  without a `GROUP BY` has no groups to keep"
             }
-            Self::Window => "window functions are not supported",
+            Self::Window => {
+                "a window is computed over the rows a **projection** read - `SELECT country, \
+                 row_number() OVER (PARTITION BY country ORDER BY amount DESC) FROM t` - \
+                 because that is the one answer this surface materialises as rows. A grouped \
+                 answer, a tuple grouping and a join are numbers about sets rather than rows, \
+                 so there is nothing for a partition to be a partition of: `ORDER BY count(*) \
+                 DESC LIMIT 10` is the ranking those already carry, and `topK(n)(x)` is the \
+                 same ranking as a list in one cell. A window function written without `OVER` \
+                 earns this too - it is a window missing the clause that says which rows it \
+                 ranks"
+            }
             Self::Order => {
                 "a grouped answer is ordered by the grouped column or by the one aggregate the \
                  select list asked for, in either direction; `ORDER BY count(*) DESC` is the \
@@ -892,6 +926,27 @@ impl Refused {
                  and not be, and a `LIMIT 10` would answer with ten rows per set. The rows do arrive in \
                  a fixed order - the sets longest first, each in its own key order - so order and cut \
                  them in the client, or write the one set you want ordered as its own `GROUP BY`"
+            }
+            Self::WindowFrame => {
+                "a window here is computed over the whole partition in the order given, which is the \
+                 default frame for `row_number`, `rank`, `lag`, `first_value` and the rest of those two \
+                 families - so `ROWS`, `RANGE`, `GROUPS` and `EXCLUDE` have nothing to narrow and are \
+                 refused rather than accepted and ignored. An `ORDER BY` under `sum`, `avg`, `count`, \
+                 `min` or `max` says the same thing: the running total, whose frame is `RANGE UNBOUNDED \
+                 PRECEDING` and whose answer is a different number from the partition total. Write \
+                 `sum(x) OVER (PARTITION BY c)` for the partition total, and order the answer itself"
+            }
+            Self::WindowName => {
+                "a window is written where it is used - `row_number() OVER (PARTITION BY country ORDER \
+                 BY amount DESC)` - and there is no `WINDOW w AS (...)` to name one somewhere else. A name \
+                 would be a second place for the clause to live and a second thing to keep in step with the \
+                 first; writing it out at each entry is longer and says what it does"
+            }
+            Self::Qualify => {
+                "`QUALIFY` filters on a window function's own output, which exists only once every row of \
+                 every partition has been read - so it is a second pass over the finished answer rather than \
+                 anything a plan could carry. `WHERE` narrows the records the window then ranks, which is the \
+                 cheap half and usually the one that was meant; filter on the ranking itself in the client"
             }
             Self::SystemClause => {
                 "a system view answers in full, and the clause it takes is \

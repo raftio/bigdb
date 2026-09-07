@@ -86,8 +86,15 @@ fn every_refusal_names_itself() {
     // And the shapes that hold no aggregate at all for one to be about.
     assert_eq!(code("SELECT amount FROM t HAVING count(*) > 5"), "sql_unsupported");
     assert_eq!(code("SELECT * FROM t HAVING count(*) > 5"), "sql_unsupported");
-    assert_eq!(code("SELECT row_number() OVER () FROM t"), "sql_unsupported");
     assert_eq!(code("SELECT count(*) FROM t LIMIT 1 OFFSET 5"), "sql_unsupported");
+    // A window used to be refused outright and share `sql_unsupported` with everything else
+    // this surface had no answer for. It has one now, so what is left are the two mistakes a
+    // window can be: no ordering to rank by, and a shape that holds no rows to rank.
+    assert_eq!(code("SELECT row_number() OVER () FROM t"), "sql_window_frame");
+    assert_eq!(
+        code("SELECT category, row_number() OVER (ORDER BY amount) FROM t GROUP BY category"),
+        "sql_window_shape"
+    );
     // Arithmetic is answered now; what is refused is an expression that is not about one
     // column - two of them in a cell, or none at all.
     assert_eq!(code("SELECT concat(country, category) FROM t"), "sql_unsupported");

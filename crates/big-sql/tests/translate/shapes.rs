@@ -138,16 +138,18 @@ fn a_projection_carries_its_cut_in_the_plan() {
         translate("SELECT amount AS a, price FROM t LIMIT 5").unwrap().answer.shape,
         Shape::Table {
             columns: Columns::Named(vec![
-                Selected {
-                    column: "a".to_string(),
-                    units: Units::Written { table: "t".to_string(), field: "amount".to_string() },
-                    apply: None,
-                },
-                Selected {
-                    column: "price".to_string(),
-                    units: Units::Written { table: "t".to_string(), field: "price".to_string() },
-                    apply: None,
-                },
+                Selected::read(
+                    "a",
+                    Units::Written { table: "t".to_string(), field: "amount".to_string() },
+                    None,
+                    0,
+                ),
+                Selected::read(
+                    "price",
+                    Units::Written { table: "t".to_string(), field: "price".to_string() },
+                    None,
+                    1,
+                ),
             ]),
             order: None,
             cut: None,

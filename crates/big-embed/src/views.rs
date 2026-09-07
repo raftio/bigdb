@@ -310,6 +310,20 @@ fn remap_leaf(proj: &mut Proj, exposed: &Exposed) -> Result<()> {
         | Proj::Quantile { field: name, .. }
         | Proj::TopKeys { field: name, .. }
         | Proj::Column(name) => exposed.rename(name)?,
+        // A window names its columns in its own clause rather than in the entry, so every one
+        // of them is remapped: the column it reads, and the ones it partitions and orders by.
+        // A view is substituted before any of this is planned, so a window over one works for
+        // the same reason a `WHERE` over one does.
+        Proj::Window(w) => {
+            for name in w
+                .arg
+                .iter_mut()
+                .chain(w.partition.iter_mut())
+                .chain(w.order.iter_mut().map(|(n, _)| n))
+            {
+                exposed.rename(name)?;
+            }
+        }
         // `count(*)` names no column, so a view exposing none of them still answers it; and
         // `now()` names nothing at all, so a view with no columns exposed still answers that.
         Proj::Star | Proj::Count | Proj::Now { .. } => {}

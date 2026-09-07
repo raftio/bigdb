@@ -69,9 +69,9 @@ pub use big_plan::{Level, Plan, Rows, TimeUnit};
 pub use big_plan::Literal;
 pub use big_sql::lower;
 pub use big_sql::{
-    Absent, Answer, Ask, Cell, Columns, Cut, Format, GroupOrder, Having, JoinSide, Keying, Of,
-    OrderBy, Pairing, Probe as SqlProbe, Refused, Scalar, Selected, Shape,
-    Statement as SqlStatement, Threshold, Units,
+    Absent, Answer, Ask, Cell, Columns, Cut, Format, Frame, GroupOrder, Having, JoinSide, Keying,
+    Of, OrderBy, Pairing, Probe as SqlProbe, Refused, Scalar, Selected, Selection, Shape,
+    Statement as SqlStatement, Threshold, Units, WinFunc,
 };
 pub use big_sql::{
     Acl as SqlAcl, AclObject as SqlAclObject, Alter as SqlAlter, Column as SqlColumn,

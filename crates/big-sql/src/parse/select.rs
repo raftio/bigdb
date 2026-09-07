@@ -172,6 +172,16 @@ impl Parser<'_> {
 
         let having = if self.eat_word("HAVING") { Some(self.having()?) } else { None };
 
+        // `QUALIFY` and a named `WINDOW` clause, refused where they are written. Both sit
+        // between `HAVING` and `ORDER BY`, so a statement carrying either would otherwise fail
+        // at `ORDER BY` with a syntax error about a word that is not the problem.
+        if self.word_is("QUALIFY") {
+            return Err(self.refuse(Refused::Qualify));
+        }
+        if self.word_is("WINDOW") {
+            return Err(self.refuse(Refused::WindowName));
+        }
+
         let order_by = if self.eat_word("ORDER") {
             self.expect_word("BY", "BY after ORDER")?;
             Some(self.order()?)

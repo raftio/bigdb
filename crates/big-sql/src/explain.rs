@@ -40,7 +40,7 @@ use crate::insert::Source as big_sql_source;
 use crate::lower::Probe;
 use crate::shape::{
     Absent, Answer, Cell, Cut, Format, GroupOrder, Having, JoinSide, Of, Operand, OrderBy, Pairing,
-    Selected, Shape, Threshold, Units,
+    Selected, Selection, Shape, Threshold, Units,
 };
 use crate::show::{Show, Shown};
 use big_plan::{Literal, Plan};
@@ -329,7 +329,42 @@ fn selected(selected: &Selected) -> String {
         Some(expr) => format!(" apply={}", expr.print()),
         None => String::new(),
     };
-    format!("{}{}{}", selected.column, units(&selected.units), applied)
+    format!("{}{}{}{}", selected.column, units(&selected.units), selection(&selected.of), applied)
+}
+
+/// Where a projected column's values come from.
+///
+/// A plain read prints nothing, so every projection that existed before windows did reads exactly
+/// as it did. A window prints the whole clause - the function, the field it reads and the rows it
+/// sees, all as positions in the plan's own column list - because two windows differing only in
+/// their partition are two different answers, and a printer that hid the difference would print
+/// them the same.
+fn selection(of: &Selection) -> String {
+    let Selection::Over { func, arg, offset, window } = of else { return String::new() };
+    let fields = |at: &[usize]| at.iter().map(|a| format!("@{a}")).collect::<Vec<_>>().join(", ");
+    // The arguments as they were written: a column, a number, or both. `ntile(4)` writes its
+    // bucket count where the others write a column, so the two share the slot rather than the
+    // comma. And an offset of one is the default for every function that takes one, so it is
+    // printed only where it was chosen - noise on ten lines otherwise, to say something about two.
+    let written: Vec<String> = arg
+        .map(|at| format!("@{at}"))
+        .into_iter()
+        .chain((*offset != 1).then(|| offset.to_string()))
+        .collect();
+    let mut out = format!(" = {}({})", func.name(), written.join(", "));
+    if !window.partition.is_empty() {
+        out.push_str(&format!(" over ({})", fields(&window.partition)));
+    }
+    if !window.order.is_empty() {
+        let by = window
+            .order
+            .iter()
+            .map(|(at, desc)| format!("@{at}{}", if *desc { " desc" } else { "" }))
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.push_str(&format!(" by {by}"));
+    }
+    out
 }
 
 /// Where a cell's number comes from, with plans named by the index the shape holds.

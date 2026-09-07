@@ -81,8 +81,8 @@ pub use parse::{parse, Parsed};
 pub use scalar::{BinOp, Func, Scalar, UnOp};
 pub use settings::Settings;
 pub use shape::{
-    Absent, Answer, Cell, Columns, Cut, Format, GroupOrder, Having, JoinSide, Keying, Of, Operand,
-    OrderBy, Pairing, Selected, Shape, Threshold, Units,
+    Absent, Answer, Cell, Columns, Cut, Format, Frame, GroupOrder, Having, JoinSide, Keying, Of,
+    Operand, OrderBy, Pairing, Selected, Selection, Shape, Threshold, Units, WinFunc,
 };
 pub use show::{Show, Shown, SystemView};
 pub use update::Update;

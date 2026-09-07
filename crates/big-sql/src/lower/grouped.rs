@@ -215,6 +215,9 @@ pub(super) fn measures_of(
                 )?,
                 over: count_plan(calls, table, &rows, group)?,
             },
+            // A window is bucketed on its own by `lower_one` and refused by name wherever
+            // the answer is numbers about sets rather than rows. See `Refused::Window`.
+            Proj::Window(_) => unreachable!("refused above"),
             Proj::Star
             | Proj::Column(_)
             | Proj::CountDistinct(_)

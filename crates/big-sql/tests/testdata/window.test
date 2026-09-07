@@ -1,0 +1,160 @@
+# Window functions: arithmetic over the rows a projection already read.
+#
+# **No plan variant and no merge arm.** The plan is the ordinary `Project` a projection always
+# made; what is new is that the columns it reads and the columns the answer carries are no longer
+# the same list. A window reads a column to partition, order or fold by, and that column need not
+# be in the header.
+#
+# The cost is real and is visible here: a window takes the `LIMIT` out of the plan. Compare the
+# two statements under "the cut" - the same ten rows asked for, and one of them reads everything.
+
+## Ranking
+
+plan
+SELECT country, row_number() OVER (ORDER BY amount) FROM t
+----
+Project t.(country, amount)
+└── all
+
+shape
+SELECT country, row_number() OVER (ORDER BY amount) FROM t
+----
+Table
+├── country
+└── row_number = row_number() by @1
+
+shape
+SELECT country, rank() OVER (PARTITION BY country ORDER BY amount DESC) FROM t
+----
+Table
+├── country
+└── rank = rank() over (@0) by @1 desc
+
+shape
+SELECT country, dense_rank() OVER (PARTITION BY country ORDER BY amount DESC, price) FROM t
+----
+Table
+├── country
+└── dense_rank = dense_rank() over (@0) by @1 desc, @2
+
+shape
+SELECT ntile(4) OVER (ORDER BY amount) FROM t
+----
+Table
+└── ntile = ntile(4) by @0
+
+## Offset
+
+shape
+SELECT amount, lag(amount) OVER (ORDER BY seen) FROM t
+----
+Table
+├── amount
+└── lag = lag(@0) by @1
+
+shape
+SELECT amount, lag(amount, 2) OVER (ORDER BY seen), lead(amount) OVER (ORDER BY seen) FROM t
+----
+Table
+├── amount
+├── lag = lag(@0, 2) by @1
+└── lead = lead(@0) by @1
+
+shape
+SELECT amount, first_value(amount) OVER (PARTITION BY country ORDER BY seen) FROM t
+----
+Table
+├── amount
+└── first_value = first_value(@0) over (@1) by @2
+
+## Aggregate windows
+#
+# No `ORDER BY`, because an ordering under one of these means the running total - a different
+# number, and a frame this surface does not have. See `sql_window_frame`.
+
+shape
+SELECT country, amount, sum(amount) OVER (PARTITION BY country) FROM t
+----
+Table
+├── country
+├── amount
+└── sum = sum(@1) over (@0)
+
+shape
+SELECT country, count(*) OVER (PARTITION BY country) FROM t
+----
+Table
+├── country
+└── count = count() over (@0)
+
+## A window reads a column the header does not show
+#
+# `category` is not a column of the answer, and the plan reads it anyway - one point read per
+# record, which is what the statement asked for by writing it. The extra field in the `Project`
+# is where that is visible, and it is why an `EXPLAIN` is worth reading before this goes in a
+# dashboard.
+
+plan
+SELECT country, row_number() OVER (PARTITION BY category ORDER BY amount) FROM t
+----
+Project t.(country, category, amount)
+└── all
+
+## A column named twice is read once
+
+plan
+SELECT amount, row_number() OVER (ORDER BY amount) FROM t
+----
+Project t.(amount)
+└── all
+
+## The cut
+#
+# **The load-bearing pair.** Without a window the `LIMIT` is in the plan and bounds the read;
+# with one it is not, because a window has to see every row of its partition before it knows any
+# one row's number. Same clause, and the difference is a full scan.
+
+plan
+SELECT country FROM t LIMIT 10
+----
+Project t.(country) limit=10
+└── all
+
+plan
+SELECT country, row_number() OVER (ORDER BY amount) FROM t LIMIT 10
+----
+Project t.(country, amount)
+└── all
+
+shape
+SELECT country, row_number() OVER (ORDER BY amount) FROM t LIMIT 10
+----
+Table
+├── country
+└── row_number = row_number() by @1
+
+## Beside the answer's own ORDER BY
+#
+# Two orderings that are not the same one: the window's ranks the rows it numbers, and the
+# statement's sorts the rows that come out.
+
+shape
+SELECT country, row_number() OVER (PARTITION BY country ORDER BY amount) AS n FROM t ORDER BY n
+----
+Table order=n
+├── country
+└── n = row_number() over (@0) by @1
+
+## Under a WHERE, and with an expression applied
+
+shape
+SELECT country, row_number() OVER (ORDER BY amount) FROM t WHERE amount > 100
+----
+Table
+├── country
+└── row_number = row_number() by @1
+
+shape
+SELECT country, row_number() OVER (ORDER BY amount) * 10 FROM t
+----
+error: parse_error

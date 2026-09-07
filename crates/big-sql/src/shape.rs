@@ -498,6 +498,200 @@ pub struct Selected {
     /// comes back. That is the same place [`Units`] puts a decimal's point back, and for the
     /// same reason - it is the last step, and the only one that has to know.
     pub apply: Option<Scalar>,
+    /// Where this column's values come from.
+    pub of: Selection,
+}
+
+impl Selected {
+    /// A column that reads the field at `at` in the plan's list, which is every projected column
+    /// there was before there were windows.
+    ///
+    /// A constructor for the reason [`Cell::plain`] is one: a struct that gained a field should
+    /// not make every existing caller name it, and the new field has one right answer for all of
+    /// them.
+    pub fn read(column: impl Into<String>, units: Units, apply: Option<Scalar>, at: usize) -> Self {
+        Self { column: column.into(), units, apply, of: Selection::Read { at } }
+    }
+}
+
+/// Where a projected column's value comes from.
+///
+/// **Two variants because there are two, and the difference is the whole of what a window is.** A
+/// read is one point read per record, paid by the plan. A window is arithmetic over the rows
+/// *after* every one of them has been read, paid at the coordinator - see [`Selection::Over`] on
+/// what that costs.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Selection {
+    /// The field at this position in the plan's `fields`.
+    Read {
+        /// Index into the `Project` plan's column list.
+        at: usize,
+    },
+    /// A number computed over the finished rows.
+    ///
+    /// **A window moves the cut out of the plan, exactly as an `ORDER BY` does.** A window
+    /// function has to see every row of its partition before it knows any one row's number, so
+    /// the plan cannot carry the `LIMIT` and the reads are not bounded by it: `SELECT c,
+    /// row_number() OVER (ORDER BY c) FROM t LIMIT 10` reads every record matching the `WHERE`
+    /// where the same statement without the window reads ten. What bounds it is the record
+    /// ceiling every other unbounded read answers to.
+    Over {
+        /// Which function.
+        func: WinFunc,
+        /// The column it reads, as a position in the plan's `fields`.
+        ///
+        /// **A position rather than a name, and that is the rule rather than a representation.**
+        /// A window may only read a column the projection reads - the same rule an `ORDER BY`
+        /// over a projection has, and for the same reason. `None` for `row_number`, `rank` and
+        /// the rest of the ranking family, which are about a row's position rather than a value.
+        arg: Option<usize>,
+        /// `lag(x, 2)`, `nth_value(x, 2)`, `ntile(4)`. One where none was written.
+        offset: u32,
+        /// Which rows this one is ranked among, and in what order.
+        window: Frame,
+    },
+}
+
+/// The rows a window sees, and the order it sees them in - both as positions in the plan's
+/// `fields`.
+///
+/// Named for the SQL clause rather than for a frame in the `ROWS BETWEEN` sense, of which this
+/// surface has exactly one: the whole partition, in the order given. See [`WinFunc`].
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct Frame {
+    /// `PARTITION BY`: rows sharing these values are ranked together. Empty is one partition of
+    /// every row.
+    pub partition: Vec<usize>,
+    /// `ORDER BY` inside the window: the field and whether it descends, in the order written.
+    pub order: Vec<(usize, bool)>,
+}
+
+/// A window function.
+///
+/// **No frame, and that is a decision.** Every function here is defined over the whole partition
+/// in the ordering given, which is the default frame for the ranking and offset families.
+/// `ROWS`, `RANGE`, `GROUPS` and `EXCLUDE` are refused at the keyword rather than accepted and
+/// ignored, because a frame that is silently the default is a different answer wearing the right
+/// syntax.
+///
+/// The ordering rule falls out of that and is enforced in the parser. A ranking or an offset
+/// *needs* an `ORDER BY` - a rank with nothing to rank by is not a rank - and an aggregate window
+/// must not have one, because an ordering under an aggregate means the running total, whose
+/// default frame is `RANGE UNBOUNDED PRECEDING` and whose answer is a different number from the
+/// partition total.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum WinFunc {
+    /// `row_number()`: 1, 2, 3 - ties broken by the row order underneath.
+    RowNumber,
+    /// `rank()`: ties share a number and the next one skips.
+    Rank,
+    /// `dense_rank()`: ties share a number and the next one does not skip.
+    DenseRank,
+    /// `ntile(n)`: which of `n` buckets of as-equal-as-possible size this row falls in.
+    NTile,
+    /// `percent_rank()`: `(rank - 1) / (rows - 1)`, and `0` for a partition of one.
+    PercentRank,
+    /// `cume_dist()`: the share of rows at or before this one in the ordering.
+    CumeDist,
+    /// `lag(x[, n])`: the value `n` rows earlier, or absent at the start.
+    Lag,
+    /// `lead(x[, n])`: the value `n` rows later, or absent at the end.
+    Lead,
+    /// `first_value(x)`: the first row of the partition's value.
+    FirstValue,
+    /// `last_value(x)`: the last row of the partition's value.
+    ///
+    /// The *partition's* last row, which is the whole point of having no frame: under the
+    /// standard default frame this would be the current row, which is a number nobody wants and
+    /// everybody is surprised by.
+    LastValue,
+    /// `nth_value(x, n)`: the `n`th row of the partition's value, counting from one.
+    NthValue,
+    /// `sum(x) OVER (...)`: the partition's total, repeated on every row of it.
+    Sum,
+    /// `avg(x) OVER (...)`.
+    Avg,
+    /// `count(x) OVER (...)`, or `count(*) OVER (...)` where no column is named.
+    Count,
+    /// `min(x) OVER (...)`.
+    Min,
+    /// `max(x) OVER (...)`.
+    Max,
+}
+
+impl WinFunc {
+    /// The spelling this function is written under, which is the one every dialect agrees on.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::RowNumber => "row_number",
+            Self::Rank => "rank",
+            Self::DenseRank => "dense_rank",
+            Self::NTile => "ntile",
+            Self::PercentRank => "percent_rank",
+            Self::CumeDist => "cume_dist",
+            Self::Lag => "lag",
+            Self::Lead => "lead",
+            Self::FirstValue => "first_value",
+            Self::LastValue => "last_value",
+            Self::NthValue => "nth_value",
+            Self::Sum => "sum",
+            Self::Avg => "avg",
+            Self::Count => "count",
+            Self::Min => "min",
+            Self::Max => "max",
+        }
+    }
+
+    /// Whether this function reads a column, as against being about a row's position.
+    ///
+    /// `count` is the one that is neither: `count(*) OVER (...)` is the partition's size and
+    /// names no column, while `count(x) OVER (...)` counts the rows holding a value.
+    pub fn needs_arg(self) -> bool {
+        matches!(
+            self,
+            Self::Lag
+                | Self::Lead
+                | Self::FirstValue
+                | Self::LastValue
+                | Self::NthValue
+                | Self::Sum
+                | Self::Avg
+                | Self::Min
+                | Self::Max
+        )
+    }
+
+    /// Whether this is a fold over the partition rather than a fact about a row's place in it.
+    ///
+    /// The two halves take opposite answers about an `ORDER BY` - see the type's own note.
+    pub fn is_aggregate(self) -> bool {
+        matches!(self, Self::Sum | Self::Avg | Self::Count | Self::Min | Self::Max)
+    }
+
+    /// Whether the answer is a count of rows rather than a value out of the column read.
+    ///
+    /// What decides a cell's units: a `sum` over a decimal column carries that column's scale,
+    /// and a `row_number` over one is a plain integer.
+    pub fn counts_rows(self) -> bool {
+        match self {
+            Self::RowNumber
+            | Self::Rank
+            | Self::DenseRank
+            | Self::NTile
+            | Self::PercentRank
+            | Self::CumeDist
+            | Self::Count => true,
+            Self::Lag
+            | Self::Lead
+            | Self::FirstValue
+            | Self::LastValue
+            | Self::NthValue
+            | Self::Sum
+            | Self::Avg
+            | Self::Min
+            | Self::Max => false,
+        }
+    }
 }
 
 impl Cell {
@@ -1164,18 +1358,22 @@ impl Shape {
                         columns: Columns::Named(
                             names
                                 .into_iter()
-                                .map(|field| {
+                                .enumerate()
+                                .map(|(at, field)| {
                                     let units = Units::Written {
                                         table: table.clone(),
                                         field: field.clone(),
                                     };
-                                    Ok(Selected {
-                                        column: field,
-                                        units: resolve_units(schema, units)?,
-                                        // `SELECT *` names no function, so there is nothing to
-                                        // apply - a rounding only ever arrives written down.
-                                        apply: None,
-                                    })
+                                    // `SELECT *` names no function, so there is nothing to
+                                    // apply - a rounding only ever arrives written down - and
+                                    // no window either, so the columns are the plan's fields in
+                                    // the order it read them.
+                                    Ok(Selected::read(
+                                        field,
+                                        resolve_units(schema, units)?,
+                                        None,
+                                        at,
+                                    ))
                                 })
                                 .collect::<Result<Vec<_>, PlanError>>()?,
                         ),

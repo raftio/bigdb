@@ -60,11 +60,15 @@ pub fn matching(records: &[u16]) -> Matches {
 }
 
 /// One projected column whose field stores whole numbers, which is every field but a decimal.
-pub fn plain_column(column: &str) -> Selected {
-    Selected { column: column.to_string(), units: Units::PLAIN, apply: None }
+///
+/// `at` is which of the plan's fields it reads. Since windows the two lists are not the same
+/// one - a window can make the plan read a column the header does not show - so a projection's
+/// columns name their field rather than sitting opposite it.
+pub fn plain_column(column: &str, at: usize) -> Selected {
+    Selected::read(column, Units::PLAIN, None, at)
 }
 
 /// One projected column out of a decimal field of `scale` digits.
-pub fn scaled_column(column: &str, scale: u8) -> Selected {
-    Selected { column: column.to_string(), units: Units::Digits(scale), apply: None }
+pub fn scaled_column(column: &str, scale: u8, at: usize) -> Selected {
+    Selected::read(column, Units::Digits(scale), None, at)
 }

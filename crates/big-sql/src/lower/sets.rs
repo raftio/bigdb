@@ -230,6 +230,9 @@ fn whole_set(
             },
             Proj::Now { unix_seconds } => Of::Now { unix_seconds: *unix_seconds },
             Proj::Scalar { .. } => unreachable!("leaf() sees through the expression"),
+            // A window is bucketed on its own by `lower_one` and refused by name wherever
+            // the answer is numbers about sets rather than rows. See `Refused::Window`.
+            Proj::Window(_) => unreachable!("refused above"),
             Proj::Star
             | Proj::Column(_)
             | Proj::CountDistinct(_)

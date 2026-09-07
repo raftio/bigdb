@@ -65,7 +65,12 @@ pub(super) fn field_measured(proj: &Proj) -> Option<&Name> {
         // is record ids.
         // `now()` measures nothing at all, and a rounded column is read back per record rather
         // than folded - neither is a number a `HAVING` could name.
-        Proj::Count
+        // A window is a number about a row rather than about the set, so no `HAVING` and no
+        // `ORDER BY` over a grouping can name one - there is no grouping. Its own column's units
+        // are decided where the projection's columns are, which is the one place that knows
+        // whether the function counts rows or reads values.
+        Proj::Window(_)
+        | Proj::Count
         | Proj::CountDistinct(_)
         | Proj::TopKeys { .. }
         | Proj::Star
