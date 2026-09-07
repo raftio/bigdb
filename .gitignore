@@ -48,3 +48,5 @@ clients/go/dist/
 # repository. One line here is cheaper than a rotated password.
 *.cred
 local
+# Scratch design notes kept local, not part of the repository.
+crates/big-sql/olap-sql-surface-cheatsheet.md
