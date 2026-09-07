@@ -259,8 +259,7 @@ enum Which {
     ///
     /// **All eight map to the exact count**, because `Distinct` here walks each fragment once and
     /// counts overlaps without building them - there is nothing an approximation would buy. A
-    /// client porting from ClickHouse gets a different number where its sketch was wrong, which
-    /// is worth saying out loud and is said in `olap-sql-surface-cheatsheet.md`.
+    /// client porting from ClickHouse gets a different number where its sketch was wrong.
     ///
     /// `approx_count_distinct` is on the list for the same reason the other seven are, and not
     /// because Doris is owed a spelling: a name that promises an approximation is answered
