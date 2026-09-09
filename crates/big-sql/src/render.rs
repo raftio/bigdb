@@ -62,6 +62,18 @@ pub fn create_table(table: &str, engine: Option<&str>, columns: &[Column]) -> St
 /// One column's type, in the spelling `Parser::column_type` reads back as this same column.
 fn column_type(column: &Column) -> String {
     match column.kind {
+        // The declared type rather than the storage one, which is the whole point of keeping the
+        // members: a column written as an enum reads back as one. Quoted with `''` doubled, the
+        // way every string literal in this dialect is written.
+        ColumnKind::Enum => format!(
+            "ENUM({})",
+            column
+                .members
+                .iter()
+                .map(|m| format!("'{}'", m.replace('\'', "''")))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
         ColumnKind::Set => "SET".to_string(),
         ColumnKind::Mutex => "MUTEX".to_string(),
         ColumnKind::Bool => "BOOL".to_string(),

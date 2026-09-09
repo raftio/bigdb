@@ -24,7 +24,14 @@ use big_embed::{introspect, Datum, Fact, FieldInfo, FieldKind, TableEngine, Tabl
 use big_plan::Literal;
 
 fn field(name: &str, kind: FieldKind, bit_depth: u32, scale: i8) -> FieldInfo {
-    FieldInfo { name: name.to_string(), kind, bit_depth, scale, granularity: Vec::new() }
+    FieldInfo {
+        name: name.to_string(),
+        kind,
+        bit_depth,
+        scale,
+        granularity: Vec::new(),
+        members: Vec::new(),
+    }
 }
 
 fn schema() -> Vec<TableInfo> {
@@ -198,4 +205,33 @@ fn a_value_a_field_cannot_hold_says_what_the_field_wanted() {
     assert_eq!(big_embed::fact::written(&Literal::Dec { units: 1250, scale: 2 }), "12.50");
     assert_eq!(big_embed::fact::written(&Literal::Dec { units: 5, scale: 3 }), "0.005");
     assert_eq!(big_embed::fact::written(&Literal::Sint(-5)), "-5");
+}
+
+/// **The refusal names the values the column was declared to hold.**
+///
+/// The code a client branches on is the generic one for a value a field cannot take, and that is
+/// right — what to do about it is the same. The *message* is where an enum earns its keep: a
+/// closed list is short by construction, so naming it turns "that value is not allowed" into
+/// "these are", which is the only question the error raises.
+#[test]
+fn a_value_outside_an_enum_is_refused_with_the_members_named() {
+    let info = big_embed::FieldInfo {
+        name: "status".to_string(),
+        kind: big_embed::FieldKind::Mutex,
+        bit_depth: 0,
+        scale: 0,
+        granularity: Vec::new(),
+        members: ["new", "paid"].map(str::to_string).to_vec(),
+    };
+
+    let err = big_embed::fact::from_text("status", &info, 1, "refunded")
+        .expect_err("a value outside the list is refused");
+    let why = err.why("status", "refunded");
+    assert!(why.contains("'new'") && why.contains("'paid'"), "the members are named: {why}");
+
+    // A declared value goes through, and so does anything at all on a field that declared none -
+    // which is what says the check belongs to the declaration rather than to the kind.
+    assert!(big_embed::fact::from_text("status", &info, 1, "paid").is_ok());
+    let loose = big_embed::FieldInfo { members: Vec::new(), ..info };
+    assert!(big_embed::fact::from_text("status", &loose, 1, "anything at all").is_ok());
 }

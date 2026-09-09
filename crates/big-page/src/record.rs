@@ -69,10 +69,22 @@ pub mod kind {
     /// are never reissued, so a table dropped and recreated under the same name gets a new id
     /// and cannot inherit the privileges the old one carried.
     pub const GRANT: u8 = 11;
+    /// One 104-byte slice of a field's declared enum members, under its table and field id.
+    ///
+    /// **The second payload in this format that spans records**, and it follows
+    /// [`SAVED_QUERY_TEXT`]'s shape for the same reason: a record is a fixed width and a list of
+    /// member names is not. The members are joined by a NUL byte, which is the one byte a
+    /// member may not contain, and cut wherever 104 bytes falls - including mid-character, so
+    /// the chunks are joined before they are validated.
+    ///
+    /// Purely additive. A reader that predates this kind skips the entry and sees the field as
+    /// the `MUTEX` it is stored as, which is what it was before enums existed - the same
+    /// backward story [`DATABASE`] and [`SEQ`] tell.
+    pub const FIELD_ENUM: u8 = 12;
 }
 
 /// Every kind, so adding one without checking it against the others is not possible.
-pub const ALL_KINDS: [u8; 11] = [
+pub const ALL_KINDS: [u8; 12] = [
     kind::TABLE,
     kind::FIELD,
     kind::VIEW,
@@ -84,6 +96,7 @@ pub const ALL_KINDS: [u8; 11] = [
     kind::SAVED_QUERY_TEXT,
     kind::ROLE,
     kind::GRANT,
+    kind::FIELD_ENUM,
 ];
 
 // Distinctness, checked at compile time. Two crates allocate out of this space and cannot see

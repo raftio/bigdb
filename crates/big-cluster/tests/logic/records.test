@@ -142,3 +142,66 @@ SHOW TABLES FORMAT TSV
 ----
 name  type        engine           fields
 tx    BASE TABLE  bitmap+columnar  4
+
+## `SAMPLE`: one record in every n, by record id — against real records.
+#
+# The claim these cases pin is that the sample is on the *id* and not on a block of ids, which
+# is only visible with ids whose values are known. Ten records, ids 1..10: one in two takes the
+# even ids, one in five takes 5 and 10. A sample that took a block would take 1..5 instead, and
+# `sum` is what tells the two apart — a block would sum to 15 where an id sample sums to 30.
+
+statement
+CREATE TABLE smp (amount UINT(32))
+
+statement
+INSERT INTO smp (_record_id, amount) VALUES
+  (1, 1), (2, 2), (3, 3), (4, 4), (5, 5),
+  (6, 6), (7, 7), (8, 8), (9, 9), (10, 10)
+
+query
+SELECT count(*), sum(amount) FROM smp
+----
+count  sum
+10     55
+
+# Every second id: 2, 4, 6, 8, 10.
+query
+SELECT count(*), sum(amount) FROM smp SAMPLE 2
+----
+count  sum
+5      30
+
+# Every fifth: 5 and 10. A block of two would have been 1 and 2.
+query
+SELECT count(*), sum(amount) FROM smp SAMPLE 5
+----
+count  sum
+2      15
+
+# The fraction and the ratio are the same stride as the integer.
+query
+SELECT count(*) FROM smp SAMPLE 0.5
+----
+count
+5
+
+query
+SELECT count(*) FROM smp SAMPLE 1/5
+----
+count
+2
+
+# `SAMPLE` wraps the filter, so this is half of the records over five rather than half of every
+# record of which some are over five: ids 6..10 are over five, and 6, 8, 10 are even.
+query
+SELECT count(*), sum(amount) FROM smp SAMPLE 2 WHERE amount > 5
+----
+count  sum
+3      24
+
+# A stride past the record count is not an error, it is a small answer.
+query
+SELECT count(*) FROM smp SAMPLE 64
+----
+count
+0

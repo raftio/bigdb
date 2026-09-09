@@ -185,6 +185,12 @@ pub struct Select {
     /// Every one of them has to key its table on the same column the others do: what makes
     /// several joins answerable is that they are one star around one shared key.
     pub joins: Vec<Join>,
+    /// `SAMPLE`: one record in every `n`, absent when the statement asked for all of them.
+    ///
+    /// **Held as the stride rather than as the fraction that was written**, because the stride
+    /// is what the engine does: `SAMPLE 0.1` and `SAMPLE 1/10` are one number by the time
+    /// anything reads this, so nothing downstream has to know which was typed.
+    pub sample: Option<u32>,
     /// `WHERE`, absent when every record is in play.
     pub filter: Option<Cond>,
     /// `GROUP BY`: the columns, and the boundary each is rounded to.

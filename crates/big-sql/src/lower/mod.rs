@@ -246,6 +246,17 @@ fn lower_one(select: &Select) -> Result<Statement> {
         Some(cond) => rows(cond),
         None => call("All", vec![]),
     };
+    // **Wrapped around the filter rather than beside it**, which is the order the two clauses
+    // mean: `WHERE amount > 5 SAMPLE 1/10` is a tenth of the records over five, not a tenth of
+    // every record of which some are over five. The second reading would answer a different
+    // question and would answer it with a smaller number, which is the kind of wrong nobody
+    // checks.
+    let rows = match select.sample {
+        None => rows,
+        Some(stride) => {
+            call("Sample", vec![rows, named("stride", Expr::Literal(Literal::Int(stride.into())))])
+        }
+    };
 
     // Three buckets, because the select list decides the plans and every legal list is one of a
     // small number of combinations of them.

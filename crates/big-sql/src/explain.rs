@@ -621,18 +621,31 @@ fn qualified(database: &Option<String>, table: &str) -> String {
 /// statement does.
 fn column(column: &Column) -> String {
     format!(
-        "{} {} depth={}{}",
+        "{} {} depth={}{}{}",
         column.name,
         column.kind.as_str(),
         column.bit_depth,
-        opt(" scale=", column.scale.as_ref())
+        opt(" scale=", column.scale.as_ref()),
+        // **Printed, because the kind alone cannot tell an enum from the mutex it is stored
+        // as.** Without this an explained `ENUM('a','b')` and an explained `MUTEX` are the same
+        // line, and a corpus case about the members would be checking nothing.
+        match column.members.is_empty() {
+            true => String::new(),
+            false => format!(
+                " members=[{}]",
+                column.members.iter().map(|m| format!("'{m}'")).collect::<Vec<_>>().join(", ")
+            ),
+        }
     )
 }
 
 /// A write, as its columns and its rows.
 pub fn insert(insert: &Insert) -> String {
     let mut out = format!(
-        "Insert {} ({}){}",
+        "Insert{} {} ({}){}",
+        // Printed because it is the difference between writing rows and replacing every row -
+        // which is the one thing somebody explaining this statement most needs to see.
+        if insert.overwrite { " overwrite" } else { "" },
         qualified(&insert.database, &insert.table),
         insert.columns.join(", "),
         // Which column is the record id is the whole difference between the two forms of this

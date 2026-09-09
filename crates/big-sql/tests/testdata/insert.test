@@ -140,3 +140,38 @@ INSERT INTO tx (country, amount) SELECT country, sum(amount) FROM u GROUP BY cou
 ----
 Insert tx (country, amount) id=allocated
 └── select country, sum from u
+
+## `INSERT OVERWRITE`: empty the table, then write.
+#
+# Two operations with no transaction around them, and the statement says so rather than implying
+# otherwise. What it buys over writing `TRUNCATE` and `INSERT` separately is the *order*: the
+# source query is read whole and merged before anything is cleared, so a `SELECT` that turns out
+# to be unreadable leaves the table alone. The atomic replacement is `EXCHANGE TABLES`.
+
+insert
+INSERT OVERWRITE INTO t (amount) VALUES (1), (2)
+----
+Insert overwrite t (amount) id=allocated
+├── 1
+└── 2
+
+# `TABLE` is optional, the way it is after `TRUNCATE` - Hive and Spark write it, and the word
+# decides nothing.
+insert
+INSERT OVERWRITE TABLE t (amount) VALUES (1)
+----
+Insert overwrite t (amount) id=allocated
+└── 1
+
+insert
+INSERT OVERWRITE t (amount) SELECT amount FROM u
+----
+Insert overwrite t (amount) id=allocated
+└── select amount from u
+
+# Without the word it is the ordinary statement, and nothing is emptied.
+insert
+INSERT INTO t (amount) VALUES (1)
+----
+Insert t (amount) id=allocated
+└── 1

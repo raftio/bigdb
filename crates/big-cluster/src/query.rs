@@ -327,6 +327,11 @@ impl<P: PagerMut + Sync> Cluster<P> {
             big_embed::FieldKind::TimeQuantum => {
                 self.create_time_quantum(table, &column.name, Vec::new())
             }
+            // Decided on the declaration rather than on the kind, because an enum and a plain
+            // mutex are one `FieldKind` and only the member list tells them apart.
+            _ if !column.members.is_empty() => {
+                self.create_enum(table, &column.name, column.members.clone())
+            }
             _ => self.create_field(table, &column.name, kind, column.bit_depth),
         }
     }
@@ -935,6 +940,20 @@ impl<P: PagerMut + Sync> Cluster<P> {
             }
             Some(select) => self.read_source(select, &name, opts)?,
         };
+
+        // **`OVERWRITE` empties here, and the position is the whole of what it promises.**
+        // After the source query has been read whole and merged, so a `SELECT` that turns out
+        // to be unreadable leaves the table alone; before a single fact is written, so what
+        // lands is these rows and nothing older. It is still two operations with no transaction
+        // around them - a crash in between leaves the table empty, which `Insert::overwrite`
+        // says out loud rather than hiding. The atomic replacement is `EXCHANGE TABLES`.
+        //
+        // Row ids are allocated *after* this, because a truncate keeps the row keys but frees
+        // the fragments: allocating first would hand out ids against a record count that is
+        // about to become zero.
+        if insert.overwrite {
+            self.sql_truncate_table(&name, false)?;
+        }
 
         // Asked for once for the whole statement rather than once per row: a round trip per
         // row would make a thousand-row insert a thousand round trips to one node.

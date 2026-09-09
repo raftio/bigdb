@@ -275,20 +275,40 @@ impl Parser<'_> {
         // width in brackets is refused below rather than read as a depth: `INT(11)` is eleven
         // digits where MySQL wrote it and eleven bits here, and eleven bits stop at 2047.
         let column = match word.as_str() {
-            "SET" => Column { name, kind: Set, bit_depth: KEYLESS_DEPTH, scale: None },
-            "MUTEX" => Column { name, kind: Mutex, bit_depth: KEYLESS_DEPTH, scale: None },
-            "BOOL" | "BOOLEAN" => {
-                Column { name, kind: Bool, bit_depth: KEYLESS_DEPTH, scale: None }
-            }
+            "SET" => Column {
+                name,
+                kind: Set,
+                bit_depth: KEYLESS_DEPTH,
+                scale: None,
+                members: Vec::new(),
+            },
+            "MUTEX" => Column {
+                name,
+                kind: Mutex,
+                bit_depth: KEYLESS_DEPTH,
+                scale: None,
+                members: Vec::new(),
+            },
+            "BOOL" | "BOOLEAN" => Column {
+                name,
+                kind: Bool,
+                bit_depth: KEYLESS_DEPTH,
+                scale: None,
+                members: Vec::new(),
+            },
             // A time quantum is keyed by a moment and viewed by day, and it keeps its own
             // spelling. `DATE` and `DATETIME` used to be spellings of it too, and stopped being
             // when they got scalar kinds: a keyed field answers `f = 'k' AND f BETWEEN lo AND
             // hi` and nothing else, so `WHERE d >= '2024-01-01'`, `ORDER BY d` and `max(d)` -
             // which is most of what anyone writes a date column for - had no way to be asked.
             // The two are different things and now have different names.
-            "TIMEQUANTUM" => {
-                Column { name, kind: TimeQuantum, bit_depth: KEYLESS_DEPTH, scale: None }
-            }
+            "TIMEQUANTUM" => Column {
+                name,
+                kind: TimeQuantum,
+                bit_depth: KEYLESS_DEPTH,
+                scale: None,
+                members: Vec::new(),
+            },
             // A day count and a second count, both from 1970 and both signed, because dates
             // before it are ordinary values. The depths are what those counts need: 32 planes of
             // days is ±5.8 million years, and seconds want the full width.
@@ -314,7 +334,7 @@ impl Parser<'_> {
                     "FLOAT" | "FLOAT32" | "REAL" => (Float32, 32),
                     _ => (Float64, 64),
                 };
-                Column { name, kind, bit_depth, scale: None }
+                Column { name, kind, bit_depth, scale: None, members: Vec::new() }
             }
             // A length on a key is a bound on nothing: keys are stored whole, and there is no
             // truncation or padding for a `VARCHAR(255)` to describe.
@@ -322,7 +342,13 @@ impl Parser<'_> {
                 if self.peek() == Some(&Tok::LParen) {
                     return Err(self.refuse(Refused::Constraint));
                 }
-                Column { name, kind: Set, bit_depth: KEYLESS_DEPTH, scale: None }
+                Column {
+                    name,
+                    kind: Set,
+                    bit_depth: KEYLESS_DEPTH,
+                    scale: None,
+                    members: Vec::new(),
+                }
             }
             // **The one type name that describes an encoding rather than a domain**, and the
             // encoding it describes is the only one a keyed field has: a `SET` interns each
@@ -340,7 +366,13 @@ impl Parser<'_> {
                 if !matches!(inner.as_str(), "STRING" | "TEXT" | "VARCHAR" | "CHAR") {
                     return Err(self.refuse_at(Refused::ColumnType, at));
                 }
-                Column { name, kind: Set, bit_depth: KEYLESS_DEPTH, scale: None }
+                Column {
+                    name,
+                    kind: Set,
+                    bit_depth: KEYLESS_DEPTH,
+                    scale: None,
+                    members: Vec::new(),
+                }
             }
             // The two wrappers this engine recognises and declines, refused at the word that
             // names them rather than after the bracket is read. Nothing is consumed first
@@ -355,9 +387,10 @@ impl Parser<'_> {
             "ARRAY" | "MAP" | "TUPLE" | "NESTED" => {
                 return Err(self.refuse_at(Refused::CompositeType, at))
             }
-            // Its own sentence rather than the composite one, because what it needs is a
-            // different rewrite: `MUTEX` is already the storage an enum wants.
-            "ENUM" | "ENUM8" | "ENUM16" => return Err(self.refuse_at(Refused::EnumType, at)),
+            // `ENUM('a', 'b')`: a mutex that also says which values it may hold. The width in
+            // `Enum8`/`Enum16` is read and discarded, the way `INT UNSIGNED`'s word is: it
+            // names how many members fit, and the dictionary underneath has no such ceiling.
+            "ENUM" | "ENUM8" | "ENUM16" => self.enum_members(name)?,
             "BITMAP" | "AGGREGATEFUNCTION" => return Err(self.refuse_at(Refused::BitmapType, at)),
             // The sketch types, which are a different refusal from `BITMAP` even though both
             // decline a column: a bitmap is refused because every column here already is one,
@@ -384,16 +417,32 @@ impl Parser<'_> {
                     self.eat_word("UNSIGNED");
                     Int
                 };
-                Column { name, kind, bit_depth, scale: None }
+                Column { name, kind, bit_depth, scale: None, members: Vec::new() }
             }
             // The two native spellings, which exist because the SQL names carry a fixed width
             // and a bit-sliced field is cheaper the narrower it is: every plane is one more
             // bitmap a range query intersects.
-            "UINT" => Column { name, kind: Int, bit_depth: self.bit_depth()?, scale: None },
+            // **An IPv4 address is a 32-bit number, and nothing is lost by saying so.** It
+            // compares, sorts, ranges and zone-maps exactly as `UINT(32)` does, because that is
+            // what it is - so this joins `TIMESTAMP` -> `DATETIME` and `BIGINT` -> `UINT(64)`
+            // as a spelling this dialect reads and writes back under its canonical name.
+            //
+            // `UUID` and `IPv6` are deliberately *not* here. Both are 128 bits where a
+            // bit-sliced value stops at 64, so the only column they could land in is a keyed
+            // one - and a keyed column answers `=` but not `<`. Accepting them would take an
+            // ordering away silently; refusing them says so (`sql_unknown_column_type`).
+            "IPV4" => Column { name, kind: Int, bit_depth: 32, scale: None, members: Vec::new() },
+            "UINT" => Column {
+                name,
+                kind: Int,
+                bit_depth: self.bit_depth()?,
+                scale: None,
+                members: Vec::new(),
+            },
             "SIGNED" => {
                 let bit_depth =
                     if self.peek() == Some(&Tok::LParen) { self.bit_depth()? } else { 32 };
-                Column { name, kind: Signed, bit_depth, scale: None }
+                Column { name, kind: Signed, bit_depth, scale: None, members: Vec::new() }
             }
             "DECIMAL" | "NUMERIC" => self.decimal(name)?,
             _ => return Err(self.refuse_at(Refused::ColumnType, at)),
@@ -412,6 +461,57 @@ impl Parser<'_> {
             return Err(self.refuse(Refused::Constraint));
         }
         Ok(column)
+    }
+
+    /// `ENUM('a', 'b')`, with the type name consumed.
+    ///
+    /// # Why the numbers are refused
+    ///
+    /// `Enum8('a' = 1, 'b' = 2)` is what ClickHouse writes, and the number says which integer
+    /// the value is stored as. Here a mutex interns each value into the dictionary and the
+    /// *dictionary* decides that number, so an accepted `= 1` would be a promise about storage
+    /// that nothing keeps. Refused at the `=` with the spelling that works, rather than read and
+    /// dropped - a number silently ignored is the failure this whole surface is built to avoid.
+    ///
+    /// Duplicates are refused for the same reason a rename onto a live name is: the second one
+    /// would be unreachable, and a list that quietly held fewer values than it named would make
+    /// `SHOW CREATE TABLE` disagree with what was typed.
+    fn enum_members(&mut self, name: String) -> Result<Column> {
+        let at = self.at();
+        if !self.eat(&Tok::LParen) {
+            return Err(self.syntax("( and the values the enum may hold"));
+        }
+        let mut members: Vec<String> = Vec::new();
+        loop {
+            let value = match self.peek() {
+                Some(Tok::Str(s)) => {
+                    let s = s.clone();
+                    self.i += 1;
+                    s
+                }
+                _ => return Err(self.syntax("a quoted value")),
+            };
+            // The one byte a member may not hold, because it is what separates them on disk.
+            if value.contains('\0') || members.contains(&value) {
+                return Err(self.refuse_at(Refused::EnumType, at));
+            }
+            members.push(value);
+            // `= 1`, which promises a storage number the dictionary assigns.
+            if self.peek() == Some(&Tok::Op("=")) {
+                return Err(self.refuse_at(Refused::EnumType, at));
+            }
+            if !self.eat(&Tok::Comma) {
+                break;
+            }
+        }
+        if !self.eat(&Tok::RParen) {
+            return Err(self.syntax(") after the values"));
+        }
+        // An enum of nothing is a column that can hold nothing, which is a table nobody meant.
+        if members.is_empty() {
+            return Err(self.refuse_at(Refused::EnumType, at));
+        }
+        Ok(Column { name, kind: ColumnKind::Enum, bit_depth: KEYLESS_DEPTH, scale: None, members })
     }
 
     /// `DECIMAL(precision, scale)`, with the type name consumed.
@@ -452,6 +552,7 @@ impl Parser<'_> {
             kind: ColumnKind::Decimal,
             bit_depth: bits as u32,
             scale: Some(scale as i8),
+            members: Vec::new(),
         })
     }
 

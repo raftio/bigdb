@@ -74,6 +74,18 @@ pub struct Insert {
     pub id_at: Option<usize>,
     /// Where the values come from: literals, or a query that reads them.
     pub source: Source,
+    /// `INSERT OVERWRITE`: empty the table first, then write these rows.
+    ///
+    /// **Two operations, and the statement says so rather than implying otherwise.** Nothing
+    /// here wraps a truncate and an insert in one transaction, so a crash between them leaves
+    /// the table empty - which is a real outcome and is documented rather than hidden. What it
+    /// buys over writing the two statements is that the source query is read *whole, before
+    /// anything is cleared*, so `INSERT OVERWRITE t (a) SELECT a FROM u` cannot half-empty `t`
+    /// because `u` turned out to be unreadable.
+    ///
+    /// For a replacement that is genuinely atomic, write into a second table and
+    /// `EXCHANGE TABLES` them.
+    pub overwrite: bool,
 }
 
 impl Insert {

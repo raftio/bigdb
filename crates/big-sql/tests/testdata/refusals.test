@@ -1203,19 +1203,36 @@ sql_no_optimize
 # the local spelling for that question - not the news that a feature is absent. Where there is no
 # local spelling, it says which decision the absence follows from.
 
-## Sampling. There is no rank-select over a container, and the units that *are* cheap to skip
-## whole are windows of write order rather than random subsets.
+## Sampling. `SAMPLE` is answered - see `select.test` - but only where the fraction names a
+## whole stride, and only on a statement rather than on a column.
 
+# One in 3.33 is not a stride, and answering it as one in three would be a tenth more data than
+# was asked for under the name that was asked for.
 error
-SELECT count(*) FROM t SAMPLE 0.1
+SELECT count(*) FROM t SAMPLE 0.3
 ----
 sql_no_sample
 
 error
-SELECT count(*) FROM t SAMPLE 0.1 WHERE amount > 5
+SELECT count(*) FROM t SAMPLE 0.15
 ----
 sql_no_sample
 
+# Taking every record is what the statement without the clause already says.
+error
+SELECT count(*) FROM t SAMPLE 1
+----
+sql_no_sample
+
+# A ratio has to have one on top: `2/10` is a fraction this would have to reduce, and a
+# reduction is a second place for it to disagree with what was written.
+error
+SELECT count(*) FROM t SAMPLE 2/10
+----
+parse_error
+
+# `SAMPLE BY` declares which column a sample is *drawn on*, and here the unit is the record id -
+# which is not a column and cannot be chosen.
 error
 CREATE TABLE t (a SET) SAMPLE BY a
 ----
@@ -1223,13 +1240,10 @@ sql_no_sample
 
 ## Writes that are two operations wearing one word.
 
+# `INSERT OVERWRITE` is answered now; what stays refused is aiming it at a partition, because a
+# shard is a function of the record id and there is nothing for the clause to name.
 error
-INSERT OVERWRITE TABLE t SELECT a FROM u
-----
-sql_no_overwrite
-
-error
-INSERT OVERWRITE t VALUES (1)
+INSERT OVERWRITE TABLE t PARTITION (dt = '2026-01-01') SELECT amount FROM u
 ----
 sql_no_overwrite
 

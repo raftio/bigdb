@@ -29,14 +29,22 @@ impl Parser<'_> {
     /// that caused it: a missing column list at the table name, a missing `id` at the closing
     /// bracket of the list that should have held one, and a `SELECT` at the `SELECT`.
     pub(super) fn insert(&mut self) -> Result<Insert> {
-        // Before `INTO`, because `INSERT OVERWRITE TABLE t` writes neither word in the place
-        // this expects one. It is a truncate and an insert, and nothing wraps two of those in
-        // one transaction - so the sentence offers the two statements, and the atomic spelling.
-        if self.word_is("OVERWRITE") {
-            return Err(self.refuse(Refused::Overwrite));
+        // `INSERT OVERWRITE [TABLE] t (...)`: empty the table, then write. `TABLE` is optional
+        // here for the reason it is optional after `TRUNCATE` - Hive and Spark write it, and the
+        // word decides nothing.
+        let overwrite = self.eat_word("OVERWRITE");
+        if overwrite {
+            self.eat_word("TABLE");
         }
         self.eat_word("INTO");
         let (database, table) = self.table_ref("a table name")?;
+
+        // `PARTITION (dt = '...')` is the half of `INSERT OVERWRITE` that stays refused: there
+        // are no partitions here to aim one at, because a shard is a function of the record id.
+        // Narrowed to this from refusing the whole statement, which is a widening.
+        if self.word_is("PARTITION") {
+            return Err(self.refuse(Refused::Overwrite));
+        }
 
         // `INSERT INTO t SELECT ...` with no column list would be positional against a field
         // order the statement does not carry, which is the same refusal `VALUES` earns.
@@ -67,7 +75,7 @@ impl Parser<'_> {
             if self.peek().is_some() {
                 return Err(self.syntax("the end of the statement"));
             }
-            return Ok(Insert { database, table, columns, id_at, source });
+            return Ok(Insert { database, table, columns, id_at, source, overwrite });
         }
 
         // `VALUE` is MySQL's spelling of the same word and means the same thing.
@@ -91,7 +99,7 @@ impl Parser<'_> {
         if self.peek().is_some() {
             return Err(self.syntax("the end of the statement"));
         }
-        Ok(Insert { database, table, columns, id_at, source: Source::Values(rows) })
+        Ok(Insert { database, table, columns, id_at, source: Source::Values(rows), overwrite })
     }
 
     /// The `SELECT` an `INSERT` reads its values from, with `SELECT` still ahead.

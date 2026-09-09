@@ -55,6 +55,12 @@ pub struct FieldInfo {
     pub scale: i8,
     /// The views a time quantum field writes. Empty for every other kind.
     pub granularity: Vec<Granularity>,
+    /// The values an `ENUM` was declared with. Empty for every other kind, and for a `MUTEX`
+    /// declared as one.
+    ///
+    /// Reported for the reason a decimal's scale is: without it a client cannot tell an enum
+    /// from the mutex it is stored as, and could not recreate the field as it was declared.
+    pub members: Vec<String>,
 }
 
 /// Copies the catalog into owned values, dropping the lock before returning.
@@ -85,6 +91,7 @@ pub(crate) fn snapshot(catalog: &Catalog) -> Vec<TableInfo> {
                 .fields_of(table.id)
                 .map(|f| FieldInfo {
                     name: f.name.clone(),
+                    members: f.members.clone(),
                     kind: f.kind,
                     bit_depth: f.bit_depth,
                     scale: f.scale,

@@ -250,6 +250,59 @@ The new name is bare and both tables are in one database. A rename that also mov
 changes wearing one name, and it is a syntax error rather than a refusal — there is nothing to
 write instead of it.
 
+## A column with a closed set of values
+
+```sql
+CREATE TABLE orders (status ENUM('new', 'paid', 'shipped'))
+```
+
+**Stored as a `MUTEX`, with the members as metadata beside it.** One value per record over an
+interned dictionary is what a mutex already is, so an enum costs no new `FieldKind`, no engine
+change and no storage format — the list travels in the catalog next to the field, in its own
+record kind because it does not fit in one.
+
+What the list buys is the two things a mutex cannot say. A value outside it is refused on the way
+in, naming the values that are allowed; and `SHOW CREATE TABLE` answers `ENUM('new', 'paid',
+'shipped')` rather than `MUTEX`, because the declaration is still there to print. A field that
+declares no members is a plain mutex and takes anything, which is what says the check belongs to
+the declaration rather than to the kind — and is also what every field written before this
+existed reads back as.
+
+`Enum8` and `Enum16` are the same declaration; the width names how many members fit and the
+dictionary has no such ceiling. The `'a' = 1` form is refused (`sql_enum_type`): the number says
+which integer the value is stored as, and here the dictionary assigns that, so keeping it would
+be a promise nothing honours. A repeated member is refused too — the second is unreachable, and a
+list holding fewer values than it names would make `SHOW CREATE TABLE` disagree with what was
+typed.
+
+## Sampling, and replacing a table's contents
+
+```sql
+SELECT count(*) FROM t SAMPLE 10        -- also `SAMPLE 1/10` and `SAMPLE 0.1`
+INSERT OVERWRITE TABLE t (a) SELECT a FROM u
+```
+
+**A sample is on the record id's low bits, not on a block of them**, and that is what makes it a
+sample. A container holds 65,536 consecutive ids, so "every tenth id" is a pattern inside each
+one — built once per phase and intersected, costing a pass over containers and never decoding a
+record. Every tenth *container* would be as cheap and would be a different thing: ids are handed
+out in write order, so a block of them is a window of time and a number drawn from one would
+lean whichever way the data drifted.
+
+The three spellings are one stride, and `0.1` is read through the decimal it parsed as — units
+and a scale, never a float — so it is exactly one in ten. A fraction that is not one over a whole
+number has no stride and is refused rather than rounded (`sql_no_sample`), because one in 3.33
+answered as one in three is a tenth more data than was asked for. It wraps the `WHERE` rather
+than sitting beside it: a tenth of the records over five, not a tenth of every record of which
+some are over five.
+
+`INSERT OVERWRITE` empties the table and then writes. It is two operations with nothing wrapping
+them, and what it buys over writing `TRUNCATE` and `INSERT` separately is the order: the source
+query is read whole and merged *before* anything is cleared, so a `SELECT` that turns out to be
+unreadable leaves the table alone. A crash between the two still leaves it empty, which is said
+rather than hidden — the atomic replacement is `EXCHANGE TABLES`. It demands `DELETE` as well as
+`INSERT`, because destroying what was there is what it does.
+
 ## Rows from nothing
 
 ```sql
@@ -388,18 +441,14 @@ and `IPv6` are 128 bits where a bit-sliced value stops at 64, so they are `TEXT`
 and compared as bitmaps, but without a number's ordering.
 
 **The P2 tier of the OLAP surface**, each with the local spelling in its sentence rather than the
-news that a feature is absent. `SAMPLE` (`sql_no_sample`): there is no rank-select over a
-container, and the units that are cheap to skip whole are windows of write order rather than
-random subsets. `INSERT OVERWRITE` (`sql_no_overwrite`): a truncate and an insert, which nothing
-wraps in one transaction — so two statements, or `EXCHANGE TABLES` for an atomic replacement.
-`COPY INTO` (`sql_no_copy_into`): loading is `POST /table/{t}/import`. `CREATE TEMPORARY TABLE`
+news that a feature is absent. `COPY INTO` (`sql_no_copy_into`): loading is `POST /table/{t}/import`. `CREATE TEMPORARY TABLE`
 (`sql_no_temporary_table`): there is no session for one to be temporary to. `PARTITION BY` and
 `DISTRIBUTED BY` (`sql_no_distribution`): a shard is `record_id >> 20`, computed rather than
 declared. `MATERIALIZED` and `ALIAS` columns (`sql_computed_column`): one is a view, the other a
 materialised one. `Array`, `Map`, `Tuple` (`sql_composite_type`) and `ARRAY JOIN`
 (`sql_no_array_join`) and the `array*` functions (`sql_array_function`): a keyed column already
 holds many values per record, so `has(c, x)` is `c = 'x'` and one row per element is
-`GROUP BY c`. `Enum8` (`sql_enum_type`): `MUTEX` is that storage already. `neighbor`,
+`GROUP BY c`. `neighbor`,
 `windowFunnel` and `retention` (`sql_no_sequence_function`). And `s3`, `url`, `file` and
 `generateRandom` (`sql_no_table_function`), where `numbers(n)` is the one that works.
 

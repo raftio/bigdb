@@ -773,7 +773,14 @@ mod parse_tests {
     use super::*;
 
     fn field(name: &str, kind: FieldKind) -> FieldInfo {
-        FieldInfo { name: name.to_string(), kind, bit_depth: 20, scale: 0, granularity: Vec::new() }
+        FieldInfo {
+            name: name.to_string(),
+            kind,
+            bit_depth: 20,
+            scale: 0,
+            granularity: Vec::new(),
+            members: Vec::new(),
+        }
     }
 
     /// The word-at-a-time scan against the obvious one, at every length and every offset a

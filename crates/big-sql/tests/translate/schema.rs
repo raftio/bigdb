@@ -282,6 +282,7 @@ fn alter_table_adds_and_drops_fields() {
                 kind: ColumnKind::Set,
                 bit_depth: 32,
                 scale: None,
+                members: Vec::new(),
             })],
         }
     );

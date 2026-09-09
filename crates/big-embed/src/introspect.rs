@@ -36,6 +36,10 @@ use big_sql::{Column as SqlColumn, ColumnKind as SqlColumnKind};
 /// The field kind a column list's type means.
 pub fn kind_of(kind: SqlColumnKind) -> FieldKind {
     match kind {
+        // Stored as the mutex it is. The member list travels beside the kind rather than inside
+        // it - see `big_sql::Column::members` - which is what keeps an enum free of any engine
+        // change at all.
+        SqlColumnKind::Enum => FieldKind::Mutex,
         SqlColumnKind::Set => FieldKind::Set,
         SqlColumnKind::Mutex => FieldKind::Mutex,
         SqlColumnKind::Bool => FieldKind::Bool,
@@ -279,9 +283,16 @@ pub fn show_create(
         .iter()
         .map(|f| SqlColumn {
             name: f.name.clone(),
-            kind: sql_kind_of(f.kind),
+            // **The declared type, which the storage kind alone cannot say.** A mutex and an
+            // enum are one `FieldKind`; what tells them apart is whether a member list was
+            // declared, so that is what decides here rather than the kind.
+            kind: match f.members.is_empty() {
+                true => sql_kind_of(f.kind),
+                false => SqlColumnKind::Enum,
+            },
             bit_depth: f.bit_depth,
             scale: (f.kind == FieldKind::Decimal).then_some(f.scale),
+            members: f.members.clone(),
         })
         .collect();
     // Qualified whenever the table is not in the default database, so the statement this

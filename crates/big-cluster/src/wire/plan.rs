@@ -63,6 +63,7 @@ mod rows_tag {
     pub const ALL: u8 = 9;
     pub const COMPARE_FLOAT: u8 = 10;
     pub const KEY_LIKE: u8 = 11;
+    pub const SAMPLE: u8 = 12;
 }
 
 pub fn put_rows(out: &mut Vec<u8>, rows: &Rows) {
@@ -123,6 +124,11 @@ pub fn put_rows(out: &mut Vec<u8>, rows: &Rows) {
             put_rows(out, inner);
         }
         Rows::All => put_u8(out, rows_tag::ALL),
+        Rows::Sample { inner, stride } => {
+            put_u8(out, rows_tag::SAMPLE);
+            put_u32(out, *stride);
+            put_rows(out, inner);
+        }
     }
 }
 
@@ -168,6 +174,12 @@ fn get_rows_at(r: &mut Reader<'_>, depth: usize) -> Result<Rows> {
         ),
         rows_tag::NOT => Rows::Not(Box::new(get_rows_at(r, depth + 1)?)),
         rows_tag::ALL => Rows::All,
+        rows_tag::SAMPLE => {
+            // The stride before the inner set, so it is read before the recursion rather than
+            // after it - the same order it was written in.
+            let stride = r.u32()?;
+            Rows::Sample { inner: Box::new(get_rows_at(r, depth + 1)?), stride }
+        }
         tag => return Err(WireError::BadTag { what: "row set", tag }),
     })
 }

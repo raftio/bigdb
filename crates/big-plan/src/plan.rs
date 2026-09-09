@@ -113,6 +113,23 @@ pub enum Rows {
     /// Complement against every record that exists, which is why the table is carried along.
     Not(Box<Rows>),
     All,
+    /// One record in every `stride`, by record id.
+    ///
+    /// **Sampled on the *low bits of the id*, not on blocks of them**, and the difference is the
+    /// whole reason this is answerable at all. A roaring container holds 65,536 consecutive
+    /// ids, so "every eighth id" is a fixed bit pattern inside each container - one word
+    /// constant, ANDed - which costs a pass over containers and never decodes a record. Taking
+    /// every eighth *container* would be as cheap and would be a different thing: ids are
+    /// handed out in write order, so a block of them is a window of time, and a number drawn
+    /// from one would lean whichever way the data drifted.
+    ///
+    /// `stride` is at least two. It need not divide a container: the pattern repeats every
+    /// `stride` ids whatever it is, and a container that starts part-way through one begins at
+    /// a known phase - so the mask is still built rather than walked.
+    Sample {
+        inner: Box<Rows>,
+        stride: u32,
+    },
 }
 
 /// One column a grouping is over, and how its values become sets of records.
@@ -824,6 +841,7 @@ impl<S: Schema> Ctx<'_, S> {
             "Like" => self.like(call, false),
             "ILike" => self.like(call, true),
             "Not" => Ok(Rows::Not(Box::new(self.one_rows_arg("Not", &call.args)?))),
+            "Sample" => self.sample(call),
             "Intersect" => Ok(Rows::Intersect(self.rows_args("Intersect", &call.args)?)),
             "Union" => Ok(Rows::Union(self.rows_args("Union", &call.args)?)),
             "Difference" => match call.args.as_slice() {
@@ -969,6 +987,36 @@ impl<S: Schema> Ctx<'_, S> {
         let by = crate::rounded::By::parse(by, digits)
             .ok_or(PlanError::BadArgument { call: "Rounded", want: WANT })?;
         crate::rounded::rows(field, self.class(field)?, by, op, value)
+    }
+
+    /// `Sample(<bitmap>, stride=<n>)`: one record in every `n`, by record id.
+    ///
+    /// `stride` is named rather than positional for the reason a field is on an aggregate: the
+    /// two arguments are not interchangeable and a reader should not have to remember the order.
+    ///
+    /// **Any stride from two upwards**, because the mask does not have to divide a container to
+    /// be a mask: the pattern repeats every `stride` ids, and a container beginning part-way
+    /// through one begins at a phase that is arithmetic rather than a search. Rounding a stride
+    /// to a nearby power of two would be a different sample wearing the right name.
+    fn sample(&self, call: &Call) -> Result<Rows> {
+        const WANT: &str = "a bitmap and stride=<2 or more>";
+        let (mut inner, mut stride) = (None, None);
+        for arg in &call.args {
+            match arg {
+                Expr::Call(c) => inner = Some(self.rows(c)?),
+                Expr::Named { name, value } if name == "stride" => match value.as_ref() {
+                    Expr::Literal(Literal::Int(n)) if (2..=u64::from(u32::MAX)).contains(n) => {
+                        stride = Some(*n as u32)
+                    }
+                    _ => return Err(PlanError::BadArgument { call: "Sample", want: WANT }),
+                },
+                _ => return Err(PlanError::BadArgument { call: "Sample", want: WANT }),
+            }
+        }
+        let (Some(inner), Some(stride)) = (inner, stride) else {
+            return Err(PlanError::Arity { call: "Sample", want: WANT, got: call.args.len() });
+        };
+        Ok(Rows::Sample { inner: Box::new(inner), stride })
     }
 
     fn row(&self, call: &Call) -> Result<Rows> {

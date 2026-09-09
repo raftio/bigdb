@@ -35,7 +35,10 @@ use big_sql::SqlError;
 /// **No `String` in it.** The happy path of an import runs once per fact over bodies of
 /// millions, so the error path is the only one that may allocate: this is the fact that
 /// something was wrong, and [`ValueError::why`] is the sentence, built on the way out.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+// **Not , because one variant carries the members it refused against.** Naming the legal
+// values is most of what that error is worth - a closed list is short, and "which values, then"
+// is the only question it raises - so the list is carried and the trait is not.
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub enum ValueError {
     /// An unsigned integer field, given something that is not a whole number.
     NeedsNumber,
@@ -47,6 +50,16 @@ pub enum ValueError {
     NeedsSeconds,
     /// A keyed field, given something that is not a string.
     NeedsKey,
+    /// An enum column, given a value it was not declared to hold.
+    ///
+    /// **The whole of what declaring the members buys**, and the reason it is a refusal rather
+    /// than a stored value: a mutex takes any string, so without this the declaration would be
+    /// a comment. Carries the members so the message can name them - a closed list is short by
+    /// construction, and "which values, then" is the only question this error raises.
+    NotAMember {
+        /// The values the column was declared with, in the order written.
+        members: Vec<String>,
+    },
     /// A float field, given something that is not a number.
     NeedsFloat,
     /// A float field, given a number it cannot hold: a NaN, or a magnitude past the range of a
@@ -87,6 +100,10 @@ impl ValueError {
                 format!("`{field}` takes `key@seconds`, and `{value}` is not a number")
             }
             Self::NeedsKey => format!("`{field}` needs a key, got `{value}`"),
+            Self::NotAMember { members } => {
+                let list = members.iter().map(|m| format!("'{m}'")).collect::<Vec<_>>().join(", ");
+                format!("`{field}` was declared to hold one of {list}, got `{value}`")
+            }
             Self::NeedsFloat => format!("`{field}` needs a number, got `{value}`"),
             Self::FloatOutOfRange => {
                 format!("`{field}` cannot hold `{value}`")
@@ -178,8 +195,26 @@ pub fn from_text<'a>(
                 Err(_) => return Err(ValueError::NeedsSeconds),
             },
         },
-        _ => Fact::Key { field, record, value },
+        _ => {
+            // The other funnel a written value comes through - the import route's `field record
+            // value` lines - so the declaration is enforced on both or on neither.
+            member_check(info, value)?;
+            Fact::Key { field, record, value }
+        }
     })
+}
+
+/// Refuses a value an enum column was not declared to hold.
+///
+/// A field with no members is not an enum, so this is the whole of the cost for every other
+/// column: one `is_empty` on a `Vec` that is empty. The scan is linear because the list is
+/// short by construction - a closed set somebody typed into a column definition - and building
+/// an index per write would cost more than it saved.
+fn member_check(info: &FieldInfo, value: &str) -> Result<(), ValueError> {
+    if info.members.is_empty() || info.members.iter().any(|m| m == value) {
+        return Ok(());
+    }
+    Err(ValueError::NotAMember { members: info.members.clone() })
 }
 
 /// One fact, from a value written as a SQL literal.
@@ -252,7 +287,13 @@ pub fn from_literal<'a>(
         (FieldKind::TimeQuantum, Literal::Str(s)) => from_text(field, info, record, s)?,
         (FieldKind::TimeQuantum, _) => return Err(ValueError::NeedsKey),
 
-        (_, Literal::Str(s)) => Fact::Key { field, record, value: s.as_str() },
+        (_, Literal::Str(s)) => {
+            // Checked here rather than at the storage layer, which sees a mutex and has no list
+            // to check against: the declaration lives in the catalog beside the field, and this
+            // is the one funnel every written value passes through.
+            member_check(info, s)?;
+            Fact::Key { field, record, value: s.as_str() }
+        }
         (_, _) => return Err(ValueError::NeedsKey),
     })
 }
